@@ -1,4 +1,4 @@
-# Updates testNN subdomain, GitHub repo URL, and cert issuer from project_settings.ts in ArgoCD and other deployment manifests.
+# Updates test-prefix subdomain, GitHub repo URL, and cert issuer from project_settings.ts in ArgoCD and other deployment manifests.
 
 #!/bin/bash
 set -euo pipefail
@@ -66,6 +66,8 @@ if [ -z "$test_prefix" ]; then
     test_prefix="test"
 fi
 
+escaped_test_prefix=$(printf '%s' "$test_prefix" | sed -E 's/[][(){}.^$*+?|\\/]/\\\\&/g')
+
 if [ "$rollout_type" = "Testing" ]; then
     test_subdomain="${test_prefix}${test_number}"
     tld="${test_subdomain}.${base_domain}"
@@ -109,14 +111,20 @@ if [ ${#deployment_files[@]} -eq 0 ]; then
     exit 1
 fi
 
-echo "Updating all testNN. occurrences to '$tld'."
+echo "Updating all ${test_prefix}N+. occurrences to '$tld'."
 
-# Replace all testNN. subdomain patterns with current test number
-TEST_NUMBER="$test_number" perl -pi -e 's/\btest[0-9]{2}\./test$ENV{TEST_NUMBER}./g' "${deployment_files[@]}"
+# Replace all <testSubdomainPrefix>N. patterns with current test number (supports test1, test34, test123...)
+TEST_PREFIX="$test_prefix" TEST_NUMBER="$test_number" perl -pi -e '
+    my $p = quotemeta($ENV{TEST_PREFIX});
+    s/\b${p}[0-9]+\./$ENV{TEST_PREFIX}$ENV{TEST_NUMBER}./g;
+' "${deployment_files[@]}"
 
 # Also update root level README
 if [ -f "$REPO_ROOT/README.md" ]; then
-    TEST_NUMBER="$test_number" perl -pi -e 's/\btest[0-9]{2}\./test$ENV{TEST_NUMBER}./g' "$REPO_ROOT/README.md"
+    TEST_PREFIX="$test_prefix" TEST_NUMBER="$test_number" perl -pi -e '
+        my $p = quotemeta($ENV{TEST_PREFIX});
+        s/\b${p}[0-9]+\./$ENV{TEST_PREFIX}$ENV{TEST_NUMBER}./g;
+    ' "$REPO_ROOT/README.md"
 fi
 
 # Discover and replace old GitHub URLs
@@ -133,10 +141,10 @@ fi
 # Keep RENOVATE_REPOSITORIES aligned with github.repoUrl (owner/repo only).
 GITHUB_REPO_SLUG="$github_repo_slug" perl -0777 -pi -e 's#(-\s*name:\s*RENOVATE_REPOSITORIES\s*\n\s*value:\s*")[^"]+(")#$1$ENV{GITHUB_REPO_SLUG}$2#gms' "${deployment_files[@]}"
 
-# Discover prior base domains from existing testNN.<domain> hostnames and migrate them.
+# Discover prior base domains from existing <testSubdomainPrefix>N.<domain> hostnames and migrate them.
 mapfile -t discovered_old_domains < <(
-    grep -RhoE '([*A-Za-z0-9-]+\.)*test[0-9]{2}\.[A-Za-z0-9.-]+' "$REPO_ROOT/deployment" "$REPO_ROOT/README.md" 2>/dev/null \
-        | sed -E 's/^.*test[0-9]{2}\.//' \
+    grep -RhoE "([*A-Za-z0-9-]+\.)*${escaped_test_prefix}[0-9]+\.[A-Za-z0-9.-]+" "$REPO_ROOT/deployment" "$REPO_ROOT/README.md" 2>/dev/null \
+        | sed -E "s/^.*${escaped_test_prefix}[0-9]+\.//" \
         | sed -E 's/\.+$//' \
         | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' \
         | grep -E '^[A-Za-z0-9.-]+$' \
@@ -150,16 +158,18 @@ for old_domain in "${discovered_old_domains[@]}"; do
     fi
 
     echo "Migrating domain references: $old_domain -> $base_domain"
-    OLD_DOMAIN="$old_domain" TLD="$tld" BASE_DOMAIN="$base_domain" perl -pi -e '
+    TEST_PREFIX="$test_prefix" OLD_DOMAIN="$old_domain" TLD="$tld" BASE_DOMAIN="$base_domain" perl -pi -e '
+        my $p = quotemeta($ENV{TEST_PREFIX});
         my $old = quotemeta($ENV{OLD_DOMAIN});
-        s/(test[0-9]{2})\.$old/$ENV{TLD}/g;
+        s/(${p}[0-9]+)\.$old/$ENV{TLD}/g;
         s/\b$old\b/$ENV{BASE_DOMAIN}/g;
     ' "${deployment_files[@]}"
 
     if [ -f "$REPO_ROOT/README.md" ]; then
-        OLD_DOMAIN="$old_domain" TLD="$tld" BASE_DOMAIN="$base_domain" perl -pi -e '
+        TEST_PREFIX="$test_prefix" OLD_DOMAIN="$old_domain" TLD="$tld" BASE_DOMAIN="$base_domain" perl -pi -e '
+            my $p = quotemeta($ENV{TEST_PREFIX});
             my $old = quotemeta($ENV{OLD_DOMAIN});
-            s/(test[0-9]{2})\.$old/$ENV{TLD}/g;
+            s/(${p}[0-9]+)\.$old/$ENV{TLD}/g;
             s/\b$old\b/$ENV{BASE_DOMAIN}/g;
         ' "$REPO_ROOT/README.md"
     fi
