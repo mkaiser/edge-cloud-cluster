@@ -1,0 +1,27 @@
+# ArgoCD Application: NFS PVC stale lock file cleanup
+# Wave 1 — runs before opendesk (wave 2), headscale (wave 4), etc.
+# Clears stale lock files from NFS PVCs left over from a previous cluster run.
+# Safe on first deploy — rm -f is a no-op when files don't exist.
+# See deployment/nfs-pvc-cleanup/ for details.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nfs-pvc-cleanup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:owner/repo.git
+    targetRevision: main
+    path: deployment/nfs-pvc-cleanup
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

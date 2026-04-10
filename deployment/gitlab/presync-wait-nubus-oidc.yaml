@@ -1,0 +1,47 @@
+---
+# Hard gate: block GitLab sync until Nubus/Keycloak OIDC discovery is reachable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-wait-nubus-oidc
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 2000
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: wait-oidc
+        image: curlimages/curl:8.10.1
+        env:
+        - name: KEYCLOAK_URL
+          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+        - name: REALM
+          value: "opendesk"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          URL="${KEYCLOAK_URL}/realms/${REALM}/.well-known/openid-configuration"
+          echo "Waiting for OIDC discovery endpoint: ${URL}"
+
+          max_tries=180
+          i=1
+          while [ "$i" -le "$max_tries" ]; do
+            code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "OIDC endpoint reachable (HTTP 200)."
+              exit 0
+            fi
+            echo "Try ${i}/${max_tries}: HTTP ${code:-000}, retrying in 10s..."
+            i=$((i + 1))
+            sleep 10
+          done
+
+          echo "Timed out waiting for Nubus/Keycloak OIDC endpoint."
+          exit 1

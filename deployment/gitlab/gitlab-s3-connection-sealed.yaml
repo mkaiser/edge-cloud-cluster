@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: gitlab-s3-connection
+  namespace: gitlab
+spec:
+  encryptedData:
+    connection: AgBJa8hTzsIIctOzYEAPd7Yllu7B/Lu/l+A20A+HR+Aauz+TxeIhE8VKXYP1gvMvJ/ML1U5t2Q1mq3bPymeW5Lg/i6u9QqhMbLXWNZVU5xmBWnkI0udN6yKDuXgeehM9g0xjDJEZeMpZpHGMpJ1yWS9NvMBRQMYlFqaB6mR/Rmjp/qMrQGyZ6ZfPKKiZhY5VgkrEcsik2pt1r+XFWxs8Cb/Vl8PKt9KAkvBr+lky51Wm+5uUYHCQtW2FYxIvLIZkxEt4hhYJsjLdM/L6SQ+0ENHRj9LHGu8a+dd1EwpMrScexKLC7KtxYB+6bvPexFOoJoHM8bICHxVuUFBq//cSB7ETFo1XPj1KZWBZ96rWi8x7nVT9sUoHF7dgjXGepGhgVCvbKEabOXniLvO7Ykihm+NfBruFDbSra+zaa7atVp/7xJ15xk6jFLzWHT7DIfgWk8ZPB5zO+5J8sOPqmeC0OrK6pp2sUSUX7tTq/jCY1q3mf8UzoI5tvB11DU+I3lpFa3g47nT5zMUVsax8P7SdZcOW9jR2/ZlAt4Yfr8GsoXa0FJeoiov016vLIQBvORYPEuKIfcqj6Jb2BYnuWi4snLOJtx+155KPchlyyagmGWeN3UQtPbK+85TX4pJEOr1nyKdkZ4PlpxfioD6CDgBXLoh+uLo4uGjmRBCdG5qUSClLgFGwhAYeXQvIUD1BWe2sfckhqs1f+RMqa4yTiilzmCGx/m8GbpGrPFhsFm5LQTnn/4C79Twycx3roU3f6fQbCkBfTv/d36YaNZzzB5H1tIlttMEJrl6iFR4WG1QdoqbnCAAuh4oDUVfhjgQdDXUZTgeayQKaaEr/VCVaYDVHQo+pzAejqBYLMkp1Itk8vfbSR9v5FzAbt/reGk7KQTXlPmq0dln15omKMqyuf4WEZaj7GnU/8tGN8itt4JQ2HngoU+0seE4lZwTsNUPR6bu3n7RFboVOUKQ=
+  template:
+    metadata:
+      name: gitlab-s3-connection
+      namespace: gitlab

@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: headscale-keycloak-admin
+  namespace: headscale
+spec:
+  encryptedData:
+    password: AgCXoSlVyzoSqL0uasM/4H/0fpj6TuP8avuIm5Uk81jVLLwRKTpwujcZBwOylisDbB9+8O3a9dAcatHzwQfqqNGbMpC5P+kc87fZ3PkqTDiIjZT1/VriI182uujXXsbwditcy/zj98T0Yy7pVkSnd0058z2rIDDLkdwlQVn08Ya+EQYh8rMwjCpMUzDvVWWFm0ZD0GsTOJEJpBmOVpNd/X3oJQATD4h9nWO4EOv+EcB2NWuH4MWCgBWu0d0Yb48WQxCKvhvxJVUwUaqhDBVBhEUNjivOLExfsi/O0mG89T5VL9QecpLUMqK6v3wbzXrrRS3S2W2KfxQRXgif7fERsvvhQYpWTk9MArxdQF7oo5JDs0+vWaE+eFgFeQkX7IsdNFjgpWKvWXwIspONFveeh1ZnXhOfUhnfvilv99B/ILDJziHUnE5VupcS5AWwV53JV+GvkD2+AfWF+srvmrzja2sqsUlh3TLDpd5PQi6VF7uqvjOOlmCMyQ2vAnSRbYIsTY6Ett6soHAMtUDSVfjv4SwMxC+B7Fl6EBq0IZKQRh2ri92jMTZoHYsRNpfqfIaaTAfhAK4wJePTw93xgfL6clzSRXM1UHSt2t0F1W9GVENFbjFhfFV2RZSopcaheTWnrOh9y0Crn8AQN/d425VXWhM6KX1OX88MOlj+mkUkxb0IneX+Gl7gVf9Y6HByIjzos6m5GQNGL4TT482Yc37q3j0+
+  template:
+    metadata:
+      name: headscale-keycloak-admin
+      namespace: headscale

@@ -1,0 +1,118 @@
+# PostSync hook: fixes an upstream opendesk bug where the migrations-status
+# ConfigMap is initialized with stage=POST on a fresh install, causing the
+# opendesk-migrations-post job to fail with:
+#   "Current Stage POST is the same as POST - this is suspicious"
+#
+# ROOT CAUSE:
+#   opendesk-migrations-pre (opendesk internal wave 7) creates the ConfigMap
+#   with stage=POST + init=true on fresh install. opendesk-migrations-post
+#   then finds stage already=POST and errors out.
+#
+# WHY PostSync AND NOT wave 1 Sync:
+#   The migrations-status ConfigMap does not exist at wave 1 — it is created
+#   by the opendesk helmfile sync (wave 2+). A wave 1 Sync hook exits early
+#   because the ConfigMap isn't there yet. PostSync runs after all waves
+#   complete, so the ConfigMap exists. The job polls until the bad state
+#   appears (up to 30 min), patches it, then triggers a re-sync of the
+#   migrations-post app so it completes successfully.
+#
+# SAFE FOR UPGRADES:
+#   Only patches when init=true (set only on fresh install). On upgrades,
+#   init=false — the job exits without touching anything.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: migrations-preflight
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: migrations-preflight
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["migrations-status"]
+  verbs: ["get", "patch"]
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  resourceNames: ["opendesk-opendesk-migrations-post"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: migrations-preflight
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: migrations-preflight
+subjects:
+- kind: ServiceAccount
+  name: migrations-preflight
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrations-preflight
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # 35 min — opendesk-migrations-pre can be slow on cold NFS
+  activeDeadlineSeconds: 2100
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: migrations-preflight
+      restartPolicy: Never
+      containers:
+      - name: preflight
+        image: docker.io/alpine/k8s:1.32.3
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          CM="migrations-status"
+          echo "Watching ${CM} for fresh-install bug (stage=POST init=true)..."
+
+          for i in $(seq 1 60); do
+            STAGE=$(kubectl get configmap "$CM" -n argocd \
+              -o jsonpath='{.data.stage}' 2>/dev/null || true)
+            RUN_ID=$(kubectl get configmap "$CM" -n argocd \
+              -o jsonpath='{.data.run_id}' 2>/dev/null || true)
+            INIT=$(kubectl get configmap "$CM" -n argocd \
+              -o jsonpath='{.data.init}' 2>/dev/null || true)
+
+            echo "  Attempt $i/60 — stage=${STAGE} run_id=${RUN_ID} init=${INIT}"
+
+            # Not a fresh install — nothing to do.
+            if [ "$INIT" = "false" ]; then
+              echo "init=false — this is an upgrade, no fix needed."
+              exit 0
+            fi
+
+            # Fresh install with bad state — patch and exit.
+            if [ "$STAGE" = "POST" ] && [ "$INIT" = "true" ]; then
+              echo "Detected bad state (stage=POST init=true) — patching to stage=PRE..."
+              kubectl patch configmap "$CM" -n argocd \
+                --type=merge -p '{"data":{"stage":"PRE","state":"SUCCESS","run_id":"6"}}'
+              echo "Patched. opendesk-opendesk-migrations-post will be re-synced by ArgoCD selfHeal."
+              exit 0
+            fi
+
+            sleep 30
+          done
+
+          echo "WARNING: ${CM} did not reach expected state within 30 minutes. Manual intervention may be needed."
+          exit 1

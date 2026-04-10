@@ -1,0 +1,55 @@
+// see https://github.com/pulumi/pulumi/blob/master/.devcontainer/devcontainer.json
+{
+    "name": "Pulumi",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "USER_NAME": "user",
+            "USER_UID": "1000"
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            // "installZsh": true,
+            // "installOhMyZsh": true,
+            // "installOhMyZshConfig": true,
+            // "upgradePackages": true,
+            "installSsl": true,
+            "username": "automatic",
+            "userUid": "automatic",
+            "userGid": "automatic"
+        }
+    },
+    "remoteUser": "user",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "golang.go",
+                "ms-dotnettools.csharp",
+                "ms-python.python",
+                "formulahendry.dotnet-test-explorer",
+                "pflannery.vscode-versionlens",
+                "pulumi.pulumi",
+                "redhat.vscode-yaml",
+                "mhutchie.git-graph",
+                "pulumi.pulumi-vscode-tools",
+                "pulumi.pulumi-lsp-client",
+                "pulumi.pulumi-vscode-copilot",
+                "anthropic.claude-code",
+                "ms-azuretools.vscode-containers",
+                "ms-kubernetes-tools.vscode-kubernetes-tools",
+                "tim-koehler.helm-intellisense",
+                "ms-vsliveshare.vsliveshare",
+                "bierner.markdown-preview-github-styles",
+                "esbenp.prettier-vscode"
+            ]
+        }
+    },
+    "postCreateCommand": "make install && echo 'Devcontainer started. Invoke source initPulumi.sh now' && echo pwd ",
+    "containerEnv": {
+        "TZ": "Europe/Berlin"
+    },
+    "remoteEnv": {
+        "PULUMI_MCP_ACCESS_TOKEN": "${localEnv:PULUMI_MCP_ACCESS_TOKEN}"
+    }
+}

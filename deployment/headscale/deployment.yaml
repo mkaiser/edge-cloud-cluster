@@ -1,0 +1,12 @@
+# Headscale VPN server deployed via wrenix helm chart.
+# https://wrenix.eu/docs/helm-charts/headscale/
+#
+# The ArgoCD Application (deployment/apps/headscale.yaml) now sources directly from:
+#   oci://codeberg.org/wrenix/helm-charts/headscale
+#
+# This file is no longer used as an ArgoCD source path.
+# It is kept for reference / supplementary resources only.
+#
+# NOTE: The postgres password (headscale.config.database.postgres.pass) must be
+# injected via a sealed-secret values override before activating the Application.
+# See sealSecrets.sh for the sealing workflow.

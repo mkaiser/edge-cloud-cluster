@@ -1,0 +1,145 @@
+# PostSync notification: sends an email when Ryax is ready.
+# Ryax is manually synced — this job polls until ryax reports Synced+Healthy,
+# timing out after 30 minutes.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notify-ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: notify-ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  resourceNames: ["ryax"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["smtp-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notify-ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: notify-ryax
+subjects:
+- kind: ServiceAccount
+  name: notify-ryax
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notify-ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "9"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: notify-ryax
+      restartPolicy: Never
+      containers:
+      - name: notify
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: NOTIFY_TO
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: sendBootstrapFinishMailRecipient
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: host
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: port
+        - name: SMTP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: username
+        - name: SMTP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: password
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          APP="ryax"
+          echo "Waiting for ${APP} to be Synced+Healthy..."
+          i=0
+          while [ "$i" -lt 180 ]; do
+            SYNC=$(kubectl get application "$APP" -n argocd \
+              -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+            HEALTH=$(kubectl get application "$APP" -n argocd \
+              -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+            [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && break
+            echo "  Attempt $i/180 — sync=${SYNC} health=${HEALTH}, waiting 10s..."
+            sleep 10; i=$((i+1))
+          done
+          if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ]; then
+            echo "ERROR: ryax not ready within 30 minutes"; exit 1
+          fi
+          echo "Ryax ready — sending notification."
+
+          python3 - <<PYEOF
+          import smtplib, os, time
+          from email.message import EmailMessage
+
+          to       = os.environ["NOTIFY_TO"]
+          host     = os.environ["SMTP_HOST"]
+          port     = int(os.environ["SMTP_PORT"])
+          username = os.environ.get("SMTP_USERNAME", "")
+          password = os.environ.get("SMTP_PASSWORD", "")
+
+          msg = EmailMessage()
+          msg["Subject"] = "Ryax ready"
+          msg["From"]    = "no-reply@your-domain.tld"
+          msg["To"]      = to
+          msg.set_content(
+              "Ryax workflow automation is Synced and Healthy.\n\n"
+              "Ryax is ready for use.\n"
+          )
+
+          for attempt in range(1, 11):
+              try:
+                  with smtplib.SMTP(host, port, timeout=10) as s:
+                      s.ehlo(); s.starttls()
+                      if username:
+                          s.login(username, password)
+                      s.send_message(msg)
+                  print(f"Notification sent to {to}")
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/10 failed: {e}")
+                  if attempt < 10:
+                      time.sleep(30)
+          else:
+              raise RuntimeError("Failed to send notification after 10 attempts")
+          PYEOF

@@ -1,0 +1,94 @@
+# ArgoCD Application: external-dns (Hetzner DNS provider)
+# Automatically creates/updates DNS records from Ingress hostnames.
+# Requires the 'hetzner-dns-token' secret in the 'external-dns' namespace,
+# which is created by Pulumi (index.ts).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes-sigs.github.io/external-dns/
+    chart: external-dns
+    targetRevision: "1.20.0"  # https://github.com/kubernetes-sigs/external-dns/releases
+    helm:
+      values: |
+        provider:
+          name: webhook
+          webhook:
+            image:
+              repository: ghcr.io/mconfalonieri/external-dns-hetzner-webhook
+              tag: v0.12.0  # https://github.com/mconfalonieri/external-dns-hetzner-webhook/pkgs/container/external-dns-hetzner-webhook
+            env:
+              - name: HETZNER_API_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: hetzner-dns-token
+                    key: token
+              - name: USE_CLOUD_API
+                value: "true"
+              # BULK_MODE disabled: the zonefile parser in v0.11.0+ treats the SOA serial
+              # as a calendar date and rejects it when Hetzner auto-increments it to a
+              # future date (e.g. "20260320" on 2026-03-19), breaking all record updates.
+              # Re-enable once https://github.com/mconfalonieri/external-dns-hetzner-webhook
+              # ships a fix for the SOA serial validation.
+              - name: BULK_MODE
+                value: "false"
+              - name: ZONE_CACHE_TTL
+                value: "1800"       # cache zone list for 30 minutes
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: http-webhook
+              initialDelaySeconds: 10
+              timeoutSeconds: 5
+            readinessProbe:
+              httpGet:
+                path: /readyz
+                port: http-webhook
+              initialDelaySeconds: 10
+              timeoutSeconds: 5
+        interval: 5m
+        extraArgs:
+          - --webhook-provider-url=http://127.0.0.1:8888
+          # All services use Pulumi-managed wildcard DNS (*.infra* / *.test*).
+          # --exclude-domains only matches exact domains, not subdomains.
+          # Use --regex-domain-exclusion to prevent per-host records under the wildcards.
+          # Only exclude single-label subdomains (e.g. nextcloud.domain) — deeper subdomains
+          # like *.pages.gitlab.subdomain.domain.tld* are managed via DNSEndpoint CRDs.
+          - --regex-domain-exclusion=^[^.]+\.(subdomain|subdomain)\.your-domain\.tld$
+
+        serviceMonitor:
+          # Disabled here: ServiceMonitor CRD is installed by kube-prometheus-stack
+          # (wave 3) which hasn't run yet at wave 1.  The ServiceMonitor is instead
+          # deployed by a separate wave-3 patch in deployment/kube-prometheus-stack/.
+          enabled: false
+
+        txtOwnerId: edgecloudinfra
+        domainFilters:
+          - your-domain.tld
+        policy: sync
+        sources:
+          # ingress source disabled: all DNS is covered by Pulumi wildcard records
+          # (*.infra* / *.test*). Re-enable if non-wildcard services are added.
+          # - ingress
+          - service
+          # crd source: manages wildcard records declared via DNSEndpoint CRDs
+          # (e.g. *.pages.gitlab.subdomain.domain.tld for GitLab Pages)
+          - crd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: external-dns
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    automated:
+      prune: true
+      selfHeal: true      
+

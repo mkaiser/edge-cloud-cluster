@@ -1,0 +1,172 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 83.4.0  # https://github.com/prometheus-community/helm-charts/pkgs/container/charts%2Fkube-prometheus-stack
+    helm:
+      values: |
+        prometheusOperator:
+          admissionWebhooks:
+            # Admission webhook Jobs use Helm hooks that ArgoCD cannot track reliably —
+            # the Job completes and is GC'd before ArgoCD polls it, causing a permanent
+            # stuck sync. cert-manager handles TLS for webhooks instead.
+            enabled: false
+            patch:
+              enabled: false
+          tls:
+            enabled: false
+        grafana:
+          admin:
+            existingSecret: kube-prometheus-stack-grafana
+            userKey: admin-user
+            passwordKey: admin-password
+          grafana.ini:
+            users:
+              allow_sign_up: false
+            auth:
+              disable_login_form: false
+              disable_initial_admin_creation: false
+            security:
+              disable_initial_admin_password_change: true
+          sidecar:
+            dashboards:
+              searchNamespace: ALL  # discover dashboard ConfigMaps from all namespaces
+          # Dashboards imported from grafana.com — check each gnetId for latest revision
+          dashboards:
+            default:
+              argocd:
+                gnetId: 14584
+                revision: 10
+                datasource: Prometheus
+              external-dns:
+                gnetId: 15038
+                revision: 3
+                datasource: Prometheus
+              cert-manager:
+                gnetId: 20842
+                revision: 2
+                datasource: Prometheus
+              haproxy-ingress:
+                gnetId: 12693
+                revision: 2
+                datasource: Prometheus
+              wireguard:
+                gnetId: 12177
+                revision: 1
+                datasource: Prometheus
+              headscale:
+                gnetId: 20614
+                revision: 1
+                datasource: Prometheus
+              gitlab-overview:
+                gnetId: 2662
+                revision: 4
+                datasource: Prometheus
+          ingress:
+            enabled: true
+            ingressClassName: haproxy
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-staging"
+              haproxy-ingress.github.io/ssl-redirect: "true"
+            hosts:
+              - grafana.test34.your-domain.tld
+            tls:
+              - hosts:
+                  - grafana.test34.your-domain.tld
+                secretName: grafana-tls
+        # ServiceMonitors for components deployed by Pulumi (or wave-1 apps).
+        # These live here (not in Pulumi/wave-1) because the CRD doesn't exist until
+        # the kube-prometheus-stack Helm chart is deployed.
+        additionalServiceMonitors:
+          - name: external-dns
+            namespace: prometheus
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: external-dns
+            namespaceSelector:
+              matchNames:
+                - external-dns
+            endpoints:
+              - port: http
+                interval: 30s
+          - name: cert-manager
+            namespace: prometheus
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: cert-manager
+                app.kubernetes.io/component: controller
+            namespaceSelector:
+              matchNames:
+                - cert-manager
+            endpoints:
+              - port: http-metrics
+                path: /metrics
+                interval: 60s
+          - name: haproxy-ingress
+            namespace: prometheus
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: haproxy-ingress
+            namespaceSelector:
+              matchNames:
+                - haproxy-ingress
+            endpoints:
+              - port: stat
+                path: /metrics
+                interval: 30s
+          - name: wireguard
+            namespace: prometheus
+            selector:
+              matchLabels:
+                app: wireguard
+            namespaceSelector:
+              matchNames:
+                - wireguard-infra
+            endpoints:
+              - port: metrics
+                path: /metrics
+                interval: 30s
+          - name: headscale
+            namespace: prometheus
+            selector:
+              matchLabels:
+                app.kubernetes.io/instance: headscale
+                app.kubernetes.io/name: headscale
+            namespaceSelector:
+              matchNames:
+                - headscale
+            endpoints:
+              - port: http
+                path: /metrics
+                interval: 30s
+
+        prometheus:
+          ingress:
+            enabled: true
+            ingressClassName: haproxy
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-staging"
+              haproxy-ingress.github.io/ssl-redirect: "true"
+            hosts:
+              - prometheus.test34.your-domain.tld
+            tls:
+              - hosts:
+                  - prometheus.test34.your-domain.tld
+                secretName: prometheus-tls
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prometheus
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true

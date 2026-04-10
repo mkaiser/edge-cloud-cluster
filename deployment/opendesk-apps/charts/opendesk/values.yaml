@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2024 Zentrum für Digitale Souveränität der Öffentlichen Verwaltung (ZenDiS) GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+
+# based on git_opendesk-argocd-deploy/charts/opendesk/values.yaml
+
+# openDesk related settings.
+openDesk:
+  # -- Deployment domain.
+  domain: "test34.your-domain.tld" # MODIFIED
+  # -- Deployment password seed.
+  masterPassword: "x&9gX#ZgiqRHshvYR9AiSuopK9^aKS#TP4qZ/h3oo2Z9^&Wed" # MODIFIED
+  # -- TURN sever credential.
+  turnPassword: ""
+  # -- Primary mail domain (MAIL_DOMAIN). Defaults to domain if unset.
+  # Controls system account addresses (e.g. no-reply@<mailDomain>).
+  mailDomain: "test34.your-domain.tld" # MODIFIED
+  # -- Overwrite openDesk helmfile environment settings.
+  overwrites: # MODIFIED
+    certificate:
+      wildcard: true
+    openproject:
+      enabled: false
+    persistence:
+      storageClassNames:
+        RWO: "hcloud-nfs-ssd-volumes"
+        RWX: "hcloud-nfs-ssd-volumes"
+    cluster:
+      persistence:
+        readWriteMany:
+          enabled: true
+    objectstores:
+      nextcloud:
+        bucket: "edgecloud-nextcloud"
+        endpoint: "nbg1.your-objectstorage.com"
+        region: "nbg1"
+        useSSL: true
+        pathStyle: true
+        port: 443
+
+# Argo CD related settings.
+argo:
+  # -- A list of openDesk applications to deploy.
+  applications:
+    - name: "opendesk-migrations-pre"
+      syncWave: "0"
+    - name: "opendesk-services"
+      syncWave: "1"
+    - name: "services-external"
+      syncWave: "1"
+    - name: "open-xchange"
+      syncWave: "1"
+      selector: "name=dovecot"
+    - name: "open-xchange"
+      syncWave: "2"
+      selector: "name=ox-connector"
+    - name: "open-xchange"
+      syncWave: "2"
+      selector: "name=open-xchange"
+    - name: "open-xchange"
+      syncWave: "2"
+      selector: "name=opendesk-open-xchange-bootstrap"
+    - name: "open-xchange" 
+      syncWave: "2"
+      selector: "name=postfix-ox"
+    - name: "nubus"
+      syncWave: "1"
+      selector: "name=nubus"
+    - name: "nubus"
+      syncWave: "2"
+      selector: "name=ums"
+    - name: "nubus"
+      syncWave: "2"
+      selector: "name=intercom-service"
+    - name: "nubus"
+      syncWave: "3"
+      selector: "name=opendesk-keycloak-bootstrap"
+    - name: "collabora"
+      syncWave: "4"
+    - name: "cryptpad"
+      syncWave: "4"
+    - name: "element"
+      syncWave: "4"
+    - name: "jitsi"
+      syncWave: "4"
+    - name: "notes"
+      syncWave: "4"
+    - name: "nextcloud"
+      syncWave: "4"
+      selector: "name=opendesk-nextcloud-management"
+    # openproject disabled — Ruby 3.4 world-writable /tmp regression in openProject 17.2.1
+    # (wait-for-db init container crashes with "could not find a temporary directory")
+    # Re-enable once upstream fixes the image. Also re-enable openproject.enabled: true in overwrites.
+    # - name: "openproject"
+    #   syncWave: "4"
+    - name: "xwiki"
+      syncWave: "4"
+    - name: "nextcloud"
+      syncWave: "5"
+      selector: "name=opendesk-nextcloud"
+    # disabled together with openproject above
+    # - name: "opendesk-openproject-bootstrap"
+    #   syncWave: "6"
+    - name: "opendesk-migrations-post"
+      syncWave: "7"
+  # Destination settings.
+  destination:
+    # -- Deployment Namespace.
+    namespace: "argocd"
+    # -- Deployment Server.
+    server: "https://kubernetes.default.svc"
+  # -- Argo CD project.
+  project: "default"
+  # openDesk source setting.
+  source:
+    # -- Git repository used for Argo to fetch openDesk.
+    repoURL: "https://gitlab.opencode.de/bmi/opendesk/deployment/opendesk.git" # MODIFIED
+    # -- Git revision.
+    targetRevision: "v1.13.2" # MODIFIED
+  # -- SyncPolicy settings.
+  syncPolicy: {}
+...

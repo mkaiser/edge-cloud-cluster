@@ -1,0 +1,31 @@
+# Chart value overrides for openDesk components.
+# Mounted into the helmfile-opendesk CMP sidecar at /overrides/.
+# Referenced via --state-values-file and --state-values-set in HELMFILE_GLOBAL_OPTIONS.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opendesk-chart-overrides
+  namespace: argocd
+data:
+  # # Disable postfix spool PVC — the spool is transient (relay only, no mail store)
+  # # and a persistent PVC causes crash loops from stale PID files after pod restarts.
+  # # With persistence disabled, the chart uses the container's ephemeral filesystem
+  # # for /var/spool/postfix, which resets cleanly on every restart.
+  # postfix-no-persistence.yaml: |
+  #   persistence:
+  #     enabled: false
+
+  # Global helmfile state overrides applied to every openDesk app via
+  # --state-values-file /overrides/global-overwrites.yaml.
+  # additionalMailDomains: creates mail/domain LDAP objects on first deploy,
+  #   allowing users to have email addresses in these domains.
+  # smtp.host/port/username/password are injected via env vars from the
+  #   opendesk-smtp-credentials SealedSecret (see sealSecrets.sh).
+  global-overwrites.yaml: |
+    global:
+      additionalMailDomains:
+        - "your-domain.tld"
+    functional:
+      internationalization:
+        defaultLanguage: "en_US"

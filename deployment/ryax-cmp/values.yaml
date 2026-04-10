@@ -1,0 +1,6 @@
+# Helm values for the Ryax CMP sidecar — merged into the argocd-self Helm release.
+# Referenced by deployment/argocd/argocd-self.yaml as an additional valueFile.
+#
+# Placeholder — no sidecar defined yet. Add extraContainers and volumes here
+# when Ryax helmfile rendering is implemented.
+# The plugin name will be "helmfile-ryax" to isolate secrets from openDesk.

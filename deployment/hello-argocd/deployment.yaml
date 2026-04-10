@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: hello-argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      labels:
+        app: hello-world
+    spec:
+      containers:
+      - name: hello
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+      initContainers:
+      - name: init-html
+        image: busybox:1.36
+        command: ["sh", "-c"]
+        args:
+        - |
+          cat > /html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>ArgoCD Hello World</title></head>
+          <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: linear-gradient(135deg, #00b300 0%, #cc0000 100%);">
+          <div style="text-align: center; color: white;">
+          <h1>Hello ArgoCD World!</h1>
+          <p style="font-size: 18px; margin-top: 20px;">Deployed via GitOps</p>
+          <p>Hostname: <span id="host" style="font-family: monospace;"></span></p>
+          <script>document.getElementById('host').textContent = location.hostname;</script>
+          </div>
+          </body>
+          </html>
+          EOF
+        volumeMounts:
+        - name: html
+          mountPath: /html
+      volumes:
+      - name: html
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world
+  namespace: hello-argocd
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+  selector:
+    app: hello-world

@@ -1,0 +1,31 @@
+# Plugin configuration for the openDesk helmfile CMP sidecar.
+# Mounted at /home/argocd/cmp-server/config/plugin.yaml in the helmfile-opendesk
+# container, overriding the name baked into the travisghansen image ("helmfile")
+# so that ArgoCD routes openDesk apps exclusively to this sidecar.
+# Applications reference it via: plugin.name: "helmfile-opendesk"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cmp-opendesk-plugin
+  namespace: argocd
+data:
+  plugin.yaml: |
+    apiVersion: argoproj.io/v1alpha1
+    kind: ConfigManagementPlugin
+    metadata:
+      name: helmfile-opendesk
+    spec:
+      init:
+        command: ["argo-cd-helmfile.sh"]
+        args: ["init"]
+      generate:
+        command: ["argo-cd-helmfile.sh"]
+        args: ["generate"]
+      discover:
+        find:
+          command: [argo-cd-helmfile.sh, discover]
+      parameters:
+        dynamic:
+          command: [argo-cd-helmfile.sh, parameters]
+      preserveFileMode: true

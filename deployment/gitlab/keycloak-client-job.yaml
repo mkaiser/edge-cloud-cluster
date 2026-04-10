@@ -1,0 +1,168 @@
+# Registers the "gitlab" OIDC client in the openDesk Keycloak realm.
+# PostSync hook — runs after all resources are synced so it doesn't block deployment.
+# Reads Keycloak admin credentials from the opendesk-keycloak-bootstrap-admin-creds
+# secret in the argocd namespace (requires ClusterRole).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-keycloak-setup
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-keycloak-setup
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["opendesk-keycloak-bootstrap-admin-creds"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-keycloak-setup
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-keycloak-setup
+subjects:
+- kind: ServiceAccount
+  name: gitlab-keycloak-setup
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-keycloak-client-setup
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: gitlab-keycloak-setup
+      restartPolicy: OnFailure
+      containers:
+      - name: keycloak-client-setup
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: KEYCLOAK_URL
+          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+        - name: REALM
+          value: "opendesk"
+        - name: CLIENT_ID
+          value: "gitlab"
+        - name: CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: gitlab-oidc-client-secret
+              key: client-secret
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Wait for the opendesk realm to be fully bootstrapped before proceeding.
+          # The realm is created by ums-keycloak-bootstrap (PostSync of opendesk wave 2)
+          # and may not exist yet when this job starts at wave 6.
+          echo "Waiting for Keycloak opendesk realm to be ready..."
+          for i in $(seq 1 120); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+              "${KEYCLOAK_URL}/realms/opendesk" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Realm opendesk is ready."
+              break
+            fi
+            echo "  Attempt $i/120 — realm status=${STATUS}, waiting 10s..."
+            sleep 10
+          done
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: opendesk realm not ready after 20 minutes"
+            exit 1
+          fi
+
+          # Read Keycloak admin credentials from openDesk secret in argocd namespace
+          echo "Reading Keycloak admin credentials..."
+          ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
+            -n argocd -o jsonpath='{.data.admin\.yaml}' | base64 -d)
+          KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep 'username:' | awk '{print $2}')
+          KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep 'password:' | awk '{print $2}')
+
+          if [ -z "$KC_ADMIN_USER" ] || [ -z "$KC_ADMIN_PASS" ]; then
+            echo "ERROR: Could not read Keycloak admin credentials"
+            exit 1
+          fi
+
+          echo "Obtaining Keycloak admin token..."
+          TOKEN=$(curl -sf -X POST \
+            "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+            -d "client_id=admin-cli" \
+            -d "username=${KC_ADMIN_USER}" \
+            -d "password=${KC_ADMIN_PASS}" \
+            -d "grant_type=password" | \
+            sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to obtain admin token"
+            exit 1
+          fi
+          echo "Admin token obtained."
+
+          # Check if client already exists
+          EXISTING=$(curl -sf \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${KEYCLOAK_URL}/admin/realms/${REALM}/clients?clientId=${CLIENT_ID}")
+
+          CLIENT_UUID=$(echo "$EXISTING" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+
+          CLIENT_JSON='{
+            "clientId": "'"${CLIENT_ID}"'",
+            "protocol": "openid-connect",
+            "publicClient": false,
+            "clientAuthenticatorType": "client-secret",
+            "secret": "'"${CLIENT_SECRET}"'",
+            "standardFlowEnabled": true,
+            "directAccessGrantsEnabled": false,
+            "serviceAccountsEnabled": false,
+            "redirectUris": [
+              "https://gitlab.test34.your-domain.tld/users/auth/openid_connect/callback"
+            ],
+            "webOrigins": [
+              "https://gitlab.test34.your-domain.tld"
+            ],
+            "defaultClientScopes": ["openid", "profile", "email"]
+          }'
+
+          if [ -n "$CLIENT_UUID" ] && [ "$CLIENT_UUID" != "[]" ]; then
+            echo "Client '${CLIENT_ID}' exists (UUID: ${CLIENT_UUID}), updating..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${CLIENT_JSON}" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_UUID}")
+          else
+            echo "Client '${CLIENT_ID}' does not exist, creating..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${CLIENT_JSON}" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/clients")
+          fi
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Keycloak client '${CLIENT_ID}' configured successfully (HTTP ${HTTP_CODE})."
+          else
+            echo "ERROR: Keycloak API returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi

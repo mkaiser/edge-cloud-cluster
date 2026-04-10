@@ -1,0 +1,10 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  namespace: argocd
+data:
+  notify.from: {{ .Values.from | quote }}
+  notify.subject: {{ .Values.subject | quote }}
+  notify.body: {{ .Values.body | quote }}

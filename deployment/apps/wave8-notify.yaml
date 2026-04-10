@@ -1,0 +1,35 @@
+# ArgoCD Application: all-services-ready notification.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: notify
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "8"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:owner/repo.git
+    targetRevision: main
+    path: deployment/notify
+    helm:
+      valuesObject:
+        from: "no-reply@your-domain.tld"
+        subject: "Cluster bootstrap complete"
+        body: |
+          All ArgoCD sync waves have completed successfully.
+
+          The cluster is fully ready:
+            - Monitoring (kube-prometheus-stack)
+            - OpenDesk / Nubus
+            - Headscale VPN + Headplane + Renovate
+            - GitLab + Runner
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

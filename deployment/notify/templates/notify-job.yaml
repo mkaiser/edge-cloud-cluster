@@ -1,0 +1,101 @@
+---
+# PostSync Job: sends a notification email when this ArgoCD wave completes.
+# Connects directly to the SMTP relay (smtp-credentials secret).
+# Resource names are derived from .Release.Name to allow multiple instances
+# in the same namespace (argocd).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: notify
+          image: python:3.12-alpine
+          env:
+            - name: NOTIFY_TO
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: sendBootstrapFinishMailRecipient
+            - name: NOTIFY_FROM
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .Release.Name }}-config
+                  key: notify.from
+            - name: NOTIFY_SUBJECT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .Release.Name }}-config
+                  key: notify.subject
+            - name: NOTIFY_BODY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .Release.Name }}-config
+                  key: notify.body
+            - name: SMTP_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: host
+            - name: SMTP_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: port
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: username
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-credentials
+                  key: password
+          command:
+            - python3
+            - -c
+            - |
+              import smtplib, os, time
+              from email.message import EmailMessage
+
+              to       = os.environ["NOTIFY_TO"]
+              from_    = os.environ["NOTIFY_FROM"]
+              subject  = os.environ["NOTIFY_SUBJECT"]
+              body     = os.environ["NOTIFY_BODY"]
+              host     = os.environ["SMTP_HOST"]
+              port     = int(os.environ["SMTP_PORT"])
+              username = os.environ.get("SMTP_USERNAME", "")
+              password = os.environ.get("SMTP_PASSWORD", "")
+
+              msg = EmailMessage()
+              msg["Subject"] = subject
+              msg["From"]    = from_
+              msg["To"]      = to
+              msg.set_content(body)
+
+              for attempt in range(1, 11):
+                  try:
+                      with smtplib.SMTP(host, port, timeout=10) as s:
+                          s.ehlo()
+                          s.starttls()
+                          if username:
+                              s.login(username, password)
+                          s.send_message(msg)
+                      print(f"Notification sent to {to}")
+                      break
+                  except Exception as e:
+                      print(f"Attempt {attempt}/10 failed: {e}")
+                      if attempt < 10:
+                          time.sleep(30)
+              else:
+                  raise RuntimeError("Failed to send notification after 10 attempts")

@@ -1,0 +1,135 @@
+---
+# Hard gate: block GitLab Runner sync until Nubus/Keycloak OIDC discovery is reachable.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-runner-presync-check
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-runner-presync-check
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-runner-presync-check
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-runner-presync-check
+subjects:
+- kind: ServiceAccount
+  name: gitlab-runner-presync-check
+  namespace: gitlab-runner
+---
+# Hard gate: block GitLab Runner sync until Nubus/Keycloak OIDC discovery is reachable
+# and required runner secrets exist.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-runner-wait-nubus-oidc
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 2000
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: gitlab-runner-presync-check
+      restartPolicy: Never
+      containers:
+      - name: wait-oidc
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: KEYCLOAK_URL
+          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+        - name: REALM
+          value: "opendesk"
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          URL="${KEYCLOAK_URL}/realms/${REALM}/.well-known/openid-configuration"
+          echo "Waiting for OIDC discovery endpoint: ${URL}"
+
+          max_tries=180
+          i=1
+          ready=0
+          while [ "$i" -le "$max_tries" ]; do
+            code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "OIDC endpoint reachable (HTTP 200)."
+              ready=1
+              break
+            fi
+            echo "Try ${i}/${max_tries}: HTTP ${code:-000}, retrying in 10s..."
+            i=$((i + 1))
+            sleep 10
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Timed out waiting for Nubus/Keycloak OIDC endpoint."
+            exit 1
+          fi
+
+          echo "Waiting for GitLab to be reachable at ${GITLAB_URL}..."
+          i=1
+          ready=0
+          while [ "$i" -le "$max_tries" ]; do
+            code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "${GITLAB_URL}/-/readiness" || true)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "GitLab reachable (HTTP ${code})."
+              ready=1
+              break
+            fi
+            echo "Try ${i}/${max_tries}: GitLab HTTP ${code:-000}, retrying in 10s..."
+            i=$((i + 1))
+            sleep 10
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Timed out waiting for GitLab."
+            exit 1
+          fi
+
+          echo "Checking runner bootstrap secrets in gitlab-runner namespace..."
+          for secret in gitlab-runner-token gitlab-runner-cache-s3; do
+            j=1
+            while [ "$j" -le 180 ]; do
+              if kubectl -n gitlab-runner get secret "$secret" >/dev/null 2>&1; then
+                echo "Secret present: $secret"
+                break
+              fi
+              echo "Try ${j}/180: waiting for secret $secret..."
+              j=$((j + 1))
+              sleep 10
+            done
+            kubectl -n gitlab-runner get secret "$secret" >/dev/null
+          done
+
+          echo "All runner prerequisites are ready."

@@ -1,0 +1,126 @@
+# Wave-1 Sync hook for argocd-main-app: gates wave 2 (opendesk) until the
+# helmfile CMP sidecar is ready on ALL repo-server replicas.
+#
+# Why this is needed:
+#   argocd-self (managed by argocd-infra, wave 0) triggers an ArgoCD Helm upgrade
+#   that adds the helmfile-opendesk sidecar to repo-server pods. On a fresh cluster
+#   the CMP image (travisghansen/argo-cd-helmfile) may take several minutes to pull,
+#   so the container starts long after the pod itself is Running.
+#   Wave 2 (opendesk) would otherwise start while the CMP container is still
+#   being pulled → "could not find cmp-server plugin with name helmfile-opendesk".
+#
+# Why NOT a PostSync hook on argocd-infra:
+#   argocd-main-app gates wave progression on child Application *health*, not on
+#   PostSync hooks. A PostSync hook on argocd-infra does not block wave 2.
+#
+# This Sync hook runs in wave 1 of argocd-main-app itself, which ArgoCD must
+# complete before applying any wave-2 resources.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-cmp-readiness
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-cmp-readiness
+  namespace: argocd
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-cmp-readiness
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argocd-cmp-readiness
+subjects:
+- kind: ServiceAccount
+  name: argocd-cmp-readiness
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argocd-cmp-readiness
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # 15 minutes max — covers image pull + ArgoCD Helm upgrade + pod rollout
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      serviceAccountName: argocd-cmp-readiness
+      restartPolicy: OnFailure
+      containers:
+      - name: wait
+        image: docker.io/alpine/k8s:1.35.0
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # --- Wait for argocd-self to finish its Helm upgrade ---
+          echo "Waiting for argocd-self to reach Synced + Healthy..."
+          for i in $(seq 1 90); do
+            SYNC=$(kubectl get application argocd-self -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            HEALTH=$(kubectl get application argocd-self -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "argocd-self: Synced + Healthy"
+              break
+            fi
+            echo "  Attempt $i/90 — sync=$SYNC health=$HEALTH, waiting 10s..."
+            sleep 10
+          done
+
+          if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ]; then
+            echo "ERROR: argocd-self did not reach Synced+Healthy within 15 minutes"
+            exit 1
+          fi
+
+          # --- Wait for ALL helmfile-* sidecars to be Ready on all repo-server pods ---
+          # Uses wc -l (always exits 0, always outputs a number) instead of grep -c
+          # to avoid the "bad number" error when grep finds no matches (exit code 1)
+          # and || echo 0 produces a double-line value like "0\n0".
+          echo "Waiting for all helmfile-* sidecars to be ready on all repo-server pods..."
+          for i in $(seq 1 90); do
+            TOTAL=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              --field-selector=status.phase=Running \
+              --no-headers 2>/dev/null | wc -l)
+
+            NOT_READY=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.ready}{"\n"}{end}{end}' \
+              2>/dev/null | grep "^helmfile-" | grep "=false" | wc -l)
+
+            READY_COUNT=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.ready}{"\n"}{end}{end}' \
+              2>/dev/null | grep "^helmfile-.*=true" | wc -l)
+
+            if [ "$TOTAL" -gt 0 ] && [ "$NOT_READY" -eq 0 ] && [ "$READY_COUNT" -gt 0 ]; then
+              echo "All helmfile-* sidecars ready ($READY_COUNT containers across $TOTAL pods) — CMP available"
+              exit 0
+            fi
+            echo "  Attempt $i/90 — helmfile ready: $READY_COUNT, not-ready: $NOT_READY, pods: $TOTAL, waiting 10s..."
+            sleep 10
+          done
+
+          echo "ERROR: helmfile-* sidecars did not become ready within 15 minutes"
+          exit 1

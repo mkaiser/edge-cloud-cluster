@@ -1,0 +1,15 @@
+# Persistent helm chart cache for the CMP helmfile sidecar.
+# Survives pod restarts so charts don't need to be re-downloaded on every sync.
+# Uses hcloud-nfs-ssd-volumes (RWX) so multiple repo-server replicas can share it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argocd-helm-cache
+  namespace: argocd
+spec:
+  storageClassName: hcloud-nfs-ssd-volumes
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 2Gi

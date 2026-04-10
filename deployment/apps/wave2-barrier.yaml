@@ -1,0 +1,123 @@
+# Wave 2 Sync barrier: waits until ALL wave-2 ArgoCD Applications are
+# Synced + Healthy before ArgoCD advances to wave 3+.
+#
+# WHY THIS IS NEEDED:
+#   ArgoCD advances sync waves when resources are applied (Synced), not
+#   when their pods are Running. Wave-2 apps (opendesk, OX, intercom, ...)
+#   can take 20-40 minutes for pods to fully start. Without this barrier,
+#   wave 3-6 apps (prometheus, headscale, gitlab, ...) all start at once,
+#   causing pod scheduling pressure and failures.
+#
+# HOW IT WORKS:
+#   Runs as a Sync hook at wave 2. Discovers all Applications annotated
+#   with sync-wave="2" dynamically, then polls until every one of them
+#   reports sync=Synced and health=Healthy. Times out after 60 minutes.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave2-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave2-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave2-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave2-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave2-barrier
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave2-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # 60 min — nubus on cold NFS can take up to 45 min
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave2-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.32.3
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "Wave-2 barrier: discovering applications with sync-wave=2..."
+
+          # Only look at apps directly owned by argocd-main-app at wave 2.
+          # opendesk child apps have their own internal wave numbers — those
+          # are irrelevant here. opendesk's health rolls up from all children,
+          # so waiting for opendesk=Healthy covers all opendesk child apps.
+          APPS=$(kubectl get applications -n argocd -o json | \
+            python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent == 'argocd-main-app' and wave == '2':
+                  print(item['metadata']['name'])
+          ")
+
+          echo "Waiting for: $(echo $APPS | tr '\n' ' ')"
+
+          i=0
+          while [ "$i" -lt 360 ]; do
+            ALL_READY=true
+            for APP in $APPS; do
+              SYNC=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+              HEALTH=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ] || [ "$PHASE" = "Running" ]; then
+                ALL_READY=false
+                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+              fi
+            done
+
+            if [ "$ALL_READY" = "true" ]; then
+              echo "All argocd-main-app wave-2 Applications are Synced+Healthy — releasing wave 3."
+              exit 0
+            fi
+
+            echo "Attempt $i/360 — not all ready, waiting 10s..."
+            sleep 10
+            i=$((i+1))
+          done
+
+          echo "ERROR: Not all argocd-main-app wave-2 Applications reached Synced+Healthy within 60 minutes"
+          exit 1

@@ -1,0 +1,197 @@
+# ArgoCD core Helm values — managed via GitOps (self-managed ArgoCD pattern).
+# Applied by argocd-self alongside deployment/opendesk-cmp/values.yaml and
+# deployment/ryax-cmp/values.yaml.
+#
+# This file covers only ArgoCD infrastructure: server, controller, redis, ingress.
+# CMP sidecars and app-specific secrets live in their dedicated *-cmp/ folders.
+#
+# NOT included here (injected by Pulumi bootstrap only):
+#   global.domain          — resolved from Pulumi stack config
+#   configs.secret.*       — admin password hash + server secret key
+#
+# To upgrade ArgoCD: bump targetRevision in deployment/argocd/argocd-self.yaml,
+# then manually sync the argocd-self Application.
+
+global:
+  domain: argocd.test34.your-domain.tld
+  env:
+    - name: TZ
+      value: "Europe/Berlin"
+
+configs:
+  cm:
+    timeout.reconciliation: "30m"  # 30 minutes; opendesk helmfile renders are very slow on single-threaded queue
+    oidc.config: |
+      name: Keycloak
+      issuer: https://id.test34.your-domain.tld/realms/opendesk
+      clientID: argocd
+      clientSecret: $argocd-oidc-client-secret:oidc.clientSecret
+      requestedScopes:
+        - openid
+        - profile
+        - email
+        - groups
+
+  rbac:
+    # Members of the Keycloak group "argocd-admins" get full admin access.
+    # Everyone else authenticated gets read-only access.
+    policy.csv: |
+      g, /argocd-admins, role:admin
+    policy.default: "role:readonly"
+
+  # argocd-notifications-cm — email service + templates + triggers.
+  # Env vars (SMTP_HOST etc.) are injected into the notifications controller
+  # via notifications.extraEnv below and referenced here with the $VAR notation.
+  notifications:
+    service.email: |
+      host: $SMTP_HOST
+      port: $SMTP_PORT
+      username: $SMTP_USERNAME
+      password: $SMTP_PASSWORD
+      from: $NOTIFY_FROM
+
+    # Templates
+    template.app-sync-failed: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} sync FAILED"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync Failed
+
+          {{if .app.status.operationState.syncResult}}
+          {{range .app.status.operationState.syncResult.resources}}
+          - {{.kind}}/{{.name}}: {{.status}} {{.message}}
+          {{end}}
+          {{end}}
+
+          https://argocd.test34.your-domain.tld/applications/{{.app.metadata.name}}
+
+    template.app-health-degraded: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} is DEGRADED"
+        body: |
+          Application: {{.app.metadata.name}}
+          Health:      {{.app.status.health.status}}
+          Message:     {{.app.status.health.message}}
+
+          https://argocd.test34.your-domain.tld/applications/{{.app.metadata.name}}
+
+    # Triggers
+    trigger.on-sync-failed: |
+      - when: app.status.operationState.phase in ['Error', 'Failed']
+        send: [app-sync-failed]
+
+    trigger.on-health-degraded: |
+      - when: app.status.health.status == 'Degraded'
+        send: [app-health-degraded]
+
+    # Subscribe all apps by default
+    defaultTriggers: |
+      - on-sync-failed
+      - on-health-degraded
+
+    subscriptions: |
+      - recipients:
+          - email:$NOTIFY_TO
+        triggers:
+          - on-sync-failed
+          - on-health-degraded
+
+  params:
+    # haproxy handles TLS termination; ArgoCD serves plain HTTP internally
+    server.insecure: "true"
+    # Enable git submodule support (e.g. opendesk upstream)
+    reposerver.enable.git.submodule: "true"
+    # Increase manifest generation timeout for heavy CMP plugins (helmfile/opendesk)
+    reposerver.timeout.seconds: "1800"
+    # Increase application controller's gRPC timeout to repo-server (default ~60s, kills helmfile)
+    controller.repo.server.timeout.seconds: "1800"
+    # Limit concurrent manifest generations to avoid overwhelming the CMP sidecar
+    # (23 opendesk apps rendering simultaneously will OOM/timeout)
+    reposerver.parallelism.limit: "1"
+
+server:
+  replicas: 1
+  service:
+    type: ClusterIP
+  extraArgs:
+    - --insecure
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  ingress:
+    enabled: true
+    ingressClassName: haproxy
+    hosts:
+      - argocd.test34.your-domain.tld
+    annotations:
+      haproxy-ingress.github.io/ssl-redirect: "true"
+      external-dns.alpha.kubernetes.io/exclude: "true"
+    tls:
+      - secretName: infra-wildcard-tls
+        hosts:
+          - argocd.test34.your-domain.tld
+
+controller:
+  replicas: 2
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+
+applicationSet:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+
+notifications:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  # Inject SMTP credentials from the existing smtp-credentials secret so
+  # the notifications controller can send email without a separate secret.
+  extraEnv:
+    - name: SMTP_HOST
+      valueFrom:
+        secretKeyRef:
+          name: smtp-credentials
+          key: host
+    - name: SMTP_PORT
+      valueFrom:
+        secretKeyRef:
+          name: smtp-credentials
+          key: port
+    - name: SMTP_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: smtp-credentials
+          key: username
+    - name: SMTP_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: smtp-credentials
+          key: password
+    - name: NOTIFY_FROM
+      value: "no-reply@your-domain.tld"
+    - name: NOTIFY_TO
+      valueFrom:
+        secretKeyRef:
+          name: smtp-credentials
+          key: sendBootstrapFinishMailRecipient
+
+

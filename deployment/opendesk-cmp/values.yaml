@@ -1,0 +1,113 @@
+# Helm values for the openDesk CMP sidecar — merged into the argocd-self Helm release.
+# Referenced by deployment/argocd/argocd-self.yaml as an additional valueFile.
+#
+# Owns the full repoServer configuration: replicas, timeout env, volumes, and the
+# helmfile-opendesk sidecar container. Kept separate from deployment/argocd/values.yaml
+# so openDesk-specific secrets and infrastructure don't pollute ArgoCD core config.
+
+repoServer:
+  replicas: 2
+  # argocd-cmd-params-cm reposerver.timeout.seconds is not wired to this env var
+  # in the Helm chart, so set it explicitly to override the 60s default.
+  env:
+    - name: ARGOCD_REPO_SERVER_TIMEOUT_SECONDS
+      value: "1800"
+
+  volumes:
+    - name: helmfile-cmp-tmp
+      emptyDir: {}
+    # Persistent helm chart cache — survives pod restarts, shared across replicas
+    - name: helm-cache-persistent
+      persistentVolumeClaim:
+        claimName: argocd-helm-cache
+    # openDesk chart overrides — mounted at /overrides/ in the sidecar
+    - name: opendesk-chart-overrides
+      configMap:
+        name: opendesk-chart-overrides
+    # Custom plugin.yaml — overrides the plugin name baked into the image
+    - name: cmp-opendesk-plugin
+      configMap:
+        name: cmp-opendesk-plugin
+
+  extraContainers:
+    - name: helmfile-opendesk
+      # travisghansen/argo-cd-helmfile: batteries-included CMP sidecar with
+      # helm, helmfile, helm-diff, helm-secrets, sops, age, kustomize, yq, kubectl.
+      image: travisghansen/argo-cd-helmfile:v0.3.13@sha256:1251e329f72cadaf55860b9029d13c887559b5f20287915f21d32d722aaeef2e
+      command: [/var/run/argocd/argocd-cmp-server]
+      env:
+        - name: ARGOCD_EXEC_TIMEOUT
+          # Default is 90s — far too short for helmfile init on a cold helm cache
+          # (needs to add all helm repos from scratch on first deploy).
+          value: "1800"
+        - name: HELM_CACHE_HOME
+          value: /helm-cache/cache
+        - name: HELM_CONFIG_HOME
+          value: /helm-cache/config
+        - name: XDG_CACHE_HOME
+          value: /helm-cache/cache
+        # S3 credentials for openDesk Nextcloud object storage.
+        # ArgoCD Application plugin env does not support valueFrom, so injected here.
+        - name: HETZNER_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: hetzner-s3
+              key: accessKey
+        - name: HETZNER_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: hetzner-s3
+              key: secretKey
+        # SMTP config for openDesk outbound mail (Keycloak onboarding, notifications).
+        # All four values come from the shared smtp-credentials SealedSecret
+        # (deployment/secrets/). Run deployment/secrets/sealSecrets.sh to create/update.
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: host
+              optional: true
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: port
+              optional: true
+        - name: SMTP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: username
+              optional: true
+        - name: SMTP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: password
+              optional: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+      resources:
+        requests:
+          memory: 1Gi
+          cpu: 500m
+        limits:
+          memory: 6Gi
+          # No CPU limit — helmfile renders are CPU-heavy and burst on large clusters.
+      volumeMounts:
+        - name: var-files
+          mountPath: /var/run/argocd
+        - name: plugins
+          mountPath: /home/argocd/cmp-server/plugins
+        - name: helm-cache-persistent
+          mountPath: /helm-cache
+        - name: helmfile-cmp-tmp
+          mountPath: /tmp
+        - name: opendesk-chart-overrides
+          mountPath: /overrides
+          readOnly: true
+        - name: cmp-opendesk-plugin
+          mountPath: /home/argocd/cmp-server/config/plugin.yaml
+          subPath: plugin.yaml
+          readOnly: true

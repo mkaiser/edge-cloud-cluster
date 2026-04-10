@@ -1,0 +1,24 @@
+# OmniAuth OIDC provider configuration for GitLab.
+# This file is a template — sealSecrets.sh substitutes the client secret
+# and seals it as gitlab-oidc-provider sealed secret.
+#
+# GitLab expects the provider config as a JSON blob in the 'provider' key.
+# Reference: https://docs.gitlab.com/ee/administration/auth/oidc.html
+name: openid_connect
+label: "Nubus SSO"
+args:
+  name: openid_connect
+  scope:
+    - openid
+    - profile
+    - email
+  response_type: code
+  issuer: https://id.test34.your-domain.tld/realms/opendesk
+  discovery: true
+  client_auth_method: query
+  uid_field: preferred_username
+  pkce: true
+  client_options:
+    identifier: gitlab
+    secret: OIDC_CLIENT_SECRET_PLACEHOLDER
+    redirect_uri: https://gitlab.test34.your-domain.tld/users/auth/openid_connect/callback

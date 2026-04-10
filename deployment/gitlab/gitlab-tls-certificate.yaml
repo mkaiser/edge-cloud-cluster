@@ -1,0 +1,29 @@
+# Wildcard TLS certificate for all GitLab hostnames.
+# Covers gitlab.*, registry.gitlab.*, kas.*, pages.*
+# Uses letsencrypt-staging (switch to letsencrypt-prod for production).
+#
+# This replaces the GitLab chart's self-signed gitlab-wildcard-tls secret
+# (which only covers registry.gitlab.*) with a proper cert-manager cert
+# covering all GitLab ingress hostnames.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gitlab-tls
+  namespace: gitlab
+  annotations:
+    # Resource sync-wave 1 (within the gitlab app sync):
+    # Ensures cert-manager Deployment is Ready and its webhook endpoints are registered
+    # before ArgoCD applies this Certificate. Without this, the bundled
+    # gitlab-certmanager webhook intercepts the Certificate while still starting
+    # → "no endpoints available for service gitlab-certmanager-webhook".
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  secretName: gitlab-tls
+  issuerRef:
+    name: letsencrypt-staging
+    kind: ClusterIssuer
+  dnsNames:
+    - "gitlab.test34.your-domain.tld"
+    - "registry.gitlab.test34.your-domain.tld"
+    - "kas.test34.your-domain.tld"
+    - "pages.test34.your-domain.tld"

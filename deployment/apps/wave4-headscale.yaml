@@ -1,0 +1,114 @@
+# ArgoCD Application: headscale + headplane
+# Self-hosted Tailscale-compatible VPN via Kapernikov headscale helm chart.
+# Accessible at https://vpn.test34.your-domain.tld (headscale) and https://headplane.test34.your-domain.tld/admin (GUI)
+# Issues its own cert via cert-manager (letsencrypt-prod, DNS-01 Hetzner).
+#
+# Multi-source:
+#   1. OCI chart for headscale server
+#   2. Git repo directory for plain manifests (headplane, jobs, sealed secrets)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: headscale
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  project: default
+  sources:
+    - repoURL: ghcr.io/kapernikov/charts
+      chart: headscale
+      targetRevision: "0.3.2" # https://github.com/Kapernikov/headscale-helm/releases
+      helm:
+        valuesObject:
+          image:
+            # Explicit pin to the release line currently deployed by chart 0.3.2.
+            tag: "v0.28.0"
+
+          client:
+            enabled: false
+
+          config:
+            server_url: "https://vpn.test34.your-domain.tld"
+            grpc_allow_insecure: false
+            database:
+              type: sqlite
+              sqlite:
+                path: /var/lib/headscale/db.sqlite
+            dns:
+              magic_dns: false
+            oidc:
+              issuer: "https://id.test34.your-domain.tld/realms/opendesk"
+              client_id: "headscale"
+              client_secret_path: "/etc/headscale/oidc/oidc_client_secret"
+              scope: ["openid", "profile", "email"]
+              only_start_if_oidc_is_available: false
+
+          # Supported by chart v0.3.2 templates.
+          extraVolumes:
+            - name: oidc-client-secret
+              secret:
+                secretName: headscale-oidc-client-secret
+                items:
+                  - key: client-secret
+                    path: oidc_client_secret
+
+          extraVolumeMounts:
+            - name: oidc-client-secret
+              mountPath: /etc/headscale/oidc
+              readOnly: true
+
+          persistence:
+            enabled: true
+            storageClassName: "hcloud-nfs-ssd-volumes"
+            size: 1Gi
+
+          ingress:
+            enabled: true
+            className: "haproxy"
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-staging"
+              haproxy-ingress.github.io/ssl-redirect: "true"
+              haproxy-ingress.github.io/timeout-server: "3600s"
+              haproxy-ingress.github.io/timeout-client: "3600s"
+            hosts:
+              - host: vpn.test34.your-domain.tld
+                paths:
+                  - path: /
+                    pathType: ImplementationSpecific
+            tls:
+              - hosts:
+                  - vpn.test34.your-domain.tld
+                secretName: headscale-tls
+
+    # Second source: plain manifests (headplane, jobs, sealed secrets)
+    - repoURL: git@github.com:owner/repo.git
+      targetRevision: main
+      path: deployment/headscale
+      directory:
+        exclude: '{*.template,*.sh,deployment.yaml,postgres.yaml,pg-user-secret-sealed.yaml,s3-secret-sealed.yaml,keycloak-admin-sealed.yaml}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - group: ""
+      kind: PersistentVolumeClaim
+      name: headscale
+      namespace: headscale
+      jsonPointers:
+        - /spec/storageClassName
+    - group: apps
+      kind: Deployment
+      name: headscale
+      namespace: headscale
+      jsonPointers:
+        - /spec/strategy/rollingUpdate

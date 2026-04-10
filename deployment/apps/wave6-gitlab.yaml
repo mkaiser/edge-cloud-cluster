@@ -1,0 +1,58 @@
+# ArgoCD Application: GitLab CE
+# Self-hosted GitLab on Hetzner Cloud with Nubus/Keycloak OIDC, Hetzner S3 object storage,
+# container registry, Pages, and in-cluster runner.
+#
+# Multi-source:
+#   1. Official GitLab Helm chart
+#   2. Git repo ref for sensitive helm values file (OIDC secret, rails secrets)
+#   3. Git repo directory for plain manifests (keycloak job, sealed secrets, pages DNS)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  project: default
+  sources:
+    # 1. Official GitLab Helm chart
+    - repoURL: https://charts.gitlab.io
+      chart: gitlab
+      targetRevision: "9.10.3"  # (helm search repo gitlab/gitlab --versions | grep '^gitlab/gitlab[[:space:]]\+9\.' | head -n 10)
+      helm:
+        valueFiles:
+          - $values/deployment/gitlab/values.yaml
+          - $values/deployment/gitlab/helm-values-secret.yaml
+
+    # 2. Git repo ref for values files
+    - repoURL: git@github.com:owner/repo.git
+      targetRevision: main
+      ref: values
+
+    # 3. Plain manifests (keycloak job, sealed secrets, pages DNS)
+    - repoURL: git@github.com:owner/repo.git
+      targetRevision: main
+      path: deployment/gitlab
+      directory:
+        exclude: '{*.template,*.sh,values.yaml,helm-values-secret.yaml*}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab
+  ignoreDifferences:
+    # volumeClaimTemplates are immutable — Kubernetes adds status/defaultMode fields at
+    # runtime that ArgoCD (even with SSA) cannot reconcile, causing perpetual OutOfSync.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

@@ -1,0 +1,95 @@
+# Clears stale lock files from NFS PVCs left over from a previous cluster.
+#
+# WHY THIS IS NEEDED:
+#   NFS-backed PVCs (hcloud-nfs-ssd-volumes) survive cluster recreation.
+#   Several stateful services write lock/pid files that are not cleaned up
+#   when pods are killed. On the next cluster, the new pod finds the stale
+#   lock and refuses to start:
+#
+#   OpenLDAP:   "mdb_db_open: No locks available (37)" — listener.lock,
+#               notify/transaction.lock, ldap/__db.* lock files
+#   PostgreSQL: "lock file postmaster.pid already exists"
+#   MariaDB:    aria_log_control / ibdata lock on unclean shutdown
+#
+# WHEN IT RUNS:
+#   Wave 1 Sync hook — before opendesk (wave 2), headscale (wave 4), etc.
+#   Safe on first deploy: rm -f is a no-op when files don't exist.
+#   Safe on normal restarts: lock files are only present after unclean shutdown.
+#
+# VOLUMES:
+#   All PVCs are mounted read-write. The job only removes known lock file
+#   patterns — it never touches database data files.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-pvc-cleanup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nfs-pvc-cleanup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: nfs-pvc-cleanup
+      restartPolicy: Never
+      containers:
+      - name: cleanup
+        image: busybox:1.36
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "=== NFS PVC lock file cleanup ==="
+
+          # OpenLDAP — mdb lock files + listener/notify locks
+          # Error without cleanup: "mdb_db_open: No locks available (37)"
+          echo "Cleaning OpenLDAP locks..."
+          rm -f \
+            /ldap-data/listener/listener.lock \
+            /ldap-data/notify/transaction.lock \
+            /ldap-data/ldap/__db.001 \
+            /ldap-data/ldap/__db.002 \
+            /ldap-data/ldap/__db.003 \
+            /ldap-data/ldap/log.0000000001
+          echo "  OpenLDAP: done"
+
+          # PostgreSQL — postmaster.pid prevents startup after unclean shutdown
+          # Error without cleanup: "lock file postmaster.pid already exists"
+          echo "Cleaning PostgreSQL locks..."
+          rm -f /postgresql/postmaster.pid
+          echo "  PostgreSQL: done"
+
+          # MariaDB — aria engine lock on unclean shutdown
+          echo "Cleaning MariaDB locks..."
+          rm -f /mariadb/aria_log_control
+          echo "  MariaDB: done"
+
+          echo "=== Cleanup complete ==="
+        volumeMounts:
+        - name: ldap-data
+          mountPath: /ldap-data
+        - name: postgresql
+          mountPath: /postgresql
+        - name: mariadb
+          mountPath: /mariadb
+      volumes:
+      - name: ldap-data
+        persistentVolumeClaim:
+          claimName: shared-data-ums-ldap-server-primary-0
+      - name: postgresql
+        persistentVolumeClaim:
+          claimName: data-postgresql-0
+      - name: mariadb
+        persistentVolumeClaim:
+          claimName: data-mariadb-0

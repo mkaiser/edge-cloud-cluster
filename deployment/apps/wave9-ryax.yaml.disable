@@ -1,0 +1,45 @@
+# ArgoCD Application: ryax-engine
+# Ryax workflow automation platform via OCI helm chart.
+# Accessible at https://ryax.test34.your-domain.tld
+# Chart: oci://registry.ryax.org/release-charts/ryax-engine
+# Docs: https://gitlab.com/ryax-tech/ryax/ryax-engine/-/releases
+#
+# Sync is MANUAL — trigger once the cluster is confirmed healthy:
+#   argocd app sync ryax
+# A PreSync job gates the sync on opendesk/gitlab/gitlab-runner/kube-prometheus-stack
+# all being Synced+Healthy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+spec:
+  project: default
+  sources:
+    # 1. OCI Helm chart
+    - repoURL: registry.ryax.org/release-charts
+      chart: ryax-engine
+      targetRevision: "26.2" # https://gitlab.com/ryax-tech/ryax/ryax-engine/-/releases
+      helm:
+        valuesObject:
+          global:
+            tls:
+              hostname: ryax.test34.your-domain.tld
+            defaultStorageClass: hcloud-nfs-ssd-volumes
+
+    # 2. PreSync hook: gates sync on core apps being Synced+Healthy
+    - repoURL: git@github.com:owner/repo.git
+      targetRevision: main
+      path: deployment/ryax
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ryaxns
+  syncPolicy:
+    # Automated sync intentionally disabled — Ryax is for testing only.
+    # Sync manually: argocd app sync ryax
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

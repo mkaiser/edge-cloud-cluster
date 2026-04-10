@@ -1,0 +1,136 @@
+{{/*
+SPDX-FileCopyrightText: 2024 Zentrum für Digitale Souveränität der Öffentlichen Verwaltung (ZenDiS) GmbH
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- range .Values.argo.applications }}
+{{- if or (ne .name "opendesk-migrations-pre") $.Values.argo.enableMigrationsPre }}
+---
+apiVersion: "argoproj.io/v1alpha1"
+kind: "Application"
+metadata:
+  # name: "{{ $.Values.argo.destination.namespace }}-opendesk-{{ .name }}{{ if .selector }}-{{.selector | regexFind "=(.+)" | trimPrefix "=" }}{{ end }}"
+  name: "opendesk-{{ .name }}{{ if .selector }}-{{.selector | regexFind "=(.+)" | trimPrefix "=" }}{{ end }}"
+  namespace: {{ $.Release.Namespace | quote }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .syncWave | quote }}
+  finalizers:
+    - "resources-finalizer.argocd.argoproj.io"
+spec:
+  project: {{ $.Values.argo.project | quote }}
+  source:
+    repoURL: {{ $.Values.argo.source.repoURL | quote }}
+    targetRevision: {{ $.Values.argo.source.targetRevision | quote }}
+    path: "helmfile/apps/{{ .name }}"
+    plugin:
+      # Route exclusively to the openDesk CMP sidecar (helmfile-opendesk).
+      # Defined in deployment/opendesk-cmp/ — isolated from other CMP plugins.
+      name: "helmfile-opendesk"
+      env:
+        - name: "MASTER_PASSWORD"
+          value: {{ $.Values.openDesk.masterPassword | quote }}
+        - name: "TURN_CREDENTIALS"
+          value: {{ $.Values.openDesk.turnPassword | quote }}
+        - name: "DOMAIN"
+          value: {{ $.Values.openDesk.domain | quote }}
+        - name: "MAIL_DOMAIN"
+          value: {{ $.Values.openDesk.mailDomain | default $.Values.openDesk.domain | quote }}
+        # SMTP_HOST/PORT/USERNAME/PASSWORD are injected by the CMP sidecar (argocd/values.yaml)
+        # from the opendesk-smtp-credentials SealedSecret — not passed through here.
+      parameters:
+        - name: "HELMFILE_GLOBAL_OPTIONS"
+          string: "--file helmfile.yaml.gotmpl --state-values-file /overrides/global-overwrites.yaml{{ if $.Values.openDesk.overwrites }} --state-values-set {{ include "yamlToArgs" (dict "map" $.Values.openDesk.overwrites "path" "") | trimSuffix "," }}{{ end }} --state-values-set objectstores.nextcloud.username=$HETZNER_S3_ACCESS_KEY,objectstores.nextcloud.secretKey=$HETZNER_S3_SECRET_KEY,smtp.host=$SMTP_HOST,smtp.port=$SMTP_PORT,smtp.username=$SMTP_USERNAME{{ if .selector }} --selector {{ .selector }}{{ end }}"
+  destination:
+    server: {{ $.Values.argo.destination.server | quote }}
+    namespace: {{ $.Values.argo.destination.namespace | quote }}
+  syncPolicy:
+    {{- if $.Values.argo.syncPolicy }}
+    {{ $.Values.argo.syncPolicy | toYaml | nindent 4 }}
+    {{- end }}
+    syncOptions:
+      - "CreateNamespace=true"
+      - "RespectIgnoreDifferences=true"
+      {{- if and (eq .name "nubus") $.Values.argo.useReplaceSyncOption }}
+      - "Replace=true"
+      {{- end }}
+  ignoreDifferences:
+    - kind: "ConfigMap"
+      name: "jitsi-jvb"
+      jsonPointers:
+        - "/data/JVB_PORT"
+    - kind: "ConfigMap"
+      name: "ums-portal-listener"
+      jsonPointers:
+        - "/data/LDAP_PASSWORD"
+    - group: "apps"
+      kind: "Deployment"
+      name: "jitsi-jvb"
+      jqPathExpressions:
+        - ".spec.template.spec.containers[].env"
+    - group: "apps"
+      kind: "Deployment"
+      name: "ums-guardian-management-ui"
+      jqPathExpressions:
+        - ".spec.template.spec.containers[].securityContext"
+    - group: "apps"
+      kind: "StatefulSet"
+      name: "ums-umc-server"
+      jqPathExpressions:
+        - ".spec.template.spec.containers[].resources"
+        - ".spec.template.spec.initContainers[].resources"
+        - ".spec.strategy"
+    - group: "apps"
+      kind: "Deployment"
+      name: "ums-guardian-management-ui"
+      jqPathExpressions:
+        - ".spec.template.spec.containers[].resources"
+    - kind: "Secret"
+      name: "ums-portal-consumer-ldap-tls"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "ums-portal-listener-ldap-tls"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "ums-provisioning-udm-listener-ldap-tls"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "ums-selfservice-listener-ldap-tls"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "ums-umc-server-ldap-tls"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "ums-umc-server"
+      jqPathExpressions:
+        - ".data.cert_pem"
+        - ".data.ldap_secret"
+        - ".data.machine_secret"
+        - ".data.private_key"
+        - '.data["ca.crt"]'
+        - '.data["tls.crt"]'
+        - '.data["tls.key"]'
+    - kind: "Secret"
+      name: "open-xchange-core-mw-contextsets-secret"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Secret"
+      name: "open-xchange-core-mw-ui-settings-secret"
+      jqPathExpressions:
+        - ".data"
+    - kind: "Service"
+      name: "ums-ldap-server-primary"
+      jqPathExpressions:
+        - ".spec.selector"
+    - kind: "Secret"
+      name: "openproject-cron-environment"
+      jqPathExpressions:
+        - ".data.IMAP_HOST"
+        - ".data.IMAP_PASSWORD"
+        - ".data.IMAP_USERNAME"
+...
+{{- end }}
+{{- end }}

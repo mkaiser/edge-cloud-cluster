@@ -1,0 +1,27 @@
+# ArgoCD Application: Keycloak passkey (WebAuthn Passwordless) configuration
+# Wave 3 — fires after opendesk/nubus (wave 2) is Healthy+Synced, so Keycloak
+# is guaranteed to be running before the PostSync Job attempts the Admin API.
+#
+# Idempotent: the job checks for existing flow/executions before creating them.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keycloak-passkeys
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:owner/repo.git
+    targetRevision: main
+    path: deployment/keycloak-passkeys
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

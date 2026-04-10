@@ -1,0 +1,35 @@
+# App-of-apps entry for self-managed ArgoCD.
+# Points to deployment/argocd/ which contains:
+#   - argocd-self.yaml  (Application that reconciles the ArgoCD Helm release itself)
+#   - pvc.yaml          (argocd-helm-cache PVC)
+# Helm values for the ArgoCD release are split across:
+#   deployment/argocd-infra/values.yaml — ArgoCD core config
+#   deployment/opendesk-cmp/values.yaml — openDesk CMP sidecar (deployed by opendesk-cmp app, wave 0)
+#   deployment/ryax-cmp/values.yaml     — Ryax CMP sidecar (placeholder)
+# CMP readiness gate: deployment/apps/wave1-cmp-readiness.yaml (Sync hook, wave 1)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-infra
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:owner/repo.git
+    targetRevision: main
+    path: deployment/argocd-infra
+    directory:
+      # Sealed secrets are owned by argocd-self (source 3) — exclude here to
+      # avoid dual ownership and perpetual OutOfSync on the tracking-id annotation.
+      exclude: '{*-sealed.yaml,*.sh}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

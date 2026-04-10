@@ -1,0 +1,131 @@
+# PostSync hook: initializes PostgreSQL users and databases for all
+# opendesk components.
+#
+# ROOT CAUSE OF FAILURE:
+#   The opendesk-nubus-nubus helmfile chart contains a Helm post-install Job
+#   that creates all PostgreSQL users and databases. ArgoCD skips Helm hooks
+#   by default, so this Job never runs. PostgreSQL starts with only the
+#   'postgres' superuser. Keycloak, LDAP, XWiki, Nextcloud etc. all fail with
+#   "password authentication failed" / "Role does not exist".
+#   The circular dependency (LDAP→Keycloak→DB→LDAP) then deadlocks the
+#   entire cluster.
+#
+# FIX:
+#   Run the init scripts from the 'postgresql-job' Secret (created by the
+#   nubus helmfile) as a PostSync hook. The scripts use psql without a host,
+#   so we exec them directly in the postgresql-0 pod via kubectl exec.
+#   Idempotent: uses IF NOT EXISTS / ALTER USER (update) patterns.
+#
+# TIMING:
+#   PostSync fires after all waves complete. By then opendesk-nubus-nubus
+#   has run and the postgresql-job secret exists. The job polls for both
+#   the secret and PostgreSQL readiness before running the scripts.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgresql-init
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: postgresql-init
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["postgresql-job"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgresql-init
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: postgresql-init
+subjects:
+- kind: ServiceAccount
+  name: postgresql-init
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgresql-init
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # 40 min: waits for postgresql-job secret + PostgreSQL readiness
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: postgresql-init
+      restartPolicy: Never
+      containers:
+      - name: init
+        image: docker.io/alpine/k8s:1.32.3
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "=== PostgreSQL init ==="
+
+          # Wait for postgresql-job secret (created by opendesk-nubus-nubus helmfile).
+          echo "Waiting for postgresql-job secret..."
+          for i in $(seq 1 120); do
+            if kubectl get secret postgresql-job -n argocd >/dev/null 2>&1; then
+              echo "Secret found."
+              break
+            fi
+            [ "$i" -eq 120 ] && echo "ERROR: postgresql-job secret not found after 20 min" && exit 1
+            echo "  Attempt $i/120 — not found yet, waiting 10s..."
+            sleep 10
+          done
+
+          # Wait for postgresql-0 pod to be ready.
+          echo "Waiting for postgresql-0 to be ready..."
+          kubectl wait pod/postgresql-0 -n argocd --for=condition=Ready --timeout=600s
+
+          # Check if users already exist — skip if already initialized.
+          EXISTING=$(kubectl exec postgresql-0 -n argocd -- \
+            psql -U postgres -tAc "SELECT count(*) FROM pg_user WHERE usename='keycloak_user'" 2>/dev/null || echo "0")
+          if [ "$EXISTING" = "1" ]; then
+            echo "PostgreSQL already initialized (keycloak_user exists) — skipping."
+            exit 0
+          fi
+
+          # Extract and run init-user.sh inside the postgresql-0 pod.
+          echo "Running init-user.sh..."
+          kubectl get secret postgresql-job -n argocd \
+            -o jsonpath='{.data.init-user\.sh}' | base64 -d | \
+            kubectl exec -i postgresql-0 -n argocd -- bash
+
+          # Extract and run init-db.sh inside the postgresql-0 pod.
+          # init-db.sh uses psql -c "CREATE DATABASE ..." which cannot run in
+          # a transaction block — the script handles this itself.
+          echo "Running init-db.sh..."
+          kubectl get secret postgresql-job -n argocd \
+            -o jsonpath='{.data.init-db\.sh}' | base64 -d | \
+            kubectl exec -i postgresql-0 -n argocd -- bash
+
+          echo "=== PostgreSQL init complete ==="
+          kubectl exec postgresql-0 -n argocd -- psql -U postgres -c "\du" 2>&1 | head -20
+          kubectl exec postgresql-0 -n argocd -- psql -U postgres -c "\l" 2>&1 | head -20

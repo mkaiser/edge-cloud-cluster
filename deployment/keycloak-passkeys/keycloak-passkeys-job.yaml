@@ -1,0 +1,177 @@
+# Configures WebAuthn Passwordless (passkeys) in the openDesk Keycloak realm.
+#
+# PostSync hook — runs after this App is synced, which is wave 3 of argocd-main-app,
+# meaning Keycloak (wave 2 / nubus) is Healthy+Synced before this runs.
+#
+# What this does via Keycloak Admin REST API:
+#   1. Sets the WebAuthn Passwordless Policy:
+#        - platform authenticator (TPM/Touch ID/Face ID/Windows Hello)
+#        - resident key required  (true passkey: no username entry needed)
+#        - user verification required
+#   2. Copies the built-in "browser" flow to "browser-passkeys"
+#      (idempotent: skips if already exists)
+#   3. Adds "WebAuthn Passwordless Authenticator" as a CONDITIONAL ALTERNATIVE
+#      inside the existing "Browser - Conditional OTP" sub-flow, so users can
+#      choose: passkey OR TOTP — both remain available.
+#   4. Binds "browser-passkeys" as the realm browser flow.
+#
+# Idempotent: safe to re-run — checks for existing resources before creating.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-passkeys-setup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keycloak-passkeys-setup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["opendesk-keycloak-bootstrap-admin-creds"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keycloak-passkeys-setup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keycloak-passkeys-setup
+subjects:
+- kind: ServiceAccount
+  name: keycloak-passkeys-setup
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keycloak-passkeys-setup
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: keycloak-passkeys-setup
+      restartPolicy: OnFailure
+      containers:
+      - name: setup
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: KEYCLOAK_URL
+          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+        - name: REALM
+          value: "opendesk"
+        - name: FLOW_NAME
+          value: "browser-passkeys"
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          # Wait for the opendesk realm to be fully bootstrapped.
+          echo "Waiting for Keycloak opendesk realm to be ready..."
+          i=0
+          while [ "$i" -lt 60 ]; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+              "${KEYCLOAK_URL}/realms/opendesk" || true)
+            [ "$STATUS" = "200" ] && echo "Realm ready." && break
+            echo "  Attempt $i/60 status=${STATUS}, waiting 10s..."
+            sleep 10
+            i=$((i+1))
+          done
+          [ "$STATUS" != "200" ] && echo "ERROR: realm not ready" && exit 1
+
+          # Read Keycloak admin credentials
+          echo "Reading Keycloak admin credentials..."
+          ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
+            -n argocd -o jsonpath="{.data.admin\.yaml}" | base64 -d)
+          KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep "username:" | awk "{print \$2}")
+          KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep "password:" | awk "{print \$2}")
+          [ -z "$KC_ADMIN_USER" ] && echo "ERROR: no admin user" && exit 1
+
+          echo "Obtaining admin token..."
+          TOKEN=$(curl -sf -X POST \
+            "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+            -d "client_id=admin-cli" \
+            -d "username=${KC_ADMIN_USER}" \
+            -d "password=${KC_ADMIN_PASS}" \
+            -d "grant_type=password" | jq -r ".access_token")
+          [ -z "$TOKEN" ] && echo "ERROR: no token" && exit 1
+          echo "Token obtained."
+
+          api() { curl -sf -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" "$@"; }
+
+          # --- 1. WebAuthn Passwordless Policy ---
+          echo "Setting WebAuthn Passwordless policy..."
+          api -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}" -d \
+            '{"webAuthnPolicyPasswordlessRpEntityName":"keycloak","webAuthnPolicyPasswordlessSignatureAlgorithms":["ES256","RS256"],"webAuthnPolicyPasswordlessRpId":"","webAuthnPolicyPasswordlessAttestationConveyancePreference":"not specified","webAuthnPolicyPasswordlessAuthenticatorAttachment":"platform","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required","webAuthnPolicyPasswordlessCreateTimeout":0,"webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister":false}'
+          echo "Policy set."
+
+          # --- 2. Copy browser flow to browser-passkeys (idempotent) ---
+          EXISTING_FLOW=$(api "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows" | \
+            jq -r ".[] | select(.alias == \"${FLOW_NAME}\") | .id")
+
+          if [ -n "$EXISTING_FLOW" ]; then
+            echo "Flow '${FLOW_NAME}' already exists, skipping copy."
+          else
+            echo "Copying browser flow to '${FLOW_NAME}'..."
+            api -X POST \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows/browser/copy" \
+              -d "{\"newName\": \"${FLOW_NAME}\"}"
+            EXISTING_FLOW=$(api "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows" | \
+              jq -r ".[] | select(.alias == \"${FLOW_NAME}\") | .id")
+            echo "Flow copied (id=${EXISTING_FLOW})."
+          fi
+
+          # --- 3. Add WebAuthn Passwordless as ALTERNATIVE in conditional sub-flow ---
+          EXECUTIONS_URL="${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows/${FLOW_NAME}/executions"
+
+          WEBAUTHN_EXISTS=$(api "${EXECUTIONS_URL}" | \
+            jq -r '[.[] | select(.providerId? | strings | test("webauthn.*passwordless"; "i"))] | length')
+
+          if [ "${WEBAUTHN_EXISTS}" != "0" ]; then
+            echo "WebAuthn Passwordless already in flow — skipping."
+          else
+            # Find the Conditional OTP sub-flow alias to use as parent
+            COND_OTP_ALIAS=$(api "${EXECUTIONS_URL}" | \
+              jq -r '.[] | select((.displayName // .alias) | test("[Cc]onditional.OTP")) | (.displayName // .alias)' | head -1)
+
+            if [ -n "$COND_OTP_ALIAS" ]; then
+              echo "Adding WebAuthn Passwordless into sub-flow '${COND_OTP_ALIAS}'..."
+              TARGET_FLOW="$COND_OTP_ALIAS"
+            else
+              echo "WARNING: Conditional OTP sub-flow not found, adding at top level."
+              TARGET_FLOW="$FLOW_NAME"
+            fi
+
+            api -X POST \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/authentication/flows/${TARGET_FLOW}/executions/execution" \
+              -d '{"provider":"webauthn-authenticator-passwordless"}'
+
+            # Set requirement to ALTERNATIVE
+            WEBAUTHN_EXEC_ID=$(api "${EXECUTIONS_URL}" | \
+              jq -r '.[] | select(.providerId? | strings | test("webauthn.*passwordless"; "i")) | .id')
+            api -X PUT "${EXECUTIONS_URL}" \
+              -d "{\"id\":\"${WEBAUTHN_EXEC_ID}\",\"requirement\":\"ALTERNATIVE\"}"
+            echo "WebAuthn Passwordless added as ALTERNATIVE."
+          fi
+
+          # --- 4. Bind browser-passkeys as realm browser flow ---
+          echo "Binding '${FLOW_NAME}' as realm browser flow..."
+          api -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}" \
+            -d "{\"browserFlow\":\"${FLOW_NAME}\"}"
+          echo "Passkey setup complete."

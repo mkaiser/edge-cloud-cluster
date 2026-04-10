@@ -1,0 +1,225 @@
+# GitLab CE Helm values — deployed via ArgoCD (deployment/apps/gitlab.test34.your-domain.tld).
+#
+# Secrets NOT included here (provided via helm-values-secret.yaml):
+#   global.appConfig.omniauth.providers[].secret contents
+#   global.railsSecrets
+#   global.initialRootPassword
+#
+# Sensitive S3 credentials are provided via gitlab-s3-secret sealed secret.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  edition: ce
+
+  hosts:
+    domain: test34.your-domain.tld
+    gitlab:
+      name: gitlab.test34.your-domain.tld
+    registry:
+      name: registry.gitlab.test34.your-domain.tld
+    pages:
+      name: pages.gitlab.test34.your-domain.tld
+
+  ingress:
+    class: haproxy
+    annotations:
+      haproxy-ingress.github.io/ssl-redirect: "true"
+    configureCertmanager: false
+    tls:
+      enabled: true
+      secretName: gitlab-tls
+
+  # Use existing cert-manager ClusterIssuer for all TLS
+  certmanager:
+    installCRDs: false
+
+  # ---------------------------------------------------------------------------
+  # Object Storage — Hetzner S3 (consolidated connection)
+  # ---------------------------------------------------------------------------
+  minio:
+    enabled: false
+
+  appConfig:
+    object_store:
+      enabled: true
+      proxy_download: true
+      connection:
+        secret: gitlab-s3-connection
+        key: connection
+
+    # Per-category bucket configuration
+    lfs:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-lfs
+    artifacts:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-artifacts
+    uploads:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-uploads
+    packages:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-packages
+    externalDiffs:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-external-diffs
+    terraformState:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-terraform-state
+    ciSecureFiles:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-ci-secure-files
+    dependencyProxy:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-dependency-proxy
+
+    # GitLab Pages
+    pages:
+      enabled: true
+      host: pages.gitlab.test34.your-domain.tld
+      objectStore:
+        bucket: edgecloud-gitlab
+        prefix: gitlab-pages
+
+    # Backups
+    backups:
+      bucket: edgecloud-gitlab
+      prefix: gitlab-backups
+      tmpBucket: edgecloud-gitlab
+
+    # ---------------------------------------------------------------------------
+    # Nubus/Keycloak OIDC
+    # ---------------------------------------------------------------------------
+    omniauth:
+      enabled: true
+      autoSignInWithProvider: openid_connect
+      allowSingleSignOn:
+        - openid_connect
+      blockAutoCreatedUsers: false
+      providers:
+        - secret: gitlab-oidc-provider
+          key: provider
+
+  # ---------------------------------------------------------------------------
+  # Container Registry — S3 storage
+  # ---------------------------------------------------------------------------
+  registry:
+    bucket: edgecloud-gitlab
+    prefix: gitlab-registry
+
+# ---------------------------------------------------------------------------
+# Disabled bundled sub-charts (using existing cluster services)
+# ---------------------------------------------------------------------------
+certmanager:
+  enabled: false
+
+nginx-ingress:
+  enabled: false
+
+# Bundled runner disabled — Chart.yaml condition is gitlab-runner.install (top-level).
+# Use wave7-gitlab-runner.yaml instead (token-based auth, no registration tokens).
+gitlab-runner:
+  install: false
+
+# ---------------------------------------------------------------------------
+# PostgreSQL — bundled, NFS SSD storage
+# ---------------------------------------------------------------------------
+postgresql:
+  install: true
+  primary:
+    persistence:
+      storageClass: hcloud-nfs-ssd-volumes
+      size: 20Gi
+
+# ---------------------------------------------------------------------------
+# Redis — bundled, NFS SSD storage
+# ---------------------------------------------------------------------------
+redis:
+  install: true
+  master:
+    persistence:
+      storageClass: hcloud-nfs-ssd-volumes
+      size: 5Gi
+
+# ---------------------------------------------------------------------------
+# Gitaly — Git repository storage on NFS SSD
+# ---------------------------------------------------------------------------
+gitlab:
+  gitaly:
+    persistence:
+      storageClass: hcloud-nfs-ssd-volumes
+      size: 50Gi
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  gitlab-shell:
+    enabled: false
+
+  gitlab-pages:
+    ingress:
+      tls: {}
+      annotations:
+        kubernetes.io/ingress.class: haproxy
+
+  webservice:
+    ingress:
+      annotations:
+        kubernetes.io/ingress.class: haproxy
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  sidekiq:
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  toolbox:
+    backups:
+      objectStorage:
+        config:
+          secret: gitlab-s3-connection
+          key: connection
+
+# ---------------------------------------------------------------------------
+# Container Registry
+# ---------------------------------------------------------------------------
+registry:
+  enabled: true
+  storage:
+    secret: gitlab-registry-storage
+    key: config
+  ingress:
+    annotations:
+      kubernetes.io/ingress.class: haproxy
+
+# ---------------------------------------------------------------------------
+# Prometheus (disable bundled — use existing kube-prometheus-stack)
+# ---------------------------------------------------------------------------
+prometheus:
+  install: false
+
+grafana:
+  install: false
+
+# Disabled: ArgoCD uses `helm upgrade --install`, so the pre-upgrade hook always
+# runs — including on fresh installs where no previous chart-info ConfigMap exists,
+# causing the script to fail unconditionally. Upgrade path verification is the
+# operator's responsibility when changing targetRevision in deployment/apps/gitlab.test34.your-domain.tld.
+upgradeCheck:
+  enabled: false

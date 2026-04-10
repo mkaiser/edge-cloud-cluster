@@ -1,0 +1,108 @@
+# Wildcard DNS record for GitLab Pages: *.pages.gitlab.test34.your-domain.tld
+#
+# A PostSync job reads the haproxy-ingress service's live external IPs and
+# applies the DNSEndpoint dynamically — no hardcoded IPs needed.
+# external-dns (crd source) then creates/maintains the Hetzner DNS record
+# and cleans it up on cluster destroy.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-pages-dns
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-pages-dns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  resourceNames: ["haproxy-ingress"]
+  verbs: ["get"]
+- apiGroups: ["externaldns.k8s.io"]
+  resources: ["dnsendpoints"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-pages-dns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-pages-dns
+subjects:
+- kind: ServiceAccount
+  name: gitlab-pages-dns
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-pages-dns
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 120
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: gitlab-pages-dns
+      restartPolicy: Never
+      containers:
+      - name: apply-dns
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: PAGES_HOSTNAME
+          value: "*.pages.gitlab.test34.your-domain.tld"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Reading haproxy-ingress external IPs..."
+          # Read all externalIPs — Pulumi sets one per control-plane node.
+          # Split into IPv4 and IPv6 lists.
+          ALL_IPS=$(kubectl get svc haproxy-ingress -n haproxy-ingress \
+            -o jsonpath='{range .spec.externalIPs[*]}{@}{"\n"}{end}')
+
+          if [ -z "$ALL_IPS" ]; then
+            echo "ERROR: haproxy-ingress has no externalIPs set"
+            exit 1
+          fi
+
+          IPV4_LIST=$(echo "$ALL_IPS" | grep -v ':' || true)
+          IPV6_LIST=$(echo "$ALL_IPS" | grep ':' || true)
+          echo "External IPs: $ALL_IPS"
+
+          MANIFEST=$(mktemp)
+
+          # A records
+          printf 'apiVersion: externaldns.k8s.io/v1alpha1\nkind: DNSEndpoint\nmetadata:\n  name: gitlab-pages-wildcard\n  namespace: gitlab\nspec:\n  endpoints:\n' > "$MANIFEST"
+          printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: A\n    targets:\n' "${PAGES_HOSTNAME}" >> "$MANIFEST"
+          echo "$IPV4_LIST" | while read -r ip; do
+            [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST"
+          done
+
+          # AAAA records (only if IPv6 IPs exist)
+          if [ -n "$IPV6_LIST" ]; then
+            printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: AAAA\n    targets:\n' "${PAGES_HOSTNAME}" >> "$MANIFEST"
+            echo "$IPV6_LIST" | while read -r ip; do
+              [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST"
+            done
+          fi
+
+          kubectl apply -f "$MANIFEST"
+          rm -f "$MANIFEST"
+          echo "DNSEndpoint applied for ${PAGES_HOSTNAME}"

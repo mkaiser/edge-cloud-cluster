@@ -1,0 +1,171 @@
+# Post-deploy Job: creates headscale API key (for headplane) and reusable preauthkey (for edge servers).
+# Runs after headscale is up (sync wave 2). Stores results in Kubernetes Secrets.
+# Headplane (wave 3) blocks on headplane-secrets Secret existing before it can start.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-post-deploy
+subjects:
+- kind: ServiceAccount
+  name: headscale-post-deploy
+  namespace: headscale
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: headscale-post-deploy
+      restartPolicy: OnFailure
+      containers:
+      - name: setup
+        image: docker.io/alpine/k8s:1.32.3
+        env:
+        - name: NAMESPACE
+          value: "headscale"
+        - name: OIDC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: headscale-oidc-client-secret
+              key: client-secret
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # --- Wait for headscale pod to be ready ---
+          echo "Waiting for headscale pod..."
+          POD=""
+          for i in $(seq 1 60); do
+            POD=$(kubectl get pods -n "$NAMESPACE" \
+              -l app.kubernetes.io/name=headscale \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "$POD" ]; then
+              if kubectl wait --for=condition=ready "pod/$POD" -n "$NAMESPACE" --timeout=30s 2>/dev/null; then
+                echo "Headscale pod ready: $POD"
+                break
+              fi
+            fi
+            echo "  Attempt $i/60 — waiting 5s..."
+            sleep 5
+          done
+
+          if [ -z "$POD" ]; then
+            echo "ERROR: headscale pod not found after 5 minutes"
+            exit 1
+          fi
+
+          # --- Check if headplane-secrets already has a valid API key ---
+          EXISTING_API_KEY=$(kubectl get secret headplane-secrets -n "$NAMESPACE" \
+            -o jsonpath='{.data.api-key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+          if [ -n "$EXISTING_API_KEY" ]; then
+            echo "headplane-secrets already exists with an API key — skipping API key creation."
+            echo "To force recreation, delete the secret: kubectl delete secret headplane-secrets -n $NAMESPACE"
+          else
+            echo "Creating headscale API key for headplane..."
+            API_KEY=$(kubectl exec -n "$NAMESPACE" "$POD" -- \
+              headscale apikeys create --expiration 999d 2>/dev/null)
+
+            if [ -z "$API_KEY" ]; then
+              echo "ERROR: Failed to create API key"
+              exit 1
+            fi
+
+            echo "Patching headplane-secrets with api-key and oidc-client-secret..."
+            # Use patch to preserve cookie-secret seeded by the PreSync bootstrap job
+            API_KEY_B64=$(printf '%s' "$API_KEY" | base64 -w0)
+            OIDC_B64=$(printf '%s' "$OIDC_CLIENT_SECRET" | base64 -w0)
+            kubectl patch secret headplane-secrets -n "$NAMESPACE" \
+              -p "{\"data\":{\"api-key\":\"$API_KEY_B64\",\"oidc-client-secret\":\"$OIDC_B64\"}}"
+
+            echo "headplane-secrets updated with api-key and oidc-client-secret."
+          fi
+
+          # --- Create edge-servers user and preauthkey ---
+          echo "Creating 'edge-servers' user (if not exists)..."
+          kubectl exec -n "$NAMESPACE" "$POD" -- \
+            headscale users create edge-servers 2>/dev/null || echo "  User already exists."
+
+          # headscale v0.28+: --user requires numeric ID, not username
+          # JSON format: "id" appears before "name" in each object
+          USER_ID=$(kubectl exec -n "$NAMESPACE" "$POD" -- \
+            headscale users list -o json 2>/dev/null | \
+            awk '/"id":/{id=$2} /"name": "edge-servers"/{gsub(/[^0-9]/,"",id); print id; exit}')
+          if [ -z "$USER_ID" ]; then
+            echo "ERROR: could not resolve user ID for edge-servers"
+            exit 1
+          fi
+          echo "edge-servers user ID: $USER_ID"
+
+          # Check if preauthkey secret already exists
+          EXISTING_KEY=$(kubectl get secret headscale-preauthkey -n "$NAMESPACE" \
+            -o jsonpath='{.data.key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+          if [ -n "$EXISTING_KEY" ]; then
+            echo "headscale-preauthkey already exists — skipping preauthkey creation."
+            echo "To force recreation, delete the secret: kubectl delete secret headscale-preauthkey -n $NAMESPACE"
+          else
+            echo "Creating reusable preauthkey for edge servers (1 year expiry)..."
+            PREAUTH_KEY=$(kubectl exec -n "$NAMESPACE" "$POD" -- \
+              headscale preauthkeys create --user "$USER_ID" --reusable --expiration 8760h 2>/dev/null)
+
+            if [ -z "$PREAUTH_KEY" ]; then
+              echo "ERROR: Failed to create preauthkey"
+              exit 1
+            fi
+
+            kubectl create secret generic headscale-preauthkey -n "$NAMESPACE" \
+              --from-literal=key="$PREAUTH_KEY" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            echo "headscale-preauthkey created."
+          fi
+
+          echo
+          echo "=== Post-deploy setup complete ==="
+          echo "Headplane secrets: secret/headplane-secrets"
+          echo "Edge server preauthkey: secret/headscale-preauthkey"
+          echo "To retrieve the preauthkey:"
+          echo "  kubectl get secret headscale-preauthkey -n $NAMESPACE -o jsonpath='{.data.key}' | base64 -d"

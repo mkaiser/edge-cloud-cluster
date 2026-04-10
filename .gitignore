@@ -1,0 +1,9 @@
+/node_modules/
+argocd-linux-amd64
+sealed-secrets-key-backup.yaml
+# drawio tmp files
+*.bkp
+*.dtmp
+wg-admin.conf
+config
+.install/

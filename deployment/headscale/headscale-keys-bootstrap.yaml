@@ -1,0 +1,164 @@
+# Bootstrap Job: generate and store headscale cryptographic keys on fresh cluster installs.
+#
+# Root cause of fresh-cluster failure: the helm chart's PreSync Job (keys.create: true)
+# requires the headscale-keys Secret to already exist, but that Secret is a regular
+# Sync-phase resource that doesn't exist yet when PreSync runs. This is a chart design
+# limitation — the Secret is preserved across upgrades by helm.sh/resource-policy: keep,
+# so it only breaks on first install.
+#
+# Fix: set keys.create: false in headscale.yaml and use this Job instead.
+# This Job runs at PreSync wave -1, before the headscale deployment, and is idempotent
+# (skips key generation if headscale-keys Secret already has wireguard.key).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-keys-bootstrap
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-keys-bootstrap
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-keys-bootstrap
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-keys-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: headscale-keys-bootstrap
+  namespace: headscale
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-keys-bootstrap
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: headscale-keys-bootstrap
+      restartPolicy: Never
+      initContainers:
+      - name: generate-keys
+        image: ghcr.io/juanfont/headscale:0.28.0-debug
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          headscale generate private-key --output json > /tmp/keys/wireguard.json
+          headscale generate private-key --output json > /tmp/keys/noise.json
+          headscale generate private-key --output json > /tmp/keys/derp.json
+          echo "Keys generated."
+        volumeMounts:
+        - name: keys
+          mountPath: /tmp/keys
+      containers:
+      - name: store-keys
+        image: docker.io/alpine/k8s:1.35.0
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          NS=headscale
+          SECRET=headscale-keys
+
+          # Idempotency: skip if wireguard.key already set
+          if kubectl get secret $SECRET -n $NS \
+              -o jsonpath='{.data.wireguard\.key}' 2>/dev/null | grep -q .; then
+            echo "Keys already exist in $SECRET - skipping."
+            exit 0
+          fi
+
+          echo "Storing headscale keys in $SECRET..."
+
+          # wireguard.key = raw hex key (strip "privkey:" prefix)
+          WIREGUARD_KEY=$(jq -r '.private_key | split(":")[1]' /tmp/keys/wireguard.json)
+          # noise.key and derp.key = full "privkey:..." value
+          NOISE_KEY=$(jq -r '.private_key' /tmp/keys/noise.json)
+          DERP_KEY=$(jq -r '.private_key' /tmp/keys/derp.json)
+
+          # Build base64-encoded values for the secret data
+          WG_B64=$(printf '%s' "$WIREGUARD_KEY" | base64 -w0)
+          NOISE_B64=$(printf '%s' "$NOISE_KEY" | base64 -w0)
+          DERP_B64=$(printf '%s' "$DERP_KEY" | base64 -w0)
+
+          # Build and apply the Secret using echo (heredoc breaks YAML block scalar indentation)
+          {
+            echo "apiVersion: v1"
+            echo "kind: Secret"
+            echo "metadata:"
+            echo "  name: $SECRET"
+            echo "  namespace: $NS"
+            echo "  annotations:"
+            echo "    helm.sh/resource-policy: keep"
+            echo "    argocd.argoproj.io/sync-options: Delete=false"
+            echo "type: Opaque"
+            echo "data:"
+            echo "  wireguard.key: $WG_B64"
+            echo "  noise.key: $NOISE_B64"
+            echo "  derp.key: $DERP_B64"
+          } | kubectl apply -f -
+
+          echo "headscale-keys created successfully."
+
+          # --- Seed headplane-secrets with cookie-secret so headplane can start before PostSync ---
+          HP_SECRET=headplane-secrets
+          if kubectl get secret $HP_SECRET -n $NS \
+              -o jsonpath='{.data.cookie-secret}' 2>/dev/null | grep -q .; then
+            echo "headplane-secrets cookie-secret already exists - skipping."
+          else
+            echo "Seeding headplane-secrets with cookie-secret..."
+            COOKIE=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
+            COOKIE_B64=$(printf '%s' "$COOKIE" | base64 -w0)
+            {
+              echo "apiVersion: v1"
+              echo "kind: Secret"
+              echo "metadata:"
+              echo "  name: $HP_SECRET"
+              echo "  namespace: $NS"
+              echo "  annotations:"
+              echo "    argocd.argoproj.io/sync-options: Delete=false"
+              echo "type: Opaque"
+              echo "data:"
+              echo "  cookie-secret: $COOKIE_B64"
+            } | kubectl apply -f -
+            echo "headplane-secrets cookie-secret seeded."
+          fi
+        volumeMounts:
+        - name: keys
+          mountPath: /tmp/keys
+          readOnly: true
+      volumes:
+      - name: keys
+        emptyDir: {}
