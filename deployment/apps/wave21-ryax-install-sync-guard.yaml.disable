@@ -1,0 +1,528 @@
+# PostSync job: orchestrates Ryax syncs from the argocd-main-app.
+#
+# Fresh-install deadlock: Ryax's pre-upgrade Helm hooks (ArgoCD PreSync) need
+# ryax-datastore-secret, which only exists after the main chart resources are
+# applied. Two-step fix:
+#   1. strategy=apply sync — deploys chart resources (secret + DB), no hooks
+#   2. strategy=hook sync  — runs migration PreSync hooks against the live DB
+#
+# ryax-worker-db-pass is the only volatile secret: the Helm chart defines it
+# as a pre-install,pre-upgrade hook with before-hook-creation delete policy,
+# so ArgoCD deletes it before every hook sync (bypassing lookup()). All other
+# secrets use Helm lookup() to preserve existing values across syncs.
+# Save worker-db-pass before each hook sync and restore after.
+#
+# Upgrade path (secret already exists): hook sync + worker-db-pass restore.
+# Already-Synced: no-op exit.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ryax-install-sync-guard
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "21"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ryax-install-sync-guard
+  annotations:
+    argocd.argoproj.io/sync-wave: "21"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  resourceNames: ["ryax"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ryax-worker-db-pass"]
+  verbs: ["get", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ryax-minio-secret"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "create"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale", "statefulsets", "statefulsets/scale"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ryax-install-sync-guard
+  annotations:
+    argocd.argoproj.io/sync-wave: "21"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ryax-install-sync-guard
+subjects:
+- kind: ServiceAccount
+  name: ryax-install-sync-guard
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-install-sync-guard
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "21"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: ryax-install-sync-guard
+      restartPolicy: Never
+      containers:
+      - name: install
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          APP="ryax"
+          RYAX_NS="ryaxns"
+          LOCK_NAME="ryax-install-sync-lock"
+
+          acquire_lock() {
+            local holder="${1:-ryax-install-sync-guard}"
+            kubectl get configmap "$LOCK_NAME" -n argocd >/dev/null 2>&1 && return 1
+            kubectl create configmap "$LOCK_NAME" -n argocd \
+              --from-literal=holder="$holder" \
+              --from-literal=startedAt="$(date -Iseconds)" >/dev/null
+          }
+
+          release_lock() {
+            kubectl delete configmap "$LOCK_NAME" -n argocd --ignore-not-found >/dev/null 2>&1 || true
+          }
+
+          trap release_lock EXIT
+
+          trigger_sync() {
+            local strategy="$1"
+            echo "Triggering ryax sync (strategy=${strategy})..."
+            kubectl patch application "$APP" -n argocd --type=merge -p \
+              "{\"operation\":{\"initiatedBy\":{\"username\":\"ryax-install-sync-guard\"},\"sync\":{\"prune\":true,\"syncOptions\":[\"CreateNamespace=true\",\"ServerSideApply=true\",\"RespectIgnoreDifferences=true\"],\"syncStrategy\":{\"${strategy}\":{\"force\":false}}}}}"
+          }
+
+          # Waits for sync to reach Succeeded. Returns 1 on failure or timeout.
+          wait_for_sync() {
+            local i=0
+            while [ "$i" -lt 180 ]; do
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              [ "$PHASE" = "Succeeded" ] && return 0
+              [ "$PHASE" = "Failed" ]    && { echo "ERROR: sync Failed"; return 1; }
+              echo "  phase=${PHASE}, waiting 10s... ($i/180)"
+              sleep 10; i=$((i+1))
+            done
+            echo "ERROR: sync timed out"; return 1
+          }
+
+          # Waits for sync to complete (Succeeded or Failed). Returns 1 only on
+          # timeout. Used for hook sync where deployment health failures are
+          # expected and resolved by the subsequent worker-db-pass restore.
+          wait_for_sync_lax() {
+            local i=0
+            while [ "$i" -lt 180 ]; do
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              [ "$PHASE" = "Succeeded" ] && { echo "  Sync Succeeded."; return 0; }
+              [ "$PHASE" = "Failed" ]    && { echo "  Sync Failed (proceeding with worker-db-pass restore)."; return 0; }
+              echo "  phase=${PHASE}, waiting 10s... ($i/180)"
+              sleep 10; i=$((i+1))
+            done
+            echo "ERROR: sync timed out"; return 1
+          }
+
+          # Save ryax-worker-db-pass credentials to shell variables.
+          # ArgoCD deletes this secret (hook lifecycle) during every hook sync.
+          # We save before and restore after so ryax-worker-postgresql keeps working.
+          save_worker_db_pass() {
+            if kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" &>/dev/null; then
+              SAVED_WORKER_PASS=$(kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" \
+                -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || true)
+              SAVED_PG_PASS=$(kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" \
+                -o jsonpath='{.data.postgres-password}' | base64 -d 2>/dev/null || true)
+              SAVED_WORKER_CONN=$(kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" \
+                -o jsonpath='{.data.datastore-worker}' | base64 -d 2>/dev/null || true)
+              echo "Saved ryax-worker-db-pass credentials."
+            else
+              SAVED_WORKER_PASS=""
+              SAVED_PG_PASS=""
+              SAVED_WORKER_CONN=""
+            fi
+          }
+
+          # Restore ryax-worker-db-pass from saved credentials, or create fresh
+          # if no saved values exist (first-ever install or PVC was wiped).
+          restore_or_create_worker_db_pass() {
+            if [ -z "$SAVED_WORKER_PASS" ]; then
+              echo "Creating ryax-worker-db-pass (no saved credentials)..."
+              SAVED_WORKER_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 20)
+              SAVED_PG_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 20)
+              SAVED_WORKER_CONN=$(printf 'postgresql://worker:%s@ryax-worker-postgresql/worker' "$SAVED_WORKER_PASS")
+            else
+              echo "Restoring ryax-worker-db-pass..."
+            fi
+            kubectl delete secret ryax-worker-db-pass -n "$RYAX_NS" 2>/dev/null || true
+            printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"ryax-worker-db-pass","namespace":"%s","annotations":{"argocd.argoproj.io/skip-prune":"true"}},"type":"Opaque","data":{"password":"%s","postgres-password":"%s","datastore-worker":"%s"}}' \
+              "$RYAX_NS" \
+              "$(printf '%s' "$SAVED_WORKER_PASS" | base64 -w0)" \
+              "$(printf '%s' "$SAVED_PG_PASS" | base64 -w0)" \
+              "$(printf '%s' "$SAVED_WORKER_CONN" | base64 -w0)" \
+              | kubectl create -f -
+            echo "  ryax-worker-db-pass: done"
+          }
+
+          # Sync worker-postgresql worker role password to match ryax-worker-db-pass.
+          # The hook secret is deleted and recreated on every hook sync, so the
+          # restored password must be applied to the running DB via ALTER ROLE.
+          # Uses POSTGRES_POSTGRES_PASSWORD (set at DB init, never changed) to
+          # connect — never alter the postgres role itself.
+          sync_worker_db_passwords() {
+            local worker_pass worker_pg_pod
+            worker_pass=$(kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" \
+              -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || true)
+            [ -z "$worker_pass" ] && { echo "  worker-db-pass not found, skipping"; return 0; }
+
+            local i=0
+            while [ "$i" -lt 30 ]; do
+              worker_pg_pod=$(kubectl get pods -n "$RYAX_NS" --no-headers 2>/dev/null \
+                | grep "ryax-worker-postgresql" | awk '$3=="Running" {print $1}' | head -1)
+              [ -n "$worker_pg_pod" ] && break
+              echo "  worker-postgresql pod not ready, waiting 10s... ($i/30)"
+              sleep 10; i=$((i+1))
+            done
+            [ -z "$worker_pg_pod" ] && { echo "  worker-postgresql pod not found, skipping"; return 0; }
+
+            kubectl exec -n "$RYAX_NS" "$worker_pg_pod" -- \
+              bash -c "PGPASSWORD=\"\$POSTGRES_POSTGRES_PASSWORD\" psql -U postgres \
+                -c \"ALTER ROLE worker WITH PASSWORD '${worker_pass}';\"" \
+              2>&1 | grep -v "^$" || true
+            echo "  worker-postgresql: worker password synced"
+          }
+
+          # If ryax-minio-secret was absent during a hook sync, Helm's lookup()
+          # generated a new random password — but MinIO was already initialized
+          # with a different one (stored in the mc config at init time).
+          # Read the mc config from the running MinIO pod and patch the secret
+          # if the passwords differ, then restart ryax-worker to pick up the fix.
+          sync_minio_credentials() {
+            local minio_pod mc_pass secret_pass
+            minio_pod=$(kubectl get pods -n "$RYAX_NS" --no-headers 2>/dev/null \
+              | grep "^ryax-minio" | awk '$3=="Running" {print $1}' | head -1)
+            [ -z "$minio_pod" ] && { echo "  MinIO pod not found, skipping"; return 0; }
+            mc_pass=$(kubectl exec -n "$RYAX_NS" "$minio_pod" -- \
+              sh -c 'cat /root/.mc/config.json' 2>/dev/null \
+              | jq -r '.aliases.local.secretKey' 2>/dev/null || true)
+            [ -z "$mc_pass" ] && { echo "  Could not read MinIO mc config, skipping"; return 0; }
+            secret_pass=$(kubectl get secret ryax-minio-secret -n "$RYAX_NS" \
+              -o jsonpath='{.data.root-password}' 2>/dev/null | base64 -d || true)
+            if [ "$mc_pass" != "$secret_pass" ]; then
+              echo "  MinIO credential mismatch — patching secret to match MinIO..."
+              ENCODED=$(printf '%s' "$mc_pass" | base64 -w0)
+              kubectl patch secret ryax-minio-secret -n "$RYAX_NS" --type=json -p \
+                "[{\"op\":\"replace\",\"path\":\"/data/filestore-secret\",\"value\":\"$ENCODED\"},{\"op\":\"replace\",\"path\":\"/data/root-password\",\"value\":\"$ENCODED\"}]" \
+                2>/dev/null || true
+              echo "  ryax-minio-secret patched."
+              kubectl rollout restart deployment/ryax-worker -n "$RYAX_NS" 2>/dev/null || true
+            else
+              echo "  MinIO credentials OK."
+            fi
+          }
+
+          # ------------------------------------------------------------------
+          # Guard: take a cluster-side mutex before touching the Application.
+          # This blocks overlapping PostSync runs and manual retries from
+          # starting another Ryax sync while one is already active.
+          echo "Acquiring ryax install lock..."
+          i=0
+          LOCK_ACQUIRED=false
+          while [ "$i" -lt 180 ]; do
+            if acquire_lock; then
+              echo "  lock acquired"
+              LOCK_ACQUIRED=true
+              break
+            fi
+            echo "  lock busy, waiting 10s... ($i/180)"
+            sleep 10
+            i=$((i+1))
+          done
+          if [ "$LOCK_ACQUIRED" != true ]; then
+            echo "ERROR: could not acquire ryax install lock"
+            exit 1
+          fi
+
+          # Guard: handle any in-progress operation before proceeding.
+          # Own operations (initiated by this guard) are waited on.
+          # Foreign operations (manual syncs) are terminated so the guard
+          # can take over and run the correct two-step sequence.
+          PHASE=$(kubectl get application "$APP" -n argocd \
+            -o jsonpath='{.status.operationState.phase}' 2>/dev/null || true)
+          if [ "$PHASE" = "Running" ]; then
+            INITIATED_BY=$(kubectl get application "$APP" -n argocd \
+              -o jsonpath='{.status.operationState.operation.initiatedBy.username}' \
+              2>/dev/null || true)
+            if [ "$INITIATED_BY" = "ryax-install-sync-guard" ]; then
+              echo "Own sync is Running — waiting for completion..."
+              wait_for_sync_lax
+            else
+              echo "WARNING: Foreign op running (initiatedBy=${INITIATED_BY:-unknown}) — terminating..."
+              kubectl patch application "$APP" -n argocd --type=merge \
+                -p '{"operation": null}' 2>/dev/null \
+                || echo "  Termination patch failed — waiting for natural completion."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                PHASE=$(kubectl get application "$APP" -n argocd \
+                  -o jsonpath='{.status.operationState.phase}' 2>/dev/null || true)
+                [ "$PHASE" != "Running" ] && { echo "  Cleared: phase=${PHASE}"; break; }
+                sleep 5; i=$((i+1))
+              done
+              if [ "$PHASE" = "Running" ]; then
+                echo "ERROR: stuck op did not clear after 5 minutes — aborting"
+                exit 1
+              fi
+            fi
+          fi
+          HEALTH=$(kubectl get application "$APP" -n argocd \
+            -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+
+          echo "Waiting for ryax health to leave Progressing..."
+          i=0
+          while [ "$i" -lt 360 ]; do
+            HEALTH=$(kubectl get application "$APP" -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            [ "$HEALTH" != "Progressing" ] && break
+            echo "  health=${HEALTH}, waiting 10s... ($i/360)"
+            sleep 10; i=$((i+1))
+          done
+          HEALTH=$(kubectl get application "$APP" -n argocd \
+            -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+          if [ "$HEALTH" = "Progressing" ]; then
+            echo "ERROR: ryax still Progressing after 60 minutes — aborting to avoid secret corruption"
+            exit 1
+          fi
+          echo "  health=${HEALTH} — proceeding."
+
+          # ------------------------------------------------------------------
+          # Decide what to do based on current state.
+          SYNC_STATUS=$(kubectl get application "$APP" -n argocd \
+            -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+          # ryax-worker-db-pass is restored by this job outside Helm, so ArgoCD
+          # marks it requiresPruning (skip-prune blocks deletion). Treat an
+          # OutOfSync caused solely by such prune-protected resources as Synced —
+          # no hook sync is needed.
+          if [ "$SYNC_STATUS" = "OutOfSync" ]; then
+            REAL_OOSYNC=$(kubectl get application "$APP" -n argocd -o json \
+              | jq -r '[.status.resources[]?
+                  | select(.status=="OutOfSync" and (.requiresPruning // false | not))
+                ] | length' 2>/dev/null || echo "1")
+            if [ "$REAL_OOSYNC" = "0" ]; then
+              echo "OutOfSync only due to prune-protected resources — treating as Synced"
+              SYNC_STATUS="Synced"
+            fi
+          fi
+          if [ "$SYNC_STATUS" = "Synced" ]; then
+            echo "ryax already Synced — checking ryax-worker-db-pass..."
+            if ! kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" &>/dev/null; then
+              echo "WARN: ryax-worker-db-pass missing despite Synced state — recovering from worker-postgresql..."
+              wk_pod=$(kubectl get pods -n "$RYAX_NS" --no-headers 2>/dev/null \
+                | grep "ryax-worker-postgresql" \
+                | awk '$3=="Running" {print $1}' | head -1)
+              if [ -n "$wk_pod" ]; then
+                wk_pass=$(kubectl exec -n "$RYAX_NS" "$wk_pod" -- env 2>/dev/null \
+                  | grep '^POSTGRES_PASSWORD=' | cut -d= -f2-)
+                wk_pg_pass=$(kubectl exec -n "$RYAX_NS" "$wk_pod" -- env 2>/dev/null \
+                  | grep '^POSTGRES_POSTGRES_PASSWORD=' | cut -d= -f2-)
+                SAVED_WORKER_PASS="$wk_pass"
+                SAVED_PG_PASS="$wk_pg_pass"
+                SAVED_WORKER_CONN="postgresql://worker:${wk_pass}@ryax-worker-postgresql/worker"
+                restore_or_create_worker_db_pass
+                kubectl rollout restart deployment/ryax-worker -n "$RYAX_NS" 2>/dev/null || true
+              else
+                # worker-postgresql is also down (needs the missing secret to start).
+                # The secret was lost before worker-db could initialize — its PVC is
+                # empty. Fall through to the upgrade path: it will scale both down,
+                # run hook sync (which recreates the secret), then restore credentials
+                # and let worker-postgresql initialize fresh.
+                echo "WARN: worker-postgresql not running — falling through to upgrade path"
+                SYNC_STATUS="OutOfSync"
+              fi
+            else
+              echo "ryax-worker-db-pass present — nothing to do."
+            fi
+            exit 0
+          fi
+
+          # Ensure namespace exists — CreateNamespace=true only runs after ryax syncs,
+          # but we need the namespace before we can create the PVC below.
+          kubectl create namespace "$RYAX_NS" --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+          # Ensure Nix store PVC exists with local-path (apply sync skips PreSync
+          # hooks so the chart would create it with hcloud-nfs-ssd-volumes otherwise).
+          if ! kubectl get pvc ryax-action-builder-nix-store -n "$RYAX_NS" &>/dev/null; then
+            echo "Pre-creating Nix store PVC with local-path..."
+            printf '{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"ryax-action-builder-nix-store","namespace":"%s"},"spec":{"storageClassName":"local-path","accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"160Gi"}}}}' \
+              "$RYAX_NS" | kubectl apply -f -
+          fi
+
+          SECRET_EXISTS=false
+          kubectl get secret ryax-datastore-secret -n "$RYAX_NS" &>/dev/null \
+            && SECRET_EXISTS=true
+
+          if [ "$SECRET_EXISTS" = true ]; then
+            echo "Upgrade path (secret exists, OutOfSync) — triggering hook sync..."
+            save_worker_db_pass
+            # Scale down worker and worker-postgresql before hook sync.
+            # The hook lifecycle (BeforeHookCreation) deletes ryax-worker-db-pass.
+            # Any pod restarting during that window gets CreateContainerConfigError.
+            echo "Scaling down ryax-worker and worker-postgresql before hook sync..."
+            kubectl scale deployment ryax-worker -n "$RYAX_NS" --replicas=0 2>/dev/null || true
+            kubectl scale statefulset ryax-worker-postgresql -n "$RYAX_NS" --replicas=0 2>/dev/null || true
+            trigger_sync "hook"
+            wait_for_sync_lax
+            restore_or_create_worker_db_pass
+            echo "Scaling up worker-postgresql..."
+            kubectl scale statefulset ryax-worker-postgresql -n "$RYAX_NS" --replicas=1 2>/dev/null || true
+            echo "Syncing worker-postgresql passwords..."
+            sync_worker_db_passwords
+            # Scale worker back up now that the secret is restored and DB is ready.
+            kubectl scale deployment ryax-worker -n "$RYAX_NS" --replicas=1 2>/dev/null || true
+            echo "Patching ingress classes for Traefik routing..."
+            for ing in ryax-front ryax-studio ryax-repository ryax-runner ryax-authorization ryax-webui; do
+              kubectl patch ingress "$ing" -n "$RYAX_NS" \
+                --type=merge \
+                -p '{"spec":{"ingressClassName":"ryax-traefik"}}' 2>/dev/null || true
+            done
+            echo "Verifying MinIO credentials..."
+            sync_minio_credentials
+            # Safety net: if a concurrent ArgoCD sync deleted the secret again
+            # after restore, recreate it from the running PostgreSQL pod.
+            if ! kubectl get secret ryax-worker-db-pass -n "$RYAX_NS" &>/dev/null; then
+              echo "WARN: ryax-worker-db-pass missing after restore — recovering from worker-postgresql..."
+              wk_pod=$(kubectl get pods -n "$RYAX_NS" --no-headers 2>/dev/null \
+                | grep "ryax-worker-postgresql" | grep -v "^$" \
+                | awk '$3=="Running" {print $1}' | head -1)
+              if [ -n "$wk_pod" ]; then
+                wk_pass=$(kubectl exec -n "$RYAX_NS" "$wk_pod" -- env 2>/dev/null \
+                  | grep '^POSTGRES_PASSWORD=' | cut -d= -f2-)
+                wk_pg_pass=$(kubectl exec -n "$RYAX_NS" "$wk_pod" -- env 2>/dev/null \
+                  | grep '^POSTGRES_POSTGRES_PASSWORD=' | cut -d= -f2-)
+                SAVED_WORKER_PASS="$wk_pass"
+                SAVED_PG_PASS="$wk_pg_pass"
+                SAVED_WORKER_CONN="postgresql://worker:${wk_pass}@ryax-worker-postgresql/worker"
+                restore_or_create_worker_db_pass
+                kubectl rollout restart deployment/ryax-worker -n "$RYAX_NS" 2>/dev/null || true
+              else
+                echo "ERROR: ryax-worker-postgresql not running, cannot recover"
+              fi
+            fi
+            exit 0
+          fi
+
+          # ------------------------------------------------------------------
+          # Fresh install: two-step sync.
+
+          # Create ryax-worker-db-pass before step 1 so ryax-worker-postgresql
+          # can initialise with known credentials.
+          restore_or_create_worker_db_pass
+
+          echo "Fresh install — step 1: apply sync (no hooks)..."
+          trigger_sync "apply"
+          wait_for_sync
+
+          # After apply sync, the hook Secret worker-db-pass may have been
+          # overwritten by ArgoCD SSA with the Helm-rendered version (new random
+          # values). Read the actual initialisation passwords directly from the
+          # worker-postgresql pod env vars — these are the real DB credentials
+          # regardless of what happened to the secret.
+          echo "Anchoring worker-db-pass to actual DB init credentials..."
+          WORKER_PG_POD=""
+          i=0
+          while [ "$i" -lt 30 ]; do
+            WORKER_PG_POD=$(kubectl get pods -n "$RYAX_NS" --no-headers 2>/dev/null \
+              | grep "ryax-worker-postgresql" | awk '$3=="Running" {print $1}' | head -1)
+            [ -n "$WORKER_PG_POD" ] && break
+            echo "  worker-postgresql not ready, waiting 10s... ($i/30)"
+            sleep 10; i=$((i+1))
+          done
+          if [ -n "$WORKER_PG_POD" ]; then
+            ACTUAL_WORKER_PASS=$(kubectl exec -n "$RYAX_NS" "$WORKER_PG_POD" \
+              -- bash -c 'echo $POSTGRES_PASSWORD' 2>/dev/null || true)
+            ACTUAL_PG_PASS=$(kubectl exec -n "$RYAX_NS" "$WORKER_PG_POD" \
+              -- bash -c 'echo $POSTGRES_POSTGRES_PASSWORD' 2>/dev/null || true)
+            if [ -n "$ACTUAL_WORKER_PASS" ] && [ -n "$ACTUAL_PG_PASS" ]; then
+              SAVED_WORKER_PASS="$ACTUAL_WORKER_PASS"
+              SAVED_PG_PASS="$ACTUAL_PG_PASS"
+              SAVED_WORKER_CONN=$(printf 'postgresql://worker:%s@ryax-worker-postgresql/worker' \
+                "$ACTUAL_WORKER_PASS")
+              restore_or_create_worker_db_pass
+              echo "  worker-db-pass anchored to init credentials."
+            else
+              echo "  WARNING: could not read env vars from worker-postgresql pod."
+            fi
+          else
+            echo "  WARNING: worker-postgresql pod not found; keeping generated credentials."
+          fi
+
+          # Scale down ryax-worker and worker-postgresql before hook sync.
+          # The hook lifecycle (BeforeHookCreation) deletes ryax-worker-db-pass.
+          # Any pod restarting during that window gets CreateContainerConfigError.
+          # worker-postgresql anchoring is done above, so it is safe to scale down now.
+          echo "Scaling down ryax-worker and worker-postgresql before hook sync..."
+          kubectl scale deployment ryax-worker -n "$RYAX_NS" --replicas=0 2>/dev/null || true
+          kubectl scale statefulset ryax-worker-postgresql -n "$RYAX_NS" --replicas=0 2>/dev/null || true
+
+          echo "Step 2: hook sync (migrations)..."
+          trigger_sync "hook"
+          wait_for_sync_lax
+
+          # Restore worker-db-pass with the init credentials (DB was initialised
+          # with these in step 1 and has not been changed by lookup()-based secrets).
+          restore_or_create_worker_db_pass
+
+          echo "Scaling up worker-postgresql..."
+          kubectl scale statefulset ryax-worker-postgresql -n "$RYAX_NS" --replicas=1 2>/dev/null || true
+
+          echo "Syncing worker-postgresql passwords..."
+          sync_worker_db_passwords
+
+          # Scale ryax-worker back up — new pod starts with the correct credentials.
+          echo "Scaling up ryax-worker..."
+          kubectl scale deployment ryax-worker -n "$RYAX_NS" --replicas=1 2>/dev/null || true
+
+          echo "Verifying MinIO credentials..."
+          sync_minio_credentials
+
+          # HAProxy is the cluster default IngressClass — all ryax chart ingresses
+          # get ingressClassName=haproxy from K8s admission.  Traefik v3 won't process
+          # them and therefore won't apply the strip-prefix middlewares, causing
+          # /app/main.js to return HTML instead of JS.  Patch them to ryax-traefik so
+          # Traefik routes and strips prefixes correctly (HTTPS goes HAProxy→Traefik).
+          echo "Patching ingress classes for Traefik routing..."
+          for ing in ryax-front ryax-studio ryax-repository ryax-runner ryax-authorization ryax-webui; do
+            kubectl patch ingress "$ing" -n "$RYAX_NS" \
+              --type=merge \
+              -p '{"spec":{"ingressClassName":"ryax-traefik"}}' 2>/dev/null || true
+          done
+
+          echo "Fresh install complete."

@@ -1,0 +1,110 @@
+# ArgoCD Application: Mattermost team messaging
+# Accessible at https://chat.ecc66.cape-project.eu
+# Auth: Keycloak OIDC only (local accounts disabled)
+# Storage: bundled PostgreSQL (longhorn), S3 for file uploads (edgecloud-mattermost bucket)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mattermost
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "24"
+spec:
+  project: default
+  sources:
+    - repoURL: https://helm.mattermost.com
+      chart: mattermost
+      targetRevision: "2.8.0" # renovate: datasource=helm depName=mattermost registryUrl=https://helm.mattermost.com
+      helm:
+        valuesObject:
+          global:
+            siteUrl: "https://chat.ecc66.cape-project.eu"
+            features:
+              database:
+                driver: postgres
+                existingDatabaseSecret:
+                  name: mattermost-db
+                  key: datasource
+              fileStore:
+                driver: amazons3
+                bucket: edgecloud-mattermost
+                url: nbg1.your-objectstorage.com
+                region: nbg1
+                existingSecret:
+                  name: mattermost-s3
+                  accessKeyIdKey: access-key
+                  secretAccessKeyKey: secret-key
+
+          mattermostApp:
+            image:
+              repository: mattermost/mattermost-team-edition
+              # renovate: datasource=docker depName=mattermost/mattermost-team-edition
+              tag: "9.11.5"
+
+            replicaCount: 1
+
+            ingress:
+              enabled: true
+              ingressClassName: haproxy
+              annotations:
+                cert-manager.io/cluster-issuer: "letsencrypt-staging"
+                haproxy-ingress.github.io/ssl-redirect: "true"
+                haproxy-ingress.github.io/proxy-body-size: "100M"
+              hosts:
+                - chat.ecc66.cape-project.eu
+              tls:
+                - hosts:
+                    - chat.ecc66.cape-project.eu
+                  secretName: mattermost-tls
+
+            extraEnv:
+              - name: MM_FILESETTINGS_AMAZONS3PATHSTYLE
+                value: "true"
+
+              # GitLab OAuth2 — Team Edition alternative to OpenID Connect (which requires license)
+              # Keycloak exposes GitLab-compatible OAuth2 endpoints
+              - name: MM_GITLABSETTINGS_ENABLE
+                value: "true"
+              - name: MM_GITLABSETTINGS_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: mattermost-oidc
+                    key: client-id
+              - name: MM_GITLABSETTINGS_SECRET
+                valueFrom:
+                  secretKeyRef:
+                    name: mattermost-oidc
+                    key: client-secret
+              - name: MM_GITLABSETTINGS_AUTHENDPOINT
+                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/auth"
+              - name: MM_GITLABSETTINGS_TOKENENDPOINT
+                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/token"
+              - name: MM_GITLABSETTINGS_USERAPIENDPOINT
+                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/userinfo"
+              - name: MM_GITLABSETTINGS_SCOPE
+                value: "openid profile email"
+
+              - name: MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL
+                value: "false"
+              - name: MM_EMAILSETTINGS_ENABLESIGNINWITHEMAIL
+                value: "false"
+              - name: MM_EMAILSETTINGS_ENABLESIGNINWITHUSERNAME
+                value: "false"
+
+    # Plain manifests: Keycloak client job + sealed secrets
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/mattermost
+      directory:
+        exclude: '{sealSecrets.sh}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mattermost
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

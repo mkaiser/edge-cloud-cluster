@@ -1,0 +1,47 @@
+---
+# Certificate for ryax TLS in ryaxns namespace.
+# HAProxy requires the TLS secret to be in the same namespace as the Ingress.
+# The infra-wildcard-tls is in argocd namespace and cannot be referenced cross-namespace,
+# so we issue a separate cert here.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ryax-tls
+  namespace: ryaxns
+spec:
+  dnsNames:
+  - ryax.ecc66.cape-project.eu
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-staging
+  secretName: ryax-tls
+---
+# HAProxy ingress for Ryax.
+# Routes ryax.ecc66.cape-project.eu → ryax-traefik (Ryax's internal Traefik).
+# TLS is terminated by HAProxy; Traefik receives plain HTTP and handles
+# path-based routing (with strip-prefix middleware) to Ryax services.
+# spec.tls is required so HAProxy adds this host to its HTTPS routing map.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy
+  namespace: ryaxns
+  annotations:
+    haproxy-ingress.github.io/ssl-redirect: "true"
+spec:
+  ingressClassName: haproxy
+  tls:
+  - hosts:
+    - ryax.ecc66.cape-project.eu
+    secretName: ryax-tls
+  rules:
+  - host: ryax.ecc66.cape-project.eu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ryax-traefik
+            port:
+              number: 80

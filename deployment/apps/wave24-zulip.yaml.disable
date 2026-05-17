@@ -1,0 +1,139 @@
+# ArgoCD Application: Zulip team chat
+# Accessible at https://zulip.ecc66.cape-project.eu
+# Auth: Keycloak OIDC (native GenericOpenIdConnectBackend — no license workaround needed)
+# Storage: S3 for file uploads (edgecloud-zulip bucket), Longhorn for PostgreSQL
+# Dependencies: PostgreSQL, Redis, RabbitMQ, Memcached bundled as Helm subcharts
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: zulip
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "24"
+spec:
+  project: default
+  sources:
+    - repoURL: oci://ghcr.io/zulip/helm-charts/zulip
+      chart: zulip
+      targetRevision: "1.12.0" # renovate: datasource=docker depName=ghcr.io/zulip/helm-charts/zulip
+      helm:
+        valuesObject:
+          image:
+            repository: ghcr.io/zulip/zulip-server
+            # renovate: datasource=docker depName=ghcr.io/zulip/zulip-server
+            tag: "12.0-0"
+
+          ingress:
+            enabled: true
+            className: haproxy
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-staging"
+              haproxy-ingress.github.io/ssl-redirect: "true"
+              haproxy-ingress.github.io/proxy-body-size: "100M"
+            hosts:
+              - host: zulip.ecc66.cape-project.eu
+                paths:
+                  - path: /
+            tls:
+              - hosts:
+                  - zulip.ecc66.cape-project.eu
+                secretName: zulip-tls
+
+          zulip:
+            persistence:
+              enabled: true
+              storageClass: longhorn
+              size: 5Gi
+            environment:
+              SETTING_EXTERNAL_HOST: zulip.ecc66.cape-project.eu
+              SETTING_ZULIP_ADMINISTRATOR: it@cape-project.eu
+              TRUST_GATEWAY_IP: "true"
+              SECRETS_secret_key:
+                valueFrom:
+                  secretKeyRef:
+                    name: zulip-secret-key
+                    key: secret-key
+              # S3 credentials (boto reads AWS_* env vars automatically)
+              AWS_ACCESS_KEY_ID:
+                valueFrom:
+                  secretKeyRef:
+                    name: zulip-s3
+                    key: access-key
+              AWS_SECRET_ACCESS_KEY:
+                valueFrom:
+                  secretKeyRef:
+                    name: zulip-s3
+                    key: secret-key
+              # OIDC client secret — read in postSetup script
+              OIDC_CLIENT_SECRET:
+                valueFrom:
+                  secretKeyRef:
+                    name: zulip-oidc
+                    key: client-secret
+
+          postSetup:
+            scripts:
+              01-s3.sh: |
+                #!/bin/bash
+                # Configure Hetzner S3 for uploads instead of local PVC
+                cat >> /etc/zulip/settings.py << 'PYEOF'
+                LOCAL_UPLOADS_DIR = None
+                S3_AUTH_UPLOADS_BUCKET = "edgecloud-zulip"
+                S3_ENDPOINT_URL = "https://nbg1.your-objectstorage.com"
+                PYEOF
+              02-oidc.sh: |
+                #!/bin/bash
+                # Configure Keycloak OIDC (native OIDC — no GitLab OAuth2 workaround needed)
+                cat >> /etc/zulip/settings.py << PYEOF
+                AUTHENTICATION_BACKENDS += ('zproject.backends.GenericOpenIdConnectBackend',)
+                SOCIAL_AUTH_OIDC_ENABLED_IDPS = {
+                    "keycloak": {
+                        "oidc_url": "https://id.ecc66.cape-project.eu/realms/opendesk",
+                        "client_id": "zulip",
+                        "secret": "${OIDC_CLIENT_SECRET}",
+                        "display_name": "Sign in with OpenDesk",
+                        "display_icon": None,
+                    }
+                }
+                PYEOF
+
+          postgresql:
+            primary:
+              persistence:
+                storageClass: longhorn
+                size: 8Gi
+              containerSecurityContext:
+                runAsUser: 70
+                runAsGroup: 70
+                readOnlyRootFilesystem: false
+
+          rabbitmq:
+            persistence:
+              enabled: false
+
+          redis:
+            master:
+              persistence:
+                enabled: false
+
+          global:
+            security:
+              allowInsecureImages: true
+
+    # Plain manifests: Keycloak client job + sealed secrets
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/zulip
+      directory:
+        exclude: '{sealSecrets.sh}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: zulip
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

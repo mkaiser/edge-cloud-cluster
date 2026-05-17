@@ -3,24 +3,19 @@ import * as hcloud from "@pulumi/hcloud";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
-import type { PulumiSecrets } from "./pulumi_secrets";
+import * as fs from "fs";
+import * as path from "path";
+import * as jsyaml from "js-yaml";
+import { project_settings } from "../project_settings";
 
-export interface ArgoCDArgs {
-    k8sProvider: k8s.Provider;
-    kubeconfigRaw: pulumi.Output<string>;
-    controlPlane: hcloud.Server;
-    pulumiSecrets: PulumiSecrets;
-    settings: {
-        tld: string;
-        certIssuerType: string;
-        githubRepoUrl: string;
-        completeClusterTeardown: boolean;
+// Read ConfigMap data from deployment files so the CMP ConfigMaps can be seeded by Pulumi
+// before argocd-self syncs and adds volume references for them to argocd-repo-server.
+function loadConfigMapData(relPath: string): Record<string, string> {
+    const fullPath = path.join(__dirname, "..", relPath);
+    const manifest = jsyaml.load(fs.readFileSync(fullPath, "utf8")) as {
+        data: Record<string, string>;
     };
-    dependencies: {
-        waitForHaproxyIngress: command.local.Command;
-        waitForCertManager: command.local.Command;
-        sealedSecretsChart: helm.v3.Release;
-    };
+    return manifest.data;
 }
 
 // "App of Apps" structure with self-managed ArgoCD Helm release at the bottom.
@@ -32,16 +27,23 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
     public readonly url: string;
     public readonly cliLoginCommand: pulumi.Output<string>;
 
-    constructor(name: string, args: ArgoCDArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        k8sProvider: k8s.Provider,
+        kubeconfigRaw: pulumi.Output<string>,
+        controlPlane: hcloud.Server,
+        projectSettings: typeof project_settings,
+        dependencies: {
+            waitForHaproxyIngress: command.local.Command;
+            waitForCertManager: command.local.Command;
+            sealedSecretsChart: helm.v3.Release;
+        },
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:ArgoCD", name, {}, opts);
-
-        const { k8sProvider, kubeconfigRaw, controlPlane, pulumiSecrets, settings, dependencies } =
-            args;
-
-        const { tld, certIssuerType, githubRepoUrl, completeClusterTeardown } = settings;
         const { waitForHaproxyIngress, waitForCertManager, sealedSecretsChart } = dependencies;
 
-        const argocdUrl = `argocd.${tld}`;
+        const argocdUrl = `argocd.${projectSettings.dns.tld}`;
         this.url = argocdUrl;
         this.cliLoginCommand = pulumi.interpolate`argocd login ${argocdUrl} --username admin --password $(pulumi config get argocdAdminPasswordPlain) --grpc-web`;
 
@@ -50,36 +52,41 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
             {
                 metadata: { name: "argocd" },
             },
-            { provider: k8sProvider, parent: this, customTimeouts: { delete: "180s" } },
+            {
+                provider: k8sProvider,
+                parent: this,
+                customTimeouts: { delete: "600s" },
+                ignoreChanges: ["metadata.finalizers"],
+            },
         );
 
         // Pre-create TLS secrets from saved Pulumi config so cert-manager skips
         // ACME issuance on cluster recreation (avoids Let's Encrypt rate limits).
         // cert-manager only issues a new cert when the secret does not exist.
-        if (pulumiSecrets.wildcardTlsCert && pulumiSecrets.wildcardTlsKey) {
+        if (projectSettings.tls.wildcardTlsCert && projectSettings.tls.wildcardTlsKey) {
             new k8s.core.v1.Secret(
                 "infra-wildcard-tls",
                 {
                     metadata: { name: "infra-wildcard-tls", namespace: "argocd" },
                     type: "kubernetes.io/tls",
                     data: {
-                        "tls.crt": pulumiSecrets.wildcardTlsCert,
-                        "tls.key": pulumiSecrets.wildcardTlsKey,
+                        "tls.crt": projectSettings.tls.wildcardTlsCert,
+                        "tls.key": projectSettings.tls.wildcardTlsKey,
                     },
                 },
                 { provider: k8sProvider, parent: this, dependsOn: [argocdNs] },
             );
         }
 
-        if (pulumiSecrets.argocdServerTlsCert && pulumiSecrets.argocdServerTlsKey) {
+        if (projectSettings.argocd.serverTlsCert && projectSettings.argocd.serverTlsKey) {
             new k8s.core.v1.Secret(
                 "argocd-server-tls",
                 {
                     metadata: { name: "argocd-server-tls", namespace: "argocd" },
                     type: "kubernetes.io/tls",
                     data: {
-                        "tls.crt": pulumiSecrets.argocdServerTlsCert,
-                        "tls.key": pulumiSecrets.argocdServerTlsKey,
+                        "tls.crt": projectSettings.argocd.serverTlsCert,
+                        "tls.key": projectSettings.argocd.serverTlsKey,
                     },
                 },
                 { provider: k8sProvider, parent: this, dependsOn: [argocdNs] },
@@ -92,7 +99,7 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
             "save-or-clear-tls-certs",
             {
                 create: "echo 'TLS cert save/clear ready (runs on destroy only)'",
-                delete: completeClusterTeardown
+                delete: projectSettings.general.completeClusterTeardown
                     ? `pulumi config rm wildcardTlsCert --stack edgecloudinfra 2>/dev/null || true; \
 pulumi config rm wildcardTlsKey --stack edgecloudinfra 2>/dev/null || true; \
 pulumi config rm argocdServerTlsCert --stack edgecloudinfra 2>/dev/null || true; \
@@ -124,21 +131,28 @@ fi`,
 
         // No-op command used as a destroy-order hook:
         // argocd chart → this command (delete hook) → argocd namespace
-        // Optimized to only patch resources with finalizers (xargs parallel execution).
-        const forceFinalizeArgocdNsOnDestroy = completeClusterTeardown
+        // Aggressively removes ALL finalizers from all resources and namespace itself.
+        const forceFinalizeArgocdNsOnDestroy = project_settings.general.completeClusterTeardown
             ? new command.local.Command(
                   "force-finalize-argocd-ns-on-destroy",
                   {
                       create: "echo 'argocd namespace finalizer cleanup ready (runs on destroy only)'",
                       delete: pulumi.interpolate`export KUBECONFIG=~/.kube/config; \
+echo "Starting force-finalize for argocd namespace"; \
 if kubectl get namespace argocd >/dev/null 2>&1; then \
-    kubectl -n argocd get all,applications,appsets --no-headers -o name 2>/dev/null | \
-        xargs -P 8 -I {} bash -c 'kubectl -n argocd patch {} --type=json -p="[{\\"op\\":\\"remove\\",\\"path\\":\\"/metadata/finalizers\\"}]" 2>/dev/null || true' || true; \
+    echo "Removing finalizers from all argocd resources..."; \
+    kubectl -n argocd get all,applications,appsets,repositories,clusterpolicies --no-headers -o name 2>/dev/null | \
+        xargs -P 16 -I {} bash -c 'kubectl -n argocd patch {} --type=json -p="[{\\"op\\":\\"remove\\",\\"path\\":\\"/metadata/finalizers\\"}]" 2>/dev/null && echo "Patched {}" || true' || true; \
+    echo "Removing finalizers from namespace spec..."; \
+    kubectl patch namespace argocd --type=json -p="[{\\"op\\":\\"remove\\",\\"path\\":\\"/metadata/finalizers\\"}]" 2>/dev/null || true; \
     kubectl patch namespace argocd --type=merge -p '{"spec":{"finalizers":[]}}' 2>/dev/null || true; \
-    printf '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"argocd"},"spec":{"finalizers":[]}}' \
+    echo "Attempting finalize endpoint..."; \
+    printf '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"argocd","finalizers":[]},"spec":{"finalizers":[]}}' \
       | kubectl replace --raw "/api/v1/namespaces/argocd/finalize" -f - 2>/dev/null || true; \
+else \
+    echo "argocd namespace not found"; \
 fi; \
-echo "argocd namespace finalizer cleanup completed"`,
+echo "Force-finalize completed"`,
                       triggers: [],
                   },
                   { parent: this, dependsOn: [argocdNs] },
@@ -150,7 +164,7 @@ echo "argocd namespace finalizer cleanup completed"`,
             {
                 name: "argocd",
                 chart: "argo-cd",
-                version: "9.5.0", // https://artifacthub.io/packages/helm/argo/argo-cd
+                version: "9.5.14", // renovate: datasource=helm depName=argo/argo-cd registryUrl=https://argoproj.github.io/argo-helm
                 namespace: "argocd",
                 repositoryOpts: { repo: "https://argoproj.github.io/argo-helm" },
                 values: {
@@ -159,9 +173,12 @@ echo "argocd namespace finalizer cleanup completed"`,
                         // Secrets cannot go in git — injected here by Pulumi only.
                         // All other values managed via GitOps: deployment/argocd/values.yaml
                         secret: {
-                            argocdServerAdminPassword: pulumiSecrets.argocdAdminPasswordHash,
-                            argocdServerAdminPasswordMtime: pulumiSecrets.argocdAdminPasswordMtime,
-                            extra: { "server.secretkey": pulumiSecrets.argocdServerSecretKey },
+                            argocdServerAdminPassword: project_settings.argocd.adminPasswordHash,
+                            argocdServerAdminPasswordMtime:
+                                project_settings.argocd.adminPasswordMtime,
+                            extra: {
+                                "server.secretkey": project_settings.argocd.serverSecretKey,
+                            },
                         },
                         params: { "server.insecure": "true" },
                     },
@@ -175,7 +192,8 @@ echo "argocd namespace finalizer cleanup completed"`,
                             ingressClassName: "haproxy",
                             hosts: [pulumi.interpolate`${argocdUrl}`],
                             annotations: {
-                                "cert-manager.io/cluster-issuer": certIssuerType,
+                                "cert-manager.io/cluster-issuer":
+                                    project_settings.tls.certIssuerType,
                                 "haproxy-ingress.github.io/ssl-redirect": "true",
                             },
                             tls: [
@@ -198,6 +216,39 @@ echo "argocd namespace finalizer cleanup completed"`,
                     waitForCertManager,
                     ...(forceFinalizeArgocdNsOnDestroy ? [forceFinalizeArgocdNsOnDestroy] : []),
                 ],
+            },
+        );
+
+        // Seed both CMP ConfigMaps immediately after the ArgoCD chart is installed.
+        // argocd-self (wave 0) adds volume references for these to argocd-repo-server.
+        // Without this, new repo-server pods get FailedMount until opendesk-cmp (wave 6)
+        // creates them — a ~15 min window with no helmfile-opendesk sidecar.
+        // ArgoCD's opendesk-cmp app takes over ownership at wave 6 and keeps them updated.
+        new k8s.core.v1.ConfigMap(
+            "cmp-opendesk-plugin",
+            {
+                metadata: { name: "cmp-opendesk-plugin", namespace: "argocd" },
+                data: loadConfigMapData("deployment/opendesk-cmp/plugin-config.yaml"),
+            },
+            {
+                provider: k8sProvider,
+                parent: this,
+                dependsOn: [argocdChart],
+                ignoreChanges: ["data", "metadata.annotations"],
+            },
+        );
+
+        new k8s.core.v1.ConfigMap(
+            "opendesk-chart-overrides",
+            {
+                metadata: { name: "opendesk-chart-overrides", namespace: "argocd" },
+                data: loadConfigMapData("deployment/opendesk-cmp/chart-overrides.yaml"),
+            },
+            {
+                provider: k8sProvider,
+                parent: this,
+                dependsOn: [argocdChart],
+                ignoreChanges: ["data", "metadata.annotations"],
             },
         );
 
@@ -235,8 +286,8 @@ KUBECFG
                 },
                 stringData: {
                     type: "git",
-                    url: githubRepoUrl,
-                    sshPrivateKey: pulumiSecrets.argocdGithubDeployKey,
+                    url: project_settings.argocd.gitRepoUrl,
+                    sshPrivateKey: project_settings.argocd.githubDeployKey,
                 },
             },
             { provider: k8sProvider, parent: this, dependsOn: [argocdChart] },
@@ -251,7 +302,7 @@ KUBECFG
                 spec: {
                     project: "default",
                     source: {
-                        repoURL: githubRepoUrl,
+                        repoURL: project_settings.argocd.gitRepoUrl,
                         targetRevision: "main",
                         path: "deployment/apps",
                     },

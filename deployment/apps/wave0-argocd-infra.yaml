@@ -17,7 +17,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: git@github.com:owner/repo.git
+    repoURL: git@github.com:paraXent/infra.git
     targetRevision: main
     path: deployment/argocd-infra
     directory:

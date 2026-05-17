@@ -18,7 +18,6 @@ deployment/
 ├── renovate/                  # Renovate (dependency update bot, optional)
 ├── ryax-cmp/                  # Ryax CMP sidecar (optional)
 ├── secrets/                   # Shared sealed secrets (SMTP, etc.)
-├── storage-test/              # Storage testing utilities
 ├── manageSealedSecrets.sh     # Shared helper for creating SealedSecrets
 └── Deployment.md              # Legacy deployment notes
 ```

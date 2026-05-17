@@ -1,5 +1,8 @@
-# Wave 3 Sync barrier: waits until ALL wave-3 ArgoCD Applications are
-# Synced + Healthy before ArgoCD advances to wave 4 (headscale).
+# Wave 3 Sync barrier: waits until ALL wave-2 ArgoCD Applications are
+# Synced + Healthy + NotProgressing before ArgoCD advances to wave 4.
+#
+# Wave 2 contains infra apps: kube-prometheus-stack, renovate, hello-argocd,
+# system-upgrade-controller. These must be Healthy before k3s-upgrade-plans (wave 4) starts.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -47,7 +50,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "3"
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  activeDeadlineSeconds: 3600
+  activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 300
   template:
     spec:
@@ -55,7 +58,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -70,14 +73,14 @@ spec:
               wave = ann.get('argocd.argoproj.io/sync-wave', '')
               tracking = ann.get('argocd.argoproj.io/tracking-id', '')
               parent = tracking.split(':')[0] if tracking else ''
-              if parent == 'argocd-main-app' and wave == '3':
+              if parent == 'argocd-main-app' and wave == '2':
                   print(item['metadata']['name'])
           ")
 
           echo "Waiting for: $(echo $APPS | tr '\n' ' ')"
 
           i=0
-          while [ "$i" -lt 360 ]; do
+          while [ "$i" -lt 180 ]; do
             ALL_READY=true
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
@@ -86,21 +89,24 @@ spec:
                 -o jsonpath="{.status.health.status}" 2>/dev/null || true)
               PHASE=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
-              if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ] || [ "$PHASE" = "Running" ]; then
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+                 { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+                : # ready
+              else
                 ALL_READY=false
                 echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
               fi
             done
 
             if [ "$ALL_READY" = "true" ]; then
-              echo "All argocd-main-app wave-3 Applications are Synced+Healthy — releasing wave 4."
+              echo "All argocd-main-app wave-2 Applications are Synced+Healthy+NotProgressing — releasing wave 4."
               exit 0
             fi
 
-            echo "Attempt $i/360 — not all ready, waiting 10s..."
+            echo "Attempt $i/180 — not all ready, waiting 10s..."
             sleep 10
             i=$((i+1))
           done
 
-          echo "ERROR: Not all argocd-main-app wave-3 Applications reached Synced+Healthy within 60 minutes"
+          echo "ERROR: Not all argocd-main-app wave-2 Applications reached Synced+Healthy+Completed within 30 minutes"
           exit 1

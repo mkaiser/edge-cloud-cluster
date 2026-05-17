@@ -1,0 +1,38 @@
+# ArgoCD Application: flannel-vtep-fix DaemonSet on CP0.
+#
+# Deployed at wave 15 — AFTER cp-tailscale (wave 14) has started and created
+# the tailscale0 interface. This breaks the circular dependency that would
+# otherwise occur if flannel-vtep-fix were part of the headscale app (wave 12):
+#
+#   wave 12 headscale → flannel-vtep-fix waits for tailscale0
+#   wave 13 barrier   → waits for headscale Healthy (blocked)
+#   wave 14 cp-tailscale → never starts (blocked by wave 13)
+#   tailscale0 never created → deadlock
+#
+# At wave 15 the init container finds tailscale0 immediately (cp-tailscale
+# running since wave 14) and the VTEP is fixed without blocking the wave chain.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flannel-vtep-fix
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/headscale
+    directory:
+      include: 'flannel-vtep-fix.yaml'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true

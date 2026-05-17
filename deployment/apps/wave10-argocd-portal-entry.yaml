@@ -1,0 +1,26 @@
+# Infrastructure admin portal tiles (ArgoCD, Grafana, Prometheus) — wave 10.
+# Runs after opendesk (wave 8) + barrier (wave 9) so the UDM REST API is available.
+# App-specific tiles (GitLab, Zulip, Mattermost) live as PostSync hooks in their own app directories.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: portal-tiles-infra
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/wave10-portal-tiles
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true

@@ -1,0 +1,26 @@
+# kube-vip: stable VIP 10.0.0.100 for k3s API across all control-plane nodes.
+# ARP mode on Hetzner private network — no cloud load balancer required.
+# Wave 0: must run early so the VIP is available before other apps call the API.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-vip
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/kube-vip
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

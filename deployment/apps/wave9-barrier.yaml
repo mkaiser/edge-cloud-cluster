@@ -1,0 +1,162 @@
+# Wave 9 Sync barrier: waits until ALL wave-8 ArgoCD Applications AND their
+# child apps are Synced + Healthy + NotProgressing before ArgoCD advances to wave 10+.
+#
+# WHY THIS IS NEEDED:
+#   The wave-8 app (opendesk) is an app-of-apps. It becomes Synced+Healthy
+#   as soon as it applies its child Application manifests — well before pods
+#   are running. Without checking child apps explicitly, wave 10 starts while
+#   opendesk workloads are still Progressing.
+#
+# HOW IT WORKS:
+#   Runs as a Sync hook at wave 9. Discovers:
+#     1. All Applications at sync-wave=8 owned by argocd-main-app (i.e. opendesk)
+#     2. All child Applications owned by those apps (opendesk-*)
+#   Polls until every discovered app reports Synced+Healthy+NotProgressing.
+#   Times out after 60 minutes.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave9-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave9-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave9-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave9-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave9-barrier
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave9-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "9"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave9-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "Wave-9 barrier: waiting for wave-8 apps and ALL their children..."
+
+          # Discovery runs inside the poll loop so child apps that don't exist yet
+          # at barrier startup are picked up as ArgoCD registers them.
+          discover_apps() {
+            kubectl get applications -n argocd -o json 2>/dev/null | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          wave8_parents = set()
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent == 'argocd-main-app' and wave == '8':
+                  wave8_parents.add(item['metadata']['name'])
+                  print(item['metadata']['name'])
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent in wave8_parents:
+                  print(item['metadata']['name'])
+          "
+          }
+
+          i=0
+          while [ "$i" -lt 360 ]; do
+            APPS=$(discover_apps)
+            PARENT_COUNT=$(echo "$APPS" | grep -c . || true)
+            # Count only child apps (apps whose parent is a wave-8 app, not argocd-main-app).
+            # We need at least one child to exist before declaring victory — guards against
+            # the race where the app-of-apps is Synced but hasn't registered children yet.
+            CHILD_COUNT=$(kubectl get applications -n argocd -o json 2>/dev/null | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          wave8_parents = set()
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent == 'argocd-main-app' and wave == '8':
+                  wave8_parents.add(item['metadata']['name'])
+          count = 0
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent in wave8_parents:
+                  count += 1
+          print(count)
+          " 2>/dev/null || echo 0)
+
+            if [ "$CHILD_COUNT" -eq 0 ]; then
+              echo "Attempt $i/360 — no child apps visible yet (app-of-apps still reconciling), waiting 10s..."
+              sleep 10; i=$((i+1)); continue
+            fi
+
+            ALL_READY=true
+            for APP in $APPS; do
+              SYNC=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+              HEALTH=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+                 { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+                : # ready
+              else
+                ALL_READY=false
+                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+              fi
+            done
+
+            if [ "$ALL_READY" = "true" ]; then
+              echo "All wave-8 apps + $CHILD_COUNT children Synced+Healthy — releasing wave 10."
+              exit 0
+            fi
+
+            echo "Attempt $i/360 — $CHILD_COUNT children found, not all ready, waiting 10s..."
+            sleep 10
+            i=$((i+1))
+          done
+
+          echo "ERROR: wave-8 apps did not reach Synced+Healthy within 60 minutes"
+          exit 1

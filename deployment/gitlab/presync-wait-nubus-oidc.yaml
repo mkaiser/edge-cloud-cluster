@@ -15,12 +15,14 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: wait-oidc
-        image: curlimages/curl:8.10.1
+        image: curlimages/curl:8.20.0
         env:
         - name: KEYCLOAK_URL
-          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+          value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
         - name: REALM
           value: "opendesk"
         command: ["/bin/sh", "-c"]

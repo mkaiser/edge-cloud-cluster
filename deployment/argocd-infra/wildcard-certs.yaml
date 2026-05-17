@@ -2,8 +2,8 @@
 # cert-manager issues this via Let's Encrypt DNS-01 (Hetzner webhook).
 # HAProxy uses this as its default SSL certificate (--default-ssl-certificate).
 #
-# infra-wildcard-tls  → *.your-domain.tld  (argocd, grafana, prometheus, hello-argo, etc.)
-# *.your-domain.tld is handled by OpenDesk's own opendesk-certificates chart.
+# infra-wildcard-tls  → *.cape-project.eu  (argocd, grafana, prometheus, hello-argo, etc.)
+# *.cape-project.eu is handled by OpenDesk's own opendesk-certificates chart.
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -16,4 +16,4 @@ spec:
     name: letsencrypt-staging
     kind: ClusterIssuer
   dnsNames:
-    - "*.test34.your-domain.tld"
+    - "*.ecc66.cape-project.eu"

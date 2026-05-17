@@ -60,7 +60,7 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: setup
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         env:
         - name: NAMESPACE
           value: "headscale"

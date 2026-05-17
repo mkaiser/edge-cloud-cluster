@@ -1,0 +1,137 @@
+# PostSync: add Zulip as a tile in the OpenDesk/Nubus portal (od.applications).
+# Creates portals/entry via the UDM REST API and links it into the Applications
+# category. Idempotent — safe to re-run on every sync.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zulip-portal-entry
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zulip-portal-entry
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ums-nubus-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zulip-portal-entry
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zulip-portal-entry
+subjects:
+- kind: ServiceAccount
+  name: zulip-portal-entry
+  namespace: zulip
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zulip-portal-entry
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: zulip-portal-entry
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: portal-entry
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          UDM_URL="http://ums-udm-rest-api.opendesk.svc.cluster.local:9979/univention/udm"
+          LDAP_BASE="dc=swp-ldap,dc=internal"
+          ENTRY_CN="od.zulip"
+          ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
+          CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
+          ZULIP_URL="https://zulip.ecc66.cape-project.eu"
+
+          ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
+            -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+          udm() {
+            curl -sf -H "Accept: application/json" -H "Content-Type: application/json" \
+              -u "Administrator:${ADMIN_PASS}" "$@"
+          }
+
+          # Zulip logo SVG (rounded-corner tile, 111x111, Zulip brand colours)
+          ICON=$(printf '%s' \
+            '<svg width="111" height="111" viewBox="0 0 111 111" fill="none" xmlns="http://www.w3.org/2000/svg">' \
+            '<rect width="111" height="111" rx="20" fill="#6492FE"/>' \
+            '<path d="M30 30h51l-51 25.5h51" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>' \
+            '<path d="M81 55.5H30L81 81H30" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>' \
+            '</svg>' | base64 -w0)
+
+          # --- Create portal entry if absent ---
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/json" -u "Administrator:${ADMIN_PASS}" \
+            "${UDM_URL}/portals/entry/${ENTRY_DN}")
+          if [ "$HTTP" = "200" ]; then
+            echo "Portal entry ${ENTRY_CN} already exists — skipping creation."
+          else
+            echo "Creating Zulip portal entry..."
+            udm -X POST "${UDM_URL}/portals/entry/" \
+              -d "{
+                \"position\": \"cn=entry,cn=portals,cn=univention,${LDAP_BASE}\",
+                \"properties\": {
+                  \"name\": \"${ENTRY_CN}\",
+                  \"displayName\": {\"en_US\": \"Zulip\", \"de_DE\": \"Zulip\"},
+                  \"description\": {
+                    \"en_US\": \"Team chat and messaging\",
+                    \"de_DE\": \"Team-Chat und Messaging\"
+                  },
+                  \"link\": [[\"en_US\", \"${ZULIP_URL}\"]],
+                  \"linkTarget\": \"newwindow\",
+                  \"activated\": true,
+                  \"anonymous\": false,
+                  \"icon\": \"${ICON}\"
+                }
+              }" | python3 -c "import json,sys; d=json.load(sys.stdin); print('Created:', d.get('dn','?(check UDM output)'))"
+          fi
+
+          # --- Add to od.applications category if missing ---
+          CURRENT=$(udm "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(d.get('properties',{}).get('entries',[])))")
+          if echo "${CURRENT}" | grep -qF "${ENTRY_DN}"; then
+            echo "Zulip already in od.applications category."
+          else
+            echo "Adding Zulip to od.applications category..."
+            NEW_JSON=$(printf '%s\n%s' "${CURRENT}" "${ENTRY_DN}" \
+              | grep -v '^$' \
+              | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip().split('\n')))")
+            udm -X PATCH "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+              -d "{\"properties\": {\"entries\": ${NEW_JSON}}}" \
+              -o /dev/null -w "%{http_code}\n" | grep -q "^2" && echo "Category updated." || echo "Category update failed."
+          fi
+
+          echo "Done."

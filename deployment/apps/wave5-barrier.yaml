@@ -1,15 +1,15 @@
-# Wave 5 Sync barrier: waits until ALL wave 3/4/5 ArgoCD Applications are
-# Synced + Healthy before ArgoCD advances to wave 6 (gitlab, renovate).
+# Wave 5 Sync barrier: waits until k3s-upgrade-plans is Synced+Healthy AND all
+# k8s nodes are schedulable (k3s upgrade drain+uncordon fully complete) before
+# ArgoCD advances to wave 6 (opendesk-cmp).
 #
-# WHY WAVES 3-5 (NOT JUST 5):
-#   Wave 2 is already gated by wave2-barrier. But argocd-main-app waves 3/4/5
-#   (keycloak-passkeys, kube-prometheus-stack, headscale, headplane) may still
-#   have pods starting when ArgoCD advances. This barrier ensures all of them
-#   are truly Healthy before gitlab/renovate begin.
+# Wave 4 is dedicated to the k3s upgrade sequence:
+#   wave 2: system-upgrade-controller (provides Plan CRD)
+#   wave 4: k3s-upgrade-plans (applies Plans → SUC drains, upgrades, uncordons)
+#   wave 5: this barrier (waits for Plans healthy + nodes schedulable)
+#   wave 6: opendesk-cmp (safe to start now that nodes are Ready)
 #
-# NOTE: opendesk child app wave numbers (collabora=4, nextcloud=5, etc.) are
-#   INTERNAL to the opendesk app-of-apps — not argocd-main-app waves. Those
-#   are already covered by wave2-barrier waiting for opendesk=Healthy.
+# ClusterRole (not Role) required: node schedulability check reads cluster-scoped
+# Node objects in addition to argocd-namespace Applications.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -20,27 +20,28 @@ metadata:
     argocd.argoproj.io/sync-wave: "5"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: wave5-barrier
-  namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "5"
 rules:
 - apiGroups: ["argoproj.io"]
   resources: ["applications"]
   verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: wave5-barrier
-  namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "5"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: wave5-barrier
 subjects:
 - kind: ServiceAccount
@@ -57,7 +58,6 @@ metadata:
     argocd.argoproj.io/sync-wave: "5"
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  # 60 min — nextcloud and xwiki can be slow on cold NFS
   activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 300
   template:
@@ -66,15 +66,12 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         command: ["/bin/sh", "-ec"]
         args:
         - |
-          echo "Wave-5 barrier: discovering argocd-main-app applications at waves 3/4/5..."
+          echo "Wave-5 barrier: discovering applications with sync-wave=1..."
 
-          # Only look at apps directly owned by argocd-main-app.
-          # opendesk child apps have their own internal wave numbers — wave 4
-          # there means collabora/xwiki etc, NOT argocd-main-app wave 4 (headscale).
           APPS=$(kubectl get applications -n argocd -o json | \
             python3 -c "
           import sys, json
@@ -84,7 +81,7 @@ spec:
               wave = ann.get('argocd.argoproj.io/sync-wave', '')
               tracking = ann.get('argocd.argoproj.io/tracking-id', '')
               parent = tracking.split(':')[0] if tracking else ''
-              if parent == 'argocd-main-app' and wave in ('3', '4', '5'):
+              if parent == 'argocd-main-app' and wave == '4':
                   print(item['metadata']['name'])
           ")
 
@@ -100,15 +97,18 @@ spec:
                 -o jsonpath="{.status.health.status}" 2>/dev/null || true)
               PHASE=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
-              if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ] || [ "$PHASE" = "Running" ]; then
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+                 { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+                : # ready
+              else
                 ALL_READY=false
                 echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
               fi
             done
 
             if [ "$ALL_READY" = "true" ]; then
-              echo "All argocd-main-app wave-3/4/5 Applications are Synced+Healthy — releasing wave 6."
-              exit 0
+              echo "All argocd-main-app wave-4 Applications are Synced+Healthy+NotProgressing."
+              break
             fi
 
             echo "Attempt $i/360 — not all ready, waiting 10s..."
@@ -116,5 +116,29 @@ spec:
             i=$((i+1))
           done
 
-          echo "ERROR: Not all argocd-main-app wave-3/4/5 Applications reached Synced+Healthy within 60 minutes"
+          if [ "$ALL_READY" != "true" ]; then
+            echo "ERROR: Not all argocd-main-app wave-4 Applications reached Synced+Healthy+Completed within 60 minutes"
+            exit 1
+          fi
+
+          echo "Waiting for all nodes to be schedulable (k3s upgrade complete)..."
+          i=0
+          while [ "$i" -lt 60 ]; do
+            # Use grep|wc -l (not grep -c) — grep -c exits 1 on no matches which
+            # would fire the || fallback and corrupt the variable with "0\n0".
+            # tr -d ' ' strips leading spaces from wc output.
+            CORDONED=$(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.unschedulable}{"\n"}{end}' 2>/dev/null \
+              | grep "true" | wc -l | tr -d ' ')
+            NOT_READY=$(kubectl get nodes --no-headers 2>/dev/null \
+              | grep -v " Ready " | wc -l | tr -d ' ')
+            if [ "$CORDONED" = "0" ] && [ "$NOT_READY" = "0" ]; then
+              echo "All nodes schedulable and Ready — releasing wave 6."
+              exit 0
+            fi
+            echo "  cordoned=${CORDONED} not-ready=${NOT_READY}, waiting 10s... ($i/60)"
+            sleep 10
+            i=$((i+1))
+          done
+
+          echo "ERROR: nodes did not become schedulable within 10 minutes"
           exit 1

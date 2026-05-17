@@ -1,0 +1,57 @@
+# Longhorn distributed block storage.
+# Deployed at wave 0 - before argocd, dns and secrets
+# Provides the default StorageClass for all RWO and RWX PVCs.
+# All nodes: local disk at /var/lib/longhorn (configured via node label/annotation in cloud-init / Pulumi SSH).
+# S3 backup credentials (longhorn-s3-credentials) provisioned by Pulumi in longhorn-system.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  sources:
+  - repoURL: https://charts.longhorn.io
+    chart: longhorn
+    targetRevision: "1.11.2" # renovate: datasource=helm depName=longhorn registryUrl=https://charts.longhorn.io
+    helm:
+      valuesObject:
+        defaultSettings:
+          # 2 replicas: one on CP, one on edge worker for cross-node redundancy.
+          defaultReplicaCount: 2
+          # Disk config is driven by node labels/annotations set in cloud-init / Pulumi SSH command.
+          createDefaultDiskLabeledNodes: true
+          # best-effort: prefer local replica to avoid cross-VPN reads
+          dataLocality: best-effort
+          # Allows scheduling when fewer than defaultReplicaCount disks are available (e.g. during node join)
+          replicaSoftAntiAffinity: true
+        persistence:
+          defaultClass: true
+          defaultClassReplicaCount: 2
+          reclaimPolicy: Retain
+  - repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/longhorn
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: longhorn-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    # Longhorn injects caBundle into CRD conversion webhooks at runtime via cert rotation —
+    # the chart ships an empty value so ArgoCD always sees a diff without this.
+    # preserveUnknownFields: false is set by the chart but stripped by the API server (it's the default) — same diff.
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      jsonPointers:
+        - /metadata/annotations
+        - /spec/conversion/webhook/clientConfig/caBundle
+        - /spec/preserveUnknownFields

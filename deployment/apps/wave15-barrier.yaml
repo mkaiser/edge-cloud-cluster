@@ -1,0 +1,192 @@
+# Wave 15 Sync barrier: waits until wave-14 (cp-tailscale + headplane) are Synced+Healthy,
+# then sends a one-time "basic infrastructure ready" notification.
+#
+# At this point headscale (wave 12, confirmed by wave-13 barrier) and headplane
+# (wave 14, confirmed here) are both healthy — the VPN mesh is operational and
+# edge workers can join.
+#
+# "Send once" guard: a ConfigMap `infra-ready-notified` is created in the argocd
+# namespace (not an ArgoCD hook — no tracking annotation) so it survives re-syncs.
+# On subsequent syncs the barrier skips the notification and exits 0 immediately
+# after the health check.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave15-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave15-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["smtp-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave15-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave15-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave15-barrier
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave15-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "15"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave15-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "Wave-15 barrier: discovering applications with sync-wave=14..."
+
+          APPS=$(kubectl get applications -n argocd -o json | \
+            python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent == 'argocd-main-app' and wave == '14':
+                  print(item['metadata']['name'])
+          ")
+
+          echo "Waiting for: $(echo $APPS | tr '\n' ' ')"
+
+          i=0
+          while [ "$i" -lt 180 ]; do
+            ALL_READY=true
+            for APP in $APPS; do
+              SYNC=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+              HEALTH=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+                 { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+                : # ready
+              else
+                ALL_READY=false
+                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+              fi
+            done
+
+            if [ "$ALL_READY" = "true" ]; then
+              echo "All wave-14 Applications are Synced+Healthy+NotProgressing — releasing wave 16."
+              break
+            fi
+
+            echo "Attempt $i/180 — not all ready, waiting 10s..."
+            sleep 10
+            i=$((i+1))
+          done
+
+          if [ "$ALL_READY" != "true" ]; then
+            echo "ERROR: wave-14 Applications did not reach Synced+Healthy+Completed within 30 minutes"
+            exit 1
+          fi
+
+          # Send once: check if notification was already sent
+          if kubectl get configmap infra-ready-notified -n argocd >/dev/null 2>&1; then
+            echo "Notification already sent in a previous sync — skipping."
+            exit 0
+          fi
+
+          echo "Sending infrastructure-ready notification..."
+
+          python3 - <<'PYEOF'
+          import smtplib, subprocess, json, os, time
+          from email.message import EmailMessage
+
+          def get_secret_key(key):
+              result = subprocess.run(
+                  ["kubectl", "get", "secret", "smtp-credentials", "-n", "argocd",
+                   "-o", f"jsonpath={{.data.{key}}}"],
+                  capture_output=True, text=True)
+              import base64
+              return base64.b64decode(result.stdout.strip()).decode()
+
+          to       = get_secret_key("sendBootstrapFinishMailRecipient")
+          host     = get_secret_key("host")
+          port     = int(get_secret_key("port"))
+          username = get_secret_key("username")
+          password = get_secret_key("password")
+
+          msg = EmailMessage()
+          msg["Subject"] = "ecc66.cape-project.eu — Basic infrastructure ready"
+          msg["From"]    = "no-reply@cape-project.eu"
+          msg["To"]      = to
+          msg.set_content(
+              "Headscale VPN and Headplane are healthy.\n\n"
+              "Basic infrastructure is ready:\n"
+              "  - VPN:       https://vpn.ecc66.cape-project.eu\n"
+              "  - Headplane: https://headplane.ecc66.cape-project.eu/admin\n"
+              "  - ArgoCD:    https://argocd.ecc66.cape-project.eu\n\n"
+              "Edge workers can now join the cluster.\n"
+              "Run the join script on each edge node:\n"
+              "  ./scripts/2_joinCluster.sh\n"
+          )
+
+          for attempt in range(1, 6):
+              try:
+                  with smtplib.SMTP(host, port, timeout=10) as s:
+                      s.ehlo(); s.starttls()
+                      if username:
+                          s.login(username, password)
+                      s.send_message(msg)
+                  print(f"Notification sent to {to}")
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/5 failed: {e}")
+                  if attempt < 5:
+                      time.sleep(15)
+          else:
+              raise RuntimeError("Failed to send notification after 5 attempts")
+          PYEOF
+
+          # Mark as sent — no ArgoCD tracking annotations so it survives re-syncs
+          kubectl create configmap infra-ready-notified \
+            --from-literal=sent=true \
+            --from-literal=wave=15 \
+            -n argocd
+          echo "Notification sent and guard ConfigMap created."

@@ -1,7 +1,7 @@
 # Registers the "gitlab" OIDC client in the openDesk Keycloak realm.
 # PostSync hook — runs after all resources are synced so it doesn't block deployment.
 # Reads Keycloak admin credentials from the opendesk-keycloak-bootstrap-admin-creds
-# secret in the argocd namespace (requires ClusterRole).
+# secret in the opendesk namespace (ClusterRole grants cross-namespace access).
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -53,16 +53,20 @@ spec:
     spec:
       serviceAccountName: gitlab-keycloak-setup
       restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: keycloak-client-setup
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         env:
         - name: KEYCLOAK_URL
-          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+          value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
         - name: REALM
           value: "opendesk"
         - name: CLIENT_ID
           value: "gitlab"
+        - name: GITLAB_URL
+          value: "https://gitlab.ecc66.cape-project.eu"
         - name: CLIENT_SECRET
           valueFrom:
             secretKeyRef:
@@ -95,7 +99,7 @@ spec:
           # Read Keycloak admin credentials from openDesk secret in argocd namespace
           echo "Reading Keycloak admin credentials..."
           ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
-            -n argocd -o jsonpath='{.data.admin\.yaml}' | base64 -d)
+            -n opendesk -o jsonpath='{.data.admin\.yaml}' | base64 -d)
           KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep 'username:' | awk '{print $2}')
           KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep 'password:' | awk '{print $2}')
 
@@ -136,10 +140,10 @@ spec:
             "directAccessGrantsEnabled": false,
             "serviceAccountsEnabled": false,
             "redirectUris": [
-              "https://gitlab.test34.your-domain.tld/users/auth/openid_connect/callback"
+              "'"${GITLAB_URL}"'/users/auth/openid_connect/callback"
             ],
             "webOrigins": [
-              "https://gitlab.test34.your-domain.tld"
+              "'"${GITLAB_URL}"'"
             ],
             "defaultClientScopes": ["openid", "profile", "email"]
           }'

@@ -1,0 +1,32 @@
+---
+# HAProxy ingress for Ryax.
+# Routes ryax.ecc66.cape-project.eu to the internal ryax-traefik service.
+# TLS is terminated by HAProxy; Ryax Traefik receives plain HTTP.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy
+  namespace: ryaxns
+  annotations:
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    haproxy-ingress.github.io/secure-backends: "true"
+    haproxy-ingress.github.io/backend-protocol: "h1-ssl"
+    haproxy-ingress.github.io/secure-sni: "host"
+    haproxy-ingress.github.io/preserve-host: "true"
+spec:
+  ingressClassName: haproxy
+  tls:
+    - hosts:
+        - ryax.ecc66.cape-project.eu
+      secretName: ryax-cert-production
+  rules:
+    - host: ryax.ecc66.cape-project.eu
+      http:
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: ryax-traefik
+                port:
+                  number: 443

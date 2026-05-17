@@ -1,17 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
 import * as command from "@pulumi/command";
-
-export interface DnsArgs {
-    hProvider: hcloud.Provider;
-    dns: {
-        zoneName: string;
-        tld: string;
-        testSubdomain: string;
-    };
-    controlPlane: hcloud.Server;
-    additionalCpNodes: hcloud.Server[];
-}
+import { project_settings } from "../project_settings";
 
 export class DnsComponent extends pulumi.ComponentResource {
     public readonly dnsZoneId: pulumi.Output<string>;
@@ -40,24 +30,32 @@ export class DnsComponent extends pulumi.ComponentResource {
     private readonly _dnsSubdomainSuffix: string;
     private readonly _dnsZoneName: string;
 
-    constructor(name: string, args: DnsArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        hProvider: hcloud.Provider,
+        projectSettings: typeof project_settings,
+        controlPlane: hcloud.Server,
+        additionalCpNodes: hcloud.Server[],
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:Dns", name, {}, opts);
+        const wildcardName = projectSettings.dns.subdomain
+            ? `*.${projectSettings.dns.subdomain}`
+            : "*";
 
-        const { hProvider, dns, controlPlane, additionalCpNodes } = args;
-        const { zoneName: dnsZoneName, tld, testSubdomain } = dns;
-        const wildcardName = testSubdomain ? `*.${testSubdomain}` : "*";
-
-        this._dnsZoneName = dnsZoneName;
+        this._dnsZoneName = projectSettings.dns.zoneName;
 
         const dnsZone = pulumi.output(
-            hcloud.getZone({ name: dnsZoneName }, { provider: hProvider }),
+            hcloud.getZone({ name: projectSettings.dns.zoneName }, { provider: hProvider }),
         );
         this.dnsZoneId = dnsZone.apply((z) => String(z.id!));
 
         // When tld differs from dnsZoneName (e.g. "sub1.domain.tld" vs "domain.tld"),
         // record names inside the zone need the extra subdomain prefix appended.
         this._dnsSubdomainSuffix =
-            tld === dnsZoneName ? "" : "." + tld.replace(`.${dnsZoneName}`, "");
+            projectSettings.dns.tld === projectSettings.dns.zoneName
+                ? ""
+                : "." + projectSettings.dns.tld.replace(`.${projectSettings.dns.zoneName}`, "");
 
         /////////////////////
         // Wildcard DNS
@@ -95,6 +93,42 @@ export class DnsComponent extends pulumi.ComponentResource {
                     { provider: hProvider, parent: this, deleteBeforeReplace: true },
                 ),
         );
+
+        /////////////////////
+        // SPF record
+        /////////////////////
+
+        const spfValue = projectSettings.mail.spfInclude
+            ? `v=spf1 ${projectSettings.mail.spfInclude} ~all`
+            : `v=spf1 a:${projectSettings.mail.smtpRelay} ~all`;
+
+        new hcloud.ZoneRecord(
+            "spf-txt",
+            {
+                zone: this.dnsZoneId,
+                name: "@",
+                type: "TXT",
+                comment: "Pulumi-managed: SPF record for outbound mail relay",
+                value: `"${spfValue}"`,
+            },
+            { provider: hProvider, parent: this, deleteBeforeReplace: true },
+        );
+
+        // SPF for the subdomain (e.g. myawesomecluster.cape-project.eu) — covers system
+        // emails sent from noreply@<subdomain>.<zone> via the same relay.
+        if (projectSettings.dns.subdomain) {
+            new hcloud.ZoneRecord(
+                "spf-txt-subdomain",
+                {
+                    zone: this.dnsZoneId,
+                    name: projectSettings.dns.subdomain,
+                    type: "TXT",
+                    comment: `Pulumi-managed: SPF for ${projectSettings.dns.subdomain} mail relay`,
+                    value: `"${spfValue}"`,
+                },
+                { provider: hProvider, parent: this, deleteBeforeReplace: true },
+            );
+        }
 
         this.registerOutputs({ dnsZoneId: this.dnsZoneId });
     }

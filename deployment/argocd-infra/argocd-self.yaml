@@ -3,7 +3,6 @@
 # Values are split across dedicated folders:
 #   deployment/argocd-infra/values.yaml — ArgoCD core config (server, controller, redis)
 #   deployment/opendesk-cmp/values.yaml — openDesk helmfile sidecar + secrets
-#   deployment/ryax-cmp/values.yaml     — Ryax helmfile sidecar (placeholder)
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -16,20 +15,19 @@ metadata:
 spec:
   project: default
   sources:
-    - repoURL: git@github.com:owner/repo.git
+    - repoURL: git@github.com:paraXent/infra.git
       targetRevision: main
       ref: values
     - repoURL: https://argoproj.github.io/argo-helm
       chart: argo-cd
-      targetRevision: "9.5.0" # https://github.com/argoproj/argo-helm/releases, look for argo-cd-****
+      targetRevision: "9.5.14" # renovate: datasource=helm depName=argo-cd registryUrl=https://argoproj.github.io/argo-helm
       helm:
         releaseName: argocd
         valueFiles:
           - $values/deployment/argocd-infra/values.yaml
           - $values/deployment/opendesk-cmp/values.yaml
-          - $values/deployment/ryax-cmp/values.yaml
     # Plain manifests: OIDC sealed secret
-    - repoURL: git@github.com:owner/repo.git
+    - repoURL: git@github.com:paraXent/infra.git
       targetRevision: main
       path: deployment/argocd-infra
       directory:

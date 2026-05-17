@@ -1,0 +1,179 @@
+# Creates a GitLab OAuth application for the Mattermost GitLab plugin.
+# PostSync hook on the mattermost app (wave 24) — GitLab (wave 18) is
+# guaranteed ready by this point, so no timing issues.
+# Writes client_id + client_secret to mattermost/mattermost-gitlab-oauth.
+# Idempotent: skips if secret already exists.
+#
+# RBAC resources are permanent (not hooks) so they exist and are fully
+# propagated before the PostSync job runs. Deleting the mattermost app
+# will prune them via ArgoCD.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mattermost-oauth-setup
+  namespace: gitlab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mattermost-oauth-setup
+  namespace: gitlab
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mattermost-oauth-setup
+  namespace: gitlab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mattermost-oauth-setup
+subjects:
+- kind: ServiceAccount
+  name: mattermost-oauth-setup
+  namespace: gitlab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mattermost-oauth-secret-writer
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "create", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mattermost-oauth-secret-writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mattermost-oauth-secret-writer
+subjects:
+- kind: ServiceAccount
+  name: mattermost-oauth-setup
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mattermost-oauth-setup
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: mattermost-oauth-setup
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: setup
+        image: docker.io/alpine/k8s:1.36.0
+        env:
+        - name: GITLAB_URL
+          value: "https://gitlab.ecc66.cape-project.eu"
+        - name: MATTERMOST_URL
+          value: "https://chat.ecc66.cape-project.eu"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Idempotent: skip if credentials already stored
+          if kubectl -n mattermost get secret mattermost-gitlab-oauth >/dev/null 2>&1; then
+            echo "mattermost-gitlab-oauth already exists — nothing to do."
+            exit 0
+          fi
+
+          # Use internal service URL — no DNS/ingress/TLS dependency
+          GITLAB_INTERNAL="http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+          echo "Waiting for GitLab webservice ($GITLAB_INTERNAL)..."
+          STATUS=""
+          for i in $(seq 1 120); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+              "${GITLAB_INTERNAL}/-/health" || true)
+            [ "$STATUS" = "200" ] && { echo "GitLab ready."; break; }
+            echo "  Attempt $i/120 — HTTP ${STATUS}, retrying in 10s..."
+            sleep 10
+          done
+          [ "$STATUS" = "200" ] || { echo "ERROR: GitLab not ready after 20 min"; exit 1; }
+
+          echo "Creating temporary admin PAT via rails runner..."
+          WEBSERVICE_POD=$(kubectl -n gitlab get pods -l app=webservice \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          [ -n "$WEBSERVICE_POD" ] || { echo "ERROR: no running webservice pod"; exit 1; }
+
+          PAT=$(kubectl -n gitlab exec "$WEBSERVICE_POD" -c webservice -- \
+            /srv/gitlab/bin/rails runner "
+              user = User.find_by(username: 'root')
+              user.personal_access_tokens.find_by(name: 'mattermost-oauth-setup')&.revoke!
+              pat = user.personal_access_tokens.create!(
+                name:       'mattermost-oauth-setup',
+                scopes:     ['api'],
+                expires_at: Date.today + 1
+              )
+              puts pat.token
+            " 2>/dev/null | tail -1)
+          [ -n "$PAT" ] || { echo "ERROR: failed to create admin PAT via rails runner"; exit 1; }
+
+          # Delete existing app with same name to get fresh credentials
+          EXISTING_ID=$(curl -sf -H "PRIVATE-TOKEN: $PAT" \
+            "${GITLAB_INTERNAL}/api/v4/applications" 2>/dev/null | \
+            grep -o '"id":[0-9]*,"application_id":"[^"]*","name":"Mattermost GitLab Plugin"' | \
+            grep -o '"id":[0-9]*' | grep -o '[0-9]*' | head -1 || true)
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Removing existing OAuth app (id=${EXISTING_ID})..."
+            curl -sf -X DELETE -H "PRIVATE-TOKEN: $PAT" \
+              "${GITLAB_INTERNAL}/api/v4/applications/${EXISTING_ID}" || true
+          fi
+
+          echo "Creating OAuth application..."
+          RESULT=$(curl -sf -X POST \
+            -H "PRIVATE-TOKEN: $PAT" \
+            -H "Content-Type: application/json" \
+            "${GITLAB_INTERNAL}/api/v4/applications" \
+            -d '{
+              "name": "Mattermost GitLab Plugin",
+              "redirect_uri": "'"${MATTERMOST_URL}"'/plugins/com.github.manland.mattermost-plugin-gitlab/oauth/complete",
+              "scopes": "api read_user",
+              "confidential": true
+            }')
+
+          CLIENT_ID=$(echo "$RESULT"     | sed -n 's/.*"application_id":"\([^"]*\)".*/\1/p')
+          CLIENT_SECRET=$(echo "$RESULT" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
+          [ -n "$CLIENT_ID" ]     || { echo "ERROR: no application_id in response: $RESULT"; exit 1; }
+          [ -n "$CLIENT_SECRET" ] || { echo "ERROR: no secret in response: $RESULT"; exit 1; }
+
+          echo "Storing OAuth credentials in mattermost/mattermost-gitlab-oauth..."
+          kubectl -n mattermost create secret generic mattermost-gitlab-oauth \
+            --from-literal=client-id="$CLIENT_ID" \
+            --from-literal=client-secret="$CLIENT_SECRET" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl -n gitlab exec "$WEBSERVICE_POD" -c webservice -- \
+            /srv/gitlab/bin/rails runner "
+              User.find_by(username: 'root')
+                &.personal_access_tokens
+                &.find_by(name: 'mattermost-oauth-setup')
+                &.revoke!
+            " 2>/dev/null || true
+
+          echo "Done — OAuth credentials stored for Mattermost plugin setup."

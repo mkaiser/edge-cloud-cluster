@@ -1,90 +1,42 @@
 import * as pulumi from "@pulumi/pulumi";
-import * as hcloud from "@pulumi/hcloud";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
-import type { ClusterOS, ControlPlaneNode, LoadBalancerProvider } from "./types";
-import type { PulumiSecrets } from "./pulumi_secrets";
-
-export interface StorageArgs {
-    k8sProvider: k8s.Provider;
-    hProvider: hcloud.Provider;
-    pulumiSecrets: PulumiSecrets;
-    network: hcloud.Network;
-    cluster: {
-        os: ClusterOS;
-        loadBalancerProvider: LoadBalancerProvider;
-        completeClusterTeardown: boolean;
-    };
-    controlPlaneNodes: ControlPlaneNode[];
-    objectStorage: {
-        baseEndpoint: string;
-    };
-    backupStorage: {
-        host: string;
-    };
-    blockStorage: {
-        nfsSsdVolumeSize: string;
-    };
-    features: {
-        enableTestS3Storage: boolean;
-        enableTestSsdVolume: boolean;
-        enableTestSsdVolumeNfs: boolean;
-    };
-}
+import { project_settings } from "../project_settings";
+import type { NetworkComponent } from "./network";
 
 export class StorageComponent extends pulumi.ComponentResource {
     public readonly hcloudSecret: k8s.core.v1.Secret;
     public readonly csiDriver: helm.v3.Release;
-    public readonly nfsCsiDriver: helm.v3.Release;
-    public readonly nfsServerProvisioner: helm.v3.Release;
 
-    constructor(name: string, args: StorageArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        k8sProvider: k8s.Provider,
+        networkComponent: NetworkComponent,
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:Storage", name, {}, opts);
 
-        const {
-            k8sProvider,
-            hProvider,
-            network,
-            pulumiSecrets,
-            cluster,
-            controlPlaneNodes,
-            objectStorage,
-            backupStorage,
-            blockStorage,
-            features,
-        } = args;
-
-        const { os: clusterOS, loadBalancerProvider, completeClusterTeardown } = cluster;
-        const { baseEndpoint: hetznerS3BaseEndpoint } = objectStorage;
-        const { host: storageboxHost } = backupStorage;
-        const { nfsSsdVolumeSize } = blockStorage;
-        const nfsSsdVolumeLocation = controlPlaneNodes[0].location;
-        const { enableTestS3Storage, enableTestSsdVolume, enableTestSsdVolumeNfs } = features;
-
-        const useHetznerCcm = loadBalancerProvider === "hetzner-ccm";
-
-        // Secret must be named "hcloud" in kube-system — CSI driver and CCM look for this exact name.
         this.hcloudSecret = new k8s.core.v1.Secret(
             "hcloud-secret",
             {
                 metadata: { name: "hcloud", namespace: "kube-system" },
                 stringData: {
-                    token: pulumiSecrets.hcloudToken,
-                    network: network.id.apply((id) => String(id)),
+                    token: project_settings.server.hcloudToken,
+                    network: networkComponent.network.id.apply((id) => String(id)),
                 },
             },
             { provider: k8sProvider, parent: this },
         );
 
-        // For Debian/K3s in Hetzner CCM mode, deploy external cloud-controller-manager.
         const hcloudCcm =
-            clusterOS !== "Talos" && useHetznerCcm
+            project_settings.server.os !== "Talos" &&
+            project_settings.server.loadBalancerProvider === "hetzner-ccm"
                 ? new helm.v3.Release(
                       "hcloud-ccm",
                       {
                           chart: "hcloud-cloud-controller-manager",
-                          version: "v1.30.1", // https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases
+                          version: "1.31.0",
                           namespace: "kube-system",
                           repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                       },
@@ -96,7 +48,7 @@ export class StorageComponent extends pulumi.ComponentResource {
             "hcloud-csi",
             {
                 chart: "hcloud-csi",
-                version: "2.20.0", // https://github.com/hetznercloud/helm-charts
+                version: "2.21.0",
                 namespace: "kube-system",
                 repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                 values: {
@@ -107,6 +59,29 @@ export class StorageComponent extends pulumi.ComponentResource {
                             reclaimPolicy: "Retain",
                         },
                     ],
+                    // Restrict the CSI node DaemonSet to Hetzner Cloud nodes only.
+                    // Edge/external worker nodes lack the Hetzner metadata server
+                    // so the csi-driver container crashes on them.
+                    // csi.hetzner.cloud/location is applied by hcloud-ccm to every
+                    // Hetzner node regardless of region; Exists covers all locations.
+                    node: {
+                        affinity: {
+                            nodeAffinity: {
+                                requiredDuringSchedulingIgnoredDuringExecution: {
+                                    nodeSelectorTerms: [
+                                        {
+                                            matchExpressions: [
+                                                {
+                                                    key: "csi.hetzner.cloud/location",
+                                                    operator: "Exists",
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
                 },
             },
             {
@@ -116,39 +91,11 @@ export class StorageComponent extends pulumi.ComponentResource {
             },
         );
 
-        this.nfsCsiDriver = new helm.v3.Release(
-            "nfs-csi",
-            {
-                chart: "csi-driver-nfs",
-                version: "4.13.1", // https://github.com/kubernetes-csi/csi-driver-nfs
-                namespace: "kube-system",
-                repositoryOpts: {
-                    repo: "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts",
-                },
-            },
-            { provider: k8sProvider, parent: this },
-        );
-
-        // StorageClass: Hetzner Storagebox (NFS)
-        new k8s.storage.v1.StorageClass(
-            "hcloud-storagebox",
-            {
-                metadata: { name: "hcloud-storagebox" },
-                provisioner: "nfs.csi.k8s.io",
-                parameters: { server: storageboxHost, share: "/", mountPermissions: "0770" },
-                reclaimPolicy: "Retain",
-                volumeBindingMode: "Immediate",
-                mountOptions: ["nfsvers=3", "hard", "noatime"],
-            },
-            { provider: k8sProvider, parent: this, dependsOn: [this.nfsCsiDriver] },
-        );
-
-        // S3 CSI Driver
         const s3CsiDriver = new helm.v3.Release(
             "csi-s3",
             {
                 chart: "csi-s3",
-                version: "v0.43.4", //  https://github.com/yandex-cloud/k8s-csi-s3/releases
+                version: "0.43.7",
                 namespace: "kube-system",
                 repositoryOpts: { repo: "https://yandex-cloud.github.io/k8s-csi-s3/charts" },
                 values: {
@@ -156,16 +103,16 @@ export class StorageComponent extends pulumi.ComponentResource {
                     secret: {
                         create: true,
                         name: "csi-s3-secret",
-                        accessKey: pulumiSecrets.hetznerS3AccessKey,
-                        secretKey: pulumiSecrets.hetznerS3SecretKey,
-                        endpoint: pulumi.interpolate`https://${hetznerS3BaseEndpoint}`,
+                        accessKey: project_settings.storage.objectStorage.accessKey,
+                        secretKey: project_settings.storage.objectStorage.secretKey,
+                        endpoint: pulumi.interpolate`https://${project_settings.storage.objectStorage.baseEndpoint}`,
                     },
                 },
             },
             { provider: k8sProvider, parent: this },
         );
 
-        const storageS3 = new k8s.storage.v1.StorageClass(
+        new k8s.storage.v1.StorageClass(
             "hcloud-s3",
             {
                 metadata: { name: "hcloud-s3" },
@@ -187,405 +134,144 @@ export class StorageComponent extends pulumi.ComponentResource {
             { provider: k8sProvider, parent: this, dependsOn: [s3CsiDriver] },
         );
 
-        /////////////////////
-        // In-cluster NFS shared storage (NFS-Ganesha over SSD)
-        /////////////////////
-
-        // Auto-imports the volume if it already exists (survives pulumi down due to retainOnDelete).
-        const existingVolumeId =
-            require("child_process")
-                .execSync(
-                    `hcloud volume list -o noheader -o columns=id,name | awk '$2 == "volume-ssd-infra" {print $1}'`,
-                    { encoding: "utf-8", timeout: 10000 },
-                )
-                .trim() || undefined;
-
-        const volumeSsdInfra = new hcloud.Volume(
-            "volume-ssd-infra",
-            {
-                name: "volume-ssd-infra",
-                size: parseInt(nfsSsdVolumeSize),
-                location: nfsSsdVolumeLocation,
-                format: "ext4",
-                labels: { "managed-by": "pulumi", purpose: "infra-nfs-backing" },
-            },
-            {
-                provider: hProvider,
-                parent: this,
-                // completeClusterTeardown=true → full wipe, delete the volume.
-                // completeClusterTeardown=false → cluster recreation, keep NFS data.
-                retainOnDelete: !completeClusterTeardown,
-                ...(existingVolumeId ? { import: existingVolumeId } : {}),
-            },
+        // Namespace, SA, and S3 credentials for Longhorn — seeded before ArgoCD wave 0
+        // so the Helm pre-upgrade hook can run on fresh install (needs longhorn-service-account).
+        const longhornNs = new k8s.core.v1.Namespace(
+            "longhorn-system-ns",
+            { metadata: { name: "longhorn-system" } },
+            { provider: k8sProvider, parent: this, customTimeouts: { delete: "5m" } },
         );
 
-        const removePvFinalizer = completeClusterTeardown
-            ? new command.local.Command(
-                  "remove-pv-finalizer",
-                  {
-                      create: "echo 'PV finalizer removal ready (runs on destroy only)'",
-                      delete: pulumi.interpolate`export KUBECONFIG=~/.kube/config; \
-kubectl patch pv pv-ssd-infra -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true; \
-echo "PV finalizer removed"`,
-                      triggers: [],
-                  },
-                  { parent: this },
-              )
-            : null;
+        // The Longhorn Helm chart's pre-upgrade hook uses this SA. On fresh install
+        // the SA doesn't exist yet (chart not applied), causing the hook to fail.
+        // Seeding it here unblocks the hook so the chart can install cleanly.
+        const longhornSa = new k8s.core.v1.ServiceAccount(
+            "longhorn-service-account",
+            { metadata: { name: "longhorn-service-account", namespace: "longhorn-system" } },
+            { provider: k8sProvider, parent: this, dependsOn: [longhornNs] },
+        );
 
-        const pvSsdInfra = new k8s.core.v1.PersistentVolume(
-            "pv-ssd-infra",
+        // Temporary cluster-admin binding so the pre-upgrade job can introspect existing
+        // Longhorn resources. The chart will replace this with its own scoped RBAC on sync.
+        new k8s.rbac.v1.ClusterRoleBinding(
+            "longhorn-pre-upgrade-tmp",
             {
-                metadata: { name: "pv-ssd-infra" },
-                spec: {
-                    capacity: { storage: nfsSsdVolumeSize },
-                    accessModes: ["ReadWriteOnce"],
-                    persistentVolumeReclaimPolicy: "Retain",
-                    storageClassName: "hcloud-ssd-volumes",
-                    csi: {
-                        driver: "csi.hetzner.cloud",
-                        volumeHandle: volumeSsdInfra.id.apply((id) => String(id)),
-                        fsType: "ext4",
-                    },
+                metadata: { name: "longhorn-pre-upgrade-tmp" },
+                roleRef: {
+                    apiGroup: "rbac.authorization.k8s.io",
+                    kind: "ClusterRole",
+                    name: "cluster-admin",
                 },
-            },
-            {
-                provider: k8sProvider,
-                parent: this,
-                retainOnDelete: true,
-                dependsOn: [
-                    this.csiDriver,
-                    volumeSsdInfra,
-                    ...(removePvFinalizer ? [removePvFinalizer] : []),
+                subjects: [
+                    {
+                        kind: "ServiceAccount",
+                        name: "longhorn-service-account",
+                        namespace: "longhorn-system",
+                    },
                 ],
             },
+            { provider: k8sProvider, parent: this, dependsOn: [longhornSa] },
         );
 
-        const nfsNs = new k8s.core.v1.Namespace(
-            "nfs-server-ns",
+        const longhornS3Secret = new k8s.core.v1.Secret(
+            "longhorn-s3-credentials",
             {
-                metadata: { name: "nfs-server" },
+                metadata: { name: "longhorn-s3-credentials", namespace: "longhorn-system" },
+                stringData: {
+                    AWS_ACCESS_KEY_ID: project_settings.storage.objectStorage.accessKey,
+                    AWS_SECRET_ACCESS_KEY: project_settings.storage.objectStorage.secretKey,
+                    AWS_ENDPOINTS: pulumi.interpolate`https://${project_settings.storage.objectStorage.baseEndpoint}`,
+                    VIRTUAL_HOSTED_STYLE: "false",
+                },
             },
-            { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
+            { provider: k8sProvider, parent: this, dependsOn: [longhornNs] },
         );
 
-        const nfsServerBackingPvc = new k8s.core.v1.PersistentVolumeClaim(
-            "nfs-server-backing-pvc",
-            {
-                metadata: {
-                    name: "nfs-server-data",
-                    namespace: "nfs-server",
-                    annotations: { "pulumi.com/skipAwait": "true" },
-                },
-                spec: {
-                    storageClassName: "hcloud-ssd-volumes",
-                    volumeName: "pv-ssd-infra",
-                    accessModes: ["ReadWriteOnce"],
-                    resources: { requests: { storage: nfsSsdVolumeSize } },
-                },
-            },
-            {
-                provider: k8sProvider,
-                parent: this,
-                dependsOn: [pvSsdInfra, nfsNs],
-                ignoreChanges: ["spec"],
-                retainOnDelete: true,
-            },
-        );
-
-        this.nfsServerProvisioner = new helm.v3.Release(
-            "nfs-server-provisioner",
-            {
-                chart: "nfs-server-provisioner",
-                version: "1.8.0", // https://github.com/kubernetes-sigs/nfs-ganesha-server-and-external-provisioner/releases
-                namespace: "nfs-server",
-                repositoryOpts: {
-                    repo: "https://kubernetes-sigs.github.io/nfs-ganesha-server-and-external-provisioner/",
-                },
-                timeout: 600, // seconds — Hetzner volume attach can be slow on first run
-                waitForJobs: true,
-                values: {
-                    persistence: { enabled: true, existingClaim: "nfs-server-data" },
-                    storageClass: {
-                        create: true,
-                        name: "hcloud-nfs-ssd-volumes",
-                        defaultClass: false,
-                        reclaimPolicy: "Retain",
-                    },
-                    securityContext: { capabilities: { add: ["DAC_READ_SEARCH", "SYS_RESOURCE"] } },
-                    nodeSelector: {
-                        "node-role.kubernetes.io/control-plane": "true",
-                        "csi.hetzner.cloud/location": nfsSsdVolumeLocation,
-                    },
-                    tolerations: [
-                        {
-                            key: "node-role.kubernetes.io/control-plane",
-                            operator: "Exists",
-                            effect: "NoSchedule",
-                        },
-                    ],
-                },
-            },
-            { provider: k8sProvider, parent: this, dependsOn: [nfsServerBackingPvc] },
-        );
-
-        const testingStorageNs = new k8s.core.v1.Namespace(
-            "testing-storage-ns",
-            {
-                metadata: { name: "testing-storage" },
-            },
-            { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
-        );
-
-        new k8s.core.v1.PersistentVolumeClaim(
-            "testing-nfs-pvc",
-            {
-                metadata: {
-                    name: "testing-nfs",
-                    namespace: "testing-storage",
-                    annotations: { "pulumi.com/skipAwait": "true" },
-                },
-                spec: {
-                    storageClassName: "hcloud-nfs-ssd-volumes",
-                    accessModes: ["ReadWriteMany"],
-                    resources: { requests: { storage: "5Gi" } },
-                },
-            },
-            {
-                provider: k8sProvider,
-                parent: this,
-                dependsOn: [testingStorageNs, this.nfsServerProvisioner],
-                ignoreChanges: ["spec"],
-            },
-        );
-
-        /////////////////////
-        // Test Storage Pods (optional, gated by feature flags)
-        /////////////////////
-
-        const storageTestScript = `#!/bin/sh
-set -e
-DATAFILE=/data/persistence-test.log
-echo "=== $(date -Iseconds) | Pod start ===" >> "$DATAFILE"
-echo "Pod: $HOSTNAME" >> "$DATAFILE"
-COUNT=$(grep -c "Pod start" "$DATAFILE" || true)
-echo "Volume is mounted and writable"
-echo "This pod has started $COUNT time(s)"
-cat "$DATAFILE"
-tail -f /dev/null`;
-
-        if (enableTestS3Storage) {
-            const ns = new k8s.core.v1.Namespace(
-                "test-s3-ns",
-                { metadata: { name: "test-s3-storage" } },
-                { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
-            );
-            const pvc = new k8s.core.v1.PersistentVolumeClaim(
-                "test-s3-pvc",
+        for (const bucket of project_settings.storage.objectStorage.buckets) {
+            const endpoint = `https://${bucket.location}.your-objectstorage.com`;
+            new command.local.Command(
+                `ensure-s3-bucket-${bucket.key}`,
                 {
-                    metadata: {
-                        name: "test-s3-pvc",
-                        namespace: "test-s3-storage",
-                        annotations: { "pulumi.com/skipAwait": "true" },
-                    },
-                    spec: {
-                        storageClassName: "hcloud-s3",
-                        accessModes: ["ReadWriteMany"],
-                        resources: { requests: { storage: "1Gi" } },
-                    },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns, storageS3] },
-            );
-            const cm = new k8s.core.v1.ConfigMap(
-                "test-s3-script",
-                {
-                    metadata: { name: "test-s3-script", namespace: "test-s3-storage" },
-                    data: { "run.sh": storageTestScript },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns] },
-            );
-            new k8s.apps.v1.Deployment(
-                "test-s3-deployment",
-                {
-                    metadata: { name: "test-s3", namespace: "test-s3-storage" },
-                    spec: {
-                        replicas: 1,
-                        selector: { matchLabels: { app: "test-s3" } },
-                        template: {
-                            metadata: { labels: { app: "test-s3" } },
-                            spec: {
-                                containers: [
-                                    {
-                                        name: "tester",
-                                        image: "busybox:1.36",
-                                        command: ["sh", "/scripts/run.sh"],
-                                        volumeMounts: [
-                                            { name: "data", mountPath: "/data" },
-                                            { name: "script", mountPath: "/scripts" },
-                                        ],
-                                    },
-                                ],
-                                volumes: [
-                                    {
-                                        name: "data",
-                                        persistentVolumeClaim: { claimName: "test-s3-pvc" },
-                                    },
-                                    {
-                                        name: "script",
-                                        configMap: { name: "test-s3-script", defaultMode: 0o755 },
-                                    },
-                                ],
-                            },
-                        },
+                    create: [
+                        `aws s3api head-bucket`,
+                        `  --bucket "${bucket.name}"`,
+                        `  --endpoint-url "${endpoint}"`,
+                        `  --region "${bucket.location}"`,
+                        `  2>/dev/null`,
+                        `|| aws s3api create-bucket`,
+                        `  --bucket "${bucket.name}"`,
+                        `  --endpoint-url "${endpoint}"`,
+                        `  --region "${bucket.location}"`,
+                    ].join(" \\\n"),
+                    delete: project_settings.general.completeClusterTeardown
+                        ? `aws s3 rb s3://${bucket.name} --force --endpoint-url "${endpoint}" --region "${bucket.location}"`
+                        : "true",
+                    environment: {
+                        AWS_ACCESS_KEY_ID: project_settings.storage.objectStorage.accessKey,
+                        AWS_SECRET_ACCESS_KEY: project_settings.storage.objectStorage.secretKey,
+                        AWS_DEFAULT_REGION: bucket.location,
+                        AWS_PAGER: "",
                     },
                 },
-                { provider: k8sProvider, parent: this, dependsOn: [pvc, cm] },
+                { parent: this },
             );
         }
 
-        if (enableTestSsdVolume) {
-            const ns = new k8s.core.v1.Namespace(
-                "test-ssd-ns",
-                { metadata: { name: "test-ssd-volume" } },
-                { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
-            );
-            const pvc = new k8s.core.v1.PersistentVolumeClaim(
-                "test-ssd-pvc",
-                {
-                    metadata: {
-                        name: "test-ssd-pvc",
-                        namespace: "test-ssd-volume",
-                        annotations: { "pulumi.com/skipAwait": "true" },
-                    },
-                    spec: {
-                        storageClassName: "hcloud-ssd-volumes",
-                        accessModes: ["ReadWriteOnce"],
-                        resources: { requests: { storage: "10Gi" } },
-                    },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns, this.csiDriver] },
-            );
-            const cm = new k8s.core.v1.ConfigMap(
-                "test-ssd-script",
-                {
-                    metadata: { name: "test-ssd-script", namespace: "test-ssd-volume" },
-                    data: { "run.sh": storageTestScript },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns] },
-            );
-            new k8s.apps.v1.Deployment(
-                "test-ssd-deployment",
-                {
-                    metadata: { name: "test-ssd", namespace: "test-ssd-volume" },
-                    spec: {
-                        replicas: 1,
-                        selector: { matchLabels: { app: "test-ssd" } },
-                        template: {
-                            metadata: { labels: { app: "test-ssd" } },
-                            spec: {
-                                containers: [
-                                    {
-                                        name: "tester",
-                                        image: "busybox:1.36",
-                                        command: ["sh", "/scripts/run.sh"],
-                                        volumeMounts: [
-                                            { name: "data", mountPath: "/data" },
-                                            { name: "script", mountPath: "/scripts" },
-                                        ],
-                                    },
-                                ],
-                                volumes: [
-                                    {
-                                        name: "data",
-                                        persistentVolumeClaim: { claimName: "test-ssd-pvc" },
-                                    },
-                                    {
-                                        name: "script",
-                                        configMap: { name: "test-ssd-script", defaultMode: 0o755 },
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [pvc, cm] },
-            );
-        }
-
-        if (enableTestSsdVolumeNfs) {
-            const ns = new k8s.core.v1.Namespace(
-                "test-nfs-ns",
-                { metadata: { name: "test-ssd-volume-nfs" } },
-                { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
-            );
-            const pvc = new k8s.core.v1.PersistentVolumeClaim(
-                "test-nfs-pvc",
-                {
-                    metadata: {
-                        name: "test-nfs-pvc",
-                        namespace: "test-ssd-volume-nfs",
-                        annotations: { "pulumi.com/skipAwait": "true" },
-                    },
-                    spec: {
-                        storageClassName: "hcloud-nfs-ssd-volumes",
-                        accessModes: ["ReadWriteMany"],
-                        resources: { requests: { storage: "1Gi" } },
-                    },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns, this.nfsServerProvisioner] },
-            );
-            const cm = new k8s.core.v1.ConfigMap(
-                "test-nfs-script",
-                {
-                    metadata: { name: "test-nfs-script", namespace: "test-ssd-volume-nfs" },
-                    data: { "run.sh": storageTestScript },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [ns] },
-            );
-            new k8s.apps.v1.Deployment(
-                "test-nfs-deployment",
-                {
-                    metadata: { name: "test-nfs", namespace: "test-ssd-volume-nfs" },
-                    spec: {
-                        replicas: 1,
-                        selector: { matchLabels: { app: "test-nfs" } },
-                        template: {
-                            metadata: { labels: { app: "test-nfs" } },
-                            spec: {
-                                containers: [
-                                    {
-                                        name: "tester",
-                                        image: "busybox:1.36",
-                                        command: ["sh", "/scripts/run.sh"],
-                                        volumeMounts: [
-                                            { name: "data", mountPath: "/data" },
-                                            { name: "script", mountPath: "/scripts" },
-                                        ],
-                                    },
-                                ],
-                                volumes: [
-                                    {
-                                        name: "data",
-                                        persistentVolumeClaim: { claimName: "test-nfs-pvc" },
-                                    },
-                                    {
-                                        name: "script",
-                                        configMap: { name: "test-nfs-script", defaultMode: 0o755 },
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                { provider: k8sProvider, parent: this, dependsOn: [pvc, cm] },
-            );
-        }
+        // On destroy: fully drain longhorn-system before the namespace is deleted.
+        // Runs before longhornNs deletion (dependsOn), preventing the namespace from
+        // getting stuck in Terminating when webhook pods are already gone.
+        new command.local.Command(
+            "longhorn-pre-destroy",
+            {
+                create: "true",
+                delete: [
+                    // Every kubectl call is wrapped with `timeout 30` so no single
+                    // command can block the destroy indefinitely.
+                    // Stop ArgoCD from re-creating Longhorn resources during the destroy window.
+                    "timeout 30 kubectl delete application longhorn -n argocd --ignore-not-found 2>/dev/null || true",
+                    // Remove admission webhooks that block CR deletion once their pods are gone.
+                    "timeout 30 kubectl delete validatingwebhookconfiguration longhorn-webhook-validator 2>/dev/null || true",
+                    "timeout 30 kubectl delete mutatingwebhookconfiguration longhorn-webhook-mutator 2>/dev/null || true",
+                    // Scale down all workloads so pods terminate gracefully.
+                    "timeout 30 kubectl scale deployment --all -n longhorn-system --replicas=0 2>/dev/null || true",
+                    "timeout 30 kubectl scale daemonset --all -n longhorn-system --replicas=0 2>/dev/null || true",
+                    // Strip finalizers from ALL Longhorn CRs (dynamic discovery avoids stale hardcoded lists).
+                    "for crd in $(timeout 30 kubectl get crd -o name 2>/dev/null | grep '\\.longhorn\\.io'); do",
+                    "  kind=$(timeout 15 kubectl get \"$crd\" -o jsonpath='{.spec.names.plural}' 2>/dev/null || true)",
+                    '  [ -z "$kind" ] && continue',
+                    '  timeout 30 kubectl get "${kind}" -n longhorn-system -o name 2>/dev/null | while read r; do',
+                    '    timeout 15 kubectl patch "$r" -n longhorn-system --type=merge -p \'{"metadata":{"finalizers":[]}}\' 2>/dev/null || true',
+                    "  done",
+                    "done",
+                    // Delete all CRD instances so nothing blocks namespace deletion.
+                    "for crd in $(timeout 30 kubectl get crd -o name 2>/dev/null | grep '\\.longhorn\\.io'); do",
+                    "  kind=$(timeout 15 kubectl get \"$crd\" -o jsonpath='{.spec.names.plural}' 2>/dev/null || true)",
+                    '  [ -z "$kind" ] && continue',
+                    '  timeout 60 kubectl delete "${kind}" --all -n longhorn-system --force --grace-period=0 2>/dev/null || true',
+                    "done",
+                    // Force-terminate any remaining pods.
+                    "timeout 30 kubectl delete pods -n longhorn-system --all --force --grace-period=0 2>/dev/null || true",
+                    // Delete the namespace now so Pulumi sees a 404 (= already gone = success).
+                    // If it gets stuck in Terminating, strip its own finalizers via the finalize API.
+                    "timeout 30 kubectl delete namespace longhorn-system --force --grace-period=0 2>/dev/null || true",
+                    "for i in $(seq 1 24); do",
+                    "  PHASE=$(timeout 10 kubectl get namespace longhorn-system -o jsonpath='{.status.phase}' 2>/dev/null || echo gone)",
+                    '  [ "$PHASE" = "gone" ] || [ -z "$PHASE" ] && break',
+                    '  if [ "$PHASE" = "Terminating" ]; then',
+                    "    timeout 10 kubectl get namespace longhorn-system -o json 2>/dev/null \\",
+                    "      | python3 -c \"import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))\" \\",
+                    "      | timeout 15 kubectl replace --raw /api/v1/namespaces/longhorn-system/finalize -f - 2>/dev/null || true",
+                    "  fi",
+                    "  sleep 5",
+                    "done",
+                ].join("\n"),
+            },
+            { parent: this, dependsOn: [longhornNs], customTimeouts: { delete: "5m" } },
+        );
 
         this.registerOutputs({
             hcloudSecret: this.hcloudSecret,
             csiDriver: this.csiDriver,
-            nfsCsiDriver: this.nfsCsiDriver,
-            nfsServerProvisioner: this.nfsServerProvisioner,
         });
     }
 }

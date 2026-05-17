@@ -8,10 +8,15 @@ spec:
   source:
     repoURL: https://prometheus-community.github.io/helm-charts
     chart: kube-prometheus-stack
-    targetRevision: 83.4.0  # https://github.com/prometheus-community/helm-charts/pkgs/container/charts%2Fkube-prometheus-stack
+    targetRevision: "85.0.3" # renovate: datasource=helm depName=kube-prometheus-stack registryUrl=https://prometheus-community.github.io/helm-charts
     helm:
       values: |
         prometheusOperator:
+          # Restrict operator to prometheus namespace only.
+          # Prevents conflict with Ryax's bundled prometheus-operator in ryaxns.
+          namespaces:
+            releaseNamespace: true
+            additional: []
           admissionWebhooks:
             # Admission webhook Jobs use Helm hooks that ArgoCD cannot track reliably —
             # the Job completes and is GC'd before ArgoCD polls it, causing a permanent
@@ -75,11 +80,17 @@ spec:
               cert-manager.io/cluster-issuer: "letsencrypt-staging"
               haproxy-ingress.github.io/ssl-redirect: "true"
             hosts:
-              - grafana.test34.your-domain.tld
+              - grafana.ecc66.cape-project.eu
             tls:
               - hosts:
-                  - grafana.test34.your-domain.tld
+                  - grafana.ecc66.cape-project.eu
                 secretName: grafana-tls
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
         # ServiceMonitors for components deployed by Pulumi (or wave-1 apps).
         # These live here (not in Pulumi/wave-1) because the CRD doesn't exist until
         # the kube-prometheus-stack Helm chart is deployed.
@@ -154,11 +165,30 @@ spec:
               cert-manager.io/cluster-issuer: "letsencrypt-staging"
               haproxy-ingress.github.io/ssl-redirect: "true"
             hosts:
-              - prometheus.test34.your-domain.tld
+              - prometheus.ecc66.cape-project.eu
             tls:
               - hosts:
-                  - prometheus.test34.your-domain.tld
+                  - prometheus.ecc66.cape-project.eu
                 secretName: prometheus-tls
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+  # Prometheus CRD (>= kube-prometheus-stack 60.x / prometheus-operator 0.73+) has
+  # spec.hostNetwork which ArgoCD's schema cache may not know about, causing the
+  # structured-merge-diff calculation to fail with "field not declared in schema".
+  # Workaround: skip SMD for monitoring.coreos.com CRs by ignoring their spec fields.
+  ignoreDifferences:
+    - group: monitoring.coreos.com
+      kind: Prometheus
+      jqPathExpressions:
+        - .spec.hostNetwork
+    - group: monitoring.coreos.com
+      kind: Alertmanager
+      jqPathExpressions:
+        - .spec.hostNetwork
   destination:
     server: https://kubernetes.default.svc
     namespace: prometheus

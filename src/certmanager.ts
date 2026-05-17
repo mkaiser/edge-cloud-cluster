@@ -2,29 +2,27 @@ import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
-import type { PulumiSecrets } from "./pulumi_secrets";
-
-export interface CertManagerArgs {
-    k8sProvider: k8s.Provider;
-    kubeconfigRaw: pulumi.Output<string>;
-    pulumiSecrets: PulumiSecrets;
-    letsEncrypt: {
-        email: string;
-    };
-}
+import { project_settings } from "../project_settings";
 
 export class CertManagerComponent extends pulumi.ComponentResource {
     public readonly certManager: helm.v3.Release;
     public readonly certManagerNs: k8s.core.v1.Namespace;
     public readonly letsEncryptStagingIssuer: k8s.apiextensions.CustomResource;
     public readonly letsEncryptProdIssuer: k8s.apiextensions.CustomResource;
+    public readonly certIssuers: {
+        letsEncryptStagingIssuer: k8s.apiextensions.CustomResource;
+        letsEncryptProdIssuer: k8s.apiextensions.CustomResource;
+    };
     public readonly waitForCertManager: command.local.Command;
 
-    constructor(name: string, args: CertManagerArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        k8sProvider: k8s.Provider,
+        kubeconfigRaw: pulumi.Output<string>,
+        projectSettings: typeof project_settings,
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:CertManager", name, {}, opts);
-
-        const { k8sProvider, kubeconfigRaw, pulumiSecrets, letsEncrypt } = args;
-        const { email: letsEncryptEmail } = letsEncrypt;
 
         this.certManagerNs = new k8s.core.v1.Namespace(
             "cert-manager-ns",
@@ -39,7 +37,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             {
                 name: "cert-manager",
                 chart: "cert-manager",
-                version: "v1.20.1", // https://artifacthub.io/packages/helm/cert-manager/cert-manager
+                version: "v1.20.2", // https://artifacthub.io/packages/helm/cert-manager/cert-manager
                 namespace: "cert-manager",
                 repositoryOpts: { repo: "https://charts.jetstack.io" },
                 values: {
@@ -69,7 +67,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             {
                 name: "cert-manager-webhook-hetzner",
                 chart: "cert-manager-webhook-hetzner",
-                version: "0.6.7", // https://github.com/hetzner/cert-manager-webhook-hetzner
+                version: "0.7.0", // https://github.com/hetzner/cert-manager-webhook-hetzner
                 namespace: "cert-manager",
                 repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                 values: {
@@ -92,7 +90,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             "cert-manager-hetzner-secret",
             {
                 metadata: { name: "hetzner", namespace: "cert-manager" },
-                stringData: { token: pulumiSecrets.hcloudToken },
+                stringData: { token: projectSettings.server.hcloudToken },
             },
             { provider: k8sProvider, parent: this, dependsOn: [this.certManagerNs] },
         );
@@ -118,7 +116,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 spec: {
                     acme: {
                         server: "https://acme-staging-v02.api.letsencrypt.org/directory",
-                        email: letsEncryptEmail,
+                        email: project_settings.tls.letsEncrypt.email,
                         privateKeySecretRef: { name: "letsencrypt-staging-account-key" },
                         solvers: hetznerSolvers,
                     },
@@ -140,7 +138,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 spec: {
                     acme: {
                         server: "https://acme-v02.api.letsencrypt.org/directory",
-                        email: letsEncryptEmail,
+                        email: project_settings.tls.letsEncrypt.email,
                         privateKeySecretRef: { name: "letsencrypt-prod-account-key" },
                         solvers: hetznerSolvers,
                     },
@@ -152,6 +150,11 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 dependsOn: [this.certManager, certManagerWebhookHetzner, certManagerHetznerSecret],
             },
         );
+
+        this.certIssuers = {
+            letsEncryptStagingIssuer: this.letsEncryptStagingIssuer,
+            letsEncryptProdIssuer: this.letsEncryptProdIssuer,
+        };
 
         this.waitForCertManager = new command.local.Command(
             "wait-for-cert-manager",
@@ -182,6 +185,7 @@ KUBECFG
             certManagerNs: this.certManagerNs,
             letsEncryptStagingIssuer: this.letsEncryptStagingIssuer,
             letsEncryptProdIssuer: this.letsEncryptProdIssuer,
+            certIssuers: this.certIssuers,
             waitForCertManager: this.waitForCertManager,
         });
     }

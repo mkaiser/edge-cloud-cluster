@@ -1,4 +1,0 @@
-apiVersion: v2
-name: notify
-version: 0.1.0
-description: PostSync email notification job for ArgoCD wave milestones.

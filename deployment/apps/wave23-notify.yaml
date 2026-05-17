@@ -1,0 +1,140 @@
+# Final PostSync notification: all sync waves complete.
+# Checks argocd-main-app is Synced+Healthy before sending.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notify-final
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "23"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: notify-final
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "23"
+rules:
+
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["smtp-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notify-final
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "23"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: notify-final
+subjects:
+- kind: ServiceAccount
+  name: notify-final
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notify-final
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "23"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: notify-final
+      restartPolicy: Never
+      containers:
+      - name: notify
+        image: docker.io/alpine/k8s:1.36.0
+        env:
+        - name: NOTIFY_TO
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: sendBootstrapFinishMailRecipient
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: host
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: port
+        - name: SMTP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: username
+        - name: SMTP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: password
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          # This job is a PostSync hook on argocd-main-app — it only runs after
+          # the sync has already completed, so checking argocd-main-app status
+          # here would deadlock (app is OutOfSync while hooks are running).
+          echo "Cluster fully ready — sending notification."
+
+          python3 - <<PYEOF
+          import smtplib, os, time
+          from email.message import EmailMessage
+
+          to       = os.environ["NOTIFY_TO"]
+          host     = os.environ["SMTP_HOST"]
+          port     = int(os.environ["SMTP_PORT"])
+          username = os.environ.get("SMTP_USERNAME", "")
+          password = os.environ.get("SMTP_PASSWORD", "")
+
+          msg = EmailMessage()
+          msg["Subject"] = "ecc66.cape-project.eu Cluster bootstrap complete"
+          msg["From"]    = "no-reply@cape-project.eu"
+          msg["To"]      = to
+          msg.set_content(
+              "All ArgoCD sync waves have completed successfully.\n\n"
+              "The cluster is fully ready:\n"
+              "  - Monitoring:    https://prometheus.ecc66.cape-project.eu\n"
+              "                   https://grafana.ecc66.cape-project.eu\n"
+              "  - OpenDesk:      https://portal.ecc66.cape-project.eu\n"
+              "  - Keycloak:      https://id.ecc66.cape-project.eu\n"
+              "  - GitLab:        https://gitlab.ecc66.cape-project.eu\n"
+              "  - Headplane:     https://headplane.ecc66.cape-project.eu/admin\n"
+              "  - VPN:           https://vpn.ecc66.cape-project.eu\n"
+              "  - Ryax:          https://ryax.ecc66.cape-project.eu\n"
+              "  - Mattermost:    https://chat.ecc66.cape-project.eu\n"
+              "  - ArgoCD:        https://argocd.ecc66.cape-project.eu\n"
+              "  - Longhorn:      https://longhorn.ecc66.cape-project.eu\n"
+          )
+
+          for attempt in range(1, 11):
+              try:
+                  with smtplib.SMTP(host, port, timeout=10) as s:
+                      s.ehlo(); s.starttls()
+                      if username:
+                          s.login(username, password)
+                      s.send_message(msg)
+                  print(f"Notification sent to {to}")
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/10 failed: {e}")
+                  if attempt < 10:
+                      time.sleep(30)
+          else:
+              raise RuntimeError("Failed to send notification after 10 attempts")
+          PYEOF

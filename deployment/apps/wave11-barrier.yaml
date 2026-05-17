@@ -1,0 +1,112 @@
+# Wave 11 Sync barrier: waits until ALL wave-10 ArgoCD Applications are
+# Synced + Healthy + NotProgressing before ArgoCD advances to wave 12 (headscale).
+#
+# Wave 10 contains: argocd-keycloak-setup, keycloak-passkeys, keycloak-welcome-email,
+# opendesk-maildomain-relay.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave11-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave11-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave11-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave11-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave11-barrier
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave11-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "11"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave11-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "Wave-11 barrier: discovering applications with sync-wave=4..."
+
+          APPS=$(kubectl get applications -n argocd -o json | \
+            python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent == 'argocd-main-app' and wave == '10':
+                  print(item['metadata']['name'])
+          ")
+
+          echo "Waiting for: $(echo $APPS | tr '\n' ' ')"
+
+          i=0
+          while [ "$i" -lt 360 ]; do
+            ALL_READY=true
+            for APP in $APPS; do
+              SYNC=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+              HEALTH=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+              PHASE=$(kubectl get application "$APP" -n argocd \
+                -o jsonpath="{.status.operationState.phase}" 2>/dev/null || true)
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+                 { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+                : # ready
+              else
+                ALL_READY=false
+                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+              fi
+            done
+
+            if [ "$ALL_READY" = "true" ]; then
+              echo "All argocd-main-app wave-10 Applications are Synced+Healthy+NotProgressing — releasing wave 12."
+              exit 0
+            fi
+
+            echo "Attempt $i/360 — not all ready, waiting 10s..."
+            sleep 10
+            i=$((i+1))
+          done
+
+          echo "ERROR: Not all argocd-main-app wave-10 Applications reached Synced+Healthy+Completed within 60 minutes"
+          exit 1

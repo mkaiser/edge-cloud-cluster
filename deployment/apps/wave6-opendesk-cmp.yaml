@@ -1,0 +1,29 @@
+# Deploys the openDesk CMP (Config Management Plugin) resources into the argocd namespace.
+# Must run at wave 0 so argocd-infra (also wave 0) ConfigMaps and SealedSecrets exist before argocd-infra (wave 0)
+# triggers the argocd-self Helm upgrade that mounts them into the repo-server sidecar.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opendesk-cmp
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/opendesk-cmp
+    directory:
+      # Exclude Helm values and shell scripts — consumed by argocd-self as valueFiles,
+      # not deployed as K8s resources.
+      exclude: "{values.yaml,sealSecrets.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

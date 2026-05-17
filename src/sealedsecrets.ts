@@ -1,20 +1,13 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
-import type { PulumiSecrets } from "./pulumi_secrets";
-
-export interface SealedSecretsArgs {
-    k8sProvider: k8s.Provider;
-    pulumiSecrets: PulumiSecrets;
-}
+import { project_settings } from "../project_settings";
 
 export class SealedSecretsComponent extends pulumi.ComponentResource {
     public readonly sealedSecretsChart: helm.v3.Release;
 
-    constructor(name: string, args: SealedSecretsArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(name: string, k8sProvider: k8s.Provider, opts?: pulumi.ComponentResourceOptions) {
         super("pxCloud:infra:SealedSecrets", name, {}, opts);
-
-        const { k8sProvider, pulumiSecrets } = args;
 
         // Pre-create TLS keypair so the controller uses it on first start (no restart needed).
         // Stored in Pulumi config so it survives cluster recreates.
@@ -28,8 +21,8 @@ export class SealedSecretsComponent extends pulumi.ComponentResource {
                 },
                 type: "kubernetes.io/tls",
                 stringData: {
-                    "tls.crt": pulumiSecrets.sealedSecretsTlsCrt,
-                    "tls.key": pulumiSecrets.sealedSecretsTlsKey,
+                    "tls.crt": project_settings.tls.sealedSecretsTlsCrt,
+                    "tls.key": project_settings.tls.sealedSecretsTlsKey,
                 },
             },
             { provider: k8sProvider, parent: this },

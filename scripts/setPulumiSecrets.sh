@@ -31,22 +31,13 @@ pulumi config set --secret hcloudToken
 
 echo ""
 echo "Configuring Hetzner S3 Object Storage..."
-echo "  Endpoint and bucket names are set in project_settings.ts (s3.baseEndpoint / s3.etcdBucketName)."
+echo "  Endpoint and bucket names are set in project_settings.ts (s3.baseEndpoint)."
 
 echo "Enter Hetzner S3 Access Key (secret):"
 pulumi config set --secret hetznerS3AccessKey
 
 echo "Enter Hetzner S3 Secret Key (secret):"
 pulumi config set --secret hetznerS3SecretKey
-
-
-echo ""
-echo "Configure Hetzner Storagebox..."
-
-read -s -p "Enter Storagebox Password (secret): " storagebox_pwd
-echo
-pulumi config set --secret edgecloudinfra:storageboxPwd "$storagebox_pwd"
-
 
 
 echo ""
@@ -62,7 +53,7 @@ if [[ -n "$argocd_admin_password_hash" && -n "$argocd_admin_password_mtime" ]]; 
     pulumi config set --secret argocdAdminPasswordPlain "$argocd_admin_password"
     pulumi config set --secret argocdAdminPasswordHash "$argocd_admin_password_hash"
     pulumi config set --secret argocdAdminPasswordMtime "$argocd_admin_password_mtime"
-    echo "Set Pulumi secrets: argocdAdminPasswordHash and argocdAdminPasswordMtime"
+    echo "Set Pulumi config values: argocdAdminPasswordHash and argocdAdminPasswordMtime"
 else
     echo "Failed to compute Argocd admin hash/mtime. Ensure bcryptjs is installed (run 'npm install')."
 fi

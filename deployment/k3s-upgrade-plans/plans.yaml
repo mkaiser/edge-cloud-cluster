@@ -1,0 +1,44 @@
+---
+# Upgrade k3s server (control-plane) nodes to the latest stable release.
+# cordon only (no drain) — draining a single-node CP evicts all pods with nowhere to go.
+# With multiple CP nodes, concurrency:1 ensures rolling upgrades.
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-server
+  namespace: system-upgrade
+spec:
+  concurrency: 1
+  serviceAccountName: system-upgrade
+  version: "v1.35.4+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
+  upgrade:
+    image: rancher/k3s-upgrade
+  cordon: true
+  nodeSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+---
+# Upgrade k3s agent (worker) nodes after all server nodes are done.
+# prepare: waits for k3s-server plan to complete on server nodes first.
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-agent
+  namespace: system-upgrade
+spec:
+  concurrency: 2
+  serviceAccountName: system-upgrade
+  version: "v1.35.4+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
+  upgrade:
+    image: rancher/k3s-upgrade
+  prepare:
+    image: rancher/k3s-upgrade
+    args: ["prepare", "k3s-server"]
+  drain:
+    force: true
+    skipWaitForDeleteTimeout: 60
+  nodeSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: DoesNotExist

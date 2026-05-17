@@ -1,0 +1,118 @@
+# Admin-only portal tile for Grafana.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portal-tile-grafana
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portal-tile-grafana
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ums-nubus-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portal-tile-grafana
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portal-tile-grafana
+subjects:
+- kind: ServiceAccount
+  name: portal-tile-grafana
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: portal-tile-grafana
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: portal-tile-grafana
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: tile
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          UDM_URL="http://ums-udm-rest-api.opendesk.svc.cluster.local:9979/univention/udm"
+          LDAP_BASE="dc=swp-ldap,dc=internal"
+          ENTRY_CN="od.grafana"
+          ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
+          CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
+          APP_URL="https://grafana.ecc66.cape-project.eu"
+          ADMIN_GROUP_DN="cn=Domain Admins,cn=groups,${LDAP_BASE}"
+
+          ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
+            -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+          udm() { curl -sf -H "Accept: application/json" -H "Content-Type: application/json" \
+            -u "Administrator:${ADMIN_PASS}" "$@"; }
+
+          # Grafana logo SVG
+          ICON=$(printf '%s' \
+            '<svg width="111" height="111" viewBox="0 0 111 111" fill="none" xmlns="http://www.w3.org/2000/svg">' \
+            '<rect width="111" height="111" rx="20" fill="#1a1a2e"/>' \
+            '<circle cx="55.5" cy="55.5" r="28" fill="none" stroke="#F46800" stroke-width="6"/>' \
+            '<path d="M55.5 27.5 L55.5 40 M55.5 71 L55.5 83.5" stroke="#F46800" stroke-width="4" stroke-linecap="round"/>' \
+            '<path d="M83.5 55.5 L71 55.5 M40 55.5 L27.5 55.5" stroke="#F46800" stroke-width="4" stroke-linecap="round"/>' \
+            '<circle cx="55.5" cy="55.5" r="8" fill="#F46800"/>' \
+            '<path d="M42 42 L50 50 M61 61 L69 69 M69 42 L61 50 M50 61 L42 69" stroke="#F46800" stroke-width="3" stroke-linecap="round"/>' \
+            '</svg>' | base64 -w0)
+
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Accept: application/json" \
+            -u "Administrator:${ADMIN_PASS}" "${UDM_URL}/portals/entry/${ENTRY_DN}")
+          if [ "$HTTP" = "200" ]; then
+            echo "Entry exists — ensuring allowedGroups..."
+            udm -X PATCH "${UDM_URL}/portals/entry/${ENTRY_DN}" \
+              -d "{\"properties\":{\"allowedGroups\":[\"${ADMIN_GROUP_DN}\"]}}" -o /dev/null
+          else
+            udm -X POST "${UDM_URL}/portals/entry/" -d "{
+              \"position\":\"cn=entry,cn=portals,cn=univention,${LDAP_BASE}\",
+              \"properties\":{
+                \"name\":\"${ENTRY_CN}\",
+                \"displayName\":{\"en_US\":\"Grafana\",\"de_DE\":\"Grafana\"},
+                \"description\":{\"en_US\":\"Metrics dashboards\",\"de_DE\":\"Metriken und Dashboards\"},
+                \"link\":[[\"en_US\",\"${APP_URL}\"]],
+                \"linkTarget\":\"newwindow\",\"activated\":true,\"anonymous\":false,
+                \"allowedGroups\":[\"${ADMIN_GROUP_DN}\"],\"icon\":\"${ICON}\"}}" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print('Created:', d.get('dn',''))"
+          fi
+
+          CURRENT=$(udm "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(d.get('properties',{}).get('entries',[])))")
+          echo "${CURRENT}" | grep -qF "${ENTRY_DN}" && echo "Already in category." || {
+            NEW_JSON=$(printf '%s\n%s' "${CURRENT}" "${ENTRY_DN}" | grep -v '^$' \
+              | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip().split('\n')))")
+            udm -X PATCH "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+              -d "{\"properties\":{\"entries\":${NEW_JSON}}}" -o /dev/null && echo "Category updated."
+          }
+          echo "Done."

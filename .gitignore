@@ -7,3 +7,5 @@ sealed-secrets-key-backup.yaml
 wg-admin.conf
 config
 .install/
+/tmp/
+/external/

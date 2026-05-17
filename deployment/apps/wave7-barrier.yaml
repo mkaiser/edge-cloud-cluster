@@ -1,0 +1,131 @@
+# Wave 7 Sync barrier: waits until the helmfile-opendesk CMP sidecar is Ready
+# on ALL repo-server replicas before ArgoCD advances to wave 8 (opendesk).
+#
+# Wave 6 deploys opendesk-cmp which triggers an ArgoCD Helm upgrade adding
+# the helmfile-opendesk sidecar. This barrier ensures the sidecar container
+# is Running+Ready before opendesk helmfile syncs begin.
+# Replaces the old wave2-cmp-readiness hook.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave7-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "7"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave7-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "7"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave7-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "7"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave7-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave7-barrier
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave7-barrier
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "7"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave7-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          set -eu
+
+          # Wait for opendesk-cmp Application to be Synced+Healthy
+          echo "Waiting for opendesk-cmp to be Synced+Healthy+NotProgressing..."
+          for i in $(seq 1 90); do
+            SYNC=$(kubectl get application opendesk-cmp -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            HEALTH=$(kubectl get application opendesk-cmp -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            PHASE=$(kubectl get application opendesk-cmp -n argocd \
+              -o jsonpath='{.status.operationState.phase}' 2>/dev/null || true)
+            COND_TYPES=$(kubectl get application opendesk-cmp -n argocd \
+              -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || true)
+            if echo "$COND_TYPES" | grep -q "ComparisonError"; then
+              COMP_MSG=$(kubectl get application opendesk-cmp -n argocd \
+                -o jsonpath="{.status.conditions[?(@.type=='ComparisonError')].message}" 2>/dev/null || true)
+              echo "  opendesk-cmp: ComparisonError detected: ${COMP_MSG}, waiting 10s..."
+              sleep 10
+              continue
+            fi
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && \
+               { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+              echo "opendesk-cmp: Synced+Healthy+NotProgressing"
+              break
+            fi
+            echo "  Attempt $i/90 — sync=$SYNC health=$HEALTH phase=$PHASE, waiting 10s..."
+            sleep 10
+          done
+          if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ] || \
+             ! { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
+            echo "ERROR: opendesk-cmp did not reach Synced+Healthy+Completed within 15 minutes"
+            exit 1
+          fi
+
+          # Wait for ALL helmfile-* sidecars to be Ready on all repo-server pods
+          echo "Waiting for helmfile-* sidecars to be ready on all repo-server pods..."
+          for i in $(seq 1 90); do
+            TOTAL=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              --field-selector=status.phase=Running \
+              --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+            NOT_READY=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.ready}{"\n"}{end}{end}' \
+              2>/dev/null | grep "^helmfile-" | grep "=false" | wc -l | tr -d ' ')
+
+            READY_COUNT=$(kubectl get pods -n argocd \
+              -l app.kubernetes.io/name=argocd-repo-server \
+              -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.name}={.ready}{"\n"}{end}{end}' \
+              2>/dev/null | grep "^helmfile-.*=true" | wc -l | tr -d ' ')
+
+            if [ "$TOTAL" -gt 0 ] && [ "$NOT_READY" -eq 0 ] && [ "$READY_COUNT" -gt 0 ]; then
+              echo "All helmfile-* sidecars ready ($READY_COUNT containers across $TOTAL pods) — CMP available."
+              exit 0
+            fi
+            echo "  Attempt $i/90 — helmfile ready=$READY_COUNT not-ready=$NOT_READY pods=$TOTAL, waiting 10s..."
+            sleep 10
+          done
+
+          echo "ERROR: helmfile-* sidecars did not become ready within 15 minutes"
+          exit 1

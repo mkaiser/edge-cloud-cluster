@@ -1,32 +1,20 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
-import type { PulumiSecrets } from "./pulumi_secrets";
-
-export interface WireguardArgs {
-    k8sProvider: k8s.Provider;
-    pulumiSecrets: PulumiSecrets;
-    wireguard: {
-        serverAddr: string;
-        adminAddr: string;
-        subDomain: string;
-    };
-    dns: {
-        tld: string;
-    };
-}
+import { project_settings as projectSettingsConfig } from "../project_settings";
 
 // Pure WireGuard server — no web UI. Admin peer pre-configured from Pulumi secrets.
 // DNS is covered by the wildcard record (*.infra<N>.<zone>).
 export class WireguardComponent extends pulumi.ComponentResource {
     public readonly url: string;
 
-    constructor(name: string, args: WireguardArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        k8sProvider: k8s.Provider,
+        project_settings: typeof projectSettingsConfig,
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:Wireguard", name, {}, opts);
-
-        const { k8sProvider, pulumiSecrets, wireguard, dns } = args;
-        const { serverAddr: wgServerAddr, adminAddr: wgAdminAddr, subDomain } = wireguard;
-        const { tld } = dns;
-        this.url = `${subDomain}.${tld}`;
+        this.url = `${project_settings.wireguard.subDomain}.${project_settings.dns.tld}`;
 
         const wgNs = new k8s.core.v1.Namespace(
             "wireguard-ns",
@@ -44,16 +32,16 @@ export class WireguardComponent extends pulumi.ComponentResource {
                 metadata: { name: "wireguard-config", namespace: "wireguard-infra" },
                 stringData: {
                     "wg0.conf": pulumi.interpolate`[Interface]
-Address = ${wgServerAddr}
+Address = ${project_settings.wireguard.serverAddr}
 ListenPort = 51820
-PrivateKey = ${pulumiSecrets.wgServerPrivateKey}
+PrivateKey = ${project_settings.wireguard.wgServerPrivateKey}
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 
 [Peer]
 # admin
-PublicKey = ${pulumiSecrets.wgAdminPublicKey}
-AllowedIPs = ${wgAdminAddr}
+PublicKey = ${project_settings.wireguard.wgAdminPublicKey}
+AllowedIPs = ${project_settings.wireguard.adminAddr}
 `,
                 },
             },
@@ -93,7 +81,7 @@ AllowedIPs = ${wgAdminAddr}
                             containers: [
                                 {
                                     name: "wireguard",
-                                    image: "linuxserver/wireguard:1.0.20250521",
+                                    image: "linuxserver/wireguard:1.0.20250521", // renovate: datasource=docker depName=linuxserver/wireguard
                                     securityContext: {
                                         capabilities: { add: ["NET_ADMIN", "SYS_MODULE"] },
                                         privileged: false,

@@ -20,7 +20,7 @@ PULUMI_K8S_DELETE_UNREACHABLE=true && pulumi destroy -y || true \
 
 ```
 
-## Pulumi secrets
+## Pulumi config secrets
 
 `pulumi config --show-secrets`
 
@@ -37,6 +37,7 @@ hcloud context create default
 `hcloud image list --type system `
 
 `hcloud server list`
+`hcloud server-type list -o columns=name,location,cores,memory | awk '$2 ~ /fsn1/ {print}'`
 
 Cleanup Pulumi / argocd DNS entries
 
@@ -150,7 +151,7 @@ kubectl delete namespace argocd
 put this into another terminal
 
 ```
-source scripts/getKubeCtrl.sh
+source scripts/getKubeConfig.sh
 for NS in cert-manager argocd traefik; do
   kubectl get namespace $NS -o json | grep -v "\"kubernetes\"" > /tmp/$NS.json
   sed -i "s/\"finalizers\": \[.*\]/\"finalizers\": []/" /tmp/$NS.json

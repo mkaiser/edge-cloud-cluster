@@ -4,13 +4,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Pinned tool versions — bump these to upgrade
 # ---------------------------------------------------------------------------
-ARGOCD_VERSION="3.3.6"       # renovate: datasource=github-releases depName=argoproj/argo-cd
-KUBESEAL_VERSION="0.36.1"    # renovate: datasource=github-releases depName=bitnami-labs/sealed-secrets
-FREELENS_VERSION="1.8.1"     # renovate: datasource=github-releases depName=freelensapp/freelens
-HELMFILE_VERSION="v1.8.1"     # renovate: datasource=github-releases depName=helmfile/helmfile
-HCLOUD_VERSION="1.62.0"      # renovate: datasource=github-releases depName=hetznercloud/cli
-HCLOUD_UI_VERSION="1.62.2"    # renovate: datasource=github-releases depName=apricote/hcloud-upload-image
-TALOSCTL_VERSION="1.12.6"    # renovate: datasource=github-releases depName=siderolabs/talos
+ARGOCD_VERSION="3.4.2"       # renovate: datasource=github-releases depName=argoproj/argo-cd
+KUBESEAL_VERSION="0.36.6"    # renovate: datasource=github-releases depName=bitnami-labs/sealed-secrets
+FREELENS_VERSION="1.9.0"     # renovate: datasource=github-releases depName=freelensapp/freelens
+HELMFILE_VERSION="1.5.1"      # renovate: datasource=github-releases depName=helmfile/helmfile
+HCLOUD_VERSION="1.64.1"      # renovate: datasource=github-releases depName=hetznercloud/cli
+HCLOUD_UI_VERSION="1.4.0"     # renovate: datasource=github-releases depName=apricote/hcloud-upload-image
+TALOSCTL_VERSION="1.13.2"    # renovate: datasource=github-releases depName=siderolabs/talos
 
 
 forceInstall=0  # set to 1 to reinstall tools that are already present

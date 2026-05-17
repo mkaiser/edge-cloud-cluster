@@ -1,0 +1,338 @@
+# Wave 6 Sync job: provision test users after opendesk-nubus-ums is fully ready.
+# Idempotent — skips users that already exist.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opendesk-test-users
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opendesk-test-users
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opendesk-test-users
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opendesk-test-users
+subjects:
+- kind: ServiceAccount
+  name: opendesk-test-users
+  namespace: argocd
+---
+# Cross-namespace secret access: read ums-nubus-credentials and keycloak bootstrap creds from opendesk ns
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opendesk-test-users
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ums-nubus-credentials", "opendesk-keycloak-bootstrap-admin-creds"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opendesk-test-users
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opendesk-test-users
+subjects:
+- kind: ServiceAccount
+  name: opendesk-test-users
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opendesk-test-users
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "16"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1200
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: opendesk-test-users
+      restartPolicy: Never
+      containers:
+      - name: provision
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          UDM_URL="http://ums-udm-rest-api.opendesk.svc.cluster.local:9979/univention/udm"
+          NUBUS_APP="opendesk-nubus-ums"
+
+          # Wait for opendesk-nubus-ums to be Synced + Healthy + not progressing.
+          # The wave-5 barrier already guarantees opendesk is Healthy, but nubus-ums
+          # can still have pods rolling out. We poll until health is stable.
+          echo "Waiting for ${NUBUS_APP} to be Synced+Healthy+NotProgressing..."
+          i=0
+          while [ "$i" -lt 120 ]; do
+            SYNC=$(kubectl get application "$NUBUS_APP" -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            HEALTH=$(kubectl get application "$NUBUS_APP" -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            OP_PHASE=$(kubectl get application "$NUBUS_APP" -n argocd \
+              -o jsonpath='{.status.operationState.phase}' 2>/dev/null || true)
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ] && [ "$OP_PHASE" != "Running" ]; then
+              echo "${NUBUS_APP} ready (sync=${SYNC} health=${HEALTH} phase=${OP_PHASE})"
+              break
+            fi
+            echo "  sync=${SYNC} health=${HEALTH} phase=${OP_PHASE} — waiting 10s ($i/120)..."
+            sleep 10; i=$((i+1))
+          done
+          if [ "$i" -eq 120 ]; then
+            echo "ERROR: ${NUBUS_APP} did not become ready within 20 minutes"
+            exit 1
+          fi
+
+          UDM_ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
+            -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+          # Resolve Domain Admins group DN dynamically.
+          # UDM REST API requires a proper LDAP filter with parentheses and -G to pass
+          # the filter as a query param (not embedded in the URL).
+          echo "Resolving Domain Admins group DN..."
+          ADMINS_DN=$(curl -sf -G \
+            -u "Administrator:${UDM_ADMIN_PASS}" \
+            -H "Accept: application/json" \
+            --data-urlencode "filter=(cn=Domain Admins)" \
+            "${UDM_URL}/groups/group/" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); items=d.get('_embedded',{}).get('udm:object',[]); print(items[0]['dn'] if items else '')" \
+            2>/dev/null || true)
+
+          if [ -z "$ADMINS_DN" ]; then
+            echo "ERROR: could not resolve Domain Admins DN"
+            exit 1
+          fi
+          echo "Domain Admins DN: ${ADMINS_DN}"
+
+          # Resolve Domain Users group DN dynamically for non-admin users.
+          USERS_DN=$(curl -sf -G \
+            -u "Administrator:${UDM_ADMIN_PASS}" \
+            -H "Accept: application/json" \
+            --data-urlencode "filter=(cn=Domain Users)" \
+            "${UDM_URL}/groups/group/" | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); items=d.get('_embedded',{}).get('udm:object',[]); print(items[0]['dn'] if items else '')" \
+            2>/dev/null || true)
+
+          if [ -z "$USERS_DN" ]; then
+            echo "WARNING: could not resolve Domain Users DN — new users will not be added to Domain Users group"
+          else
+            echo "Domain Users DN: ${USERS_DN}"
+          fi
+
+          # Create a user via UDM REST API.
+          # Skips silently if the username already exists.
+          create_user() {
+            local username="$1" firstname="$2" lastname="$3"
+            local mail="$4" recovery_email="$5" password="$6" permission="${7:-user}"
+
+            # Choose group based on permission: admin -> Domain Admins, user -> Domain Users
+            local target_group_dn=""
+            if [ "$permission" = "admin" ]; then
+              target_group_dn="$ADMINS_DN"
+            else
+              target_group_dn="${USERS_DN:-$ADMINS_DN}"
+            fi
+
+            EXISTS=$(curl -sf -G \
+              -u "Administrator:${UDM_ADMIN_PASS}" \
+              -H "Accept: application/json" \
+              --data-urlencode "filter=(uid=${username})" \
+              "${UDM_URL}/users/user/" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print('yes' if d.get('_embedded',{}).get('udm:object') else 'no')" \
+              2>/dev/null || echo "no")
+
+            if [ "$EXISTS" = "yes" ]; then
+              echo "User ${username} already exists — skipping."
+              return 0
+            fi
+
+            echo "Creating user ${username}..."
+            BODY=$(printf '{"properties":{"username":"%s","firstname":"%s","lastname":"%s","mailPrimaryAddress":"%s","PasswordRecoveryEmail":"%s","password":"%s","overridePWHistory":true,"overridePWLength":true,"groups":["%s"]}}' "$username" "$firstname" "$lastname" "$mail" "$recovery_email" "$password" "$target_group_dn")
+
+            CODE=$(curl -s -o /tmp/udm_resp.txt -w "%{http_code}" \
+              -X POST \
+              -u "Administrator:${UDM_ADMIN_PASS}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "${UDM_URL}/users/user/" \
+              -d "$BODY")
+
+            if [ "$CODE" = "201" ]; then
+              echo "  ${username}: created."
+            else
+              echo "  ERROR ${username}: HTTP ${CODE}: $(cat /tmp/udm_resp.txt | head -c 300)"
+              return 1
+            fi
+          }
+
+          create_user "testadmin" "testAdminfistname" "admin" \
+            "testadmin@cape-project.eu" "martin.kaiser@paraxent.de" "blahblah123" "admin"
+
+          create_user "testuser" "testUserfirstName" "user" \
+            "testuser@cape-project.eu" "martin.kaiser@paraxent.de" "blahblah123" "user"
+
+          # Disable TOTP/2FA for test users by:
+          # 1. Removing them from the "2FA Users" group (prevents TOTP requirement)
+          # 2. Deleting any existing OTP credentials
+          # 3. Removing CONFIGURE_TOTP required action
+          echo ""
+          echo "Disabling 2FA requirement for test users..."
+
+          KEYCLOAK_URL="http://ums-keycloak.opendesk.svc.cluster.local:8080"
+          REALM="opendesk"
+          TWOFA_GROUP="2FA Users"
+
+          # Get Keycloak admin credentials
+          ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
+            -n opendesk -o jsonpath='{.data.admin\.yaml}' | base64 -d)
+          KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep 'username:' | awk '{print $2}')
+          KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep 'password:' | awk '{print $2}')
+
+          echo "Obtaining Keycloak admin token..."
+          TOKEN=$(curl -sf -X POST \
+            "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+            -d "client_id=admin-cli" \
+            -d "username=${KC_ADMIN_USER}" \
+            -d "password=${KC_ADMIN_PASS}" \
+            -d "grant_type=password" 2>/dev/null | \
+            sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+          if [ -z "$TOKEN" ]; then
+            echo "WARNING: Could not obtain Keycloak admin token — 2FA will remain enabled."
+            echo "Retry the job manually after Keycloak is fully ready."
+          else
+            echo "Token obtained."
+
+            # Helper function to remove user from 2FA requirement
+            disable_2fa_for_user() {
+              local USERNAME="$1"
+              echo "  Processing ${USERNAME}..."
+
+              # Wait for user to be synced to Keycloak (retry up to 30s)
+              local USER_ID=""
+              for i in $(seq 1 6); do
+                USER_ID=$(curl -sf -G \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  --data-urlencode "username=${USERNAME}" \
+                  "${KEYCLOAK_URL}/admin/realms/${REALM}/users" 2>/dev/null | \
+                  jq -r ".[0].id // empty")
+                
+                if [ -n "$USER_ID" ]; then
+                  break
+                fi
+                echo "    Waiting for user sync (attempt $i/6)..."
+                sleep 5
+              done
+
+              if [ -z "$USER_ID" ]; then
+                echo "    WARNING: User ${USERNAME} not found in Keycloak after 30s."
+                return 1
+              fi
+
+              echo "    User ID: ${USER_ID}"
+
+              # Get the 2FA Users group ID
+              TWOFA_GROUP_ID=$(curl -sf \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/groups?search=${TWOFA_GROUP}" 2>/dev/null | \
+                jq -r ".[] | select(.name == \"${TWOFA_GROUP}\") | .id")
+
+              if [ -n "$TWOFA_GROUP_ID" ]; then
+                echo "    Removing from '${TWOFA_GROUP}' group (ID: ${TWOFA_GROUP_ID})..."
+                curl -sf -X DELETE \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${USER_ID}/groups/${TWOFA_GROUP_ID}" 2>/dev/null || true
+                echo "    Removed from ${TWOFA_GROUP}."
+              else
+                echo "    ${TWOFA_GROUP} group not found (or user not in it)."
+              fi
+
+              # Remove CONFIGURE_TOTP required action if present
+              echo "    Removing CONFIGURE_TOTP required action..."
+              curl -sf -X DELETE \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${USER_ID}/required-actions/CONFIGURE_TOTP" 2>/dev/null || true
+
+              # Delete any existing OTP credentials
+              CREDENTIALS=$(curl -sf \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${USER_ID}/credentials" 2>/dev/null)
+
+              CRED_IDS=$(echo "$CREDENTIALS" | jq -r '.[] | select(.type == "otp" or .type == "OTP" or .type == "TOTP") | .id')
+
+              if [ -n "$CRED_IDS" ]; then
+                echo "    Deleting existing OTP credentials..."
+                for CRED_ID in $CRED_IDS; do
+                  curl -sf -X DELETE \
+                    -H "Authorization: Bearer ${TOKEN}" \
+                    "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${USER_ID}/credentials/${CRED_ID}" 2>/dev/null || true
+                done
+              fi
+
+              echo "    ${USERNAME}: 2FA disabled."
+            }
+
+            # Disable 2FA for both test users
+            disable_2fa_for_user "testadmin"
+            disable_2fa_for_user "testuser"
+
+            echo "2FA setup complete."
+
+            # Add testadmin to argocd-admins so they get ArgoCD admin access.
+            echo "Adding testadmin to argocd-admins..."
+            TESTADMIN_ID=$(curl -sf -G \
+              -H "Authorization: Bearer ${TOKEN}" \
+              --data-urlencode "username=testadmin" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/users" 2>/dev/null | \
+              jq -r ".[0].id // empty")
+            ARGOCD_ADMINS_ID=$(curl -sf \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/groups?search=argocd-admins" 2>/dev/null | \
+              jq -r ".[] | select(.name == \"argocd-admins\") | .id")
+            if [ -n "$TESTADMIN_ID" ] && [ -n "$ARGOCD_ADMINS_ID" ]; then
+              curl -sf -X PUT \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${TESTADMIN_ID}/groups/${ARGOCD_ADMINS_ID}" 2>/dev/null && \
+                echo "  testadmin added to argocd-admins." || \
+                echo "  WARNING: failed to add testadmin to argocd-admins."
+            else
+              echo "  WARNING: testadmin ID=${TESTADMIN_ID} argocd-admins ID=${ARGOCD_ADMINS_ID} — skipping."
+            fi
+          fi
+
+          echo "Done."

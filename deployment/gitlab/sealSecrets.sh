@@ -46,11 +46,10 @@ should_seal() {
   return 0
 }
 
-echo "=== GitLab Secret Setup ==="
-echo ""
-
 # Track which files were created/updated
 SEALED_FILES=()
+
+echo "=== GitLab Secret Setup ==="
 
 # --- 1. Root password + email (for user *root*) ---
 if should_seal "gitlab-root-password-sealed.yaml" "password + email for user *root*"; then
@@ -67,23 +66,11 @@ if should_seal "gitlab-root-password-sealed.yaml" "password + email for user *ro
   SEALED_FILES+=("gitlab-root-password-sealed.yaml")
 fi
 
-# --- 2. OIDC client secret + provider config (coupled — always regenerate together) ---
-if should_seal "gitlab-oidc-client-secret-sealed.yaml" "OIDC client secret + provider"; then
-  OIDC_CLIENT_SECRET=$(openssl rand -hex 32)
-  echo "  Generated new OIDC client secret."
-
-  "$SEAL" "$NAMESPACE" gitlab-oidc-client-secret \
-    gitlab/gitlab-oidc-client-secret-sealed.yaml \
-    --from-literal=client-secret="$OIDC_CLIENT_SECRET"
-  SEALED_FILES+=("gitlab-oidc-client-secret-sealed.yaml")
-
-  OIDC_PROVIDER=$(sed "s|OIDC_CLIENT_SECRET_PLACEHOLDER|${OIDC_CLIENT_SECRET}|" \
-    "${SCRIPT_DIR}/gitlab-oidc-provider.yaml.template")
-  "$SEAL" "$NAMESPACE" gitlab-oidc-provider \
-    gitlab/gitlab-oidc-provider-sealed.yaml \
-    --from-literal=provider="$OIDC_PROVIDER"
-  SEALED_FILES+=("gitlab-oidc-provider-sealed.yaml")
-fi
+# --- 2. OIDC secrets: generated dynamically by presync-oidc-secrets.yaml ---
+# gitlab-oidc-client-secret and gitlab-oidc-provider are no longer sealed secrets.
+# The presync job creates them on first install and updates the provider config
+# on every sync, reading GITLAB_URL and KEYCLOAK_ISSUER from the manifest.
+echo "  OIDC secrets: managed by presync-oidc-secrets.yaml (no sealing needed)."
 
 # --- 3. S3 connection ---
 
@@ -130,11 +117,21 @@ EOREG
 fi
 
 # --- 5. Rails secrets (sealed — safe for public repos) ---
+# --- 5. Rails secrets (sealed — safe for public repos) ---
+# Must include ALL keys GitLab 18.x needs, otherwise 2_secret_token.rb tries
+# to rewrite secrets.yml to add the missing keys — which fails with EBUSY
+# because the file is a subPath volume mount (cross-device rename).
 if should_seal "gitlab-rails-secrets-sealed.yaml" "Rails secrets"; then
   RAILS_SECRET_KEY_BASE=$(openssl rand -hex 64)
   RAILS_OTP_KEY_BASE=$(openssl rand -hex 64)
   RAILS_DB_KEY_BASE=$(openssl rand -hex 64)
   RAILS_ENCRYPTED_SETTINGS_KEY_BASE=$(openssl rand -hex 64)
+  # active_record_encryption keys: base64-encoded 32-byte random values
+  AR_PRIMARY_KEY=$(openssl rand -base64 32)
+  AR_DETERMINISTIC_KEY=$(openssl rand -base64 32)
+  AR_KEY_DERIVATION_SALT=$(openssl rand -base64 32)
+  # openid_connect_signing_key: RSA-2048 private key (PEM)
+  OIDC_SIGNING_KEY=$(openssl genrsa 2048 2>/dev/null)
   echo "  Generated new Rails secrets."
 
   RAILS_SECRETS_YML=$(cat <<EORAILS
@@ -143,6 +140,13 @@ production:
   otp_key_base: ${RAILS_OTP_KEY_BASE}
   db_key_base: ${RAILS_DB_KEY_BASE}
   encrypted_settings_key_base: ${RAILS_ENCRYPTED_SETTINGS_KEY_BASE}
+  active_record_encryption_primary_key:
+    - ${AR_PRIMARY_KEY}
+  active_record_encryption_deterministic_key:
+    - ${AR_DETERMINISTIC_KEY}
+  active_record_encryption_key_derivation_salt: ${AR_KEY_DERIVATION_SALT}
+  openid_connect_signing_key: |
+$(echo "$OIDC_SIGNING_KEY" | sed 's/^/    /')
 EORAILS
 )
   "$SEAL" "$NAMESPACE" gitlab-rails-secrets \

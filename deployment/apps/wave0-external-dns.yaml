@@ -1,7 +1,7 @@
 # ArgoCD Application: external-dns (Hetzner DNS provider)
 # Automatically creates/updates DNS records from Ingress hostnames.
 # Requires the 'hetzner-dns-token' secret in the 'external-dns' namespace,
-# which is created by Pulumi (index.ts).
+# which is created by Pulumi (main.ts).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -14,7 +14,7 @@ spec:
   source:
     repoURL: https://kubernetes-sigs.github.io/external-dns/
     chart: external-dns
-    targetRevision: "1.20.0"  # https://github.com/kubernetes-sigs/external-dns/releases
+    targetRevision: "1.21.1"  # https://github.com/kubernetes-sigs/external-dns/releases
     helm:
       values: |
         provider:
@@ -55,12 +55,6 @@ spec:
         interval: 5m
         extraArgs:
           - --webhook-provider-url=http://127.0.0.1:8888
-          # All services use Pulumi-managed wildcard DNS (*.infra* / *.test*).
-          # --exclude-domains only matches exact domains, not subdomains.
-          # Use --regex-domain-exclusion to prevent per-host records under the wildcards.
-          # Only exclude single-label subdomains (e.g. nextcloud.domain) — deeper subdomains
-          # like *.pages.gitlab.subdomain.domain.tld* are managed via DNSEndpoint CRDs.
-          - --regex-domain-exclusion=^[^.]+\.(subdomain|subdomain)\.your-domain\.tld$
 
         serviceMonitor:
           # Disabled here: ServiceMonitor CRD is installed by kube-prometheus-stack
@@ -70,15 +64,14 @@ spec:
 
         txtOwnerId: edgecloudinfra
         domainFilters:
-          - your-domain.tld
+          - cape-project.eu
         policy: sync
         sources:
-          # ingress source disabled: all DNS is covered by Pulumi wildcard records
-          # (*.infra* / *.test*). Re-enable if non-wildcard services are added.
-          # - ingress
+          # ingress source intentionally disabled: wildcard *.SUBDOMAIN covers all hosts.
+          # Exception: gitlab.SUBDOMAIN needs an explicit record (see deployment/gitlab/pages-dns.yaml)
+          # because *.pages.gitlab.SUBDOMAIN creates an empty non-terminal node that shadows the wildcard.
           - service
-          # crd source: manages wildcard records declared via DNSEndpoint CRDs
-          # (e.g. *.pages.gitlab.subdomain.domain.tld for GitLab Pages)
+          # crd source: manages records declared via DNSEndpoint CRDs
           - crd
   destination:
     server: https://kubernetes.default.svc

@@ -1,0 +1,235 @@
+# ArgoCD Application: ryax-engine
+# Ryax workflow automation platform via OCI helm chart.
+# Accessible at https://ryax.ecc66.cape-project.eu
+# Chart: oci://registry.ryax.org/release-charts/ryax-engine
+# Docs: https://gitlab.com/ryax-tech/ryax/ryax-engine/-/releases
+#
+# Sync is triggered automatically by the notify-ryax PostSync job in
+# argocd-main-app (deployment/apps/wave9-notify-ryax.yaml), which handles
+# the fresh-install two-step sync to avoid the migration hook deadlock.
+# A PreSync job gates the sync on opendesk/gitlab/gitlab-runner/kube-prometheus-stack
+# all being Synced+Healthy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ryax
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  project: default
+  sources:
+    # 1. OCI Helm chart
+    - repoURL: registry.ryax.org/release-charts
+      chart: ryax-engine
+      # https://gitlab.com/ryax-tech/ryax/ryax-engine/-/releases
+      targetRevision: "26.2" # renovate: datasource=helm depName=ryax-engine registryUrl=registry.ryax.org/release-charts
+      helm:
+        valuesObject:
+          global:
+            tls:
+              hostname: ryax.ecc66.cape-project.eu
+            defaultStorageClass: longhorn
+          action-builder:
+            nix:
+              storageClass: local-path
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+          front:
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+          repository:
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+          runner:
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+          studio:
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+          worker:
+            extraEnv:
+              - name: TZ
+                value: Europe/Berlin
+            postgresql:
+              primary:
+                extraEnvVars:
+                  - name: TZ
+                    value: Europe/Berlin
+          minio:
+            persistence:
+              storageClass: local-path
+          traefik:
+            ingressClass:
+              isDefaultClass: false
+            service:
+              type: ClusterIP
+          kube-prometheus-stack:
+            prometheusOperator:
+              # Restrict to ryaxns only — prevents conflict with the main
+              # kube-prometheus-stack operator in the prometheus namespace.
+              namespaces:
+                releaseNamespace: true
+                additional: []
+              # Disable admission webhooks: ArgoCD does not translate helm.sh/hook
+              # annotations from OCI subchart resources to ArgoCD PreSync hooks,
+              # so the certgen job never runs and the operator pod gets stuck on a
+              # missing TLS secret. Admission validation is not needed for ryax.
+              admissionWebhooks:
+                enabled: false
+                patch:
+                  enabled: false
+              tls:
+                # TLS disabled: the certgen PreSync job never runs (ArgoCD does
+                # not translate helm.sh/hook from OCI subcharts). Without the
+                # admission TLS secret the operator pod stays in ContainerCreating.
+                enabled: false
+            nodeExporter:
+              # kube-prometheus-stack already deploys node-exporter cluster-wide.
+              # Disabling here prevents hostPort conflicts on all nodes.
+              # The subchart condition key is nodeExporter.enabled (not prometheus-node-exporter.enabled).
+              enabled: false
+
+    # 2. PreSync hook: gates sync on core apps being Synced+Healthy
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/ryax
+
+  # The Nix store PVC is pre-created with local-path by a PreSync hook
+  # (deployment/ryax/presync-nix-store-pvc.yaml). storageClassName and storage
+  # size are immutable once the PVC is bound, so ArgoCD SSA cannot change them
+  # back to the chart defaults. Suppress the diffs here.
+  ignoreDifferences:
+  - group: ""
+    kind: PersistentVolumeClaim
+    name: ryax-action-builder-nix-store
+    jsonPointers:
+      - /spec/storageClassName
+      - /spec/volumeName
+      - /spec/volumeMode
+      - /spec/resources
+  - group: ""
+    kind: PersistentVolumeClaim
+    name: ryax-minio
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  # Ingresses: ryax-install-sync-guard patches ingressClassName to ryax-traefik post-sync
+  # (the chart does not set ingressClassName, so it defaults to the cluster
+  # default HAProxy). Ignoring this field prevents the patch from causing
+  # OutOfSync and triggering repeated hook syncs that regenerate passwords.
+  - group: networking.k8s.io
+    kind: Ingress
+    jqPathExpressions: [".spec.ingressClassName"]
+  # Helm-generated secrets: rendered with new random values on every sync.
+  # Ignore .data so ArgoCD treats them as Synced after ryax-install-sync-guard fixes them.
+  - group: ""
+    kind: Secret
+    name: ryax-worker-db-pass
+    jqPathExpressions: [".data", ".metadata"]
+  - group: ""
+    kind: Secret
+    name: ryax-broker-secret
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: ryax-broker-cookie
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: api-jwt-secret-key
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: grafana-credentials
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: repository-password-encryption-key
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: runner-encryption-key
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: ryax-datastore-secret
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: ryax-minio-secret
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: ryax-registry-cert
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: Secret
+    name: ryax-registry-credentials
+    jqPathExpressions: [".data"]
+  - group: ""
+    kind: PersistentVolumeClaim
+    name: ryax-registry-pvc-0
+    jsonPointers:
+      - /spec/storageClassName
+      - /spec/volumeName
+      - /spec/volumeMode
+      - /spec/resources
+  # Prometheus CRDs: main kube-prometheus-stack (prometheus namespace) owns these.
+  # Ryax subchart deploys an older version; ignore spec + annotation drift.
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: alertmanagerconfigs.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: alertmanagers.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: podmonitors.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: probes.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: prometheusagents.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: prometheuses.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: prometheusrules.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: scrapeconfigs.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: servicemonitors.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+  - group: apiextensions.k8s.io
+    kind: CustomResourceDefinition
+    name: thanosrulers.monitoring.coreos.com
+    jqPathExpressions: [".spec", ".metadata.annotations"]
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ryaxns
+  syncPolicy:
+    # No automated sync — ryax-install-sync-guard PostSync job orchestrates all syncs.
+    # This prevents ArgoCD from auto-triggering a hook sync on app creation,
+    # which would deadlock (migration hooks need ryax-datastore-secret, which
+    # only exists after the main chart resources are applied).
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

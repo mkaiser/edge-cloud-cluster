@@ -1,0 +1,116 @@
+# Admin-only portal tile for ArgoCD.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portal-tile-argocd
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portal-tile-argocd
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ums-nubus-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portal-tile-argocd
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portal-tile-argocd
+subjects:
+- kind: ServiceAccount
+  name: portal-tile-argocd
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: portal-tile-argocd
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: portal-tile-argocd
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: tile
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          UDM_URL="http://ums-udm-rest-api.opendesk.svc.cluster.local:9979/univention/udm"
+          LDAP_BASE="dc=swp-ldap,dc=internal"
+          ENTRY_CN="od.argocd"
+          ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
+          CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
+          APP_URL="https://argocd.ecc66.cape-project.eu"
+          ADMIN_GROUP_DN="cn=Domain Admins,cn=groups,${LDAP_BASE}"
+
+          ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
+            -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+          udm() { curl -sf -H "Accept: application/json" -H "Content-Type: application/json" \
+            -u "Administrator:${ADMIN_PASS}" "$@"; }
+
+          ICON=$(printf '%s' \
+            '<svg width="111" height="111" viewBox="0 0 111 111" fill="none" xmlns="http://www.w3.org/2000/svg">' \
+            '<rect width="111" height="111" rx="20" fill="#EF7B4D"/>' \
+            '<circle cx="55.5" cy="46" r="18" fill="white"/>' \
+            '<circle cx="55.5" cy="46" r="10" fill="#EF7B4D"/>' \
+            '<path d="M36 72 Q55.5 58 75 72" stroke="white" stroke-width="6" stroke-linecap="round" fill="none"/>' \
+            '<path d="M28 82 Q55.5 64 83 82" stroke="white" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.6"/>' \
+            '</svg>' | base64 -w0)
+
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Accept: application/json" \
+            -u "Administrator:${ADMIN_PASS}" "${UDM_URL}/portals/entry/${ENTRY_DN}")
+          if [ "$HTTP" = "200" ]; then
+            echo "Entry exists — ensuring allowedGroups..."
+            udm -X PATCH "${UDM_URL}/portals/entry/${ENTRY_DN}" \
+              -d "{\"properties\":{\"allowedGroups\":[\"${ADMIN_GROUP_DN}\"]}}" -o /dev/null
+          else
+            udm -X POST "${UDM_URL}/portals/entry/" -d "{
+              \"position\":\"cn=entry,cn=portals,cn=univention,${LDAP_BASE}\",
+              \"properties\":{
+                \"name\":\"${ENTRY_CN}\",
+                \"displayName\":{\"en_US\":\"ArgoCD\",\"de_DE\":\"ArgoCD\"},
+                \"description\":{\"en_US\":\"GitOps continuous delivery\",\"de_DE\":\"GitOps Continuous Delivery\"},
+                \"link\":[[\"en_US\",\"${APP_URL}\"]],
+                \"linkTarget\":\"newwindow\",\"activated\":true,\"anonymous\":false,
+                \"allowedGroups\":[\"${ADMIN_GROUP_DN}\"],\"icon\":\"${ICON}\"}}" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print('Created:', d.get('dn',''))"
+          fi
+
+          CURRENT=$(udm "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(d.get('properties',{}).get('entries',[])))")
+          echo "${CURRENT}" | grep -qF "${ENTRY_DN}" && echo "Already in category." || {
+            NEW_JSON=$(printf '%s\n%s' "${CURRENT}" "${ENTRY_DN}" | grep -v '^$' \
+              | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip().split('\n')))")
+            udm -X PATCH "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+              -d "{\"properties\":{\"entries\":${NEW_JSON}}}" -o /dev/null && echo "Category updated."
+          }
+          echo "Done."

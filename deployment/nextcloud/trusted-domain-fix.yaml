@@ -1,0 +1,120 @@
+# Nextcloud trusted_domains self-healing fix.
+#
+# Problem: on a fresh cluster, the opendesk nextcloud entrypoint reads config.php
+# from the `fs_config_store` database table. If the table does not exist yet when
+# the pod first starts (race with the bootstrap job), the pod crashes. During the
+# crash cycle Nextcloud writes a minimal config.php with only `localhost` in
+# trusted_domains. When the table is later created and the pod restarts, the
+# entrypoint sees config.php already on disk and skips regeneration — leaving
+# trusted_domains as `localhost`, which causes "Untrusted domain" errors.
+#
+# Fix: this Sync hook Job runs on every argocd-main-app sync. It checks whether
+# config.php contains the correct domain. If not, it deletes config.php and
+# restarts the deployment so the entrypoint regenerates it from the database.
+# Idempotent: exits 0 immediately when trusted_domains is already correct.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nextcloud-trusted-domain-fix
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nextcloud-trusted-domain-fix
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nextcloud-trusted-domain-fix
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nextcloud-trusted-domain-fix
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-trusted-domain-fix
+  namespace: opendesk
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nextcloud-trusted-domain-fix
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: nextcloud-trusted-domain-fix
+      restartPolicy: Never
+      containers:
+      - name: fix
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          DEPLOY="opendesk-nextcloud-aio"
+          NS="opendesk"
+
+          # Find running nextcloud pod
+          POD=$(kubectl get pods -n "$NS" \
+            -l "app.kubernetes.io/name=nextcloud-aio" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+          if [ -z "$POD" ]; then
+            echo "No running nextcloud pod found — skipping (will retry on next sync)."
+            exit 0
+          fi
+
+          echo "Nextcloud pod: $POD"
+
+          # Check current trusted_domains in config.php
+          DOMAINS=$(kubectl exec -n "$NS" "$POD" -- \
+            grep -A5 "trusted_domains" /var/www/html/config/config.php 2>/dev/null || true)
+
+          echo "Current trusted_domains block:"
+          echo "$DOMAINS"
+
+          # Check if localhost-only (broken state)
+          if echo "$DOMAINS" | grep -q "localhost" && ! echo "$DOMAINS" | grep -qv "localhost.*'[[:space:]]*$\|'trusted_domains\|array"; then
+            echo "trusted_domains contains only localhost — config.php is stale."
+          elif echo "$DOMAINS" | grep -q "localhost" && ! echo "$DOMAINS" | grep -qE "[a-z0-9-]+\.[a-z0-9-]+\.[a-z]+"; then
+            echo "trusted_domains has no real domain — config.php is stale."
+          else
+            echo "trusted_domains looks correct — nothing to do."
+            exit 0
+          fi
+
+          echo "Deleting stale config.php and restarting deployment..."
+          kubectl exec -n "$NS" "$POD" -- rm -f /var/www/html/config/config.php
+          kubectl rollout restart deployment/"$DEPLOY" -n "$NS"
+
+          echo "Waiting for rollout to complete..."
+          kubectl rollout status deployment/"$DEPLOY" -n "$NS" --timeout=120s
+
+          echo "Done — nextcloud restarted with regenerated config.php."

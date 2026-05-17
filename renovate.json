@@ -1,29 +1,91 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "argocd": {
-    "fileMatch": [
-      "deployment/apps/.+\\.yaml$",
-      "deployment/.+/.+\\.yaml$"
-    ]
-  },
-  "customManagers": [
-    {
-      "customType": "regex",
-      "description": "Pulumi helm.v3.Release versions in TypeScript source",
-      "fileMatch": ["src/.+\\.ts$"],
-      "matchStrings": [
-        "chart: \"(?<depName>[^\"]+)\",(?:[^\\n]*\\n){1,3}[^\\n]*version: \"(?<currentValue>[^\"]+)\",[^\\n]*\\n(?:[^\\n]*\\n){0,2}[^\\n]*repositoryOpts: \\{ repo: \"(?<registryUrl>[^\"]+)\""
-      ],
-      "datasourceTemplate": "helm"
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": ["config:recommended"],
+    "argocd": {
+        "managerFilePatterns": ["/deployment/apps/.+\\.yaml$/", "/deployment/.+/.+\\.yaml$/"]
     },
-    {
-      "customType": "regex",
-      "description": "Tool versions in scripts/install.sh",
-      "fileMatch": ["scripts/install\\.sh"],
-      "matchStrings": [
-        "# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)\\n[A-Z_]+=\"(?<currentValue>[^\"]+)\""
-      ]
-    }
-  ]
+    "customManagers": [
+        {
+            "customType": "regex",
+            "description": "Pulumi helm.v3.Release versions in TypeScript source",
+            "managerFilePatterns": ["/src/.+\\.ts$/"],
+            "matchStrings": [
+                "chart: \"(?<depName>[^\"]+)\",(?:[^\\n]*\\n){1,3}[^\\n]*version: \"(?<currentValue>[^\"]+)\",[^\\n]*\\n(?:[^\\n]*\\n){0,2}[^\\n]*repositoryOpts: \\{ repo: \"(?<registryUrl>[^\"]+)\""
+            ],
+            "datasourceTemplate": "helm"
+        },
+        {
+            "customType": "regex",
+            "description": "Tool versions in scripts/install.sh",
+            "managerFilePatterns": ["/scripts/install\\.sh/"],
+            "matchStrings": [
+                "[A-Z_]+=\"(?<currentValue>[^\"]+)\"\\s+# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)"
+            ]
+        },
+        {
+            "customType": "regex",
+            "description": "Talos versions in project_settings.ts",
+            "managerFilePatterns": ["/project_settings\\.ts$/"],
+            "matchStrings": [
+                "(?:talosVersion|talosKubernetesVersion): \"(?<currentValue>[^\"]+)\",\\s+// renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)(?: extractVersion=(?<extractVersion>[^\\s]+))?"
+            ]
+        },
+        {
+            "customType": "regex",
+            "description": "ArgoCD Helm Application targetRevision in deployment manifests",
+            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
+            "matchStrings": [
+                "repoURL:\\s*\"?(?<registryUrl>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,12}?chart:\\s*\"?(?<depName>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,8}?targetRevision:\\s*\"?(?<currentValue>[^\"\\n# ]+)"
+            ],
+            "datasourceTemplate": "helm"
+        },
+        {
+            "customType": "regex",
+            "description": "Git targetRevision values annotated with renovate comments",
+            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
+            "matchStrings": [
+                "targetRevision:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+            ]
+        },
+        {
+            "customType": "regex",
+            "description": "upgrade.cattle.io Plan version fields annotated with renovate comments",
+            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
+            "matchStrings": [
+                "version:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+            ]
+        },
+        {
+            "customType": "regex",
+            "description": "Container image tags in deployment manifests",
+            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
+            "matchStrings": [
+                "image:\\s*\"?(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@sha256:[a-f0-9]{64})?\"?"
+            ],
+            "datasourceTemplate": "docker"
+        }
+    ],
+    "packageRules": [
+        {
+            "description": "Group all updates into one catch-all PR",
+            "matchFileNames": ["**/*"],
+            "groupName": "update all"
+        },
+        {
+            "description": "Group deployment manifest updates separately",
+            "matchFileNames": ["deployment/**"],
+            "groupName": "deployment updates"
+        },
+        {
+            "description": "Automerge minor updates after checks pass",
+            "matchUpdateTypes": ["minor"],
+            "automerge": true
+        },
+        {
+            "description": "Exclude non-v tags for openDesk deployment (bad revisions seen: 23.12 and 24.03; valid tags are v-prefixed like v1.13.2)",
+            "matchDatasources": ["gitlab-tags"],
+            "matchPackageNames": ["bmi/opendesk/deployment/opendesk"],
+            "allowedVersions": "/^v.*$/"
+        }
+    ]
 }

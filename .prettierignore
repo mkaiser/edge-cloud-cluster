@@ -1,0 +1,12 @@
+node_modules/
+.git/
+.pulumi-state/
+external/
+*.bak
+*.bkp
+*.dtmp
+wg-admin.conf
+sealed-secrets-key-backup.yaml
+config
+*.yaml
+*.yml

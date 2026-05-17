@@ -1,4 +1,4 @@
-# GitLab CE Helm values — deployed via ArgoCD (deployment/apps/gitlab.test34.your-domain.tld).
+# GitLab CE Helm values — deployed via ArgoCD (deployment/apps/gitlab.yaml).
 #
 # Secrets NOT included here (provided via helm-values-secret.yaml):
 #   global.appConfig.omniauth.providers[].secret contents
@@ -14,13 +14,13 @@ global:
   edition: ce
 
   hosts:
-    domain: test34.your-domain.tld
+    domain: test.your-domain.tld
     gitlab:
-      name: gitlab.test34.your-domain.tld
+      name: gitlab.ecc66.cape-project.eu
     registry:
-      name: registry.gitlab.test34.your-domain.tld
+      name: registry.gitlab.ecc66.cape-project.eu
     pages:
-      name: pages.gitlab.test34.your-domain.tld
+      name: pages.gitlab.ecc66.cape-project.eu
 
   ingress:
     class: haproxy
@@ -78,7 +78,7 @@ global:
     # GitLab Pages
     pages:
       enabled: true
-      host: pages.gitlab.test34.your-domain.tld
+      host: pages.gitlab.ecc66.cape-project.eu
       objectStore:
         bucket: edgecloud-gitlab
         prefix: gitlab-pages
@@ -130,7 +130,7 @@ postgresql:
   install: true
   primary:
     persistence:
-      storageClass: hcloud-nfs-ssd-volumes
+      storageClass: longhorn
       size: 20Gi
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ redis:
   install: true
   master:
     persistence:
-      storageClass: hcloud-nfs-ssd-volumes
+      storageClass: longhorn
       size: 5Gi
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ redis:
 gitlab:
   gitaly:
     persistence:
-      storageClass: hcloud-nfs-ssd-volumes
+      storageClass: longhorn
       size: 50Gi
     metrics:
       enabled: true
@@ -220,6 +220,6 @@ grafana:
 # Disabled: ArgoCD uses `helm upgrade --install`, so the pre-upgrade hook always
 # runs — including on fresh installs where no previous chart-info ConfigMap exists,
 # causing the script to fail unconditionally. Upgrade path verification is the
-# operator's responsibility when changing targetRevision in deployment/apps/gitlab.test34.your-domain.tld.
+# operator's responsibility when changing targetRevision in deployment/apps/gitlab.yaml.
 upgradeCheck:
   enabled: false

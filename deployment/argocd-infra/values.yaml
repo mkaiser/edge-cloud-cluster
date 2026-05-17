@@ -13,7 +13,7 @@
 # then manually sync the argocd-self Application.
 
 global:
-  domain: argocd.test34.your-domain.tld
+  domain: argocd.ecc66.cape-project.eu
   env:
     - name: TZ
       value: "Europe/Berlin"
@@ -21,9 +21,34 @@ global:
 configs:
   cm:
     timeout.reconciliation: "30m"  # 30 minutes; opendesk helmfile renders are very slow on single-threaded queue
+    # Ingresses processed by ryax-traefik (internal Traefik) never get a
+    # loadBalancer address — ArgoCD would show them as Progressing forever.
+    # Return Healthy for ingresses that use the ryax-traefik class or the
+    # legacy traefik annotation.
+    # Note: ConfigMap keys cannot contain '/' (K8s 1.23+), so we use the
+    # older single-key resource.customizations format.
+    # TODO remove ryax traefik stuff here
+    resource.customizations: |
+      networking.k8s.io/Ingress:
+        health.lua: |
+          hs = {}
+          local ic = obj.spec and obj.spec.ingressClassName or ""
+          local ann = obj.metadata and obj.metadata.annotations or {}
+          if ic == "ryax-traefik" or ann["kubernetes.io/ingress.class"] == "traefik" then
+            hs.status = "Healthy"
+            hs.message = "Internal Traefik ingress"
+            return hs
+          end
+          if obj.status and obj.status.loadBalancer and obj.status.loadBalancer.ingress and #obj.status.loadBalancer.ingress > 0 then
+            hs.status = "Healthy"
+          else
+            hs.status = "Progressing"
+            hs.message = "Waiting for LoadBalancer address"
+          end
+          return hs
     oidc.config: |
       name: Keycloak
-      issuer: https://id.test34.your-domain.tld/realms/opendesk
+      issuer: https://id.ecc66.cape-project.eu/realms/opendesk
       clientID: argocd
       clientSecret: $argocd-oidc-client-secret:oidc.clientSecret
       requestedScopes:
@@ -37,7 +62,7 @@ configs:
     # Everyone else authenticated gets read-only access.
     policy.csv: |
       g, /argocd-admins, role:admin
-    policy.default: "role:readonly"
+    policy.default: ""
 
   # argocd-notifications-cm — email service + templates + triggers.
   # Env vars (SMTP_HOST etc.) are injected into the notifications controller
@@ -50,10 +75,26 @@ configs:
       password: $SMTP_PASSWORD
       from: $NOTIFY_FROM
 
-    # Templates
+    # Templates for different event types
+    template.app-sync-succeeded: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} sync succeeded"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync Succeeded
+          Sync Time:   {{.app.status.operationState.finishedAt}}
+
+          {{if .app.status.operationState.syncResult}}
+          {{range .app.status.operationState.syncResult.resources}}
+          - {{.kind}}/{{.name}}: {{.status}}
+          {{end}}
+          {{end}}
+
+          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+
     template.app-sync-failed: |
       email:
-        subject: "[ArgoCD] {{.app.metadata.name}} sync FAILED"
+        subject: "[ArgoCD] ⚠️  {{.app.metadata.name}} sync FAILED"
         body: |
           Application: {{.app.metadata.name}}
           Status:      Sync Failed
@@ -64,28 +105,59 @@ configs:
           {{end}}
           {{end}}
 
-          https://argocd.test34.your-domain.tld/applications/{{.app.metadata.name}}
+          Error: {{.app.status.operationState.phase}} — {{.app.status.operationState.message}}
+
+          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
 
     template.app-health-degraded: |
       email:
-        subject: "[ArgoCD] {{.app.metadata.name}} is DEGRADED"
+        subject: "[ArgoCD] ⚠️  {{.app.metadata.name}} is DEGRADED"
         body: |
           Application: {{.app.metadata.name}}
           Health:      {{.app.status.health.status}}
           Message:     {{.app.status.health.message}}
 
-          https://argocd.test34.your-domain.tld/applications/{{.app.metadata.name}}
+          Resources:
+          {{range .app.status.resources}}
+          - {{.kind}}/{{.name}}: {{.health.status}} — {{.health.message}}
+          {{end}}
+
+          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+
+    template.app-sync-running: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} sync started"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync In Progress
+
+          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
 
     # Triggers
     trigger.on-sync-failed: |
       - when: app.status.operationState.phase in ['Error', 'Failed']
+        oncePer: app.status.operationState.finishedAt
         send: [app-sync-failed]
+
+    trigger.on-sync-succeeded: |
+      - when: app.status.operationState.phase == 'Succeeded'
+        oncePer: app.status.operationState.finishedAt
+        send: [app-sync-succeeded]
+
+    trigger.on-sync-running: |
+      - when: app.status.operationState.phase in ['Running', 'Terminating']
+        send: [app-sync-running]
 
     trigger.on-health-degraded: |
       - when: app.status.health.status == 'Degraded'
+        oncePer: app.status.health.status
         send: [app-health-degraded]
 
-    # Subscribe all apps by default
+    trigger.on-sync-operation-failed: |
+      - when: app.status.operationState.phase in ['Error']
+        send: [app-sync-failed]
+
+    # Subscribe all apps by default — send critical alerts to ops
     defaultTriggers: |
       - on-sync-failed
       - on-health-degraded
@@ -96,6 +168,7 @@ configs:
         triggers:
           - on-sync-failed
           - on-health-degraded
+          - on-sync-succeeded
 
   params:
     # haproxy handles TLS termination; ArgoCD serves plain HTTP internally
@@ -127,14 +200,20 @@ server:
     enabled: true
     ingressClassName: haproxy
     hosts:
-      - argocd.test34.your-domain.tld
+      - argocd.ecc66.cape-project.eu
     annotations:
       haproxy-ingress.github.io/ssl-redirect: "true"
       external-dns.alpha.kubernetes.io/exclude: "true"
     tls:
       - secretName: infra-wildcard-tls
         hosts:
-          - argocd.test34.your-domain.tld
+          - argocd.ecc66.cape-project.eu
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
 
 controller:
   replicas: 2
@@ -145,6 +224,12 @@ controller:
       additionalLabels:
         release: kube-prometheus-stack
       namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
 
 applicationSet:
   metrics:
@@ -154,8 +239,16 @@ applicationSet:
       additionalLabels:
         release: kube-prometheus-stack
       namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
 
 notifications:
+  enabled: true
+  replicas: 1
   metrics:
     enabled: true
     serviceMonitor:
@@ -187,11 +280,17 @@ notifications:
           name: smtp-credentials
           key: password
     - name: NOTIFY_FROM
-      value: "no-reply@your-domain.tld"
+      value: "no-reply@cape-project.eu"
     - name: NOTIFY_TO
       valueFrom:
         secretKeyRef:
           name: smtp-credentials
           key: sendBootstrapFinishMailRecipient
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
 
 

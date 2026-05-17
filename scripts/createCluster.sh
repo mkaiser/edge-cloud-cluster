@@ -6,6 +6,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 start=$(date +%s)
 echo "$(date): Starting infrastructure deployment"
 
+if [ -z "${PULUMI_CONFIG_PASSPHRASE:-}" ]; then
+    echo "PULUMI_CONFIG_PASSPHRASE is not set."
+    read -rsp "Enter Pulumi passphrase: " PULUMI_CONFIG_PASSPHRASE
+    echo ""
+    export PULUMI_CONFIG_PASSPHRASE
+fi
+
 # Check for unpushed commits and offer to push
 upstream_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
 if [ -n "$upstream_branch" ]; then
@@ -26,9 +33,11 @@ if [ -n "$upstream_branch" ]; then
     fi
 fi
 
-pulumi up -y
+bash "$SCRIPT_DIR/importExistingResources.sh"
 
-source "$SCRIPT_DIR/getKubeCtrl.sh"
+CI=true pulumi up -y
+
+source "$SCRIPT_DIR/getKubeConfig.sh"
 
 source "$SCRIPT_DIR/argocdLoginCLI.sh"
 

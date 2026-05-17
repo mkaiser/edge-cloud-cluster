@@ -1,0 +1,89 @@
+# ArgoCD Application: GitLab Runner
+# In-cluster runner with kubernetes executor — spins up ephemeral job pods.
+# Deployed separately from GitLab so it can be added after GitLab is running
+# and the runner registration token has been generated.
+#
+# Setup:
+#   1. Deploy GitLab first (deployment/apps/gitlab.yaml)
+#   2. Create a runner in GitLab UI (Admin > CI/CD > Runners > New instance runner)
+#   3. Optional fallback: seal the runner token manually via deployment/gitlab-runner/sealRunnerToken.sh
+#   4. Commit and push — ArgoCD picks it up
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+    name: gitlab-runner
+    namespace: argocd
+    annotations:
+        argocd.argoproj.io/sync-wave: "18"
+spec:
+    project: default
+    sources:
+        - repoURL: https://charts.gitlab.io
+          chart: gitlab-runner
+          targetRevision: "0.88.2"
+          helm:
+              valuesObject:
+                  # Internal service URL — bypasses TLS entirely, works for both staging and
+                  # production certs without tls-skip-verify or cert copying.
+                  gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+
+                  # Runner authentication token (GitLab 16+ token-based registration)
+                  runners:
+                      secret: gitlab-runner-token
+                      config: |
+                          [[runners]]
+                            [runners.kubernetes]
+                              namespace = "gitlab-runner"
+                              image = "alpine:latest"
+                              privileged = false
+                              cpu_request = "250m"
+                              memory_request = "256Mi"
+                              cpu_limit = "2"
+                              memory_limit = "2Gi"
+                            [runners.cache]
+                              Type = "s3"
+                              Shared = true
+                              [runners.cache.s3]
+                                ServerAddress = "fsn1.your-objectstorage.com"
+                                BucketName = "edgecloud-gitlab"
+                                BucketLocation = "fsn1"
+                                Insecure = false
+
+                  # S3 cache credentials from sealed secret
+                  envVars:
+                      - name: CACHE_S3_ACCESS_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: gitlab-runner-cache-s3
+                                key: accessKey
+                      - name: CACHE_S3_SECRET_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: gitlab-runner-cache-s3
+                                key: secretKey
+
+                  rbac:
+                      create: true
+
+                  resources:
+                      requests:
+                          cpu: 100m
+                          memory: 128Mi
+                      limits:
+                          memory: 512Mi
+
+        - repoURL: git@github.com:paraXent/infra.git
+          targetRevision: main
+          path: deployment/gitlab-runner
+          directory:
+              exclude: "{*.template,*.sh,gitlab-runner-token-sealed.yaml,gitlab-runner-cache-s3-sealed.yaml}"
+
+    destination:
+        server: https://kubernetes.default.svc
+        namespace: gitlab-runner
+    syncPolicy:
+        automated:
+            prune: true
+            selfHeal: true
+        syncOptions:
+            - CreateNamespace=true

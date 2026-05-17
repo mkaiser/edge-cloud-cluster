@@ -1,7 +1,7 @@
 # Configures WebAuthn Passwordless (passkeys) in the openDesk Keycloak realm.
 #
-# PostSync hook — runs after this App is synced, which is wave 3 of argocd-main-app,
-# meaning Keycloak (wave 2 / nubus) is Healthy+Synced before this runs.
+# PostSync hook — runs after this App is synced (wave 10 of argocd-main-app),
+# after wave9-barrier ensures all opendesk workloads are Healthy+Synced.
 #
 # What this does via Keycloak Admin REST API:
 #   1. Sets the WebAuthn Passwordless Policy:
@@ -25,11 +25,12 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 ---
+# Role in opendesk namespace — grants access to the admin creds secret there
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: keycloak-passkeys-setup
-  namespace: argocd
+  namespace: opendesk
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 rules:
@@ -38,11 +39,12 @@ rules:
   resourceNames: ["opendesk-keycloak-bootstrap-admin-creds"]
   verbs: ["get"]
 ---
+# RoleBinding in opendesk namespace — binds SA from argocd namespace
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: keycloak-passkeys-setup
-  namespace: argocd
+  namespace: opendesk
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 roleRef:
@@ -71,10 +73,10 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: setup
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         env:
         - name: KEYCLOAK_URL
-          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+          value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
         - name: REALM
           value: "opendesk"
         - name: FLOW_NAME
@@ -95,10 +97,10 @@ spec:
           done
           [ "$STATUS" != "200" ] && echo "ERROR: realm not ready" && exit 1
 
-          # Read Keycloak admin credentials
+          # Read Keycloak admin credentials (secret lives in opendesk namespace)
           echo "Reading Keycloak admin credentials..."
           ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
-            -n argocd -o jsonpath="{.data.admin\.yaml}" | base64 -d)
+            -n opendesk -o jsonpath="{.data.admin\.yaml}" | base64 -d)
           KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep "username:" | awk "{print \$2}")
           KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep "password:" | awk "{print \$2}")
           [ -z "$KC_ADMIN_USER" ] && echo "ERROR: no admin user" && exit 1

@@ -1,4 +1,4 @@
-# Wildcard DNS record for GitLab Pages: *.pages.gitlab.test34.your-domain.tld
+# Wildcard DNS record for GitLab Pages: *.pages.gitlab.ecc66.cape-project.eu
 #
 # A PostSync job reads the haproxy-ingress service's live external IPs and
 # applies the DNSEndpoint dynamically — no hardcoded IPs needed.
@@ -28,7 +28,7 @@ rules:
   verbs: ["get"]
 - apiGroups: ["externaldns.k8s.io"]
   resources: ["dnsendpoints"]
-  verbs: ["get", "create", "update", "patch"]
+  verbs: ["get", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -63,10 +63,10 @@ spec:
       restartPolicy: Never
       containers:
       - name: apply-dns
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         env:
         - name: PAGES_HOSTNAME
-          value: "*.pages.gitlab.test34.your-domain.tld"
+          value: "*.pages.gitlab.ecc66.cape-project.eu"
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -106,3 +106,24 @@ spec:
           kubectl apply -f "$MANIFEST"
           rm -f "$MANIFEST"
           echo "DNSEndpoint applied for ${PAGES_HOSTNAME}"
+
+          # gitlab.SUBDOMAIN needs an explicit A record because *.pages.gitlab.SUBDOMAIN
+          # creates an empty non-terminal node that shadows the *.SUBDOMAIN wildcard.
+          # Derive the gitlab hostname by stripping the "*.pages." prefix.
+          GITLAB_HOSTNAME=$(echo "${PAGES_HOSTNAME}" | sed 's/\*\.pages\.//')
+          echo "Creating explicit A record for ${GITLAB_HOSTNAME} to override empty non-terminal..."
+          MANIFEST2=$(mktemp)
+          printf 'apiVersion: externaldns.k8s.io/v1alpha1\nkind: DNSEndpoint\nmetadata:\n  name: gitlab-hostname\n  namespace: gitlab\nspec:\n  endpoints:\n' > "$MANIFEST2"
+          printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: A\n    targets:\n' "${GITLAB_HOSTNAME}" >> "$MANIFEST2"
+          echo "$IPV4_LIST" | while read -r ip; do
+            [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST2"
+          done
+          if [ -n "$IPV6_LIST" ]; then
+            printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: AAAA\n    targets:\n' "${GITLAB_HOSTNAME}" >> "$MANIFEST2"
+            echo "$IPV6_LIST" | while read -r ip; do
+              [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST2"
+            done
+          fi
+          kubectl apply -f "$MANIFEST2"
+          rm -f "$MANIFEST2"
+          echo "DNSEndpoint applied for ${GITLAB_HOSTNAME}"

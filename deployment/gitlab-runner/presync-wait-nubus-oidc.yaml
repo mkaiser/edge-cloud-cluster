@@ -60,12 +60,14 @@ spec:
     spec:
       serviceAccountName: gitlab-runner-presync-check
       restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: wait-oidc
-        image: docker.io/alpine/k8s:1.32.3
+        image: docker.io/alpine/k8s:1.36.0
         env:
         - name: KEYCLOAK_URL
-          value: "http://ums-keycloak.argocd.svc.cluster.local:8080"
+          value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
         - name: REALM
           value: "opendesk"
         - name: GITLAB_URL

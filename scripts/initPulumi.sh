@@ -31,14 +31,6 @@ else
 fi
 pulumi stack select mystack
 
-
-read -p "Do you want to enter PULUMI secrets now? Previous store secrets stored in Pulumi.mystack.yaml be overriden! [y/N]: " enter_pulumi_secrets
-if [[ "$enter_pulumi_secrets" =~ ^[Yy]$ ]]; then
-    source "$SCRIPT_DIR/setPulumiSecrets.sh"
-else
-    echo "Skipping secrets configuration. You can run \"./scripts/setPulumiSecrets.sh\" later to configure secrets."
-fi
-
 if [[ ! "$store_env" =~ ^[Yy]$ ]]; then
     unset PULUMI_CONFIG_PASSPHRASE
     echo "PULUMI_CONFIG_PASSPHRASE cleared from environment."

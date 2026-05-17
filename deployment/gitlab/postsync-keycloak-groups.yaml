@@ -1,0 +1,157 @@
+# PostSync: create gitlab-users and gitlab-admin groups in Keycloak opendesk realm.
+# Members of gitlab-users can sign in to GitLab.
+# Members of gitlab-admin get admin access in GitLab (via OIDC groups claim).
+# Idempotent — safe to re-run on every sync.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-keycloak-groups
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-keycloak-groups
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["opendesk-keycloak-bootstrap-admin-creds"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-keycloak-groups
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-keycloak-groups
+subjects:
+- kind: ServiceAccount
+  name: gitlab-keycloak-groups
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-keycloak-groups
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: gitlab-keycloak-groups
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: keycloak-groups
+        image: docker.io/alpine/k8s:1.36.0
+        env:
+        - name: KEYCLOAK_URL
+          value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
+        - name: REALM
+          value: "opendesk"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          echo "Reading Keycloak admin credentials..."
+          ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
+            -n opendesk -o jsonpath='{.data.admin\.yaml}' | base64 -d)
+          KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep 'username:' | awk '{print $2}')
+          KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep 'password:' | awk '{print $2}')
+
+          echo "Obtaining admin token..."
+          TOKEN=$(curl -sf -X POST \
+            "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+            -d "client_id=admin-cli" \
+            -d "username=${KC_ADMIN_USER}" \
+            -d "password=${KC_ADMIN_PASS}" \
+            -d "grant_type=password" | \
+            sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+          [ -n "$TOKEN" ] || { echo "ERROR: no admin token"; exit 1; }
+
+          ensure_group() {
+            local NAME="$1"
+            local EXISTING
+            EXISTING=$(curl -sf \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/groups?search=${NAME}&exact=true" \
+              | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+            if [ -n "$EXISTING" ]; then
+              echo "Group '${NAME}' already exists (${EXISTING})."
+            else
+              echo "Creating group '${NAME}'..."
+              HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\": \"${NAME}\"}" \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/groups")
+              echo "  → HTTP ${HTTP}"
+            fi
+          }
+
+          ensure_group "gitlab-users"
+          ensure_group "gitlab-admin"
+
+          # Ensure the GitLab OIDC client sends groups in the token.
+          # Find the gitlab client and add a "groups" mapper if not present.
+          GITLAB_CLIENT_UUID=$(curl -sf \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${KEYCLOAK_URL}/admin/realms/${REALM}/clients?clientId=gitlab" \
+            | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+
+          if [ -z "$GITLAB_CLIENT_UUID" ]; then
+            echo "WARNING: GitLab OIDC client not found — skipping groups mapper setup."
+          else
+            MAPPER_EXISTS=$(curl -sf \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${GITLAB_CLIENT_UUID}/protocol-mappers/models" \
+              | grep -c '"groups-mapper"' || true)
+            if [ "$MAPPER_EXISTS" -gt 0 ]; then
+              echo "Groups mapper already present on GitLab client."
+            else
+              echo "Adding groups claim mapper to GitLab OIDC client..."
+              HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "name": "groups-mapper",
+                  "protocol": "openid-connect",
+                  "protocolMapper": "oidc-group-membership-mapper",
+                  "config": {
+                    "full.path": "false",
+                    "id.token.claim": "true",
+                    "access.token.claim": "true",
+                    "userinfo.token.claim": "true",
+                    "claim.name": "groups"
+                  }
+                }' \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${GITLAB_CLIENT_UUID}/protocol-mappers/models")
+              echo "  → HTTP ${HTTP}"
+            fi
+          fi
+
+          echo "Done."

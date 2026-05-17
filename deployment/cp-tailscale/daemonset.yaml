@@ -1,0 +1,210 @@
+# Tailscale DaemonSet for control-plane nodes.
+# Runs tailscaled in the HOST network namespace (hostNetwork: true) so a real
+# tailscale0 interface appears on the host — visible to k3s and flannel.
+# Auth key comes from the headscale-preauthkey secret created by the wave-12
+# headscale PostSync job.  State is persisted on the host at /var/lib/tailscale
+# so the node re-authenticates from stored state after pod restarts.
+#
+# NOTE: we bypass containerboot (the default image entrypoint) because it ignores
+# TS_LOGIN_SERVER and always hits controlplane.tailscale.com. Instead we call
+# tailscaled and tailscale up directly so --login-server is always respected.
+#
+# TLS: headscale may use a staging/private CA cert not trusted by tailscale.
+# Init container reads the headscale-tls K8s secret (already in-cluster) and
+# extracts non-leaf certs to a shared volume.  Avoids hairpin-NAT failures that
+# occur when the CP node tries to openssl-connect to its own external hostname.
+# The main container copies the certs to /usr/local/share/ca-certificates and
+# runs update-ca-certificates so Go's x509.SystemCertPool picks them up.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cp-tailscale
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cp-tailscale
+  namespace: headscale
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["headscale-preauthkey", "headscale-tls"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cp-tailscale
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cp-tailscale
+subjects:
+- kind: ServiceAccount
+  name: cp-tailscale
+  namespace: headscale
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cp-tailscale
+  namespace: headscale
+spec:
+  selector:
+    matchLabels:
+      app: cp-tailscale
+  template:
+    metadata:
+      labels:
+        app: cp-tailscale
+    spec:
+      serviceAccountName: cp-tailscale
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+      - operator: Exists
+      hostNetwork: true
+      # ClusterFirstWithHostNet: use CoreDNS even with hostNetwork=true so
+      # kubernetes.default.svc resolves inside the container.
+      dnsPolicy: ClusterFirstWithHostNet
+      initContainers:
+      # Extract intermediate/root CA certs from the headscale-tls K8s secret.
+      # Reading from the secret avoids hairpin-NAT issues (CP node reaching its
+      # own external hostname via openssl).  Writes non-leaf certs to /certs/.
+      - name: fetch-headscale-ca
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          python3 - << 'PYEOF'
+          import re, os
+          chain = open('/headscale-tls/tls.crt').read()
+          certs = re.findall(
+              r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
+              chain, re.DOTALL)
+          print(f"Found {len(certs)} cert(s) in headscale-tls secret.")
+          for i, cert in enumerate(certs[1:], 1):
+              path = f'/certs/headscale-ca-{i:02d}.crt'
+              open(path, 'w').write(cert + '\n')
+              print(f"  Wrote {path}")
+          if len(certs) <= 1:
+              print("Only leaf cert — no intermediate CA to import (production cert or self-signed).")
+          PYEOF
+        volumeMounts:
+        - name: ca-certs
+          mountPath: /certs
+        - name: headscale-tls
+          mountPath: /headscale-tls
+          readOnly: true
+      containers:
+      - name: tailscale
+        # renovate: datasource=docker
+        image: ghcr.io/tailscale/tailscale:v1.96.5
+        # Bypass containerboot — run tailscaled directly and authenticate with
+        # tailscale up, passing --login-server explicitly so headscale is used.
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+
+          # Import headscale CA certs fetched by the init container.
+          # update-ca-certificates updates /etc/ssl/certs/ca-certificates.crt
+          # which Go's x509.SystemCertPool() reads on Linux.
+          if ls /certs/headscale-ca-*.crt >/dev/null 2>&1; then
+            cp /certs/headscale-ca-*.crt /usr/local/share/ca-certificates/
+            update-ca-certificates 2>/dev/null || true
+            echo "Imported headscale CA cert(s) into system trust store."
+          else
+            echo "No extra CA certs to import."
+          fi
+
+          SOCKET=/var/run/tailscale/tailscaled.sock
+          STATE=/var/lib/tailscale/tailscaled.state
+
+          # Remove stale tailscale0 interface if left from a previous pod run.
+          ip link delete tailscale0 2>/dev/null || true
+
+          tailscaled --state="$STATE" --socket="$SOCKET" --no-logs-no-support &
+          DAEMON_PID=$!
+
+          # Wait for daemon socket to be ready (up to 30s)
+          for i in $(seq 1 30); do
+            tailscale --socket="$SOCKET" status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # Authenticate only if not already connected
+          STATUS=$(tailscale --socket="$SOCKET" status --json 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('BackendState',''))" \
+            2>/dev/null || echo "")
+          if [ "$STATUS" != "Running" ]; then
+            echo "Connecting to headscale at $TS_LOGIN_SERVER ..."
+            tailscale --socket="$SOCKET" up \
+              --login-server="$TS_LOGIN_SERVER" \
+              --authkey="$TS_AUTHKEY" \
+              --hostname="$TS_HOSTNAME" \
+              --accept-dns=false \
+              --advertise-routes=10.0.0.0/23
+          else
+            echo "Already connected: $STATUS"
+          fi
+
+          # tailscaled (v1.96.x + headscale) does not install IPv4 peer routes
+          # into the kernel routing table when another route already covers the
+          # VPN prefix — e.g. Hetzner Cloud assigns 10.0.0.0/16 on enp7s0 which
+          # swallows the headscale prefix 10.0.10.0/23.  Policy-routing table 52
+          # (priority 5270) is checked before the main table, but tailscaled never
+          # populates it with peer /32s for custom headscale prefixes.
+          # Adding a /23 host-route to the main table is more specific than the
+          # Hetzner /16 and therefore wins the longest-prefix-match lookup.
+          ip route replace 10.0.10.0/23 dev tailscale0 2>/dev/null || true
+          echo "VPN peer route installed: 10.0.10.0/23 dev tailscale0"
+
+          wait $DAEMON_PID
+        env:
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef:
+              name: headscale-preauthkey
+              key: key
+        - name: TS_LOGIN_SERVER
+          value: "https://vpn.ecc66.cape-project.eu"
+        - name: TS_HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: tun
+          mountPath: /dev/net/tun
+        - name: tailscale-state
+          mountPath: /var/lib/tailscale
+        - name: tailscale-run
+          mountPath: /var/run/tailscale
+        - name: ca-certs
+          mountPath: /certs
+      volumes:
+      - name: tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+      - name: tailscale-state
+        hostPath:
+          path: /var/lib/tailscale
+          type: DirectoryOrCreate
+      - name: tailscale-run
+        hostPath:
+          path: /var/run/tailscale
+          type: DirectoryOrCreate
+      - name: ca-certs
+        emptyDir: {}
+      - name: headscale-tls
+        secret:
+          secretName: headscale-tls
+          items:
+          - key: tls.crt
+            path: tls.crt

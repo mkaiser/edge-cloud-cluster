@@ -7,24 +7,36 @@
 # openDesk related settings.
 openDesk:
   # -- Deployment domain.
-  domain: "test34.your-domain.tld" # MODIFIED
+  domain: "test.your-domain.tld" # MODIFIED
   # -- Deployment password seed.
   masterPassword: "x&9gX#ZgiqRHshvYR9AiSuopK9^aKS#TP4qZ/h3oo2Z9^&Wed" # MODIFIED
   # -- TURN sever credential.
   turnPassword: ""
   # -- Primary mail domain (MAIL_DOMAIN). Defaults to domain if unset.
   # Controls system account addresses (e.g. no-reply@<mailDomain>).
-  mailDomain: "test34.your-domain.tld" # MODIFIED
+  mailDomain: "your-domain.tld" # MODIFIED
   # -- Overwrite openDesk helmfile environment settings.
   overwrites: # MODIFIED
+    functional:
+      internationalization:
+        defaultLanguage: "en_US"
     certificate:
       wildcard: true
     openproject:
-      enabled: false
+      enabled: true
     persistence:
       storageClassNames:
-        RWO: "hcloud-nfs-ssd-volumes"
-        RWX: "hcloud-nfs-ssd-volumes"
+        RWO: "longhorn"
+        RWX: "longhorn"
+      storages:
+        clamav:
+          storageClassName: "longhorn"
+        nubusPortalConsumer:
+          storageClassName: "longhorn"
+        nubusUdmListener:
+          storageClassName: "longhorn"
+        postfix:
+          storageClassName: "longhorn"
     cluster:
       persistence:
         readWriteMany:
@@ -60,7 +72,7 @@ argo:
     - name: "open-xchange"
       syncWave: "2"
       selector: "name=opendesk-open-xchange-bootstrap"
-    - name: "open-xchange" 
+    - name: "open-xchange"
       syncWave: "2"
       selector: "name=postfix-ox"
     - name: "nubus"
@@ -79,8 +91,8 @@ argo:
       syncWave: "4"
     - name: "cryptpad"
       syncWave: "4"
-    - name: "element"
-      syncWave: "4"
+    # - name: "element"
+    #   syncWave: "4"
     - name: "jitsi"
       syncWave: "4"
     - name: "notes"
@@ -88,9 +100,6 @@ argo:
     - name: "nextcloud"
       syncWave: "4"
       selector: "name=opendesk-nextcloud-management"
-    # openproject disabled — Ruby 3.4 world-writable /tmp regression in openProject 17.2.1
-    # (wait-for-db init container crashes with "could not find a temporary directory")
-    # Re-enable once upstream fixes the image. Also re-enable openproject.enabled: true in overwrites.
     # - name: "openproject"
     #   syncWave: "4"
     - name: "xwiki"
@@ -98,7 +107,6 @@ argo:
     - name: "nextcloud"
       syncWave: "5"
       selector: "name=opendesk-nextcloud"
-    # disabled together with openproject above
     # - name: "opendesk-openproject-bootstrap"
     #   syncWave: "6"
     - name: "opendesk-migrations-post"
@@ -106,7 +114,7 @@ argo:
   # Destination settings.
   destination:
     # -- Deployment Namespace.
-    namespace: "argocd"
+    namespace: "opendesk"
     # -- Deployment Server.
     server: "https://kubernetes.default.svc"
   # -- Argo CD project.
@@ -116,7 +124,10 @@ argo:
     # -- Git repository used for Argo to fetch openDesk.
     repoURL: "https://gitlab.opencode.de/bmi/opendesk/deployment/opendesk.git" # MODIFIED
     # -- Git revision.
-    targetRevision: "v1.13.2" # MODIFIED
+    targetRevision: "v1.14.2" # renovate: datasource=gitlab-tags depName=bmi/opendesk/deployment/opendesk registryUrl=https://gitlab.opencode.de
+  # Enable opendesk-migrations-pre job (sets stage: PRE in migrations-status
+  # ConfigMap before migrations-post runs). Required for fresh installs.
+  enableMigrationsPre: true
   # -- SyncPolicy settings.
   syncPolicy: {}
 ...

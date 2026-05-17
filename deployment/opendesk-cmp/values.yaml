@@ -36,6 +36,8 @@ repoServer:
       image: travisghansen/argo-cd-helmfile:v0.3.13@sha256:1251e329f72cadaf55860b9029d13c887559b5f20287915f21d32d722aaeef2e
       command: [/var/run/argocd/argocd-cmp-server]
       env:
+        - name: TZ
+          value: Europe/Berlin
         - name: ARGOCD_EXEC_TIMEOUT
           # Default is 90s — far too short for helmfile init on a cold helm cache
           # (needs to add all helm repos from scratch on first deploy).
@@ -58,33 +60,28 @@ repoServer:
             secretKeyRef:
               name: hetzner-s3
               key: secretKey
-        # SMTP config for openDesk outbound mail (Keycloak onboarding, notifications).
-        # All four values come from the shared smtp-credentials SealedSecret
-        # (deployment/secrets/). Run deployment/secrets/sealSecrets.sh to create/update.
-        - name: SMTP_HOST
+        # openDesk postfix relay credentials (opendesk-system@cape-project.eu).
+        # Sealed in deployment/secrets/opendesk-smtp-credentials-sealed.yaml.
+        - name: OPENDESK_SMTP_HOST
           valueFrom:
             secretKeyRef:
-              name: smtp-credentials
+              name: opendesk-smtp-credentials
               key: host
-              optional: true
-        - name: SMTP_PORT
+        - name: OPENDESK_SMTP_PORT
           valueFrom:
             secretKeyRef:
-              name: smtp-credentials
+              name: opendesk-smtp-credentials
               key: port
-              optional: true
-        - name: SMTP_USERNAME
+        - name: OPENDESK_SMTP_USER
           valueFrom:
             secretKeyRef:
-              name: smtp-credentials
+              name: opendesk-smtp-credentials
               key: username
-              optional: true
-        - name: SMTP_PASSWORD
+        - name: OPENDESK_SMTP_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: smtp-credentials
+              name: opendesk-smtp-credentials
               key: password
-              optional: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 999

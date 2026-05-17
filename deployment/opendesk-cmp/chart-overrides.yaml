@@ -8,24 +8,101 @@ metadata:
   name: opendesk-chart-overrides
   namespace: argocd
 data:
-  # # Disable postfix spool PVC — the spool is transient (relay only, no mail store)
-  # # and a persistent PVC causes crash loops from stale PID files after pod restarts.
-  # # With persistence disabled, the chart uses the container's ephemeral filesystem
-  # # for /var/spool/postfix, which resets cleanly on every restart.
-  # postfix-no-persistence.yaml: |
-  #   persistence:
-  #     enabled: false
-
   # Global helmfile state overrides applied to every openDesk app via
   # --state-values-file /overrides/global-overwrites.yaml.
-  # additionalMailDomains: creates mail/domain LDAP objects on first deploy,
-  #   allowing users to have email addresses in these domains.
-  # smtp.host/port/username/password are injected via env vars from the
-  #   opendesk-smtp-credentials SealedSecret (see sealSecrets.sh).
+  # Keep array-based overrides here. Lists are not safe via --state-values-set.
   global-overwrites.yaml: |
     global:
       additionalMailDomains:
-        - "your-domain.tld"
-    functional:
-      internationalization:
-        defaultLanguage: "en_US"
+        - "domainA.tld"
+        - "domainB.tld"
+    # Inject extra Helm values for the ums (nubus) release after
+    # values-nubus.yaml.gotmpl — later files win on merge.
+    # helmfile-child.yaml.gotmpl ranges this as a list of file paths.
+    customization:
+      release:
+        ums:
+          - "/overrides/values-nubus-custom.yaml.gotmpl"
+
+  # Additional Helm chart values for the nubus ums release.
+  # Loaded AFTER values-nubus.yaml.gotmpl — later files win on merge.
+  # Named .yaml.gotmpl so helmfile processes it as a Go template, allowing
+  # {{ env "DOMAIN" }} to inject the cluster domain without hardcoding.
+  values-nubus-custom.yaml.gotmpl: |
+    # # Override the default tcpSocket liveness probe for udm-rest-api.
+    # # The tcpSocket probe only checks the port is open — the broken shared-memory
+    # # auth cache keeps the port open while returning HTTP 500 on every request.
+    # # This exec probe treats HTTP 401 (unauthenticated but working) as healthy
+    # # and any other response (including 500) as a failure, triggering a restart.
+    # #
+    # # livenessProbe is set as a YAML STRING (not a map) to bypass Helm's
+    # # coalesceTables sub-chart coalescing. When the parent value is a non-nil
+    # # non-map, coalesceTables leaves it untouched — the sub-chart default
+    # # tcpSocket:{port:9979} is never merged in. Setting tcpSocket: null (map)
+    # # does NOT work: coalesceTables treats nil-dst + non-nil-src as "src wins".
+    # # common.tplvalues.render detects typeIs "string" and renders via tpl,
+    # # producing clean YAML with only the exec handler.
+    # nubusUdmRestApi:
+    #   livenessProbe: |
+    #     exec:
+    #       command:
+    #         - /bin/sh
+    #         - -c
+    #         - 'wget -qS -O/dev/null http://localhost:9979/univention/udm/ 2>&1 | grep -qE "HTTP/[0-9.]+ 401"'
+    #     initialDelaySeconds: 30
+    #     periodSeconds: 30
+    #     timeoutSeconds: 10
+    #     failureThreshold: 3
+    #     successThreshold: 1
+    # # Remove ArgoCD hook annotations from stack-data-ums resources.
+    # # values-nubus.yaml.gotmpl sets additionalAnnotations with argocd hook
+    # # annotations that propagate to ALL sub-chart resources (ConfigMaps + Job).
+    # # ArgoCD then treats ConfigMaps as transient hooks (BeforeHookCreation
+    # # deletes them before each sync) — ums-ldap-server-primary-0 can't mount
+    # # ums-stack-data-ums-ucr. Null removes these keys via mergeMaps (parent
+    # # values files use mergeMaps, not coalesceTables, so null works here).
+    # nubusStackDataUms:
+    #   additionalAnnotations:
+    #     "argocd.argoproj.io/hook": null
+    #     "argocd.argoproj.io/hook-delete-policy": null
+    # global:
+    #   configUcr:
+    #     umc:
+    #       saml:
+    #         # LDAP entrypoint (ucr-light-filter) requires these keys to start.
+    #         # The chart does not set them — they must come from here.
+    #         idp-server: "https://id.{{ env "DOMAIN" }}/realms/opendesk/protocol/saml/descriptor"
+    #         idp-server-internal: "http://ums-keycloak:8080/realms/opendesk/protocol/saml/descriptor"
+    #       self-service:
+    #         passwordreset:
+    #           whitelist:
+    #             groups: "Domain Users, Domain Admins"
+    #           email:
+    #             sender_address: "no-reply@cape-project.eu"
+    #             subject: "Welcome to openDesk — set your password"
+    nubusUmcServer:
+      selfService:
+        passwordresetEmailBody: |
+          Dear user,
+
+          Your username for {domainname} is: {username}
+
+          You are receiving this message because your account has been created
+          or because you requested a password reset.
+
+          Please click the following link to set your password:
+          {tokenlink}
+
+          This link is valid for 48 hours. After that, request a new one at:
+          https://{fqdn}/univention/portal/#/selfservice/passwordforgotten
+
+          Best regards,
+          Your {domainname} team
+    # Ensure IAM (ums/keycloak) components run on control-plane nodes for stability
+    ums:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"

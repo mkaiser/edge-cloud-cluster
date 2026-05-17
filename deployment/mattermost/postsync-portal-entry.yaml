@@ -1,0 +1,134 @@
+# Portal tile for Mattermost (visible to all logged-in users).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mattermost-portal-entry
+  namespace: mattermost
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mattermost-portal-entry
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["ums-nubus-credentials"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mattermost-portal-entry
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mattermost-portal-entry
+subjects:
+- kind: ServiceAccount
+  name: mattermost-portal-entry
+  namespace: mattermost
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mattermost-portal-entry
+  namespace: mattermost
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: mattermost-portal-entry
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: portal-entry
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          UDM_URL="http://ums-udm-rest-api.opendesk.svc.cluster.local:9979/univention/udm"
+          LDAP_BASE="dc=swp-ldap,dc=internal"
+          ENTRY_CN="od.mattermost"
+          ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
+          CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
+          APP_URL="https://chat.ecc66.cape-project.eu"
+
+          ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
+            -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+          udm() {
+            curl -sf -H "Accept: application/json" -H "Content-Type: application/json" \
+              -u "Administrator:${ADMIN_PASS}" "$@"
+          }
+
+          ICON=$(printf '%s' \
+            '<svg width="111" height="111" viewBox="0 0 111 111" fill="none" xmlns="http://www.w3.org/2000/svg">' \
+            '<rect width="111" height="111" rx="20" fill="#0058CC"/>' \
+            '<path d="M55.5 28 C38 28 24 40 24 55 C24 62 27 68.5 32 73 L28 83 L42 78 C46 80 50.5 81 55.5 81 C73 81 87 69 87 55 C87 40 73 28 55.5 28Z" fill="white"/>' \
+            '<circle cx="43" cy="55" r="5" fill="#0058CC"/>' \
+            '<circle cx="55.5" cy="55" r="5" fill="#0058CC"/>' \
+            '<circle cx="68" cy="55" r="5" fill="#0058CC"/>' \
+            '</svg>' | base64 -w0)
+
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/json" -u "Administrator:${ADMIN_PASS}" \
+            "${UDM_URL}/portals/entry/${ENTRY_DN}")
+          if [ "$HTTP" = "200" ]; then
+            echo "Portal entry ${ENTRY_CN} already exists — skipping creation."
+          else
+            echo "Creating Mattermost portal entry..."
+            udm -X POST "${UDM_URL}/portals/entry/" \
+              -d "{
+                \"position\": \"cn=entry,cn=portals,cn=univention,${LDAP_BASE}\",
+                \"properties\": {
+                  \"name\": \"${ENTRY_CN}\",
+                  \"displayName\": {\"en_US\": \"Mattermost\", \"de_DE\": \"Mattermost\"},
+                  \"description\": {
+                    \"en_US\": \"Team messaging and collaboration\",
+                    \"de_DE\": \"Team-Messaging und Zusammenarbeit\"
+                  },
+                  \"link\": [[\"en_US\", \"${APP_URL}\"]],
+                  \"linkTarget\": \"newwindow\",
+                  \"activated\": true,
+                  \"anonymous\": false,
+                  \"icon\": \"${ICON}\"
+                }
+              }" | python3 -c "import json,sys; d=json.load(sys.stdin); print('Created:', d.get('dn','?(check UDM output)'))"
+          fi
+
+          CURRENT=$(udm "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(d.get('properties',{}).get('entries',[])))")
+          if echo "${CURRENT}" | grep -qF "${ENTRY_DN}"; then
+            echo "Mattermost already in od.applications category."
+          else
+            echo "Adding Mattermost to od.applications category..."
+            NEW_JSON=$(printf '%s\n%s' "${CURRENT}" "${ENTRY_DN}" \
+              | grep -v '^$' \
+              | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip().split('\n')))")
+            udm -X PATCH "${UDM_URL}/portals/category/${CATEGORY_DN}" \
+              -d "{\"properties\": {\"entries\": ${NEW_JSON}}}" \
+              -o /dev/null -w "%{http_code}\n" | grep -q "^2" && echo "Category updated." || echo "Category update failed."
+          fi
+
+          echo "Done."

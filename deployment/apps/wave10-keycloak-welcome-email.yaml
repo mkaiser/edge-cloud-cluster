@@ -1,0 +1,254 @@
+# CronJob: sends welcome / initial-password-setup emails to newly created users.
+# Runs every 5 minutes — picks up new users shortly after UMC creates them.
+#
+# Password setup uses UCS self-service (POST /univention/command/passwordreset/send_token)
+# rather than Keycloak's execute-actions-email, because the Keycloak LDAP federation
+# is READ_ONLY — Keycloak cannot write passwords back to the UCS LDAP directory.
+# The UCS self-service link lets the user set their password directly in UCS.
+#
+# UCS self-service requires the user attribute PasswordRecoveryEmail to be set in
+# UDM/LDAP. Admin-created users don't have this set automatically, so we patch it
+# via the UDM REST API before calling send_token.
+#
+# Idempotent: tracks sent state in ConfigMap keycloak-welcome-email-sent
+# (Keycloak user attributes are overwritten by LDAP sync on every sync).
+#
+# Users skipped:
+#   - service accounts (username starts with "service-account-")
+#   - users whose email domain matches the cluster domain (internal/admin accounts)
+#   - users that already have emailVerified=true
+#   - users whose email is empty
+#   - users already in the sent ConfigMap
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-welcome-email
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keycloak-welcome-email
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["opendesk-keycloak-bootstrap-admin-creds", "ums-nubus-credentials"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["keycloak-welcome-email-sent"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keycloak-welcome-email
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keycloak-welcome-email
+subjects:
+- kind: ServiceAccount
+  name: keycloak-welcome-email
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-welcome-email
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  schedule: "0 8 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 100
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: keycloak-welcome-email
+          restartPolicy: Never
+          containers:
+          - name: send-welcome-email
+            image: docker.io/alpine/k8s:1.36.0
+            env:
+            - name: KC_URL
+              value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
+            - name: UMC_URL
+              value: "http://ums-umc-server.argocd.svc.cluster.local"
+            - name: REALM
+              value: "opendesk"
+            - name: CLUSTER_DOMAIN
+              value: "ecc66.cape-project.eu"
+            - name: UDM_URL
+              value: "http://ums-udm-rest-api.argocd.svc.cluster.local:9979/univention/udm"
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              set -eu
+
+              ADMIN_YAML=$(kubectl get secret opendesk-keycloak-bootstrap-admin-creds \
+                -n argocd -o jsonpath='{.data.admin\.yaml}' | base64 -d)
+              KC_ADMIN_USER=$(echo "$ADMIN_YAML" | grep 'username:' | awk '{print $2}')
+              KC_ADMIN_PASS=$(echo "$ADMIN_YAML" | grep 'password:' | awk '{print $2}')
+
+              TOKEN=$(curl -sf -X POST \
+                "${KC_URL}/realms/master/protocol/openid-connect/token" \
+                -d "client_id=admin-cli" \
+                -d "username=${KC_ADMIN_USER}" \
+                -d "password=${KC_ADMIN_PASS}" \
+                -d "grant_type=password" | \
+                sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+              if [ -z "$TOKEN" ]; then
+                echo "ERROR: Failed to obtain Keycloak admin token"
+                exit 1
+              fi
+
+              UDM_ADMIN_PASS=$(kubectl get secret ums-nubus-credentials \
+                -n argocd -o jsonpath='{.data.administrator_password}' | base64 -d)
+
+              NS="argocd"
+              CM="keycloak-welcome-email-sent"
+
+              # Load or create the ConfigMap that tracks which user IDs have been emailed.
+              # Keycloak LDAP federation (READ_ONLY) overwrites all user attributes on every
+              # sync, so we cannot use Keycloak attributes as persistent state.
+              if ! kubectl get configmap "$CM" -n "$NS" &>/dev/null; then
+                kubectl create configmap "$CM" -n "$NS"
+              fi
+
+              USERS=$(curl -sf \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "${KC_URL}/admin/realms/${REALM}/users?max=500")
+
+              echo "$USERS" | grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"//' | \
+              while read -r USER_ID; do
+                USER=$(curl -sf \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  "${KC_URL}/admin/realms/${REALM}/users/${USER_ID}")
+
+                USERNAME=$(echo "$USER" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p' | head -1)
+                EMAIL=$(echo "$USER" | sed -n 's/.*"email":"\([^"]*\)".*/\1/p' | head -1)
+                EMAIL_VERIFIED=$(echo "$USER" | grep -o '"emailVerified":[^,}]*' | sed 's/"emailVerified"://')
+
+                # Skip system/service accounts by username
+                case "$USERNAME" in
+                  service-account-*|ldapsearch_*|Administrator|readonly|oxSystemUser|svc-portal-server)
+                    continue;;
+                esac
+                [ "$EMAIL_VERIFIED" = "true" ] && continue
+
+                # Check ConfigMap for sent marker (key = user ID, sanitised for k8s key rules)
+                CM_KEY=$(echo "$USER_ID" | tr -cd 'a-z0-9-')
+                SENT=$(kubectl get configmap "$CM" -n "$NS" \
+                  -o jsonpath="{.data.${CM_KEY}}" 2>/dev/null || true)
+                [ "$SENT" = "sent" ] && continue
+
+                echo "Processing ${USERNAME}..."
+
+                # Determine where to send: PasswordRecoveryEmail in UDM is authoritative.
+                # Keycloak email (mailPrimaryAddress) may be internal (@cluster-domain) so
+                # we only use it as fallback when it is an external address.
+                USER_DN=$(echo "$USER" | grep -o '"LDAP_ENTRY_DN":\["[^"]*"\]' | \
+                  sed 's/"LDAP_ENTRY_DN":\["//;s/"\]//')
+
+                SEND_TO=""
+                if [ -n "$USER_DN" ]; then
+                  DN_ENC=$(printf '%s' "$USER_DN" | \
+                    python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))")
+
+                  UDM_USER=$(curl -sf \
+                    -u "Administrator:${UDM_ADMIN_PASS}" \
+                    -H "Accept: application/json" \
+                    "${UDM_URL}/users/user/${DN_ENC}" 2>/dev/null || true)
+
+                  SEND_TO=$(echo "$UDM_USER" | \
+                    python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('properties',{}).get('PasswordRecoveryEmail','') or '')" 2>/dev/null || true)
+                  ETAG=$(echo "$UDM_USER" | \
+                    python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('_links',{}).get('self',[{}])[0].get('etag','*'))" 2>/dev/null || echo "*")
+                fi
+
+                # Fallback: use Keycloak email only if it's an external address
+                if [ -z "$SEND_TO" ]; then
+                  case "$EMAIL" in
+                    *"${CLUSTER_DOMAIN}"*|"") ;;   # internal or empty — skip
+                    *) SEND_TO="$EMAIL" ;;
+                  esac
+                fi
+
+                if [ -z "$SEND_TO" ]; then
+                  echo "  No external email or PasswordRecoveryEmail for ${USERNAME} — skipping."
+                  continue
+                fi
+
+                # Ensure PasswordRecoveryEmail is set in UDM (send_token reads it from LDAP).
+                # Wait for UDM→LDAP propagation before calling send_token.
+                LDAP_READY=false
+                if [ -n "$USER_DN" ] && [ -n "$DN_ENC" ]; then
+                  PATCH_CODE=$(curl -s -o /tmp/udm_resp.txt -w "%{http_code}" \
+                    -X PATCH \
+                    -u "Administrator:${UDM_ADMIN_PASS}" \
+                    -H "Content-Type: application/json" \
+                    -H "Accept: application/json" \
+                    -H "If-Match: ${ETAG}" \
+                    -d "{\"properties\":{\"PasswordRecoveryEmail\":\"${SEND_TO}\"}}" \
+                    "${UDM_URL}/users/user/${DN_ENC}")
+                  if [ "$PATCH_CODE" = "200" ] || [ "$PATCH_CODE" = "204" ]; then
+                    echo "  PasswordRecoveryEmail set to ${SEND_TO}."
+                    # Poll UDM until the value is readable back (confirms LDAP sync).
+                    for i in 1 2 3 4 5 6; do
+                      sleep 5
+                      VERIFY=$(curl -sf \
+                        -u "Administrator:${UDM_ADMIN_PASS}" \
+                        -H "Accept: application/json" \
+                        "${UDM_URL}/users/user/${DN_ENC}" 2>/dev/null | \
+                        python3 -c "import json,sys; print(json.load(sys.stdin).get('properties',{}).get('PasswordRecoveryEmail',''))" 2>/dev/null || true)
+                      if [ "$VERIFY" = "$SEND_TO" ]; then
+                        echo "  LDAP sync confirmed (attempt $i)."
+                        LDAP_READY=true
+                        break
+                      fi
+                      echo "  Waiting for LDAP sync ($i/6)..."
+                    done
+                  else
+                    echo "  WARNING: UDM PATCH HTTP ${PATCH_CODE}: $(head -c 200 /tmp/udm_resp.txt)"
+                  fi
+                fi
+
+                if [ "$LDAP_READY" = "false" ]; then
+                  echo "  Skipping send_token — PasswordRecoveryEmail not confirmed in LDAP."
+                  continue
+                fi
+
+                CODE=$(curl -s -o /tmp/umc_resp.txt -w "%{http_code}" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"options\":{\"username\":\"${USERNAME}\",\"method\":\"email\"}}" \
+                  "${UMC_URL}/univention/command/passwordreset/send_token")
+
+                if [ "$CODE" = "200" ]; then
+                  echo "  Welcome email sent to ${SEND_TO}."
+                  kubectl patch configmap "$CM" -n "$NS" \
+                    --type=merge -p "{\"data\":{\"${CM_KEY}\":\"sent\"}}"
+                else
+                  echo "  ERROR: UMC send_token HTTP ${CODE}: $(cat /tmp/umc_resp.txt)"
+                fi
+              done
+
+              echo "Done."

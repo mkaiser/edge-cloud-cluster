@@ -1,0 +1,98 @@
+# PostSync: write complete GitLab SSO config into Mattermost's database config.
+#
+# Problem: Mattermost uses PostgreSQL as its config store (MM_CONFIG=postgres://).
+# Environment variable overrides (MM_GITLABSETTINGS_*) are not reliably applied
+# to the runtime config in all v9.x versions when using database config store.
+#
+# Fix: write all GitLab settings (Enable, Id, Secret, endpoints) directly to the
+# active configurations row. Idempotent — safe to re-run every sync.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mattermost-gitlab-sso-fix
+  namespace: mattermost
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: fix
+        image: docker.io/postgres:16-alpine
+        command: ["/bin/sh", "-ec"]
+        env:
+        - name: DSN
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-db
+              key: datasource
+        - name: GITLAB_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-oidc
+              key: client-id
+        - name: GITLAB_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-oidc
+              key: client-secret
+        - name: KEYCLOAK_BASE
+          value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect"
+        args:
+        - |
+          PG_HOST=$(echo "$DSN" | sed 's|postgres://[^@]*@\([^:/]*\).*|\1|')
+          PG_PORT=$(echo "$DSN" | sed 's|.*:\([0-9]*\)/.*|\1|')
+          PG_USER=$(echo "$DSN" | sed 's|postgres://\([^:]*\):.*|\1|')
+          PG_PASS=$(echo "$DSN" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+          PG_DB=$(echo "$DSN" | sed 's|.*/\([^?]*\).*|\1|')
+          export PGPASSWORD="$PG_PASS"
+
+          echo "Waiting for Mattermost DB (configurations table)..."
+          for i in $(seq 1 60); do
+            TABLE_EXISTS=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+              -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='configurations'" 2>/dev/null || echo 0)
+            [ "$TABLE_EXISTS" = "1" ] && break
+            echo "  Attempt $i/60 — waiting 10s..."
+            sleep 10
+          done
+          if [ "$TABLE_EXISTS" != "1" ]; then
+            echo "configurations table not found after timeout — Mattermost not yet initialized."
+            exit 0
+          fi
+
+          echo "Writing complete GitLabSettings to DB..."
+          psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -c "
+            UPDATE configurations
+            SET value = jsonb_set(
+              jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(
+                      jsonb_set(
+                        jsonb_set(
+                          value::jsonb,
+                          '{GitLabSettings,Enable}', 'true'::jsonb
+                        ),
+                        '{GitLabSettings,Id}', to_jsonb('${GITLAB_CLIENT_ID}'::text)
+                      ),
+                      '{GitLabSettings,Secret}', to_jsonb('${GITLAB_CLIENT_SECRET}'::text)
+                    ),
+                    '{GitLabSettings,AuthEndpoint}', to_jsonb('${KEYCLOAK_BASE}/auth'::text)
+                  ),
+                  '{GitLabSettings,TokenEndpoint}', to_jsonb('${KEYCLOAK_BASE}/token'::text)
+                ),
+                '{GitLabSettings,UserAPIEndpoint}', to_jsonb('${KEYCLOAK_BASE}/userinfo'::text)
+              ),
+              '{GitLabSettings,Scope}', to_jsonb('openid profile email'::text)
+            )
+            WHERE active = true"
+          echo "GitLabSettings written to DB."
+          echo "Done."

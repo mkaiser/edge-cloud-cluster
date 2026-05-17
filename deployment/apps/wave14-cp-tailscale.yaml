@@ -1,0 +1,29 @@
+# ArgoCD Application: cp-tailscale
+# Installs the Tailscale daemon on every control-plane host so CP nodes join the
+# headscale VPN.  Required for edge workers to join k3s: flannel overlay traffic
+# is routed via tailscale0 between CP nodes and edge workers behind NAT.
+# Depends on headscale-preauthkey secret created by wave-12 headscale PostSync job.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cp-tailscale
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "14"
+spec:
+  project: default
+  sources:
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/cp-tailscale
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

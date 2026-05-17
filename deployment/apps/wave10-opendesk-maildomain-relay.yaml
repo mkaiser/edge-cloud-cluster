@@ -1,0 +1,177 @@
+# Ensures external mail domains exist in UDM and are marked for external relay.
+# Runs as ArgoCD Sync hook after openDesk services are up.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opendesk-maildomain-relay-config
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+data:
+  domains: |
+    paraxent.de
+    paraxent.com
+    techfak.uni-bielefeld.de
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opendesk-maildomain-relay-sync
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: relay-sync
+          image: python:3.14-alpine
+          env:
+            - name: UDM_API_URL
+              value: "http://ums-udm-rest-api:9979/univention/udm"
+            - name: UDM_API_USER
+              value: "cn=admin"
+            - name: UDM_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ums-ldap-server-admin
+                  key: password
+                  optional: true
+            - name: DOMAINS
+              valueFrom:
+                configMapKeyRef:
+                  name: opendesk-maildomain-relay-config
+                  key: domains
+          command: ["python", "-c"]
+          args:
+            - |
+              import base64
+              import json
+              import os
+              import sys
+              import urllib.error
+              import urllib.parse
+              import urllib.request
+
+              base = os.getenv("UDM_API_URL", "").rstrip("/")
+              user = os.getenv("UDM_API_USER", "")
+              password = os.getenv("UDM_API_PASSWORD", "")
+              raw_domains = os.getenv("DOMAINS", "")
+
+              domains = []
+              for line in raw_domains.splitlines():
+                  candidate = line.strip()
+                  if candidate and not candidate.startswith("#"):
+                      domains.append(candidate)
+
+              if not base or not user or not password:
+                  print("SKIP: Missing UDM API configuration or password secret.")
+                  sys.exit(0)
+              if not domains:
+                  print("SKIP: No domains configured.")
+                  sys.exit(0)
+
+              auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+              def request(method, url, payload=None):
+                  headers = {
+                      "Authorization": auth,
+                      "Accept": "application/json",
+                  }
+                  data = None
+                  if payload is not None:
+                      headers["Content-Type"] = "application/json"
+                      data = json.dumps(payload).encode()
+                  req = urllib.request.Request(url, method=method, headers=headers, data=data)
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      body = resp.read().decode("utf-8")
+                      return resp.status, body
+
+              def get_mail_domains():
+                  url = f"{base}/mail/domain/?limit=500"
+                  status, body = request("GET", url)
+                  if status < 200 or status >= 300:
+                      raise RuntimeError(f"Failed to query mail/domain list: HTTP {status}")
+                  data = json.loads(body)
+                  return data.get("_embedded", {}).get("udm:object", [])
+
+              existing_objects = get_mail_domains()
+              existing_by_name = {
+                  obj.get("properties", {}).get("name"): obj
+                  for obj in existing_objects
+                  if obj.get("properties", {}).get("name")
+              }
+
+              errors = []
+              for domain in domains:
+                  try:
+                      obj = existing_by_name.get(domain)
+                      if obj is None:
+                          create_payload = {
+                              "position": "cn=domain,cn=mail,dc=swp-ldap,dc=internal",
+                              "properties": {
+                                  "name": domain,
+                                  "opendeskMailDomainRelayExternal": True,
+                              },
+                          }
+                          status, body = request("POST", f"{base}/mail/domain/", create_payload)
+                          if status < 200 or status >= 300:
+                              raise RuntimeError(f"create failed with HTTP {status}")
+                          created = json.loads(body)
+                          existing_by_name[domain] = created
+                          print(f"CREATED: {domain} (relayExternal=true)")
+                          continue
+
+                      relay_enabled = bool(obj.get("properties", {}).get("opendeskMailDomainRelayExternal", False))
+                      if relay_enabled:
+                          print(f"OK: {domain} already relayExternal=true")
+                          continue
+
+                      edit_links = obj.get("_links", {}).get("udm:object/edit", [])
+                      if not edit_links:
+                          # List endpoint omits edit links; fetch the individual object.
+                          self_links = obj.get("_links", {}).get("self", [])
+                          if not self_links:
+                              raise RuntimeError("missing udm:object/edit and self link")
+                          self_url = self_links[0].get("href") if isinstance(self_links, list) else self_links.get("href")
+                          if not self_url:
+                              raise RuntimeError("empty self URL")
+                          _, full_body = request("GET", self_url)
+                          full_obj = json.loads(full_body)
+                          edit_links = full_obj.get("_links", {}).get("udm:object/edit", [])
+                          if not edit_links:
+                              raise RuntimeError("missing udm:object/edit link even on individual fetch")
+                          obj = full_obj
+                      edit_url = edit_links[0].get("href")
+                      if not edit_url:
+                          raise RuntimeError("empty edit URL")
+
+                      properties = dict(obj.get("properties", {}))
+                      properties["opendeskMailDomainRelayExternal"] = True
+                      update_payload = {
+                          "position": obj.get("position", "cn=domain,cn=mail,dc=swp-ldap,dc=internal"),
+                          "properties": properties,
+                      }
+                      status, _ = request("PUT", edit_url, update_payload)
+                      if status < 200 or status >= 300:
+                          raise RuntimeError(f"update failed with HTTP {status}")
+                      print(f"UPDATED: {domain} relayExternal=true")
+                  except urllib.error.HTTPError as e:
+                      detail = e.read().decode("utf-8", errors="ignore")
+                      errors.append(f"{domain}: HTTP {e.code} {detail[:300]}")
+                  except Exception as e:
+                      errors.append(f"{domain}: {e}")
+
+              if errors:
+                  print("ERROR: mail domain relay sync failed for one or more domains:")
+                  for err in errors:
+                      print(f" - {err}")
+                  sys.exit(1)
+
+              print("Done: external mail domains ensured.")

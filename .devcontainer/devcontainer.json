@@ -24,10 +24,9 @@
     "customizations": {
         "vscode": {
             "extensions": [
-                "golang.go",
-                "ms-dotnettools.csharp",
-                "ms-python.python",
-                "formulahendry.dotnet-test-explorer",
+                // "golang.go",
+                // "ms-dotnettools.csharp",
+                // "ms-python.python",
                 "pflannery.vscode-versionlens",
                 "pulumi.pulumi",
                 "redhat.vscode-yaml",
@@ -41,6 +40,7 @@
                 "tim-koehler.helm-intellisense",
                 "ms-vsliveshare.vsliveshare",
                 "bierner.markdown-preview-github-styles",
+                "bierner.markdown-mermaid",
                 "esbenp.prettier-vscode"
             ]
         }

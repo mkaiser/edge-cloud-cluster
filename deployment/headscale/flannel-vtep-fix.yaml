@@ -1,0 +1,156 @@
+# Fixes CP0's flannel.1 VTEP when k3s recreates it with the wrong config.
+#
+# Problem: k3s embeds Flannel and creates flannel.1 at startup bound to
+# the Hetzner public IP (eth0). Edge nodes connect via the headscale VPN
+# (tailscale0, 10.0.10.x), so VXLAN from edge arrives on tailscale0,
+# but the VTEP ignores it. k3s also creates flannel.1 with VNI=0 on CP0
+# (bug/mismatch) while workers use VNI=1, breaking all cross-node traffic.
+#
+# Fix: the main container runs a 30-second polling loop that checks
+# flannel.1 (local IP and VNI) and rebuilds it to VNI=1 on tailscale0
+# whenever it drifts. Re-applies automatically after every k3s restart.
+#
+# This DaemonSet runs only on CP nodes (nodeSelector control-plane=true).
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flannel-vtep-fix
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  selector:
+    matchLabels:
+      app: flannel-vtep-fix
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: flannel-vtep-fix
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      hostNetwork: true
+      hostPID: true
+      serviceAccountName: flannel-vtep-fix
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: fix-vtep
+        image: docker.io/alpine/k8s:1.36.0
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+
+          ensure_edge_routes() {
+            kubectl get nodes \
+              -l '!node-role.kubernetes.io/control-plane' \
+              -o jsonpath='{range .items[*]}{.metadata.annotations.flannel\.alpha\.coreos\.com/backend-data} {.spec.podCIDR}{"\n"}{end}' \
+              2>/dev/null | while read -r backend cidr; do
+                vtep_mac=$(echo "$backend" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['VtepMAC'])" 2>/dev/null || true)
+                gw=$(echo "$cidr" | sed 's|\(.*\)\.[0-9]*/.*|\1.0|')
+                [ -n "$vtep_mac" ] && [ -n "$gw" ] || continue
+                ip neigh add "$gw" lladdr "$vtep_mac" dev flannel.1 nud permanent 2>/dev/null || \
+                  ip neigh change "$gw" lladdr "$vtep_mac" dev flannel.1 nud permanent 2>/dev/null || true
+                bridge fdb append "$vtep_mac" dev flannel.1 dst "$(kubectl get nodes \
+                  -l '!node-role.kubernetes.io/control-plane' \
+                  -o jsonpath='{.items[0].metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}' 2>/dev/null)" 2>/dev/null || true
+                ip route add "$cidr" via "$gw" dev flannel.1 onlink 2>/dev/null || true
+              done
+          }
+
+          fix_flannel() {
+            # Wait for tailscale0
+            for i in $(seq 1 60); do
+              ip link show tailscale0 >/dev/null 2>&1 && break
+              echo "Waiting for tailscale0... ($i/60)"
+              sleep 3
+            done
+            ip link show tailscale0 >/dev/null 2>&1 || { echo "ERROR: tailscale0 not found"; return 1; }
+
+            VPN_IP=$(ip addr show tailscale0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+            [ -n "$VPN_IP" ] || { echo "ERROR: no IP on tailscale0"; return 1; }
+
+            CURRENT_LOCAL=$(ip -d link show flannel.1 2>/dev/null | grep -o 'local [0-9.]*' | awk '{print $2}' || true)
+            CURRENT_VNI=$(ip -d link show flannel.1 2>/dev/null | grep -oE 'id [0-9]+' | awk '{print $2}' || echo "0")
+
+            if [ "$CURRENT_LOCAL" = "$VPN_IP" ] && [ "$CURRENT_VNI" = "1" ]; then
+              ensure_edge_routes
+              return 0
+            fi
+
+            echo "$(date -u): Rebuilding flannel.1 (local=$CURRENT_LOCAL vni=$CURRENT_VNI) -> (local=$VPN_IP vni=1)"
+
+            FDB_ENTRIES=$(bridge fdb show dev flannel.1 2>/dev/null | grep -v '^$' || true)
+
+            ip link set flannel.1 down 2>/dev/null || true
+            ip link del flannel.1 2>/dev/null || true
+
+            ip link add flannel.1 type vxlan id 1 local "$VPN_IP" dev tailscale0 dstport 8472 nolearning
+            ip addr add 10.42.0.0/32 dev flannel.1
+            ip link set flannel.1 up
+
+            echo "$FDB_ENTRIES" | while read -r mac dst ip _rest; do
+              [ "$mac" = "" ] && continue
+              [ "$dst" = "dst" ] && bridge fdb append "$mac" dev flannel.1 dst "$ip" 2>/dev/null || true
+            done
+
+            ensure_edge_routes
+
+            NEW_MAC=$(ip link show flannel.1 | grep ether | awk '{print $2}')
+            kubectl annotate node "$NODE_NAME" \
+              "flannel.alpha.coreos.com/public-ip=$VPN_IP" \
+              "flannel.alpha.coreos.com/backend-data={\"VNI\":1,\"VtepMAC\":\"$NEW_MAC\"}" \
+              --overwrite
+            echo "$(date -u): Done — flannel.1 rebuilt (public-ip=$VPN_IP, VNI=1, MAC=$NEW_MAC)"
+          }
+
+          echo "flannel-vtep-fix: starting continuous monitor on $NODE_NAME"
+          while true; do
+            fix_flannel || echo "fix_flannel failed, will retry"
+            sleep 30
+          done
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flannel-vtep-fix
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: flannel-vtep-fix
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: flannel-vtep-fix
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flannel-vtep-fix
+subjects:
+- kind: ServiceAccount
+  name: flannel-vtep-fix
+  namespace: headscale

@@ -1,6 +1,1 @@
-[submodule "external/git_opendesk-argocd-deploy"]
-	path = external/git_opendesk-argocd-deploy
-	url = https://gitlab.opencode.de/bmi/opendesk/deployment/options/argocd-deploy.git
-[submodule "external/git_opendesk"]
-	path = external/git_opendesk
-	url = https://gitlab.opencode.de/bmi/opendesk/deployment/opendesk.git
+

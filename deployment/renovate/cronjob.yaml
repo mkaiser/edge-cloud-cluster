@@ -15,7 +15,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: renovate
-              image: ghcr.io/renovatebot/renovate:39  # https://github.com/renovatebot/renovate/releases
+              image: ghcr.io/renovatebot/renovate:43  # https://github.com/renovatebot/renovate/releases
               env:
                 - name: RENOVATE_TOKEN
                   valueFrom:
@@ -23,6 +23,6 @@ spec:
                       name: renovate-token
                       key: token
                 - name: RENOVATE_REPOSITORIES
-                  value: "owner/repo"
+                  value: "paraXent/infra"
                 - name: LOG_LEVEL
                   value: "info"

@@ -34,11 +34,11 @@ spec:
           value: {{ $.Values.openDesk.domain | quote }}
         - name: "MAIL_DOMAIN"
           value: {{ $.Values.openDesk.mailDomain | default $.Values.openDesk.domain | quote }}
-        # SMTP_HOST/PORT/USERNAME/PASSWORD are injected by the CMP sidecar (argocd/values.yaml)
+        # OPENDESK_SMTP_HOST/PORT/USER/PASSWORD are injected by the CMP sidecar
         # from the opendesk-smtp-credentials SealedSecret — not passed through here.
       parameters:
         - name: "HELMFILE_GLOBAL_OPTIONS"
-          string: "--file helmfile.yaml.gotmpl --state-values-file /overrides/global-overwrites.yaml{{ if $.Values.openDesk.overwrites }} --state-values-set {{ include "yamlToArgs" (dict "map" $.Values.openDesk.overwrites "path" "") | trimSuffix "," }}{{ end }} --state-values-set objectstores.nextcloud.username=$HETZNER_S3_ACCESS_KEY,objectstores.nextcloud.secretKey=$HETZNER_S3_SECRET_KEY,smtp.host=$SMTP_HOST,smtp.port=$SMTP_PORT,smtp.username=$SMTP_USERNAME{{ if .selector }} --selector {{ .selector }}{{ end }}"
+          string: "--file helmfile.yaml.gotmpl --state-values-file /overrides/global-overwrites.yaml{{ if $.Values.openDesk.overwrites }} --state-values-set {{ include "yamlToArgs" (dict "map" $.Values.openDesk.overwrites "path" "") | trimSuffix "," }}{{ end }} --state-values-set objectstores.nextcloud.username=$HETZNER_S3_ACCESS_KEY,objectstores.nextcloud.secretKey=$HETZNER_S3_SECRET_KEY,smtp.host=$OPENDESK_SMTP_HOST,smtp.port=$OPENDESK_SMTP_PORT,smtp.username=$OPENDESK_SMTP_USER,smtp.password=$OPENDESK_SMTP_PASSWORD,secrets.postfix.opendeskSystemPassword=$OPENDESK_SMTP_PASSWORD{{ if .selector }} --selector {{ .selector }}{{ end }}"
   destination:
     server: {{ $.Values.argo.destination.server | quote }}
     namespace: {{ $.Values.argo.destination.namespace | quote }}

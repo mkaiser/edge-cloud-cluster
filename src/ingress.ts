@@ -4,25 +4,23 @@ import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
 
-export interface IngressArgs {
-    k8sProvider: k8s.Provider;
-    kubeconfigRaw: pulumi.Output<string>;
-    controlPlane: hcloud.Server;
-    additionalCpNodes: hcloud.Server[];
-    certIssuers: {
-        letsEncryptStagingIssuer: k8s.apiextensions.CustomResource;
-        letsEncryptProdIssuer: k8s.apiextensions.CustomResource;
-    };
-}
-
 export class IngressComponent extends pulumi.ComponentResource {
     public readonly haproxyIngress: helm.v3.Release;
     public readonly waitForHaproxyIngress: command.local.Command;
 
-    constructor(name: string, args: IngressArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        k8sProvider: k8s.Provider,
+        kubeconfigRaw: pulumi.Output<string>,
+        controlPlane: hcloud.Server,
+        additionalCpNodes: hcloud.Server[],
+        certIssuers: {
+            letsEncryptStagingIssuer: k8s.apiextensions.CustomResource;
+            letsEncryptProdIssuer: k8s.apiextensions.CustomResource;
+        },
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:Ingress", name, {}, opts);
-
-        const { k8sProvider, kubeconfigRaw, controlPlane, additionalCpNodes, certIssuers } = args;
         const { letsEncryptStagingIssuer, letsEncryptProdIssuer } = certIssuers;
 
         // haproxy-ingress in DaemonSet + hostNetwork mode: binds to port 80/443 on each node.
@@ -40,7 +38,7 @@ export class IngressComponent extends pulumi.ComponentResource {
             {
                 name: "haproxy-ingress",
                 chart: "haproxy-ingress",
-                version: "0.16.0", // https://haproxy-ingress.github.io/
+                version: "0.16.1", // https://haproxy-ingress.github.io/
                 namespace: "haproxy-ingress",
                 repositoryOpts: { repo: "https://haproxy-ingress.github.io/charts" },
                 values: {
@@ -49,6 +47,7 @@ export class IngressComponent extends pulumi.ComponentResource {
                         kind: "DaemonSet",
                         hostNetwork: true,
                         dnsPolicy: "ClusterFirstWithHostNet",
+                        nodeSelector: { "node-role.kubernetes.io/control-plane": "true" },
                         ingressClassResource: { enabled: true, default: true },
                         service: {
                             type: "ClusterIP",
@@ -82,6 +81,10 @@ export class IngressComponent extends pulumi.ComponentResource {
                         config: {
                             "config-global": "tune.bufsize 65536\ntune.http.maxhdr 256",
                             "bind-ip-addr-http": "[::]",
+                            // Set X-Forwarded-Proto so apps behind TLS termination
+                            // (e.g. XWiki OIDC callback) know the original scheme was HTTPS.
+                            "config-frontend":
+                                "http-request set-header X-Forwarded-Proto https if { ssl_fc }",
                         },
                         stats: {
                             port: 1936,

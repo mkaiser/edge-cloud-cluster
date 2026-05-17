@@ -1,0 +1,31 @@
+# ArgoCD Application: Nextcloud trusted_domains self-healing fix.
+# Wave 10 — fires after the wave-9 barrier confirms opendesk (including
+# nextcloud) is fully Synced+Healthy.
+#
+# On every sync, a Sync hook Job checks whether config.php contains only
+# 'localhost' (stale state from a fresh-cluster race condition) and fixes it
+# by deleting config.php and restarting the deployment so the entrypoint
+# regenerates it from the fs_config_store database table.
+# Idempotent: exits 0 immediately when trusted_domains is already correct.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nextcloud-trusted-domain-fix
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/nextcloud
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: opendesk
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

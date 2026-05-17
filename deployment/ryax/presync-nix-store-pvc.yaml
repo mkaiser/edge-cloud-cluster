@@ -1,0 +1,128 @@
+# PreSync hook: create the action-builder Nix store PVC on local-path storage
+# before ArgoCD creates it on NFS (global.defaultStorageClass).
+#
+# Why local-path: The Nix store is a persistent build cache (~100 GiB, grows
+# over time). Local SSD is faster than NFS for Nix's many small file reads,
+# avoids NFS lock issues (ENOLCK), and each node has 300+ GiB of local storage.
+# Acceptable trade-off: pod pinned to the node that holds the PV; store is
+# rebuilt from scratch if node is replaced (it's a cache, not persistent state).
+#
+# Mechanism: PVC storageClassName is immutable once bound. If we create it
+# here (PreSync, wave -1) with local-path before ArgoCD's main sync applies
+# the chart's NFS version, ArgoCD SSA cannot change the storageClassName.
+# ignoreDifferences in wave9-ryax.yaml suppresses the resulting OutOfSync.
+#
+# Runs in argocd namespace (not ryaxns) so it works on fresh clusters where
+# ryaxns does not exist yet (CreateNamespace=true only runs during main sync,
+# after PreSync hooks). The job creates ryaxns if absent.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ryax-nix-store-pvc
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ryax-nix-store-pvc
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ryax-nix-store-pvc
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ryax-nix-store-pvc
+subjects:
+- kind: ServiceAccount
+  name: ryax-nix-store-pvc
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-nix-store-pvc
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  activeDeadlineSeconds: 60
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: ryax-nix-store-pvc
+      restartPolicy: Never
+      containers:
+      - name: create-pvc
+        image: docker.io/alpine/k8s:1.36.0
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          PVC="ryax-action-builder-nix-store"
+          NS="ryaxns"
+
+          # Ensure namespace exists — CreateNamespace=true only runs during main
+          # sync (after PreSync), so we must create it ourselves on fresh installs.
+          if ! kubectl get namespace "$NS" &>/dev/null; then
+            echo "Creating namespace ${NS}..."
+            kubectl create namespace "$NS"
+          fi
+
+          if kubectl get pvc "$PVC" -n "$NS" &>/dev/null; then
+            SC=$(kubectl get pvc "$PVC" -n "$NS" \
+              -o jsonpath='{.spec.storageClassName}')
+            PHASE=$(kubectl get pvc "$PVC" -n "$NS" \
+              -o jsonpath='{.status.phase}')
+            if [ "$SC" = "local-path" ]; then
+              echo "PVC exists with storageClass=local-path — no action needed."
+              exit 0
+            fi
+            if [ "$PHASE" = "Bound" ]; then
+              echo "PVC exists with storageClass=${SC} and is Bound — cannot recreate safely."
+              exit 0
+            fi
+            echo "PVC exists with wrong storageClass=${SC} (phase=${PHASE}) — deleting to recreate with local-path..."
+            kubectl delete pvc "$PVC" -n "$NS"
+          fi
+
+          echo "Creating ${PVC} with local-path storage..."
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ${PVC}
+            namespace: ${NS}
+          spec:
+            storageClassName: local-path
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 160Gi 
+                # NIX storage requires a lot of storage
+                # targeting here the CX43 (8CPU/16GB/160GB) 9€
+                # maybe this needs to be increased in the future
+          EOF
+          echo "PVC created."

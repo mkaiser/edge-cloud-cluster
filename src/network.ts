@@ -1,57 +1,44 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
-import type { ClusterOS, ROLLOUT_TYPE } from "./types";
-
-export interface NetworkArgs {
-    cluster: {
-        name: string;
-        os: ClusterOS;
-        rolloutType: ROLLOUT_TYPE;
-    };
-    network: {
-        privateRange: string;
-        subnetRange: string;
-    };
-    hProvider: hcloud.Provider;
-}
+import { project_settings } from "../project_settings";
 
 export class NetworkComponent extends pulumi.ComponentResource {
     public readonly network: hcloud.Network;
     public readonly subnet: hcloud.NetworkSubnet;
     public readonly firewall: hcloud.Firewall;
 
-    constructor(name: string, args: NetworkArgs, opts?: pulumi.ComponentResourceOptions) {
+    constructor(
+        name: string,
+        hProvider: hcloud.Provider,
+        projectSettings: typeof project_settings,
+        opts?: pulumi.ComponentResourceOptions,
+    ) {
         super("pxCloud:infra:Network", name, {}, opts);
 
-        const { cluster, network, hProvider } = args;
-        const { name: clusterName, os: clusterOS, rolloutType } = cluster;
-        const { privateRange: privateNetworkRange, subnetRange: privateSubnetRange } = network;
-        const permissiveFirewall = rolloutType !== "Production";
-
         this.network = new hcloud.Network(
-            `${clusterName}-net`,
+            `${projectSettings.general.name}-net`,
             {
                 name: "private-network",
-                ipRange: privateNetworkRange,
-                labels: { cluster: clusterName },
+                ipRange: projectSettings.network.privateRange,
+                labels: { cluster: projectSettings.general.name },
             },
             { provider: hProvider, parent: this },
         );
 
         this.subnet = new hcloud.NetworkSubnet(
-            `${clusterName}-subnet`,
+            `${projectSettings.general.name}-subnet`,
             {
                 networkId: this.network.id.apply((id) => Number(id)),
                 type: "server",
                 networkZone: "eu-central",
-                ipRange: privateSubnetRange,
+                ipRange: projectSettings.network.subnetRange,
             },
             { provider: hProvider, parent: this },
         );
 
         // Bootstrap rules: open ports needed during initial cluster setup.
         const bootstrapFirewallRules =
-            clusterOS === "Talos"
+            projectSettings.server.os === "Talos"
                 ? [
                       {
                           direction: "in",
@@ -72,7 +59,7 @@ export class NetworkComponent extends pulumi.ComponentResource {
                           protocol: "tcp",
                           port: "2380",
                           description: "etcd peer (HA control plane, private network only)",
-                          sourceIps: [privateNetworkRange],
+                          sourceIps: [projectSettings.network.privateRange],
                       },
                       {
                           direction: "in",
@@ -102,7 +89,7 @@ export class NetworkComponent extends pulumi.ComponentResource {
                           protocol: "tcp",
                           port: "2380",
                           description: "etcd peer (HA control plane, private network only)",
-                          sourceIps: [privateNetworkRange],
+                          sourceIps: [projectSettings.network.privateRange],
                       },
                       {
                           direction: "in",
@@ -113,7 +100,7 @@ export class NetworkComponent extends pulumi.ComponentResource {
                       },
                   ];
 
-        // Production rules: only HTTP(S) and WireGuard exposed publicly.
+        // Production rules: only HTTP(S), Jitsi Meet and WireGuard exposed publicly.
         const productionFirewallRules = [
             {
                 direction: "in",
@@ -132,6 +119,20 @@ export class NetworkComponent extends pulumi.ComponentResource {
             {
                 direction: "in",
                 protocol: "udp",
+                port: "10000",
+                description: "Jitsi Video Bridge ICE port",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "tcp",
+                port: "4443",
+                description: "Jitsi Video Bridge TCP fallback",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "udp",
                 port: "51820",
                 description: "WireGuard VPN tunnel",
                 sourceIps: ["0.0.0.0/0", "::/0"],
@@ -139,11 +140,12 @@ export class NetworkComponent extends pulumi.ComponentResource {
         ];
 
         this.firewall = new hcloud.Firewall(
-            `${clusterName}-fw`,
+            `${projectSettings.general.name}-fw`,
             {
-                rules: permissiveFirewall
-                    ? [...bootstrapFirewallRules, ...productionFirewallRules]
-                    : [...productionFirewallRules],
+                rules:
+                    projectSettings.general.rolloutType !== "Production"
+                        ? [...bootstrapFirewallRules, ...productionFirewallRules]
+                        : [...productionFirewallRules],
             },
             { provider: hProvider, parent: this },
         );
