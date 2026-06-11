@@ -63,7 +63,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -97,7 +97,7 @@ spec:
           done
           if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ] || \
              ! { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
-            echo "ERROR: opendesk-cmp did not reach Synced+Healthy+Completed within 15 minutes"
+            echo "ERROR: timed out waiting for:${PENDING}"
             exit 1
           fi
 

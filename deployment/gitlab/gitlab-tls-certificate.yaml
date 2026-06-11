@@ -23,7 +23,7 @@ spec:
     name: letsencrypt-staging
     kind: ClusterIssuer
   dnsNames:
-    - "gitlab.ecc66.cape-project.eu"
-    - "registry.gitlab.ecc66.cape-project.eu"
-    - "kas.ecc66.cape-project.eu"
-    - "pages.ecc66.cape-project.eu"
+    - "gitlab.ecc76.your-domain.tld"
+    - "registry.gitlab.ecc76.your-domain.tld"
+    - "kas.ecc76.your-domain.tld"
+    - "pages.ecc76.your-domain.tld"

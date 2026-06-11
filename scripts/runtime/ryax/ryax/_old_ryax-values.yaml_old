@@ -1,0 +1,48 @@
+# ryax-values.yaml
+global:
+  tls:
+    hostname: ryax.ecc54.cape-project.eu
+  defaultStorageClass: longhorn
+ingress:
+  enabled: true
+  className: haproxy
+  annotations:
+    haproxy-ingress.github.io/ssl-redirect: "true"
+  hosts:
+    - host: ryax.ecc54.cape-project.eu
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: ryax-tls
+      hosts:
+        - ryax.ecc54.cape-project.eu
+action-builder:
+  nix:
+    storageClass: local-path
+  extraEnv:
+    - name: TZ
+      value: Europe/Berlin
+worker:
+  extraEnv:
+    - name: TZ
+      value: Europe/Berlin
+minio:
+  persistence:
+    storageClass: local-path
+traefik:
+  ingressClass:
+    isDefaultClass: false
+  service:
+    type: ClusterIP
+kube-prometheus-stack:
+  prometheusOperator:
+    namespaces:
+      releaseNamespace: true
+      additional: []
+    admissionWebhooks:
+      enabled: false
+    tls:
+      enabled: false
+  nodeExporter:
+    enabled: false

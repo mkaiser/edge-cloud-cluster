@@ -1,6 +1,6 @@
 # ArgoCD Application: headscale + headplane
 # Self-hosted Tailscale-compatible VPN via Kapernikov headscale helm chart.
-# Accessible at https://vpn.ecc66.cape-project.eu (headscale) and https://headplane.ecc66.cape-project.eu/admin (GUI)
+# Accessible at https://vpn.ecc76.your-domain.tld (headscale) and https://headplane.ecc76.your-domain.tld/admin (GUI)
 # Issues its own cert via cert-manager (letsencrypt-prod, DNS-01 Hetzner).
 #
 # Multi-source:
@@ -29,7 +29,7 @@ spec:
             enabled: false
 
           config:
-            server_url: "https://vpn.ecc66.cape-project.eu"
+            server_url: "https://vpn.ecc76.your-domain.tld"
             grpc_allow_insecure: false
             prefixes:
               v4: "10.0.10.0/23" # edge node VPN network (10.0.10.1–10.0.11.255)
@@ -46,7 +46,7 @@ spec:
                   type: "A"
                   value: "10.0.0.100"
             oidc:
-              issuer: "https://id.ecc66.cape-project.eu/realms/opendesk"
+              issuer: "https://id.ecc76.your-domain.tld/realms/opendesk"
               client_id: "headscale"
               client_secret_path: "/etc/headscale/oidc/oidc_client_secret"
               scope: ["openid", "profile", "email"]
@@ -80,21 +80,21 @@ spec:
               haproxy-ingress.github.io/timeout-server: "3600s"
               haproxy-ingress.github.io/timeout-client: "3600s"
             hosts:
-              - host: vpn.ecc66.cape-project.eu
+              - host: vpn.ecc76.your-domain.tld
                 paths:
                   - path: /
                     pathType: ImplementationSpecific
             tls:
               - hosts:
-                  - vpn.ecc66.cape-project.eu
+                  - vpn.ecc76.your-domain.tld
                 secretName: headscale-tls
 
     # Second source: plain manifests (headplane, jobs, sealed secrets)
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/headscale
       directory:
-        exclude: '{*.template,*.sh,deployment.yaml,postgres.yaml,pg-user-secret-sealed.yaml,s3-secret-sealed.yaml,keycloak-admin-sealed.yaml,flannel-vtep-fix.yaml}'
+        exclude: '{*.template,*.sh,deployment.yaml,postgres.yaml,pg-user-secret-sealed.yaml,s3-secret-sealed.yaml,keycloak-admin-sealed.yaml}'
 
   destination:
     server: https://kubernetes.default.svc

@@ -68,7 +68,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -99,7 +99,7 @@ spec:
           }
 
           i=0
-          while [ "$i" -lt 360 ]; do
+          while [ "$i" -lt 120 ]; do
             APPS=$(discover_apps)
             PARENT_COUNT=$(echo "$APPS" | grep -c . || true)
             # Count only child apps (apps whose parent is a wave-8 app, not argocd-main-app).
@@ -127,11 +127,11 @@ spec:
           " 2>/dev/null || echo 0)
 
             if [ "$CHILD_COUNT" -eq 0 ]; then
-              echo "Attempt $i/360 — no child apps visible yet (app-of-apps still reconciling), waiting 10s..."
+              echo "Attempt $i/120 — no child apps visible yet (app-of-apps still reconciling), waiting 10s..."
               sleep 10; i=$((i+1)); continue
             fi
 
-            ALL_READY=true
+            PENDING=""
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
@@ -143,20 +143,19 @@ spec:
                  { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
                 : # ready
               else
-                ALL_READY=false
-                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},phase=${PHASE})"
               fi
             done
 
-            if [ "$ALL_READY" = "true" ]; then
+            if [ -z "$PENDING" ]; then
               echo "All wave-8 apps + $CHILD_COUNT children Synced+Healthy — releasing wave 10."
               exit 0
             fi
 
-            echo "Attempt $i/360 — $CHILD_COUNT children found, not all ready, waiting 10s..."
-            sleep 10
+            echo "Attempt $i/120 — $CHILD_COUNT children found, not ready:${PENDING}, waiting 30s..."
+            sleep 30
             i=$((i+1))
           done
 
-          echo "ERROR: wave-8 apps did not reach Synced+Healthy within 60 minutes"
+          echo "ERROR: timed out waiting for:${PENDING}"
           exit 1

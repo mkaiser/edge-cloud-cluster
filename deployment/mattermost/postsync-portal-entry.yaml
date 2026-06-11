@@ -63,7 +63,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: portal-entry
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -72,7 +72,7 @@ spec:
           ENTRY_CN="od.mattermost"
           ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
           CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
-          APP_URL="https://chat.ecc66.cape-project.eu"
+          APP_URL="https://chat.ecc76.your-domain.tld"
 
           ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \
             -o jsonpath='{.data.administrator_password}' | base64 -d)

@@ -14,13 +14,13 @@ global:
   edition: ce
 
   hosts:
-    domain: test.your-domain.tld
+    domain: ecc76.your-domain.tld
     gitlab:
-      name: gitlab.ecc66.cape-project.eu
+      name: gitlab.ecc76.your-domain.tld
     registry:
-      name: registry.gitlab.ecc66.cape-project.eu
+      name: registry.gitlab.ecc76.your-domain.tld
     pages:
-      name: pages.gitlab.ecc66.cape-project.eu
+      name: pages.gitlab.ecc76.your-domain.tld
 
   ingress:
     class: haproxy
@@ -78,7 +78,7 @@ global:
     # GitLab Pages
     pages:
       enabled: true
-      host: pages.gitlab.ecc66.cape-project.eu
+      host: pages.gitlab.ecc76.your-domain.tld
       objectStore:
         bucket: edgecloud-gitlab
         prefix: gitlab-pages

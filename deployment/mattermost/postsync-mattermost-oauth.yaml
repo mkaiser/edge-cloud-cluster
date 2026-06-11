@@ -85,12 +85,12 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: setup
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: GITLAB_URL
-          value: "https://gitlab.ecc66.cape-project.eu"
+          value: "https://gitlab.ecc76.your-domain.tld"
         - name: MATTERMOST_URL
-          value: "https://chat.ecc66.cape-project.eu"
+          value: "https://chat.ecc76.your-domain.tld"
         command: ["/bin/sh", "-c"]
         args:
         - |

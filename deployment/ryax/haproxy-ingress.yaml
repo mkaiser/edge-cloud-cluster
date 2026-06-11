@@ -10,14 +10,14 @@ metadata:
   namespace: ryaxns
 spec:
   dnsNames:
-  - ryax.ecc66.cape-project.eu
+  - ryax.ecc76.your-domain.tld
   issuerRef:
     kind: ClusterIssuer
     name: letsencrypt-staging
   secretName: ryax-tls
 ---
 # HAProxy ingress for Ryax.
-# Routes ryax.ecc66.cape-project.eu → ryax-traefik (Ryax's internal Traefik).
+# Routes ryax.ecc76.your-domain.tld → ryax-traefik (Ryax's internal Traefik).
 # TLS is terminated by HAProxy; Traefik receives plain HTTP and handles
 # path-based routing (with strip-prefix middleware) to Ryax services.
 # spec.tls is required so HAProxy adds this host to its HTTPS routing map.
@@ -32,10 +32,10 @@ spec:
   ingressClassName: haproxy
   tls:
   - hosts:
-    - ryax.ecc66.cape-project.eu
+    - ryax.ecc76.your-domain.tld
     secretName: ryax-tls
   rules:
-  - host: ryax.ecc66.cape-project.eu
+  - host: ryax.ecc76.your-domain.tld
     http:
       paths:
       - path: /

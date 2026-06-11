@@ -9,7 +9,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: git@github.com:paraXent/infra.git
+    repoURL: git@github.com:orga/repo.git
     targetRevision: main
     path: deployment/hello-argocd
   destination:

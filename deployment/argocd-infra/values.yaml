@@ -13,7 +13,7 @@
 # then manually sync the argocd-self Application.
 
 global:
-  domain: argocd.ecc66.cape-project.eu
+  domain: argocd.ecc76.your-domain.tld
   env:
     - name: TZ
       value: "Europe/Berlin"
@@ -48,7 +48,7 @@ configs:
           return hs
     oidc.config: |
       name: Keycloak
-      issuer: https://id.ecc66.cape-project.eu/realms/opendesk
+      issuer: https://id.ecc76.your-domain.tld/realms/opendesk
       clientID: argocd
       clientSecret: $argocd-oidc-client-secret:oidc.clientSecret
       requestedScopes:
@@ -90,7 +90,7 @@ configs:
           {{end}}
           {{end}}
 
-          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+          https://argocd.ecc76.your-domain.tld/applications/{{.app.metadata.name}}
 
     template.app-sync-failed: |
       email:
@@ -107,7 +107,7 @@ configs:
 
           Error: {{.app.status.operationState.phase}} — {{.app.status.operationState.message}}
 
-          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+          https://argocd.ecc76.your-domain.tld/applications/{{.app.metadata.name}}
 
     template.app-health-degraded: |
       email:
@@ -122,7 +122,7 @@ configs:
           - {{.kind}}/{{.name}}: {{.health.status}} — {{.health.message}}
           {{end}}
 
-          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+          https://argocd.ecc76.your-domain.tld/applications/{{.app.metadata.name}}
 
     template.app-sync-running: |
       email:
@@ -131,7 +131,7 @@ configs:
           Application: {{.app.metadata.name}}
           Status:      Sync In Progress
 
-          https://argocd.ecc66.cape-project.eu/applications/{{.app.metadata.name}}
+          https://argocd.ecc76.your-domain.tld/applications/{{.app.metadata.name}}
 
     # Triggers
     trigger.on-sync-failed: |
@@ -200,14 +200,14 @@ server:
     enabled: true
     ingressClassName: haproxy
     hosts:
-      - argocd.ecc66.cape-project.eu
+      - argocd.ecc76.your-domain.tld
     annotations:
       haproxy-ingress.github.io/ssl-redirect: "true"
       external-dns.alpha.kubernetes.io/exclude: "true"
     tls:
       - secretName: infra-wildcard-tls
         hosts:
-          - argocd.ecc66.cape-project.eu
+          - argocd.ecc76.your-domain.tld
   nodeSelector:
     node-role.kubernetes.io/control-plane: "true"
   tolerations:
@@ -280,7 +280,7 @@ notifications:
           name: smtp-credentials
           key: password
     - name: NOTIFY_FROM
-      value: "no-reply@cape-project.eu"
+      value: "no-reply@your-domain.tld"
     - name: NOTIFY_TO
       valueFrom:
         secretKeyRef:

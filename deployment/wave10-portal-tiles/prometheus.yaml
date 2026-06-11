@@ -59,7 +59,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: tile
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -68,7 +68,7 @@ spec:
           ENTRY_CN="od.prometheus"
           ENTRY_DN="cn=${ENTRY_CN},cn=entry,cn=portals,cn=univention,${LDAP_BASE}"
           CATEGORY_DN="cn=od.applications,cn=category,cn=portals,cn=univention,${LDAP_BASE}"
-          APP_URL="https://prometheus.ecc66.cape-project.eu"
+          APP_URL="https://prometheus.ecc76.your-domain.tld"
           ADMIN_GROUP_DN="cn=Domain Admins,cn=groups,${LDAP_BASE}"
 
           ADMIN_PASS=$(kubectl get secret ums-nubus-credentials -n opendesk \

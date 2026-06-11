@@ -1,0 +1,99 @@
+# Saves the list of currently-cordoned nodes to a ConfigMap before wave4
+# applies k3s upgrade plans. Runs in parallel with wave3-barrier — both must
+# complete before wave4 starts, so the snapshot is always taken before SUC
+# can cordon nodes for the upgrade.
+# wave5-barrier reads this ConfigMap to avoid uncordoning manually-cordoned nodes.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave3-save-cordoned
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wave3-save-cordoned
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wave3-save-cordoned
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wave3-save-cordoned
+subjects:
+- kind: ServiceAccount
+  name: wave3-save-cordoned
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wave3-save-cordoned
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wave3-save-cordoned
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wave3-save-cordoned
+subjects:
+- kind: ServiceAccount
+  name: wave3-save-cordoned
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave3-save-cordoned
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: wave3-save-cordoned
+      restartPolicy: Never
+      containers:
+      - name: save
+        image: docker.io/alpine/k8s:1.36.1
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          CORDONED=$(kubectl get nodes \
+            -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{" "}{end}' \
+            2>/dev/null | sed 's/ *$//' || true)
+          echo "Manually cordoned nodes before upgrade: '${CORDONED}'"
+          kubectl create configmap cordoned-before-upgrade \
+            --from-literal=nodes="${CORDONED}" \
+            -n argocd \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "Saved to ConfigMap cordoned-before-upgrade."

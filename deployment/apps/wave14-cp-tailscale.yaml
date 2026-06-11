@@ -13,7 +13,7 @@ metadata:
 spec:
   project: default
   sources:
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/cp-tailscale
 

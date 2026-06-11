@@ -33,7 +33,7 @@ export class SealedSecretsComponent extends pulumi.ComponentResource {
             {
                 name: "sealed-secrets",
                 chart: "sealed-secrets",
-                version: "2.18.5", // https://github.com/bitnami-labs/sealed-secrets/releases
+                version: "2.18.6", // https://github.com/bitnami-labs/sealed-secrets/releases
                 namespace: "kube-system",
                 repositoryOpts: { repo: "https://bitnami-labs.github.io/sealed-secrets" },
                 values: {

@@ -10,7 +10,7 @@ metadata:
 spec:
   concurrency: 1
   serviceAccountName: system-upgrade
-  version: "v1.35.4+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
+  version: "v1.36.1+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
   upgrade:
     image: rancher/k3s-upgrade
   cordon: true
@@ -29,15 +29,13 @@ metadata:
 spec:
   concurrency: 2
   serviceAccountName: system-upgrade
-  version: "v1.35.4+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
+  version: "v1.36.1+k3s1" # renovate: datasource=github-releases depName=k3s-io/k3s versioning=loose
   upgrade:
     image: rancher/k3s-upgrade
   prepare:
     image: rancher/k3s-upgrade
     args: ["prepare", "k3s-server"]
-  drain:
-    force: true
-    skipWaitForDeleteTimeout: 60
+  cordon: true
   nodeSelector:
     matchExpressions:
       - key: node-role.kubernetes.io/control-plane

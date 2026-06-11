@@ -64,6 +64,12 @@ export class DnsComponent extends pulumi.ComponentResource {
         const ipv4 = [controlPlane.ipv4Address, ...additionalCpNodes.map((n) => n.ipv4Address)];
         const ipv6 = [controlPlane.ipv6Address, ...additionalCpNodes.map((n) => n.ipv6Address)];
 
+        // Clean any orphaned RRset before creating — prevents "duplicate value" errors
+        // when a prior pulumi up created the record on Hetzner but timed out before
+        // recording it in state (so the next run tries to create it again).
+        const cleanA = this.cleanDnsRrset("wildcard-a", wildcardName, "A");
+        const cleanAAAA = this.cleanDnsRrset("wildcard-aaaa", wildcardName, "AAAA");
+
         ipv4.forEach(
             (ip, i) =>
                 new hcloud.ZoneRecord(
@@ -75,7 +81,12 @@ export class DnsComponent extends pulumi.ComponentResource {
                         comment: `Pulumi-managed: wildcard for cluster services (cp${i})`,
                         value: ip,
                     },
-                    { provider: hProvider, parent: this, deleteBeforeReplace: true },
+                    {
+                        provider: hProvider,
+                        parent: this,
+                        deleteBeforeReplace: true,
+                        dependsOn: [cleanA],
+                    },
                 ),
         );
 
@@ -90,7 +101,12 @@ export class DnsComponent extends pulumi.ComponentResource {
                         comment: `Pulumi-managed: wildcard for cluster services (cp${i})`,
                         value: ip,
                     },
-                    { provider: hProvider, parent: this, deleteBeforeReplace: true },
+                    {
+                        provider: hProvider,
+                        parent: this,
+                        deleteBeforeReplace: true,
+                        dependsOn: [cleanAAAA],
+                    },
                 ),
         );
 

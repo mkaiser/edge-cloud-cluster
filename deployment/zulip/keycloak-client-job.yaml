@@ -56,7 +56,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: keycloak-client-setup
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: KEYCLOAK_URL
           value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
@@ -119,10 +119,10 @@ spec:
             "directAccessGrantsEnabled": false,
             "serviceAccountsEnabled": false,
             "redirectUris": [
-              "https://zulip.ecc66.cape-project.eu/complete/oidc/"
+              "https://zulip.ecc76.your-domain.tld/complete/oidc/"
             ],
             "webOrigins": [
-              "https://zulip.ecc66.cape-project.eu"
+              "https://zulip.ecc76.your-domain.tld"
             ],
             "defaultClientScopes": ["openid", "profile", "email"]
           }'

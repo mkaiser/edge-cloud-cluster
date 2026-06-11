@@ -1,6 +1,6 @@
 # ArgoCD Application: ryax-engine
 # Ryax workflow automation platform via OCI helm chart.
-# Accessible at https://ryax.ecc66.cape-project.eu
+# Accessible at https://ryax.ecc76.your-domain.tld
 # Chart: oci://registry.ryax.org/release-charts/ryax-engine
 # Docs: https://gitlab.com/ryax-tech/ryax/ryax-engine/-/releases
 #
@@ -28,7 +28,7 @@ spec:
         valuesObject:
           global:
             tls:
-              hostname: ryax.ecc66.cape-project.eu
+              hostname: ryax.ecc76.your-domain.tld
             defaultStorageClass: longhorn
           action-builder:
             nix:
@@ -96,7 +96,7 @@ spec:
               enabled: false
 
     # 2. PreSync hook: gates sync on core apps being Synced+Healthy
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/ryax
 

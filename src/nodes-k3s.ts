@@ -81,36 +81,44 @@ Destination=${project_settings.network.privateRange}
 Gateway=${project_settings.network.gateway}
 ROUTECONF
         ip route add ${project_settings.network.privateRange} via ${project_settings.network.gateway} dev "\${PRIVATE_IFACE}" onlink || true
+        # Persist IP forwarding for WireGuard
+        cat > /etc/sysctl.d/99-wireguard.conf << SYSCTLWG
+net.ipv4.ip_forward = 1
+SYSCTLWG
+        sysctl --system || true
     else
         echo "WARNING: private network interface not found" >&2
         PRIVATE_IP=""
     fi
 `;
 
-        const etcdS3ConfigBlock = project_settings.server.backupClusterToS3
-            ? pulumi.interpolate`etcd-s3: true
+        const etcdS3ConfigBlock =
+            project_settings.general.backupToS3IntervalHour > 0
+                ? pulumi.interpolate`etcd-s3: true
 etcd-s3-folder: ${project_settings.server.os === "Talos" ? "talos-etcd" : "k3s-etcd"}
-# Take etcd snapshots every N hours (config: backupClusterToS3IntervalHour).
-etcd-snapshot-schedule-cron: "0 */${project_settings.server.backupClusterToS3IntervalHour} * * *"
+# Take etcd snapshots every N hours (config: general.backupToS3IntervalHour).
+etcd-snapshot-schedule-cron: "0 */${project_settings.general.backupToS3IntervalHour} * * *"
 etcd-snapshot-retention: 144`
-            : pulumi.output("# etcd-s3 backup disabled (backupClusterToS3=false)");
+                : pulumi.output("# etcd-s3 backup disabled (backupToS3IntervalHour=0)");
 
         const etcdBucket = project_settings.storage.objectStorage.buckets.find(
             (b) => b.key === "etcd",
         )!;
-        const etcdS3SecretsBlock = project_settings.server.backupClusterToS3
-            ? pulumi.interpolate`etcd-s3-endpoint: ${project_settings.storage.objectStorage.baseEndpoint}
+        const etcdS3SecretsBlock =
+            project_settings.general.backupToS3IntervalHour > 0
+                ? pulumi.interpolate`etcd-s3-endpoint: ${project_settings.storage.objectStorage.baseEndpoint}
 etcd-s3-bucket: ${etcdBucket.name}
 etcd-s3-access-key: ${project_settings.storage.objectStorage.accessKey}
 etcd-s3-secret-key: ${project_settings.storage.objectStorage.secretKey}`
-            : pulumi.output("");
+                : pulumi.output("");
 
-        const s3ConnectivityCheck = project_settings.server.backupClusterToS3
-            ? pulumi.interpolate`S3_HTTP=$(curl -so /dev/null -w "%{http_code}" --max-time 10 "https://${etcdBucket.name}.${project_settings.storage.objectStorage.baseEndpoint}/")
+        const s3ConnectivityCheck =
+            project_settings.general.backupToS3IntervalHour > 0
+                ? pulumi.interpolate`S3_HTTP=$(curl -so /dev/null -w "%{http_code}" --max-time 10 "https://${etcdBucket.name}.${project_settings.storage.objectStorage.baseEndpoint}/")
 if [ "$S3_HTTP" = "000" ]; then
     echo "ERROR: S3 bucket unreachable (HTTP $S3_HTTP)" >&2; exit 1
 fi`
-            : pulumi.output("# S3 connectivity check skipped (backup disabled)");
+                : pulumi.output("# S3 connectivity check skipped (backup disabled)");
 
         /////////////////////
         // Control Plane 0
@@ -129,12 +137,16 @@ cluster-init: true
 ${k3sDisableFlags}
 ${k3sServerCloudProviderConfig}
 ${etcdS3ConfigBlock}
+kube-controller-manager-arg:
+  - "node-monitor-grace-period=300s"
+  - "node-monitor-period=30s"
 KCONFIG
 PUBLIC_IP=$(ip -o -4 addr show | awk '$4 !~ /^10\\./ && $4 !~ /^127\\./ {split($4,a,"/"); print a[1]; exit}')
 cat >> /etc/rancher/k3s/config.yaml << KCONFIG_SECRETS
 node-name: ${project_settings.general.name.toLowerCase()}-cp0
 advertise-address: \$PRIVATE_IP
 node-ip: \$PRIVATE_IP
+flannel-iface: \$PRIVATE_IFACE
 tls-san:
   - \$PUBLIC_IP
   - \$PRIVATE_IP
@@ -143,11 +155,27 @@ ${etcdS3SecretsBlock}
 KCONFIG_SECRETS
 chmod 600 /etc/rancher/k3s/config.yaml
 
+# Custom flannel config: force VNI=1 (k3s defaults to VNI=0 on Debian 13, workers use VNI=1).
+cat > /etc/rancher/k3s/flannel-conf.json << 'FLANNEL_CONF'
+{
+  "Network": "10.42.0.0/16",
+  "EnableIPv6": false,
+  "EnableIPv4": true,
+  "IPv6Network": "::/0",
+  "Backend": {
+    "Type": "vxlan",
+    "VNI": 1,
+    "Port": 8472
+  }
+}
+FLANNEL_CONF
+echo "flannel-conf: /etc/rancher/k3s/flannel-conf.json" >> /etc/rancher/k3s/config.yaml
+
 ${s3ConnectivityCheck}
 
 curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh -
 
-if [ "${project_settings.server.restoreClusterFromS3Backup}" = "true" ]; then
+if [ "${project_settings.general.restoreClusterFromS3Backup}" = "true" ]; then
     SNAPSHOT=$(k3s etcd-snapshot ls \
         --etcd-s3-endpoint=${project_settings.storage.objectStorage.baseEndpoint} \
         --etcd-s3-access-key=${project_settings.storage.objectStorage.accessKey} \
@@ -185,7 +213,11 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
                 firewallIds: [firewall.id.apply((id) => Number(id))],
                 userData: primaryCpUserData,
             },
-            { provider: hProvider, parent: this },
+            {
+                provider: hProvider,
+                parent: this,
+                ignoreChanges: ["userData"],
+            },
         );
 
         this.controlPlanePrivateIp = this.controlPlane.networks.apply(
@@ -200,7 +232,7 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
             "k3s-cp0-join-or-init",
             {
                 create: pulumi
-                    .all([this.controlPlane.ipv4Address, project_settings.server.hcloudToken])
+                    .all([this.controlPlane.ipv4Address, project_settings.general.hcloudToken])
                     .apply(
                         ([cp0Ip, token]) => `
             set -euo pipefail
@@ -219,7 +251,7 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
                 jq -r '.servers[0].public_net.ipv4.ip // ""' 2>/dev/null || echo "")
 
             JOIN_MODE=false
-            if [ -n "$CP1_IP" ] && [ "${project_settings.server.restoreClusterFromS3Backup}" != "true" ]; then
+            if [ -n "$CP1_IP" ] && [ "${project_settings.general.restoreClusterFromS3Backup}" != "true" ]; then
                 if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                     -o ConnectTimeout=5 root@"$CP1_IP" \
                     'k3s kubectl get --raw="/readyz" 2>/dev/null | grep -q "^ok$"' 2>/dev/null; then
@@ -253,10 +285,10 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
             { parent: this, dependsOn: [this.controlPlane] },
         );
 
-        // Compute CP0 Longhorn disk config in TypeScript so it can be safely embedded
-        // in the SSH command without heredoc expansion issues.
-        const cp0NodeName = `${project_settings.general.name.toLowerCase()}-cp0`;
-        const cp0DiskCfg = JSON.stringify([
+        // Longhorn disk config shared across all node types (CP0, additional CPs, workers).
+        // Encoded in TypeScript so it can be safely embedded in SSH commands and
+        // k3s config.yaml node-annotation values without heredoc/quoting issues.
+        const longhornDiskCfg = JSON.stringify([
             {
                 path: "/var/lib/longhorn",
                 allowScheduling: true,
@@ -264,10 +296,11 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
                 tags: ["local-ssd"],
             },
         ]);
+        const cp0NodeName = `${project_settings.general.name.toLowerCase()}-cp0`;
         const longhornAnnotateB64 = Buffer.from(
             [
                 `k3s kubectl label node ${cp0NodeName} node.longhorn.io/create-default-disk=config --overwrite >/dev/null 2>&1 || true`,
-                `k3s kubectl annotate node ${cp0NodeName} 'node.longhorn.io/default-disks-config=${cp0DiskCfg}' --overwrite >/dev/null 2>&1 || true`,
+                `k3s kubectl annotate node ${cp0NodeName} 'node.longhorn.io/default-disks-config=${longhornDiskCfg}' --overwrite >/dev/null 2>&1 || true`,
             ].join("\n"),
         ).toString("base64");
 
@@ -314,7 +347,43 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
             { parent: this, dependsOn: [getK3SToken] },
         );
 
-        this.kubeconfigRaw = getKubeconfig.stdout;
+        const selectKubeconfig = new command.local.Command(
+            "select-kubeconfig",
+            {
+                create: pulumi.interpolate`PUBLIC_KC=$(mktemp)
+PRIVATE_KC=$(mktemp)
+cleanup() {
+    rm -f "$PUBLIC_KC" "$PRIVATE_KC"
+}
+trap cleanup EXIT
+
+cat > "$PUBLIC_KC" << 'KUBECFG_PUBLIC'
+${getKubeconfig.stdout}
+KUBECFG_PUBLIC
+
+SSH_PRIVATE_KC=$(ssh -T -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${this.controlPlane.ipv4Address} cat /etc/rancher/k3s/k3s.yaml | sed "s|https://127.0.0.1:6443|https://${this.controlPlanePrivateIp}:6443|g")
+printf '%s\n' "$SSH_PRIVATE_KC" > "$PRIVATE_KC"
+
+for i in $(seq 1 180); do
+    if kubectl --kubeconfig="$PRIVATE_KC" get --raw='/readyz' >/dev/null 2>&1; then
+        cat "$PRIVATE_KC"
+        exit 0
+    fi
+    if kubectl --kubeconfig="$PUBLIC_KC" get --raw='/readyz' >/dev/null 2>&1; then
+        cat "$PUBLIC_KC"
+        exit 0
+    fi
+    echo "Waiting for a reachable K3s API endpoint... (attempt $i/180)" >&2
+    sleep 5
+done
+echo "No reachable K3s API endpoint found in time" >&2
+exit 1`,
+                triggers: [this.controlPlane.ipv4Address],
+            },
+            { parent: this, dependsOn: [getKubeconfig] },
+        );
+
+        this.kubeconfigRaw = selectKubeconfig.stdout;
 
         /////////////////////
         // Additional Control Planes — sequential (etcd allows one learner at a time)
@@ -328,6 +397,19 @@ echo "K3s install complete — waiting for Pulumi to start K3s" >&2
             const userData = pulumi.interpolate`#!/usr/bin/env bash
 set -euo pipefail
 ${privateNetworkSetupScript}
+    # Route to WireGuard VPN subnet via primary control plane private IP
+    if [ -n "\$PRIVATE_IFACE" ]; then
+        mkdir -p /etc/systemd/network
+        cat > /etc/systemd/network/10-wireguard-route.network << ROUTECONF_WG
+[Match]
+Name=\${PRIVATE_IFACE}
+
+[Route]
+Destination=${project_settings.wireguard.vpnSubnet}
+Gateway=${this.controlPlanePrivateIp}
+ROUTECONF_WG
+        ip route add ${project_settings.wireguard.vpnSubnet} via ${this.controlPlanePrivateIp} dev "\$PRIVATE_IFACE" onlink || true
+    fi
 ${timezoneSetupScript}
 ${sysctlTuningScript}
 apt-get update -qq && apt-get install -y nfs-common open-iscsi && systemctl enable --now iscsid
@@ -371,6 +453,7 @@ echo "K3s additional control plane (${nodeName}) setup complete"
                     provider: hProvider,
                     parent: this,
                     dependsOn: [cpJoinBarrier, waitForK3sCp0SetupReady, getK3SToken],
+                    ignoreChanges: ["userData"],
                 },
             );
 
@@ -392,6 +475,8 @@ KUBECFG
                     READY=$(kubectl --kubeconfig="$TMPKC" get node ${nodeName} -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)
                     if [ "$READY" = "True" ]; then
                         kubectl --kubeconfig="$TMPKC" label node ${nodeName} node-role.kubernetes.io/control-plane=true --overwrite >/dev/null 2>&1 || true
+                        kubectl --kubeconfig="$TMPKC" label node ${nodeName} node.longhorn.io/create-default-disk=config --overwrite >/dev/null 2>&1 || true
+                        kubectl --kubeconfig="$TMPKC" annotate node ${nodeName} 'node.longhorn.io/default-disks-config=${longhornDiskCfg}' --overwrite >/dev/null 2>&1 || true
                         echo "${nodeName} is Ready"
                         exit 0
                     fi
@@ -430,8 +515,11 @@ KUBECFG
                 kubeconfig: this.kubeconfigRaw,
                 suppressDeprecationWarnings: true,
                 enableServerSideApply: true,
+                // If the cluster becomes unreachable mid-destroy (VMs already gone),
+                // treat K8s resource deletions as successful instead of erroring.
+                deleteUnreachable: true,
             },
-            { parent: this, dependsOn: [cpJoinBarrier] },
+            { parent: this, dependsOn: [cpJoinBarrier, selectKubeconfig] },
         );
 
         /////////////////////
@@ -440,26 +528,34 @@ KUBECFG
 
         this.cloudWorkers = project_settings.nodes.workers.map((node) => {
             const nodeName = `${project_settings.general.name.toLowerCase()}-${node.id}`;
-            const workerDiskCfg = JSON.stringify([
-                {
-                    path: "/var/lib/longhorn",
-                    allowScheduling: true,
-                    storageReserved: 0,
-                    tags: ["local-ssd"],
-                },
-            ]);
             const workerUserData = pulumi.interpolate`#!/usr/bin/env bash
 set -euo pipefail
 ${privateNetworkSetupScript}
+    # Route to WireGuard VPN subnet via primary control plane private IP
+    if [ -n "\$PRIVATE_IFACE" ]; then
+        mkdir -p /etc/systemd/network
+        cat > /etc/systemd/network/10-wireguard-route.network << ROUTECONF_WG
+[Match]
+Name=\${PRIVATE_IFACE}
+
+[Route]
+Destination=${project_settings.wireguard.vpnSubnet}
+Gateway=${this.controlPlanePrivateIp}
+ROUTECONF_WG
+        ip route add ${project_settings.wireguard.vpnSubnet} via ${this.controlPlanePrivateIp} dev "\$PRIVATE_IFACE" onlink || true
+    fi
     ${timezoneSetupScript}
 ${sysctlTuningScript}
 apt-get update -qq && apt-get install -y nfs-common open-iscsi && systemctl enable --now iscsid
 mkdir -p /etc/rancher/k3s
 cat > /etc/rancher/k3s/config.yaml << KCONFIG_WORKER
 node-ip: \$PRIVATE_IP
+flannel-iface: \$PRIVATE_IFACE
 ${k3sWorkerCloudProviderConfig}
 node-label:
-  - 'node.longhorn.io/create-default-disk=true'
+  - 'node.longhorn.io/create-default-disk=config'
+node-annotation:
+  - 'node.longhorn.io/default-disks-config=${longhornDiskCfg}'
 KCONFIG_WORKER
 chmod 600 /etc/rancher/k3s/config.yaml
 curl -sfL https://get.k3s.io | K3S_URL=https://${this.controlPlanePrivateIp}:6443 K3S_TOKEN=${getK3SToken.stdout} sh -
@@ -477,7 +573,12 @@ echo "K3s worker setup complete"
                     firewallIds: [firewall.id.apply((id) => Number(id))],
                     userData: workerUserData,
                 },
-                { provider: hProvider, parent: this, dependsOn: [cpJoinBarrier] },
+                {
+                    provider: hProvider,
+                    parent: this,
+                    dependsOn: [cpJoinBarrier],
+                    ignoreChanges: ["userData"],
+                },
             );
         });
 

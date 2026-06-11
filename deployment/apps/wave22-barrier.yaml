@@ -55,7 +55,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -78,7 +78,7 @@ spec:
 
           i=0
           while [ "$i" -lt 360 ]; do
-            ALL_READY=true
+            PENDING=""
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
@@ -90,20 +90,19 @@ spec:
                  { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
                 : # ready
               else
-                ALL_READY=false
-                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},phase=${PHASE})"
               fi
             done
 
-            if [ "$ALL_READY" = "true" ]; then
+            if [ -z "$PENDING" ]; then
               echo "All wave-18 Applications are Synced+Healthy — releasing wave 24."
               exit 0
             fi
 
-            echo "Attempt $i/360 — not all ready, waiting 10s..."
+            echo "Attempt $i/360 — waiting for:${PENDING}"
             sleep 10
             i=$((i+1))
           done
 
-          echo "ERROR: wave-18 Applications did not reach Synced+Healthy+Completed within 60 minutes"
+          echo "ERROR: timed out waiting for:${PENDING}"
           exit 1

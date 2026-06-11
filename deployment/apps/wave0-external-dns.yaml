@@ -64,7 +64,7 @@ spec:
 
         txtOwnerId: edgecloudinfra
         domainFilters:
-          - cape-project.eu
+          - your-domain.tld
         policy: sync
         sources:
           # ingress source intentionally disabled: wildcard *.SUBDOMAIN covers all hosts.

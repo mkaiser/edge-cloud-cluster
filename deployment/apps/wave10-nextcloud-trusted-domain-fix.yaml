@@ -2,11 +2,9 @@
 # Wave 10 — fires after the wave-9 barrier confirms opendesk (including
 # nextcloud) is fully Synced+Healthy.
 #
-# On every sync, a Sync hook Job checks whether config.php contains only
-# 'localhost' (stale state from a fresh-cluster race condition) and fixes it
-# by deleting config.php and restarting the deployment so the entrypoint
-# regenerates it from the fs_config_store database table.
-# Idempotent: exits 0 immediately when trusted_domains is already correct.
+# On every sync, a Sync hook Job calls `occ config:system:set` to write
+# trusted_domains directly into Nextcloud's DB-backed config layer.
+# No pod restart needed; survives crash cycles on fresh clusters.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -17,7 +15,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: git@github.com:paraXent/infra.git
+    repoURL: git@github.com:orga/repo.git
     targetRevision: main
     path: deployment/nextcloud
   destination:

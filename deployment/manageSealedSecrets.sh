@@ -36,7 +36,7 @@ seal_secret() {
 
   if ! (cd "$repo_dir" && pulumi config get sealedSecretsTlsCrt &>/dev/null); then
     echo "ERROR: Could not read sealedSecretsTlsCrt from Pulumi config."
-    echo "Run ./scripts/setPulumiSecrets.sh to configure the sealed-secrets keypair first."
+    echo "Run ./scripts/secrets/setAllSecrets.sh to configure the sealed-secrets keypair first."
     exit 1
   fi
 
@@ -112,7 +112,7 @@ fi
 # Verify Pulumi cert is available
 if ! (cd "$REPO_DIR" && pulumi config get sealedSecretsTlsCrt &>/dev/null); then
     echo "ERROR: Could not extract sealedSecretsTlsCrt from Pulumi config."
-    echo "Run setPulumiSecrets.sh to configure the sealed-secrets keypair first."
+    echo "Run setAllSecrets.sh to configure the sealed-secrets keypair first."
     exit 1
 fi
 

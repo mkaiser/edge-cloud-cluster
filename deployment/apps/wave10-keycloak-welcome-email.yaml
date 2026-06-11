@@ -86,7 +86,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: send-welcome-email
-            image: docker.io/alpine/k8s:1.36.0
+            image: docker.io/alpine/k8s:1.36.1
             env:
             - name: KC_URL
               value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"
@@ -95,7 +95,7 @@ spec:
             - name: REALM
               value: "opendesk"
             - name: CLUSTER_DOMAIN
-              value: "ecc66.cape-project.eu"
+              value: "ecc76.your-domain.tld"
             - name: UDM_URL
               value: "http://ums-udm-rest-api.argocd.svc.cluster.local:9979/univention/udm"
             command: ["/bin/sh", "-c"]

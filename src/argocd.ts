@@ -60,6 +60,30 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
             },
         );
 
+        // Credentials for the Nextcloud S3 object store (injected into ArgoCD CMP env)
+        const hetznerS3Secret = new k8s.core.v1.Secret(
+            "hetzner-s3",
+            {
+                metadata: { name: "hetzner-s3", namespace: "argocd" },
+                stringData: {
+                    accessKey: projectSettings.storage.objectStorage.accessKey,
+                    secretKey: projectSettings.storage.objectStorage.secretKey,
+                },
+            },
+            { provider: k8sProvider, parent: this, dependsOn: [argocdNs] },
+        );
+
+        // Pre-delete: strip ArgoCD finalizer so Pulumi can delete the secret cleanly.
+        // Depends on the secret → destroyed first during pulumi destroy.
+        new command.local.Command(
+            "hetzner-s3-pre-destroy",
+            {
+                create: "true",
+                delete: 'kubectl patch secret hetzner-s3 -n argocd --type=merge -p \'{"metadata":{"finalizers":[]}}\' 2>/dev/null || true',
+            },
+            { parent: this, dependsOn: [hetznerS3Secret] },
+        );
+
         // Pre-create TLS secrets from saved Pulumi config so cert-manager skips
         // ACME issuance on cluster recreation (avoids Let's Encrypt rate limits).
         // cert-manager only issues a new cert when the secret does not exist.
@@ -164,7 +188,7 @@ echo "Force-finalize completed"`,
             {
                 name: "argocd",
                 chart: "argo-cd",
-                version: "9.5.14", // renovate: datasource=helm depName=argo/argo-cd registryUrl=https://argoproj.github.io/argo-helm
+                version: "9.5.20", // renovate: datasource=helm depName=argo/argo-cd registryUrl=https://argoproj.github.io/argo-helm
                 namespace: "argocd",
                 repositoryOpts: { repo: "https://argoproj.github.io/argo-helm" },
                 values: {
@@ -314,6 +338,7 @@ KUBECFG
                 provider: k8sProvider,
                 parent: this,
                 dependsOn: [argocdChart, waitForArgocdCrds, sealedSecretsChart],
+                retainOnDelete: true,
             },
         );
 

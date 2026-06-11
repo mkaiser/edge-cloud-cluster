@@ -8,11 +8,14 @@ import type { NetworkComponent } from "./network";
 export class StorageComponent extends pulumi.ComponentResource {
     public readonly hcloudSecret: k8s.core.v1.Secret;
     public readonly csiDriver: helm.v3.Release;
+    public readonly longhornChart!: helm.v3.Release;
+    public readonly longhornBackupTarget!: command.local.Command;
 
     constructor(
         name: string,
         k8sProvider: k8s.Provider,
         networkComponent: NetworkComponent,
+        kubeconfigRaw: pulumi.Output<string>,
         opts?: pulumi.ComponentResourceOptions,
     ) {
         super("pxCloud:infra:Storage", name, {}, opts);
@@ -22,7 +25,7 @@ export class StorageComponent extends pulumi.ComponentResource {
             {
                 metadata: { name: "hcloud", namespace: "kube-system" },
                 stringData: {
-                    token: project_settings.server.hcloudToken,
+                    token: project_settings.general.hcloudToken,
                     network: networkComponent.network.id.apply((id) => String(id)),
                 },
             },
@@ -36,7 +39,7 @@ export class StorageComponent extends pulumi.ComponentResource {
                       "hcloud-ccm",
                       {
                           chart: "hcloud-cloud-controller-manager",
-                          version: "1.31.0",
+                          version: "1.31.1",
                           namespace: "kube-system",
                           repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                       },
@@ -48,7 +51,7 @@ export class StorageComponent extends pulumi.ComponentResource {
             "hcloud-csi",
             {
                 chart: "hcloud-csi",
-                version: "2.21.0",
+                version: "2.21.2",
                 namespace: "kube-system",
                 repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                 values: {
@@ -142,37 +145,6 @@ export class StorageComponent extends pulumi.ComponentResource {
             { provider: k8sProvider, parent: this, customTimeouts: { delete: "5m" } },
         );
 
-        // The Longhorn Helm chart's pre-upgrade hook uses this SA. On fresh install
-        // the SA doesn't exist yet (chart not applied), causing the hook to fail.
-        // Seeding it here unblocks the hook so the chart can install cleanly.
-        const longhornSa = new k8s.core.v1.ServiceAccount(
-            "longhorn-service-account",
-            { metadata: { name: "longhorn-service-account", namespace: "longhorn-system" } },
-            { provider: k8sProvider, parent: this, dependsOn: [longhornNs] },
-        );
-
-        // Temporary cluster-admin binding so the pre-upgrade job can introspect existing
-        // Longhorn resources. The chart will replace this with its own scoped RBAC on sync.
-        new k8s.rbac.v1.ClusterRoleBinding(
-            "longhorn-pre-upgrade-tmp",
-            {
-                metadata: { name: "longhorn-pre-upgrade-tmp" },
-                roleRef: {
-                    apiGroup: "rbac.authorization.k8s.io",
-                    kind: "ClusterRole",
-                    name: "cluster-admin",
-                },
-                subjects: [
-                    {
-                        kind: "ServiceAccount",
-                        name: "longhorn-service-account",
-                        namespace: "longhorn-system",
-                    },
-                ],
-            },
-            { provider: k8sProvider, parent: this, dependsOn: [longhornSa] },
-        );
-
         const longhornS3Secret = new k8s.core.v1.Secret(
             "longhorn-s3-credentials",
             {
@@ -184,7 +156,112 @@ export class StorageComponent extends pulumi.ComponentResource {
                     VIRTUAL_HOSTED_STYLE: "false",
                 },
             },
-            { provider: k8sProvider, parent: this, dependsOn: [longhornNs] },
+            { provider: k8sProvider, parent: this, dependsOn: [longhornNs], retainOnDelete: true },
+        );
+
+        // Bootstrap Longhorn so the restore step can run before ArgoCD starts.
+        // retainOnDelete: longhorn-pre-destroy handles kubectl cleanup on destroy;
+        // Pulumi must not helm-uninstall (finalizers would deadlock namespace deletion).
+        this.longhornChart = new helm.v3.Release(
+            "longhorn",
+            {
+                chart: "longhorn",
+                version: "1.12.0", // renovate: datasource=helm depName=longhorn registryUrl=https://charts.longhorn.io
+                namespace: "longhorn-system",
+                repositoryOpts: { repo: "https://charts.longhorn.io" },
+                values: {
+                    defaultSettings: {
+                        defaultReplicaCount: 2,
+                        createDefaultDiskLabeledNodes: true,
+                        dataLocality: "best-effort",
+                        replicaSoftAntiAffinity: true,
+                        recurringFailedJobsHistoryLimit: 14,
+                        recurringSuccessfulJobsHistoryLimit: 14,
+                    },
+                    persistence: {
+                        defaultClass: true,
+                        defaultClassReplicaCount: 2,
+                        reclaimPolicy: "Retain",
+                    },
+                },
+            },
+            {
+                provider: k8sProvider,
+                parent: this,
+                dependsOn: [longhornNs, longhornS3Secret],
+                retainOnDelete: true,
+                customTimeouts: { create: "10m" },
+            },
+        );
+
+        // Wait until Longhorn engine images are deployed and longhorn-manager is fully ready.
+        // Must complete before the backup target is configured and before ArgoCD wave 2
+        // can create PVCs (postgresql helm hooks etc.).
+        const longhornReady = new command.local.Command(
+            "longhorn-ready",
+            {
+                create: `TMPKC=$(mktemp)
+cleanup() { rm -f "$TMPKC"; }
+trap cleanup EXIT
+printf '%s\n' "$KUBECONFIG_CONTENT" > "$TMPKC"
+export KUBECONFIG="$TMPKC"
+
+i=0
+while [ "$i" -lt 60 ]; do
+  NOT_DEPLOYED=$(kubectl get engineimage -n longhorn-system \
+    -o jsonpath='{range .items[*]}{.metadata.name}={.status.state}{"\\n"}{end}' \
+    2>/dev/null | grep -v '=deployed' | grep -v '^$' || true)
+  TOTAL_EI=$(kubectl get engineimage -n longhorn-system \
+    --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  DESIRED=$(kubectl get daemonset longhorn-manager -n longhorn-system \
+    -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+  READY=$(kubectl get daemonset longhorn-manager -n longhorn-system \
+    -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  if [ -z "$NOT_DEPLOYED" ] && [ "$TOTAL_EI" -gt 0 ] && \
+     [ "$DESIRED" -gt 0 ] && [ "$READY" = "$DESIRED" ]; then
+    echo "Longhorn ready: $TOTAL_EI engine image(s) deployed, longhorn-manager $READY/$DESIRED."
+    exit 0
+  fi
+  echo "Attempt $i/60 — engineimages: total=$TOTAL_EI not-deployed=\${NOT_DEPLOYED:-none}; manager: $READY/$DESIRED"
+  sleep 10
+  i=$((i+1))
+done
+echo "ERROR: Longhorn not ready after 10 minutes"
+exit 1`,
+                delete: "true",
+                environment: { KUBECONFIG_CONTENT: kubeconfigRaw },
+            },
+            { parent: this, dependsOn: [this.longhornChart], customTimeouts: { create: "12m" } },
+        );
+
+        // Configure the S3 backup target before the restore step runs.
+        // Longhorn Helm chart already creates BackupTarget "default" with an empty spec,
+        // so we patch it via SSA (--server-side --force-conflicts) instead of creating.
+        const longhornBucket = project_settings.storage.objectStorage.buckets.find(
+            (b) => b.key === "longhornBackup",
+        )!;
+        this.longhornBackupTarget = new command.local.Command(
+            "longhorn-backup-target",
+            {
+                create: `TMPKC=$(mktemp)
+cleanup() { rm -f "$TMPKC"; }
+trap cleanup EXIT
+printf '%s\n' "$KUBECONFIG_CONTENT" > "$TMPKC"
+kubectl --kubeconfig="$TMPKC" apply --server-side --force-conflicts --validate=false -f - <<'EOF'
+apiVersion: longhorn.io/v1beta2
+kind: BackupTarget
+metadata:
+  name: default
+  namespace: longhorn-system
+spec:
+  backupTargetURL: "s3://${longhornBucket.name}@${longhornBucket.location}/"
+  credentialSecret: longhorn-s3-credentials
+  pollInterval: 5m0s
+EOF`,
+                delete: "true",
+                environment: { KUBECONFIG_CONTENT: kubeconfigRaw },
+            },
+            { parent: this, dependsOn: [longhornReady] },
         );
 
         for (const bucket of project_settings.storage.objectStorage.buckets) {
@@ -266,7 +343,11 @@ export class StorageComponent extends pulumi.ComponentResource {
                     "done",
                 ].join("\n"),
             },
-            { parent: this, dependsOn: [longhornNs], customTimeouts: { delete: "5m" } },
+            {
+                parent: this,
+                dependsOn: [longhornNs, this.longhornChart],
+                customTimeouts: { delete: "20m" },
+            },
         );
 
         this.registerOutputs({

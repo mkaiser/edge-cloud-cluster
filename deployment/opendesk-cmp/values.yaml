@@ -60,7 +60,7 @@ repoServer:
             secretKeyRef:
               name: hetzner-s3
               key: secretKey
-        # openDesk postfix relay credentials (opendesk-system@cape-project.eu).
+        # openDesk postfix relay credentials (opendesk-system@your-domain.tld).
         # Sealed in deployment/secrets/opendesk-smtp-credentials-sealed.yaml.
         - name: OPENDESK_SMTP_HOST
           valueFrom:

@@ -26,7 +26,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: fix
-        image: docker.io/postgres:16-alpine
+        image: docker.io/postgres:18-alpine
         command: ["/bin/sh", "-ec"]
         env:
         - name: DSN
@@ -45,7 +45,7 @@ spec:
               name: mattermost-oidc
               key: client-secret
         - name: KEYCLOAK_BASE
-          value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect"
+          value: "https://id.ecc76.your-domain.tld/realms/opendesk/protocol/openid-connect"
         args:
         - |
           PG_HOST=$(echo "$DSN" | sed 's|postgres://[^@]*@\([^:/]*\).*|\1|')

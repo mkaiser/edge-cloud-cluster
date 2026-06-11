@@ -53,7 +53,7 @@ export class TalosNodesComponent extends pulumi.ComponentResource {
             {
                 create: pulumi.interpolate`
         set -uo pipefail
-        export HCLOUD_TOKEN="${project_settings.server.hcloudToken}"
+        export HCLOUD_TOKEN="${project_settings.general.hcloudToken}"
         EXISTING=$(hcloud image list -t snapshot -o noheader -o columns=id,description | grep "talos-${project_settings.server.talosVersion}" | head -1 | awk '{print $1}' || true)
         if [ -n "$EXISTING" ]; then
             echo "$EXISTING"
@@ -219,7 +219,7 @@ export class TalosNodesComponent extends pulumi.ComponentResource {
         // Bootstrap & Kubeconfig
         /////////////////////
 
-        const talosBootstrap = project_settings.server.restoreClusterFromS3Backup
+        const talosBootstrap = project_settings.general.restoreClusterFromS3Backup
             ? new command.local.Command(
                   "talos-bootstrap-restore",
                   {
@@ -334,6 +334,9 @@ export class TalosNodesComponent extends pulumi.ComponentResource {
                 kubeconfig: this.kubeconfigRaw,
                 suppressDeprecationWarnings: true,
                 enableServerSideApply: true,
+                // If the cluster becomes unreachable mid-destroy (VMs already gone),
+                // treat K8s resource deletions as successful instead of erroring.
+                deleteUnreachable: true,
             },
             { parent: this, dependsOn: [talosKubeconfig] },
         );

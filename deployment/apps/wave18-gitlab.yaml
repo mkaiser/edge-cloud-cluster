@@ -19,19 +19,19 @@ spec:
     # 1. Official GitLab Helm chart
     - repoURL: https://charts.gitlab.io
       chart: gitlab
-      targetRevision: "9.11.4"  # (helm search repo gitlab/gitlab --versions | grep '^gitlab/gitlab[[:space:]]\+9\.' | head -n 10)
+      targetRevision: "10.0.1"  # (helm search repo gitlab/gitlab --versions | grep '^gitlab/gitlab[[:space:]]\+9\.' | head -n 10)
       helm:
         valueFiles:
           - $values/deployment/gitlab/values.yaml
           - $values/deployment/gitlab/helm-values-secret.yaml
 
     # 2. Git repo ref for values files
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       ref: values
 
     # 3. Plain manifests (keycloak job, sealed secrets, pages DNS)
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/gitlab
       directory:

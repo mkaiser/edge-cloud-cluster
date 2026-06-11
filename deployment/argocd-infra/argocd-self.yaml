@@ -15,19 +15,19 @@ metadata:
 spec:
   project: default
   sources:
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       ref: values
     - repoURL: https://argoproj.github.io/argo-helm
       chart: argo-cd
-      targetRevision: "9.5.14" # renovate: datasource=helm depName=argo-cd registryUrl=https://argoproj.github.io/argo-helm
+      targetRevision: "9.5.20" # renovate: datasource=helm depName=argo-cd registryUrl=https://argoproj.github.io/argo-helm
       helm:
         releaseName: argocd
         valueFiles:
           - $values/deployment/argocd-infra/values.yaml
           - $values/deployment/opendesk-cmp/values.yaml
     # Plain manifests: OIDC sealed secret
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/argocd-infra
       directory:

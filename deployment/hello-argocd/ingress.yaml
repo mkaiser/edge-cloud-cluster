@@ -1,4 +1,4 @@
-# Ingress for hello-world — routes hello-argo.ecc66.cape-project.eu to the hello-world service.
+# Ingress for hello-world — routes hello-argo.ecc76.your-domain.tld to the hello-world service.
 # TLS is provided by a pre-issued wildcard certificate secret.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: haproxy
   rules:
-  - host: hello-argo.ecc66.cape-project.eu
+  - host: hello-argo.ecc76.your-domain.tld
     http:
       paths:
       - path: /
@@ -23,5 +23,5 @@ spec:
               number: 80
   tls:
   - hosts:
-    - hello-argo.ecc66.cape-project.eu
+    - hello-argo.ecc76.your-domain.tld
     secretName: infra-wildcard-tls

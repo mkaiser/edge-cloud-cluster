@@ -1,5 +1,5 @@
 # Headplane — admin GUI for Headscale
-# Deployed at https://headplane.ecc66.cape-project.eu/admin/
+# Deployed at https://headplane.ecc76.your-domain.tld/admin/
 # Uses the same OIDC client as headscale for reliable user matching.
 # Connects to headscale via internal cluster service URL.
 ---
@@ -13,9 +13,9 @@ data:
     server:
       host: "0.0.0.0"
       port: 3000
-      base_url: "https://headplane.ecc66.cape-project.eu"
+      base_url: "https://headplane.ecc76.your-domain.tld"
       cookie_secure: true
-      cookie_domain: "headplane.ecc66.cape-project.eu"
+      cookie_domain: "headplane.ecc76.your-domain.tld"
       cookie_max_age: 86400
       cookie_secret_path: "/etc/headplane/secrets/cookie-secret"
       data_path: "/data"
@@ -26,7 +26,7 @@ data:
       config_strict: false
 
     oidc:
-      issuer: "https://id.ecc66.cape-project.eu/realms/opendesk"
+      issuer: "https://id.ecc76.your-domain.tld/realms/opendesk"
       client_id: "headscale"
       # Read directly from the sealed OIDC secret to avoid PostSync timing races.
       client_secret_path: "/etc/headplane/oidc/client-secret"
@@ -94,7 +94,7 @@ spec:
       serviceAccountName: headplane
       initContainers:
       - name: wait-for-headplane-api-key
-        image: busybox:1.37
+        image: busybox:1.38
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -115,7 +115,7 @@ spec:
           readOnly: true
       containers:
       - name: headplane
-        image: ghcr.io/tale/headplane:0.6.2
+        image: ghcr.io/tale/headplane:0.6.3
         ports:
         - containerPort: 3000
           name: http
@@ -208,10 +208,10 @@ spec:
   ingressClassName: haproxy
   tls:
   - hosts:
-    - headplane.ecc66.cape-project.eu
+    - headplane.ecc76.your-domain.tld
     secretName: infra-wildcard-tls
   rules:
-  - host: headplane.ecc66.cape-project.eu
+  - host: headplane.ecc76.your-domain.tld
     http:
       paths:
       - path: /

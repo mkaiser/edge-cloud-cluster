@@ -1,5 +1,5 @@
 # ArgoCD Application: Mattermost team messaging
-# Accessible at https://chat.ecc66.cape-project.eu
+# Accessible at https://chat.ecc76.your-domain.tld
 # Auth: Keycloak OIDC only (local accounts disabled)
 # Storage: bundled PostgreSQL (longhorn), S3 for file uploads (edgecloud-mattermost bucket)
 apiVersion: argoproj.io/v1alpha1
@@ -18,7 +18,7 @@ spec:
       helm:
         valuesObject:
           global:
-            siteUrl: "https://chat.ecc66.cape-project.eu"
+            siteUrl: "https://chat.ecc76.your-domain.tld"
             features:
               database:
                 driver: postgres
@@ -51,10 +51,10 @@ spec:
                 haproxy-ingress.github.io/ssl-redirect: "true"
                 haproxy-ingress.github.io/proxy-body-size: "100M"
               hosts:
-                - chat.ecc66.cape-project.eu
+                - chat.ecc76.your-domain.tld
               tls:
                 - hosts:
-                    - chat.ecc66.cape-project.eu
+                    - chat.ecc76.your-domain.tld
                   secretName: mattermost-tls
 
             extraEnv:
@@ -76,11 +76,11 @@ spec:
                     name: mattermost-oidc
                     key: client-secret
               - name: MM_GITLABSETTINGS_AUTHENDPOINT
-                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/auth"
+                value: "https://id.ecc76.your-domain.tld/realms/opendesk/protocol/openid-connect/auth"
               - name: MM_GITLABSETTINGS_TOKENENDPOINT
-                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/token"
+                value: "https://id.ecc76.your-domain.tld/realms/opendesk/protocol/openid-connect/token"
               - name: MM_GITLABSETTINGS_USERAPIENDPOINT
-                value: "https://id.ecc66.cape-project.eu/realms/opendesk/protocol/openid-connect/userinfo"
+                value: "https://id.ecc76.your-domain.tld/realms/opendesk/protocol/openid-connect/userinfo"
               - name: MM_GITLABSETTINGS_SCOPE
                 value: "openid profile email"
 
@@ -92,7 +92,7 @@ spec:
                 value: "false"
 
     # Plain manifests: Keycloak client job + sealed secrets
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/mattermost
       directory:

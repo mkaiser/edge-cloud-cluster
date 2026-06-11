@@ -58,7 +58,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
       - name: keycloak-client-setup
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: KEYCLOAK_URL
           # Use internal service: /admin/ is not exposed through the ingress (only /realms/ is)
@@ -140,12 +140,12 @@ spec:
             "directAccessGrantsEnabled": false,
             "serviceAccountsEnabled": false,
             "redirectUris": [
-              "https://vpn.ecc66.cape-project.eu/oidc/callback",
-              "https://headplane.ecc66.cape-project.eu/admin/oidc/callback"
+              "https://vpn.ecc76.your-domain.tld/oidc/callback",
+              "https://headplane.ecc76.your-domain.tld/admin/oidc/callback"
             ],
             "webOrigins": [
-              "https://vpn.ecc66.cape-project.eu",
-              "https://headplane.ecc66.cape-project.eu"
+              "https://vpn.ecc76.your-domain.tld",
+              "https://headplane.ecc76.your-domain.tld"
             ],
             "defaultClientScopes": ["openid", "profile", "email"]
           }'

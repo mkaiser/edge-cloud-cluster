@@ -85,7 +85,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: provision
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -199,10 +199,10 @@ spec:
           }
 
           create_user "testadmin" "testAdminfistname" "admin" \
-            "testadmin@cape-project.eu" "martin.kaiser@paraxent.de" "blahblah123" "admin"
+            "testadmin@your-domain.tld" "admin@domain.tld" "blahblah123" "admin"
 
           create_user "testuser" "testUserfirstName" "user" \
-            "testuser@cape-project.eu" "martin.kaiser@paraxent.de" "blahblah123" "user"
+            "testuser@your-domain.tld" "user@domain.tld" "blahblah123" "user"
 
           # Disable TOTP/2FA for test users by:
           # 1. Removing them from the "2FA Users" group (prevents TOTP requirement)

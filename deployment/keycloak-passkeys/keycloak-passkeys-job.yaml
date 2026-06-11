@@ -73,7 +73,7 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: setup
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: KEYCLOAK_URL
           value: "http://ums-keycloak.opendesk.svc.cluster.local:8080"

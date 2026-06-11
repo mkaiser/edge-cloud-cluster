@@ -88,7 +88,7 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: keycloak-client-setup
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: KEYCLOAK_URL
           # Use internal service: /admin/ is not exposed through the ingress (only /realms/ is)
@@ -98,7 +98,7 @@ spec:
         - name: CLIENT_ID
           value: "argocd"
         - name: ARGOCD_URL
-          value: "https://argocd.ecc66.cape-project.eu"
+          value: "https://argocd.ecc76.your-domain.tld"
         - name: CLIENT_SECRET
           valueFrom:
             secretKeyRef:
@@ -290,7 +290,7 @@ spec:
             "smtpServer": {
               "host": "'"${SMTP_HOST}"'",
               "port": "'"${SMTP_PORT}"'",
-              "from": "no-reply@cape-project.eu",
+              "from": "no-reply@your-domain.tld",
               "fromDisplayName": "openDesk",
               "replyTo": "",
               "replyToDisplayName": "",

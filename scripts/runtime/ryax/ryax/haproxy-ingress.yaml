@@ -1,0 +1,46 @@
+---
+# SSL passthrough for ryax.ecc73.cape-project.eu → Ryax Traefik.
+# HAProxy forwards raw TLS by SNI; Traefik terminates TLS and manages its own cert
+# via cert-manager (letsencrypt-stg, http-01/traefik entrypoint).
+# Port 80 is forwarded to Traefik:80 so ACME http-01 challenges reach the solver pods.
+# The environment (stg/production) is controlled by global.tls.environment in prod.yaml
+# and updated by scripts/environment/updateConfigFromProjectSettings.sh.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy
+  namespace: ryaxns
+  annotations:
+    haproxy-ingress.github.io/ssl-passthrough: "true"
+    haproxy-ingress.github.io/ssl-passthrough-http-port: "80"
+spec:
+  ingressClassName: haproxy
+  rules:
+    - host: ryax.ecc73.cape-project.eu
+      http:
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: ryax-traefik
+                port:
+                  number: 443
+---
+# registry.ryax.* serves plain HTTP — ssl-passthrough would fail.
+# HAProxy terminates TLS using a cert issued via cluster letsencrypt-staging (DNS-01).
+# The secret name ryax-registry-ingress-cert matches what the Ryax chart's
+# ryax-registry haproxy ingress expects.
+# cert issuer updated by scripts/environment/updateConfigFromProjectSettings.sh.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ryax-registry-cert
+  namespace: ryaxns
+spec:
+  secretName: ryax-registry-ingress-cert
+  issuerRef:
+    name: letsencrypt-staging
+    kind: ClusterIssuer
+  dnsNames:
+    - registry.ryax.ecc73.cape-project.eu

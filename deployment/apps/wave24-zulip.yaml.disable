@@ -1,5 +1,5 @@
 # ArgoCD Application: Zulip team chat
-# Accessible at https://zulip.ecc66.cape-project.eu
+# Accessible at https://zulip.ecc76.your-domain.tld
 # Auth: Keycloak OIDC (native GenericOpenIdConnectBackend — no license workaround needed)
 # Storage: S3 for file uploads (edgecloud-zulip bucket), Longhorn for PostgreSQL
 # Dependencies: PostgreSQL, Redis, RabbitMQ, Memcached bundled as Helm subcharts
@@ -31,12 +31,12 @@ spec:
               haproxy-ingress.github.io/ssl-redirect: "true"
               haproxy-ingress.github.io/proxy-body-size: "100M"
             hosts:
-              - host: zulip.ecc66.cape-project.eu
+              - host: zulip.ecc76.your-domain.tld
                 paths:
                   - path: /
             tls:
               - hosts:
-                  - zulip.ecc66.cape-project.eu
+                  - zulip.ecc76.your-domain.tld
                 secretName: zulip-tls
 
           zulip:
@@ -45,8 +45,8 @@ spec:
               storageClass: longhorn
               size: 5Gi
             environment:
-              SETTING_EXTERNAL_HOST: zulip.ecc66.cape-project.eu
-              SETTING_ZULIP_ADMINISTRATOR: it@cape-project.eu
+              SETTING_EXTERNAL_HOST: zulip.ecc76.your-domain.tld
+              SETTING_ZULIP_ADMINISTRATOR: it@your-domain.tld
               TRUST_GATEWAY_IP: "true"
               SECRETS_secret_key:
                 valueFrom:
@@ -88,7 +88,7 @@ spec:
                 AUTHENTICATION_BACKENDS += ('zproject.backends.GenericOpenIdConnectBackend',)
                 SOCIAL_AUTH_OIDC_ENABLED_IDPS = {
                     "keycloak": {
-                        "oidc_url": "https://id.ecc66.cape-project.eu/realms/opendesk",
+                        "oidc_url": "https://id.ecc76.your-domain.tld/realms/opendesk",
                         "client_id": "zulip",
                         "secret": "${OIDC_CLIENT_SECRET}",
                         "display_name": "Sign in with OpenDesk",
@@ -121,7 +121,7 @@ spec:
               allowInsecureImages: true
 
     # Plain manifests: Keycloak client job + sealed secrets
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/zulip
       directory:

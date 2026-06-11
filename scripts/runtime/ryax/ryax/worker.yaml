@@ -1,0 +1,10 @@
+global:
+  nodeSelector:
+    node.kubernetes.io/edge-worker: "true"
+  defaultStorageClass: local-path
+
+config:
+  site:
+    type: KUBERNETES
+    spec:
+      namespace: ryaxns-execs

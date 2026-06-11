@@ -1,17 +1,60 @@
-# Nextcloud trusted_domains self-healing fix.
+# Nextcloud trusted_domains + Redis self-healing fix.
 #
-# Problem: on a fresh cluster, the opendesk nextcloud entrypoint reads config.php
-# from the `fs_config_store` database table. If the table does not exist yet when
-# the pod first starts (race with the bootstrap job), the pod crashes. During the
-# crash cycle Nextcloud writes a minimal config.php with only `localhost` in
-# trusted_domains. When the table is later created and the pod restarts, the
-# entrypoint sees config.php already on disk and skips regeneration — leaving
-# trusted_domains as `localhost`, which causes "Untrusted domain" errors.
+# Problem: on a fresh cluster the opendesk Nextcloud pod crashes before the DB is
+# ready. During the crash cycle it writes a minimal config.php with only `localhost`
+# in trusted_domains and no Redis/memcache settings. On the next (successful) start
+# the entrypoint sees config.php already on disk and skips regeneration, leaving
+# the stale values.
 #
-# Fix: this Sync hook Job runs on every argocd-main-app sync. It checks whether
-# config.php contains the correct domain. If not, it deletes config.php and
-# restarts the deployment so the entrypoint regenerates it from the database.
-# Idempotent: exits 0 immediately when trusted_domains is already correct.
+# Fix: use PHP to patch config.php directly on every ArgoCD sync.
+# occ config:system:set is blocked by config_is_read_only in this image.
+# config.php is owned by nginx (r--r-----); the owner can chmod their own file,
+# so we temporarily unlock it, patch all settings, and restore read-only.
+# No pod restart needed. Idempotent.
+#
+# The PHP script is stored in a ConfigMap and piped into the Nextcloud pod via
+# kubectl exec -i to avoid shell-escaping issues.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextcloud-config-fix-script
+  namespace: opendesk
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  fix.php: |
+    <?php
+    require '/var/www/html/config/config.php';
+    $redis_user = getenv('FS_ENV_REDIS_USER');
+    $CONFIG['redis'] = array(
+        'host'     => getenv('FS_ENV_REDIS_HOST') ?: 'redis-headless',
+        'port'     => intval(getenv('FS_ENV_REDIS_PORT') ?: 6379),
+        'timeout'  => intval(getenv('FS_ENV_REDIS_TIMEOUT') ?: 30),
+        'dbindex'  => intval(getenv('FS_ENV_REDIS_DBINDEX') ?: 0),
+        'password' => getenv('FS_ENV_REDIS_PASSWORD') ?: '',
+    );
+    if ($redis_user !== false && $redis_user !== '') {
+        $CONFIG['redis']['user'] = $redis_user;
+    }
+    $CONFIG['memcache.distributed'] = '\OC\Memcache\Redis';
+    $CONFIG['memcache.locking']     = '\OC\Memcache\Redis';
+    $CONFIG['memcache.local']       = '\OC\Memcache\APCu';
+    $CONFIG['filelocking.enabled']  = true;
+    $CONFIG['config_is_read_only']  = false;
+    $CONFIG['allow_local_remote_servers'] = true;
+    $domain = getenv('FS_ENV_TRUSTED_DOMAINS') ?: '';
+    if ($domain) {
+        $CONFIG['trusted_domains']   = [$domain];
+        $CONFIG['overwrite.cli.url'] = 'https://' . $domain;
+        $CONFIG['overwriteprotocol'] = getenv('FS_ENV_OVERWRITE_PROTOCOL') ?: 'https';
+    }
+    if (file_put_contents('/var/www/html/config/config.php',
+            '<?php' . PHP_EOL . '$CONFIG = ' . var_export($CONFIG, true) . ';' . PHP_EOL) === false) {
+        fwrite(STDERR, "file_put_contents failed\n");
+        exit(1);
+    }
+    echo 'Config updated from env vars.' . PHP_EOL;
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -71,18 +114,24 @@ spec:
     spec:
       serviceAccountName: nextcloud-trusted-domain-fix
       restartPolicy: Never
+      volumes:
+      - name: fix-script
+        configMap:
+          name: nextcloud-config-fix-script
       containers:
       - name: fix
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
+        volumeMounts:
+        - name: fix-script
+          mountPath: /scripts
         command: ["/bin/sh", "-ec"]
         args:
         - |
-          DEPLOY="opendesk-nextcloud-aio"
           NS="opendesk"
 
-          # Find running nextcloud pod
+          # Find a running nextcloud pod
           POD=$(kubectl get pods -n "$NS" \
-            -l "app.kubernetes.io/name=nextcloud-aio" \
+            -l "app.kubernetes.io/name=aio,app.kubernetes.io/instance=opendesk-nextcloud" \
             --field-selector=status.phase=Running \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
@@ -93,28 +142,15 @@ spec:
 
           echo "Nextcloud pod: $POD"
 
-          # Check current trusted_domains in config.php
-          DOMAINS=$(kubectl exec -n "$NS" "$POD" -- \
-            grep -A5 "trusted_domains" /var/www/html/config/config.php 2>/dev/null || true)
+          # Temporarily make config.php writable (owner can chmod without write perm).
+          kubectl exec -n "$NS" "$POD" -- chmod 640 /var/www/html/config/config.php
 
-          echo "Current trusted_domains block:"
-          echo "$DOMAINS"
+          # Copy the PHP fix script into the pod and run it.
+          # env vars (FS_ENV_*) are already set in the pod — the script reads them directly.
+          kubectl exec -i -n "$NS" "$POD" -- sh -c "cat > /tmp/nc-config-fix.php" < /scripts/fix.php
+          kubectl exec -n "$NS" "$POD" -- php /tmp/nc-config-fix.php
 
-          # Check if localhost-only (broken state)
-          if echo "$DOMAINS" | grep -q "localhost" && ! echo "$DOMAINS" | grep -qv "localhost.*'[[:space:]]*$\|'trusted_domains\|array"; then
-            echo "trusted_domains contains only localhost — config.php is stale."
-          elif echo "$DOMAINS" | grep -q "localhost" && ! echo "$DOMAINS" | grep -qE "[a-z0-9-]+\.[a-z0-9-]+\.[a-z]+"; then
-            echo "trusted_domains has no real domain — config.php is stale."
-          else
-            echo "trusted_domains looks correct — nothing to do."
-            exit 0
-          fi
+          # Restore read-only.
+          kubectl exec -n "$NS" "$POD" -- chmod 440 /var/www/html/config/config.php
 
-          echo "Deleting stale config.php and restarting deployment..."
-          kubectl exec -n "$NS" "$POD" -- rm -f /var/www/html/config/config.php
-          kubectl rollout restart deployment/"$DEPLOY" -n "$NS"
-
-          echo "Waiting for rollout to complete..."
-          kubectl rollout status deployment/"$DEPLOY" -n "$NS" --timeout=120s
-
-          echo "Done — nextcloud restarted with regenerated config.php."
+          echo "Done — config patched (trusted_domains, Redis, memcache)."

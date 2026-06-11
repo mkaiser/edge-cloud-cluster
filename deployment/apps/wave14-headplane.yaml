@@ -1,5 +1,5 @@
 # ArgoCD Application: headplane
-# Admin GUI for Headscale, accessible at https://headplane.ecc66.cape-project.eu/admin/
+# Admin GUI for Headscale, accessible at https://headplane.ecc76.your-domain.tld/admin/
 # Depends on headplane-secrets (api-key key) being seeded by the headscale App's PostSync job.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -12,9 +12,9 @@ spec:
   project: default
   info:
     - name: Admin
-      value: https://headplane.ecc66.cape-project.eu/admin/
+      value: https://headplane.ecc76.your-domain.tld/admin/
   sources:
-    - repoURL: git@github.com:paraXent/infra.git
+    - repoURL: git@github.com:orga/repo.git
       targetRevision: main
       path: deployment/headplane
 

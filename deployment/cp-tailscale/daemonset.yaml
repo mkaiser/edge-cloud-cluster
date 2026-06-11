@@ -75,7 +75,7 @@ spec:
       # Reading from the secret avoids hairpin-NAT issues (CP node reaching its
       # own external hostname via openssl).  Writes non-leaf certs to /certs/.
       - name: fetch-headscale-ca
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -102,7 +102,7 @@ spec:
       containers:
       - name: tailscale
         # renovate: datasource=docker
-        image: ghcr.io/tailscale/tailscale:v1.96.5
+        image: ghcr.io/tailscale/tailscale:v1.98.4
         # Bypass containerboot — run tailscaled directly and authenticate with
         # tailscale up, passing --login-server explicitly so headscale is used.
         command: ["/bin/sh", "-c"]
@@ -171,7 +171,7 @@ spec:
               name: headscale-preauthkey
               key: key
         - name: TS_LOGIN_SERVER
-          value: "https://vpn.ecc66.cape-project.eu"
+          value: "https://vpn.ecc76.your-domain.tld"
         - name: TS_HOSTNAME
           valueFrom:
             fieldRef:

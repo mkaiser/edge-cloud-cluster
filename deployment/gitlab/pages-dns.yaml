@@ -1,4 +1,4 @@
-# Wildcard DNS record for GitLab Pages: *.pages.gitlab.ecc66.cape-project.eu
+# Wildcard DNS record for GitLab Pages: *.pages.gitlab.ecc76.your-domain.tld
 #
 # A PostSync job reads the haproxy-ingress service's live external IPs and
 # applies the DNSEndpoint dynamically — no hardcoded IPs needed.
@@ -63,10 +63,10 @@ spec:
       restartPolicy: Never
       containers:
       - name: apply-dns
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         env:
         - name: PAGES_HOSTNAME
-          value: "*.pages.gitlab.ecc66.cape-project.eu"
+          value: "*.pages.gitlab.ecc76.your-domain.tld"
         command: ["/bin/sh", "-c"]
         args:
         - |

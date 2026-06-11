@@ -1,0 +1,27 @@
+# Longhorn operational config — deployed after wave1-barrier confirms Longhorn is ready.
+# Longhorn itself is installed by Pulumi (not ArgoCD).
+# This app manages: RecurringJobs, weekly report CronJob, and BackupTarget.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn-config
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:orga/repo.git
+    targetRevision: main
+    path: deployment/longhorn
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: longhorn-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

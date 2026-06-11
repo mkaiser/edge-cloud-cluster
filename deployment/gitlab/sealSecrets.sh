@@ -3,7 +3,7 @@
 # Safe to re-run: checks for existing sealed secrets and asks before regenerating.
 # Skipped secrets keep their current sealed values (no data loss on re-run).
 #
-# S3 credentials are read from Pulumi config (set during cluster setup via setPulumiSecrets.sh):
+# S3 credentials are read from Pulumi config (set during cluster setup via setAllSecrets.sh):
 #   - hetznerS3AccessKey / hetznerS3SecretKey
 # GitLab root password is entered interactively.
 #

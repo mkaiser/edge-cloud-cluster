@@ -1,5 +1,8 @@
-# Wave 1 Sync barrier: waits until wave-0 Applications (argocd-infra, secrets,
-# external-dns, kube-vip, longhorn) are Synced+Healthy before advancing to wave 2.
+# Wave 1 Sync barrier: waits until all wave-0 Applications are Synced+Healthy
+# before advancing to wave 2.
+#
+# Longhorn readiness (engine images + DaemonSet) is verified by Pulumi during
+# cluster setup — no need to re-check it here.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -10,10 +13,9 @@ metadata:
     argocd.argoproj.io/sync-wave: "1"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: wave1-barrier
-  namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 rules:
@@ -22,15 +24,14 @@ rules:
   verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: wave1-barrier
-  namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: wave1-barrier
 subjects:
 - kind: ServiceAccount
@@ -55,7 +56,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -78,7 +79,7 @@ spec:
 
           i=0
           while [ "$i" -lt 90 ]; do
-            ALL_READY=true
+            PENDING=""
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
@@ -90,20 +91,21 @@ spec:
                  { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
                 : # ready
               else
-                ALL_READY=false
-                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},phase=${PHASE})"
               fi
             done
 
-            if [ "$ALL_READY" = "true" ]; then
-              echo "All wave-0 Applications are Synced+Healthy — releasing wave 2."
-              exit 0
+            if [ -z "$PENDING" ]; then
+              echo "All wave-0 Applications Synced+Healthy."
+              break
             fi
 
-            echo "Attempt $i/90 — not all ready, waiting 10s..."
+            echo "Attempt $i/90 — waiting for:${PENDING}"
             sleep 10
             i=$((i+1))
           done
 
-          echo "ERROR: wave-0 Applications did not reach Synced+Healthy+Completed within 15 minutes"
-          exit 1
+          if [ -n "$PENDING" ]; then
+            echo "ERROR: timed out waiting for:${PENDING}"
+            exit 1
+          fi

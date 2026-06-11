@@ -7,7 +7,7 @@
 # openDesk related settings.
 openDesk:
   # -- Deployment domain.
-  domain: "test.your-domain.tld" # MODIFIED
+  domain: "ecc76.your-domain.tld" # MODIFIED
   # -- Deployment password seed.
   masterPassword: "x&9gX#ZgiqRHshvYR9AiSuopK9^aKS#TP4qZ/h3oo2Z9^&Wed" # MODIFIED
   # -- TURN sever credential.
@@ -124,7 +124,7 @@ argo:
     # -- Git repository used for Argo to fetch openDesk.
     repoURL: "https://gitlab.opencode.de/bmi/opendesk/deployment/opendesk.git" # MODIFIED
     # -- Git revision.
-    targetRevision: "v1.14.2" # renovate: datasource=gitlab-tags depName=bmi/opendesk/deployment/opendesk registryUrl=https://gitlab.opencode.de
+    targetRevision: "v1.15.0" # renovate: datasource=gitlab-tags depName=bmi/opendesk/deployment/opendesk registryUrl=https://gitlab.opencode.de
   # Enable opendesk-migrations-pre job (sets stage: PRE in migrations-status
   # ConfigMap before migrations-post runs). Required for fresh installs.
   enableMigrationsPre: true

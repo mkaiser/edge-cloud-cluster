@@ -71,7 +71,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -94,7 +94,7 @@ spec:
 
           i=0
           while [ "$i" -lt 180 ]; do
-            ALL_READY=true
+            PENDING=""
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
@@ -106,23 +106,22 @@ spec:
                  { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
                 : # ready
               else
-                ALL_READY=false
-                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},phase=${PHASE})"
               fi
             done
 
-            if [ "$ALL_READY" = "true" ]; then
+            if [ -z "$PENDING" ]; then
               echo "All wave-14 Applications are Synced+Healthy+NotProgressing — releasing wave 16."
               break
             fi
 
-            echo "Attempt $i/180 — not all ready, waiting 10s..."
+            echo "Attempt $i/180 — waiting for:${PENDING}"
             sleep 10
             i=$((i+1))
           done
 
-          if [ "$ALL_READY" != "true" ]; then
-            echo "ERROR: wave-14 Applications did not reach Synced+Healthy+Completed within 30 minutes"
+          if [ -n "$PENDING" ]; then
+            echo "ERROR: timed out waiting for:${PENDING}"
             exit 1
           fi
 
@@ -153,15 +152,15 @@ spec:
           password = get_secret_key("password")
 
           msg = EmailMessage()
-          msg["Subject"] = "ecc66.cape-project.eu — Basic infrastructure ready"
-          msg["From"]    = "no-reply@cape-project.eu"
+          msg["Subject"] = "ecc76.your-domain.tld — Basic infrastructure ready"
+          msg["From"]    = "no-reply@your-domain.tld"
           msg["To"]      = to
           msg.set_content(
               "Headscale VPN and Headplane are healthy.\n\n"
               "Basic infrastructure is ready:\n"
-              "  - VPN:       https://vpn.ecc66.cape-project.eu\n"
-              "  - Headplane: https://headplane.ecc66.cape-project.eu/admin\n"
-              "  - ArgoCD:    https://argocd.ecc66.cape-project.eu\n\n"
+              "  - VPN:       https://vpn.ecc76.your-domain.tld\n"
+              "  - Headplane: https://headplane.ecc76.your-domain.tld/admin\n"
+              "  - ArgoCD:    https://argocd.ecc76.your-domain.tld\n\n"
               "Edge workers can now join the cluster.\n"
               "Run the join script on each edge node:\n"
               "  ./scripts/2_joinCluster.sh\n"

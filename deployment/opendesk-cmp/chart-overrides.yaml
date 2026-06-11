@@ -14,8 +14,9 @@ data:
   global-overwrites.yaml: |
     global:
       additionalMailDomains:
-        - "domainA.tld"
-        - "domainB.tld"
+        - "your-domain.tld"
+        - "your-domainB.tld"
+        - "your-domainC.tld"
     # Inject extra Helm values for the ums (nubus) release after
     # values-nubus.yaml.gotmpl — later files win on merge.
     # helmfile-child.yaml.gotmpl ranges this as a list of file paths.
@@ -78,7 +79,7 @@ data:
     #           whitelist:
     #             groups: "Domain Users, Domain Admins"
     #           email:
-    #             sender_address: "no-reply@cape-project.eu"
+    #             sender_address: "no-reply@your-domain.tld"
     #             subject: "Welcome to openDesk — set your password"
     nubusUmcServer:
       selfService:

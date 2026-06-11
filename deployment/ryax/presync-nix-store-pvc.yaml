@@ -77,7 +77,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: create-pvc
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |

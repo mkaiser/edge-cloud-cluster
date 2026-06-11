@@ -1,0 +1,174 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smtp-credentials
+  namespace: longhorn-system
+type: Opaque
+stringData:
+  host: mail.your-server.de
+  port: "587"
+  username: no-reply@your-domain.tld
+  password: "3_W/KTQxQ3PJk"
+  recipient: mail@domain.tld
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: longhorn-weekly-report-script
+  namespace: longhorn-system
+data:
+  report.py: |
+    import smtplib, os, subprocess
+    from datetime import datetime, timezone, timedelta
+    from email.message import EmailMessage
+
+    host      = os.environ["SMTP_HOST"]
+    port      = int(os.environ["SMTP_PORT"])
+    username  = os.environ["SMTP_USERNAME"]
+    password  = os.environ["SMTP_PASSWORD"]
+    recipient = os.environ["SMTP_RECIPIENT"]
+
+    result = subprocess.run(
+        ["kubectl", "get", "jobs", "-n", "longhorn-system",
+         "--no-headers", "-o",
+         "custom-columns=NAME:.metadata.name,START:.status.startTime,"
+         "SUCCEEDED:.status.succeeded,FAILED:.status.failed"],
+        capture_output=True, text=True
+    )
+
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    succeeded, failed, lines = 0, 0, []
+
+    for row in result.stdout.strip().splitlines():
+        parts = row.split()
+        if len(parts) < 4:
+            continue
+        name, start, suc, fail = parts[0], parts[1], parts[2], parts[3]
+        if not name.startswith("backup-daily-"):
+            continue
+        try:
+            ts = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts < week_ago:
+            continue
+        ok  = int(suc)  if suc  not in ("<none>", "") else 0
+        err = int(fail) if fail not in ("<none>", "") else 0
+        if ok >= 1:
+            succeeded += 1
+            lines.append(f"  OK   {name}  ({start})")
+        else:
+            failed += 1
+            lines.append(f"  FAIL {name}  ({start})")
+
+    report_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    detail = "\n".join(lines) if lines else "  (no backup jobs in the last 7 days)"
+
+    body = (
+        f"Longhorn Weekly Backup Report -- {report_date}\n"
+        f"Cluster : ecc76.your-domain.tld\n\n"
+        f"Backup jobs (last 7 days):\n"
+        f"  Succeeded : {succeeded}\n"
+        f"  Failed    : {failed}\n\n"
+        f"Details:\n{detail}\n\n"
+        f"Note: Snapshot jobs are local-only and not included.\n"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"Longhorn Weekly Backup Report {report_date} "
+        f"({succeeded} ok / {failed} failed)"
+    )
+    msg["From"] = "no-reply@your-domain.tld"
+    msg["To"]   = recipient
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port, timeout=15) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(username, password)
+        s.send_message(msg)
+
+    print(f"Weekly report sent to {recipient}: {succeeded} ok / {failed} failed")
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: longhorn-weekly-report
+  namespace: longhorn-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: longhorn-weekly-report
+  namespace: longhorn-system
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: longhorn-weekly-report
+  namespace: longhorn-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: longhorn-weekly-report
+subjects:
+  - kind: ServiceAccount
+    name: longhorn-weekly-report
+    namespace: longhorn-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: longhorn-backup-weekly-report
+  namespace: longhorn-system
+spec:
+  schedule: "0 8 * * 3"  # Wednesday 08:00 UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: longhorn-weekly-report
+          restartPolicy: OnFailure
+          volumes:
+            - name: script
+              configMap:
+                name: longhorn-weekly-report-script
+          containers:
+            - name: report
+              image: docker.io/alpine/k8s:1.36.1
+              command: ["python3", "/script/report.py"]
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+              env:
+                - name: SMTP_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-credentials
+                      key: host
+                - name: SMTP_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-credentials
+                      key: port
+                - name: SMTP_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-credentials
+                      key: username
+                - name: SMTP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-credentials
+                      key: password
+                - name: SMTP_RECIPIENT
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-credentials
+                      key: recipient

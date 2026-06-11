@@ -90,7 +90,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             "cert-manager-hetzner-secret",
             {
                 metadata: { name: "hetzner", namespace: "cert-manager" },
-                stringData: { token: projectSettings.server.hcloudToken },
+                stringData: { token: projectSettings.general.hcloudToken },
             },
             { provider: k8sProvider, parent: this, dependsOn: [this.certManagerNs] },
         );
@@ -126,6 +126,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 provider: k8sProvider,
                 parent: this,
                 dependsOn: [this.certManager, certManagerWebhookHetzner, certManagerHetznerSecret],
+                retainOnDelete: true,
             },
         );
 
@@ -148,6 +149,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 provider: k8sProvider,
                 parent: this,
                 dependsOn: [this.certManager, certManagerWebhookHetzner, certManagerHetznerSecret],
+                retainOnDelete: true,
             },
         );
 

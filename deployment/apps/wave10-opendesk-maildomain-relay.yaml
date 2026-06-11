@@ -10,9 +10,8 @@ metadata:
     argocd.argoproj.io/sync-wave: "10"
 data:
   domains: |
-    paraxent.de
-    paraxent.com
-    techfak.uni-bielefeld.de
+    your-domain.tld
+    your-domain1.tld
 ---
 apiVersion: batch/v1
 kind: Job

@@ -1,15 +1,19 @@
-# Wave 5 Sync barrier: waits until k3s-upgrade-plans is Synced+Healthy AND all
-# k8s nodes are schedulable (k3s upgrade drain+uncordon fully complete) before
-# ArgoCD advances to wave 6 (opendesk-cmp).
+# Wave 5 Sync barrier: waits until k3s-upgrade-plans is Synced+Healthy, then
+# actively uncordons any remaining cordoned nodes before releasing wave 6.
+#
+# Active uncordon is required for single-node k3s: when k3s restarts during a
+# SUC upgrade job the job pod is killed before it can uncordon, leaving the node
+# permanently cordoned. This barrier recovers that state automatically.
+# It is also safe when the plan version <= node version (no-op upgrade): plans
+# become Healthy immediately, the uncordon is a no-op, wave 6 proceeds.
 #
 # Wave 4 is dedicated to the k3s upgrade sequence:
 #   wave 2: system-upgrade-controller (provides Plan CRD)
-#   wave 4: k3s-upgrade-plans (applies Plans → SUC drains, upgrades, uncordons)
-#   wave 5: this barrier (waits for Plans healthy + nodes schedulable)
+#   wave 4: k3s-upgrade-plans (applies Plans → SUC upgrades, cordons)
+#   wave 5: this barrier (plans healthy → uncordon all nodes → release wave 6)
 #   wave 6: opendesk-cmp (safe to start now that nodes are Ready)
 #
-# ClusterRole (not Role) required: node schedulability check reads cluster-scoped
-# Node objects in addition to argocd-namespace Applications.
+# ClusterRole (not Role) required: node patch (uncordon) is cluster-scoped.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -31,7 +35,10 @@ rules:
   verbs: ["get", "list"]
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -66,7 +73,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: barrier
-        image: docker.io/alpine/k8s:1.36.0
+        image: docker.io/alpine/k8s:1.36.1
         command: ["/bin/sh", "-ec"]
         args:
         - |
@@ -89,7 +96,7 @@ spec:
 
           i=0
           while [ "$i" -lt 360 ]; do
-            ALL_READY=true
+            PENDING=""
             for APP in $APPS; do
               SYNC=$(kubectl get application "$APP" -n argocd \
                 -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
@@ -101,44 +108,56 @@ spec:
                  { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "SyncOk" ] || [ -z "$PHASE" ]; }; then
                 : # ready
               else
-                ALL_READY=false
-                echo "  ${APP}: sync=${SYNC} health=${HEALTH} phase=${PHASE}"
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},phase=${PHASE})"
               fi
             done
 
-            if [ "$ALL_READY" = "true" ]; then
+            if [ -z "$PENDING" ]; then
               echo "All argocd-main-app wave-4 Applications are Synced+Healthy+NotProgressing."
               break
             fi
 
-            echo "Attempt $i/360 — not all ready, waiting 10s..."
+            echo "Attempt $i/360 — waiting for:${PENDING}"
             sleep 10
             i=$((i+1))
           done
 
-          if [ "$ALL_READY" != "true" ]; then
-            echo "ERROR: Not all argocd-main-app wave-4 Applications reached Synced+Healthy+Completed within 60 minutes"
+          if [ -n "$PENDING" ]; then
+            echo "ERROR: timed out waiting for:${PENDING}"
             exit 1
           fi
 
-          echo "Waiting for all nodes to be schedulable (k3s upgrade complete)..."
+          PRE_CORDONED=$(kubectl get configmap cordoned-before-upgrade -n argocd \
+            -o jsonpath='{.data.nodes}' 2>/dev/null || true)
+          echo "Nodes manually cordoned before upgrade: '${PRE_CORDONED}'"
+
+          echo "Uncordoning nodes cordoned by the upgrade (skipping manually cordoned nodes)..."
+          CORDONED_NODES=$(kubectl get nodes -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+          if [ -n "$CORDONED_NODES" ]; then
+            for NODE in $CORDONED_NODES; do
+              if echo " ${PRE_CORDONED} " | grep -qF " ${NODE} "; then
+                echo "  Skipping ${NODE} — was manually cordoned before upgrade."
+              else
+                kubectl uncordon "$NODE" && echo "  Uncordoned ${NODE}." || echo "  WARNING: uncordon ${NODE} failed — continuing."
+              fi
+            done
+          else
+            echo "  No cordoned nodes — nothing to do."
+          fi
+
+          echo "Waiting for all nodes to be Ready..."
           i=0
           while [ "$i" -lt 60 ]; do
-            # Use grep|wc -l (not grep -c) — grep -c exits 1 on no matches which
-            # would fire the || fallback and corrupt the variable with "0\n0".
-            # tr -d ' ' strips leading spaces from wc output.
-            CORDONED=$(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.unschedulable}{"\n"}{end}' 2>/dev/null \
-              | grep "true" | wc -l | tr -d ' ')
             NOT_READY=$(kubectl get nodes --no-headers 2>/dev/null \
               | grep -v " Ready " | wc -l | tr -d ' ')
-            if [ "$CORDONED" = "0" ] && [ "$NOT_READY" = "0" ]; then
-              echo "All nodes schedulable and Ready — releasing wave 6."
+            if [ "$NOT_READY" = "0" ]; then
+              echo "All nodes Ready — releasing wave 6."
               exit 0
             fi
-            echo "  cordoned=${CORDONED} not-ready=${NOT_READY}, waiting 10s... ($i/60)"
+            echo "  not-ready=${NOT_READY}, waiting 10s... ($i/60)"
             sleep 10
             i=$((i+1))
           done
 
-          echo "ERROR: nodes did not become schedulable within 10 minutes"
+          echo "ERROR: nodes did not become Ready within 10 minutes"
           exit 1

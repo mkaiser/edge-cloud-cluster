@@ -13,7 +13,7 @@ args:
     - profile
     - email
   response_type: code
-  issuer: https://id.ecc66.cape-project.eu/realms/opendesk
+  issuer: https://id.ecc76.your-domain.tld/realms/opendesk
   discovery: true
   client_auth_method: query
   uid_field: preferred_username
@@ -21,4 +21,4 @@ args:
   client_options:
     identifier: gitlab
     secret: OIDC_CLIENT_SECRET_PLACEHOLDER
-    redirect_uri: https://gitlab.ecc66.cape-project.eu/users/auth/openid_connect/callback
+    redirect_uri: https://gitlab.ecc76.your-domain.tld/users/auth/openid_connect/callback
