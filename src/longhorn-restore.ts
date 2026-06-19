@@ -1,3 +1,16 @@
+/**
+ * Project: edgecloudinfra
+ * File: longhorn-restore.ts
+ * Purpose: Longhorn restore helper utilities.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
+import * as fs from "fs";
+import * as path from "path";
 import * as pulumi from "@pulumi/pulumi";
 import * as command from "@pulumi/command";
 import { project_settings } from "../project_settings";
@@ -9,11 +22,51 @@ const BACKUP_BUCKET = longhornBucket.name;
 const BACKUP_REGION = longhornBucket.location;
 const LONGHORN_PORT = 8091;
 
+// Namespaces whose volumes are NOT restored at cloud-cluster creation: only apps
+// tagged placement.ecc/tier: edge (e.g. windows) — their data lives on edge
+// disks (longhorn-edge), so there's nothing to restore onto the cloud plane.
+//
+// IMPORTANT: `flex`-tier apps are deliberately NOT skipped here. They are still
+// cloud-resident on longhorn-cloud (their SeaweedFS/CNPG mobility migration is
+// deferred), so their data MUST be restored to cloud. Once a `flex` app actually
+// moves off cloud, its data lives in SeaweedFS/CNPG and it has no cloud Longhorn
+// backup to restore anyway, so this stays correct.
+//
+// Scanned from git manifests because the apps aren't synced yet when restore runs.
+function deferredNamespacesFromManifests(): string[] {
+    const dir = path.join(__dirname, "..", "deployment", "argocd-sync-waves");
+    const out = new Set<string>();
+    let files: string[];
+    try {
+        files = fs.readdirSync(dir).filter((f) => f.endsWith(".yaml"));
+    } catch {
+        return [];
+    }
+    for (const f of files) {
+        const txt = fs.readFileSync(path.join(dir, f), "utf8");
+        const tierM = txt.match(/placement\.cape\.io\/tier:\s*["']?(\w+)["']?/);
+        // Only edge-tier apps are off-cloud; flex/cloud volumes restore to cloud.
+        if (!tierM || tierM[1] !== "edge") continue;
+        // destination.namespace = the namespace value that isn't the ArgoCD ns
+        const nsAll = [...txt.matchAll(/^\s*namespace:\s*["']?([\w-]+)["']?\s*$/gm)].map(
+            (m) => m[1],
+        );
+        const ns = nsAll.find((n) => n !== "argocd");
+        if (ns) out.add(ns);
+    }
+    return [...out];
+}
+const DEFERRED_NAMESPACES = deferredNamespacesFromManifests();
+
 // Runs during `pulumi up` when restoreClusterFromS3Backup=true.
 // Port-forwards the Longhorn API, waits for the backup target, then restores
 // every volume that has a backup in S3 but no healthy replicas on the new cluster.
+export interface LonghornRestoreArgs {
+    kubeconfigRaw: pulumi.Output<string>;
+}
+
 export class LonghornRestoreComponent extends pulumi.ComponentResource {
-    constructor(name: string, opts?: pulumi.ComponentResourceOptions) {
+    constructor(name: string, args: LonghornRestoreArgs, opts?: pulumi.ComponentResourceOptions) {
         super("edgecloudinfra:index:LonghornRestore", name, {}, opts);
 
         new command.local.Command(
@@ -24,12 +77,28 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     `BACKUP_BUCKET="${BACKUP_BUCKET}"`,
                     `BACKUP_REGION="${BACKUP_REGION}"`,
                     ``,
-                    `cleanup() { [ -n "\${PF_PID:-}" ] && kill "\$PF_PID" 2>/dev/null || true; }`,
+                    `TMPKC=$(mktemp)`,
+                    `cleanup() {`,
+                    `    if [ -n "\${PF_PID:-}" ]; then`,
+                    `        kill "\$PF_PID" 2>/dev/null || true`,
+                    `        wait "\$PF_PID" 2>/dev/null || true`,
+                    `    fi`,
+                    `    rm -f "$TMPKC"`,
+                    `}`,
                     `trap cleanup EXIT`,
+                    `printf '%s\\n' "$KUBECONFIG_CONTENT" > "$TMPKC"`,
+                    `export KUBECONFIG="$TMPKC"`,
                     ``,
                     `echo "=== Longhorn restore from S3 ==="`,
+                    `# Redirect ALL three fds with POSIX syntax (this runs under /bin/sh,`,
+                    `# NOT bash): the bashism "&>file" parses in dash as "background &"`,
+                    `# + a separate ">file", leaving the port-forward attached to pulumi's`,
+                    `# stdout/stderr pipe — so pulumi never sees EOF and the Command hangs`,
+                    `# forever even after this script exits. ">file 2>&1 </dev/null &"`,
+                    `# detaches every fd so the backgrounded PF holds none of pulumi's pipes.`,
                     `kubectl port-forward svc/longhorn-frontend -n longhorn-system \\`,
-                    `    "\${LONGHORN_PORT}:80" --address=127.0.0.1 &>/tmp/longhorn-restore-pf.log &`,
+                    `    "\${LONGHORN_PORT}:80" --address=127.0.0.1 \\`,
+                    `    >/tmp/longhorn-restore-pf.log 2>&1 </dev/null &`,
                     `PF_PID=$!`,
                     ``,
                     `echo "Waiting for Longhorn API (up to 5 min)..."`,
@@ -55,10 +124,24 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     `done`,
                     ``,
                     `python3 - "\${LONGHORN_PORT}" "\${BACKUP_BUCKET}" "\${BACKUP_REGION}" << 'PYEOF'`,
-                    `import sys, urllib.request, json, time`,
+                    `import sys, os, urllib.request, json, time`,
                     ``,
                     `port, bucket, region = sys.argv[1], sys.argv[2], sys.argv[3]`,
                     `base = f"http://localhost:{port}/v1"`,
+                    `# Namespaces tagged tier flex|edge — their volumes are NOT restored to cloud.`,
+                    `deferred = set(json.loads(os.environ.get("DEFERRED_NAMESPACES", "[]")))`,
+                    `print(f"Deferred (non-cloud) namespaces: {sorted(deferred) or 'none'}")`,
+                    ``,
+                    `def ns_of(obj):`,
+                    `    # Longhorn stores the source PVC namespace as a JSON 'KubernetesStatus' label.`,
+                    `    labels = obj.get("labels") or {}`,
+                    `    raw = labels.get("KubernetesStatus")`,
+                    `    if not raw:`,
+                    `        return ""`,
+                    `    try:`,
+                    `        return (json.loads(raw) or {}).get("namespace", "") or ""`,
+                    `    except Exception:`,
+                    `        return ""`,
                     ``,
                     `def api_get(path):`,
                     `    with urllib.request.urlopen(urllib.request.Request(f"{base}{path}"), timeout=30) as r:`,
@@ -89,6 +172,7 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     ``,
                     `for bv in bvols:`,
                     `    vol_name = bv["volumeName"]`,
+                    `    bv_id    = bv["id"]`,
                     `    last_bk  = bv.get("lastBackupName", "")`,
                     `    vol_size = str(bv.get("size", "0"))`,
                     ``,
@@ -97,11 +181,34 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     `        skipped.append(vol_name)`,
                     `        continue`,
                     ``,
-                    `    backup_url = (f"s3://{bucket}@{region}/backupstore"`,
-                    `                  f"/volumes/{vol_name}/backups/{last_bk}")`,
+                    `    ns = ns_of(bv)`,
+                    `    if ns and ns in deferred:`,
+                    `        print(f"  SKIP  {vol_name}: namespace '{ns}' is non-cloud tier (not restored here)")`,
+                    `        skipped.append(vol_name)`,
+                    `        continue`,
+                    ``,
+                    `    # Get canonical backup URL from Longhorn API (query-param format)`,
+                    `    try:`,
+                    `        bk_info    = api_post(f"/backupvolumes/{bv_id}?action=backupGet", {"name": last_bk})`,
+                    `        backup_url = bk_info["url"]`,
+                    `    except Exception as e:`,
+                    `        print(f"  FAIL  {vol_name}: could not get backup URL: {e}")`,
+                    `        failed.append(vol_name)`,
+                    `        continue`,
+                    ``,
+                    `    if not ns:  # fall back to the backup's own KubernetesStatus label`,
+                    `        ns = ns_of(bk_info)`,
+                    `        if ns and ns in deferred:`,
+                    `            print(f"  SKIP  {vol_name}: namespace '{ns}' is non-cloud tier (not restored here)")`,
+                    `            skipped.append(vol_name)`,
+                    `            continue`,
                     ``,
                     `    if vol_name in existing:`,
                     `        v = existing[vol_name]`,
+                    `        if v.get("state") in ("restoring", "attaching"):`,
+                    `            print(f"  SKIP  {vol_name}: already restoring/attaching")`,
+                    `            skipped.append(vol_name)`,
+                    `            continue`,
                     `        running = [r for r in v.get("replicas", []) if r.get("running") and r.get("mode") == "RW"]`,
                     `        if running:`,
                     `            print(f"  SKIP  {vol_name}: {len(running)} healthy replica(s)")`,
@@ -117,7 +224,7 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     `        except Exception as e:`,
                     `            print(f"    WARNING: delete failed: {e}")`,
                     ``,
-                    `    print(f"  RESTORE {vol_name}  (backup: {last_bk})")`,
+                    `    print(f"  RESTORE {vol_name}")`,
                     `    try:`,
                     `        api_post("/volumes", {`,
                     `            "name":             vol_name,`,
@@ -169,6 +276,10 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     `PYEOF`,
                 ].join("\n"),
                 delete: "true",
+                environment: {
+                    KUBECONFIG_CONTENT: args.kubeconfigRaw,
+                    DEFERRED_NAMESPACES: JSON.stringify(DEFERRED_NAMESPACES),
+                },
             },
             { parent: this, customTimeouts: { create: "40m" } },
         );

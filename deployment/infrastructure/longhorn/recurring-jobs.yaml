@@ -1,0 +1,114 @@
+# Longhorn recurring backup jobs.
+# Applied to all volumes via the default RecurringJob group.
+# Snapshots stay on-node (fast, no S3 cost); backups go to S3 (survives full cluster loss).
+#
+# Retention: GFS approximated via 4 separate backup jobs, each with independent retain counts.
+# etcd snapshots: hourly, retain 72 (3 days) — configured in src/nodes-k3s.ts.
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: snapshot-hourly
+  namespace: longhorn-system
+spec:
+  cron: "0 * * * *"
+  task: snapshot
+  retain: 72
+  concurrency: 10
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-6hourly
+  namespace: longhorn-system
+spec:
+  cron: "30 */6 * * *"
+  task: backup
+  retain: 10
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-daily
+  namespace: longhorn-system
+spec:
+  cron: "30 2 * * *"
+  task: backup
+  retain: 14
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-weekly
+  namespace: longhorn-system
+spec:
+  cron: "30 2 * * 0"
+  task: backup
+  retain: 12
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-monthly
+  namespace: longhorn-system
+spec:
+  cron: "30 2 1 * *"
+  task: backup
+  retain: 18
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-yearly
+  namespace: longhorn-system
+spec:
+  cron: "30 2 1 1 *"
+  task: backup
+  retain: 4
+  concurrency: 1
+  groups:
+    - default
+---
+# Edge group: edge-local volumes (longhorn-edge StorageClass, e.g. the windows VM
+# disk) get their own, less-frequent cadence — they're large and edge nodes upload
+# backups to Hetzner S3 over their own internet link. Volumes join the "edge" group
+# via the longhorn-edge StorageClass recurringJobSelector (src/storage.ts).
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: edge-snapshot-6hourly
+  namespace: longhorn-system
+spec:
+  cron: "0 */6 * * *"
+  task: snapshot
+  retain: 8
+  concurrency: 2
+  groups:
+    - edge
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: edge-backup-daily
+  namespace: longhorn-system
+spec:
+  cron: "0 3 * * *"
+  task: backup
+  retain: 7
+  concurrency: 1
+  groups:
+    - edge

@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rallly
+  namespace: rallly
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+spec:
+  ingressClassName: haproxy
+  rules:
+    - host: rallly.ecc135.cape-project.eu
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rallly
+                port:
+                  number: 3000
+  tls:
+    - hosts:
+        - rallly.ecc135.cape-project.eu
+      secretName: rallly-tls

@@ -1,0 +1,102 @@
+# Authentik blueprint: enforce MFA (TOTP or passkey) for privileged groups.
+#
+# Authentik's stock "Default - Authentication flow" already has an authenticator
+# validation stage (default-authentication-mfa-validation) at order 30, but it ships
+# with not_configured_action=skip, so MFA is optional. This blueprint:
+#   1. adds two setup stages — WebAuthn/passkey + TOTP (user may use EITHER, or both)
+#   2. reconfigures the existing validation stage to FORCE configuration when the
+#      user has no device (not_configured_action=configure), for device classes
+#      totp + webauthn
+#   3. gates that stage so it only runs for authentik-admins / employees-extended
+#      who are NOT in mfa-exempt — everyone else logs in unchanged
+#
+# Gating is done by re-declaring the stock order-30 stage binding (same identifiers,
+# so we update the existing row) with policy_engine_mode=all and attaching a
+# require-mfa expression policy. Authentik's built-in order-10 policy on that binding
+# (skip when passwordless-webauthn) is preserved; with ALL mode the stage runs only
+# when BOTH pass → (not passwordless) AND (privileged & not exempt).
+#
+# mfa-exempt: the bootstrap test users are members (see blueprint-initial-users.yaml),
+# so they keep logging in without MFA while you test. Remove them to enforce.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-mfa
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  mfa.yaml: |
+    version: 1
+    metadata:
+      name: enforce-mfa
+    entries:
+      # ---- setup stages: passkey (WebAuthn) + authenticator app (TOTP) ----
+      - id: webauthn-setup
+        model: authentik_stages_authenticator_webauthn.authenticatorwebauthnstage
+        identifiers:
+          name: mfa-webauthn-setup
+        attrs:
+          friendly_name: "Passkey / security key"
+          user_verification: preferred
+          # resident key = discoverable credential = passkey support
+          resident_key_requirement: preferred
+      - id: totp-setup
+        model: authentik_stages_authenticator_totp.authenticatortotpstage
+        identifiers:
+          name: mfa-totp-setup
+        attrs:
+          friendly_name: "Authenticator app (TOTP)"
+          digits: 6
+
+      # ---- reconfigure the stock validation stage to force setup, TOTP or passkey ----
+      - id: mfa-validate
+        model: authentik_stages_authenticator_validate.authenticatorvalidatestage
+        identifiers:
+          name: default-authentication-mfa-validation
+        attrs:
+          not_configured_action: configure
+          device_classes:
+            - totp
+            - webauthn
+          webauthn_user_verification: preferred
+          configuration_stages:
+            - !KeyOf webauthn-setup
+            - !KeyOf totp-setup
+
+      # ---- require-MFA policy: privileged groups, excluding mfa-exempt ----
+      # Evaluated against the pending_user (not yet logged in at this stage), mirroring
+      # authentik's own default-authentication-flow-password-optional policy pattern.
+      - id: policy-require-mfa
+        model: authentik_policies_expression.expressionpolicy
+        identifiers:
+          name: require-mfa
+        attrs:
+          expression: |
+            flow_plan = request.context.get("flow_plan")
+            user = flow_plan.context.get("pending_user") if flow_plan else request.user
+            if not user or not user.pk:
+                return False
+            groups = set(user.groups.values_list("name", flat=True))
+            return bool(groups & {"authentik-admins", "employees-extended"}) and "mfa-exempt" not in groups
+
+      # ---- re-declare the stock order-30 binding to AND-in require-mfa ----
+      # Same identifiers as authentik's default flow → updates that binding in place.
+      - id: mfa-validation-binding
+        model: authentik_flows.flowstagebinding
+        identifiers:
+          target: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+          stage: !Find [authentik_stages_authenticator_validate.authenticatorvalidatestage, [name, default-authentication-mfa-validation]]
+          order: 30
+        attrs:
+          # ALL: both the stock "skip-if-passwordless" policy (order 10) AND require-mfa
+          # (order 20) must pass for the stage to run.
+          policy_engine_mode: all
+          re_evaluate_policies: true
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !KeyOf mfa-validation-binding
+          policy: !KeyOf policy-require-mfa
+          order: 20
+        attrs:
+          enabled: true

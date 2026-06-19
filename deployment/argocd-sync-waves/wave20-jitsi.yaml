@@ -1,0 +1,59 @@
+# ArgoCD Application: Jitsi Meet (jitsi-contrib/jitsi-helm chart).
+# Accessible at https://meet.ecc135.cape-project.eu
+# OIDC via Authentik using the jitsi-oidc-adapter (separate Deployment) + JWT
+# token auth in prosody. Provider/tile created & removed via the Authentik API
+# (PostSync/PreDelete hooks) — all config lives in deployment/apps/jitsi.
+#
+# Same sync wave as GitLab (14).
+#
+# Multi-source:
+#   1. jitsi-meet Helm chart
+#   2. ref source for $values
+#   3. Git directory for adapter, authentik provider jobs, sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jitsi
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://jitsi-contrib.github.io/jitsi-helm/
+      chart: jitsi-meet
+      targetRevision: "2.20.0" # renovate: datasource=helm depName=jitsi-meet registryUrl=https://jitsi-contrib.github.io/jitsi-helm/
+      helm:
+        releaseName: jitsi-meet
+        valueFiles:
+          - $values/deployment/apps/jitsi/values.yaml
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/apps/jitsi
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: jitsi
+  # jibri uses a PVC; k8s mutates immutable volumeClaimTemplates with defaults
+  # ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

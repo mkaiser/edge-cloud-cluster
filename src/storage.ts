@@ -1,9 +1,67 @@
+/**
+ * Project: edgecloudinfra
+ * File: storage.ts
+ * Purpose: Storage component and Longhorn handling.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
 import { project_settings } from "../project_settings";
 import type { NetworkComponent } from "./network";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// High-availability guard.
+//
+// general.highAvailability is an explicit intent flag. When set, the cluster
+// must have ≥3 control-plane nodes (etcd quorum) — otherwise the deploy fails
+// fast with a clear message instead of silently running degraded.
+// ─────────────────────────────────────────────────────────────────────────────
+if (project_settings.general.highAvailability && project_settings.nodes.controlPlane.length < 3) {
+    throw new pulumi.RunError(
+        `general.highAvailability requires ≥3 control-plane nodes; currently ` +
+            `${project_settings.nodes.controlPlane.length} configured in project_settings.ts`,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Longhorn replica count — derived from cloud-node topology, not hardcoded.
+//
+// Only CLOUD-tagged nodes (control-plane + workers without an "edge" tag) count
+// as replica targets for the default `longhorn` StorageClass. Edge nodes are
+// excluded: mixing cloud and edge replicas in one volume forces every write to
+// wait for a WAN round-trip. Edge-local data uses the separate `longhorn-edge`
+// StorageClass instead.
+//
+// With "auto": replicas track the cloud node count, capped at 3. Soft
+// anti-affinity means asking for more replicas than nodes would just pile copies
+// on one disk, so we never exceed the node count.
+//   1 node  → 1 replica  (no wasted double-reservation on a single disk)
+//   2 nodes → 2 replicas
+//   3+ nodes → 3
+// An explicit 1 | 2 | 3 overrides the derivation regardless of node count.
+// ─────────────────────────────────────────────────────────────────────────────
+const isCloudNode = (n: { longhornTag?: "cloud" | "edge" }) =>
+    (n.longhornTag ?? "cloud") === "cloud";
+const longhornNodeCount = [
+    ...project_settings.nodes.controlPlane,
+    ...project_settings.nodes.workers,
+].filter(isCloudNode).length;
+const longhornReplicaCount: number =
+    project_settings.storage.longhorn.replicaCount === "auto"
+        ? Math.max(1, Math.min(3, longhornNodeCount))
+        : project_settings.storage.longhorn.replicaCount;
+
+// Edge nodes are managed by Pulumi only when listed in nodes.edge. When present,
+// the default `longhorn` class is pinned to cloud disks/nodes and a dedicated
+// `longhorn-edge` class is created for edge-local workloads.
+const hasEdgeNodes = project_settings.nodes.edge.length > 0;
 
 export class StorageComponent extends pulumi.ComponentResource {
     public readonly hcloudSecret: k8s.core.v1.Secret;
@@ -18,7 +76,7 @@ export class StorageComponent extends pulumi.ComponentResource {
         kubeconfigRaw: pulumi.Output<string>,
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:Storage", name, {}, opts);
+        super("ecc:infra:Storage", name, {}, opts);
 
         this.hcloudSecret = new k8s.core.v1.Secret(
             "hcloud-secret",
@@ -33,7 +91,6 @@ export class StorageComponent extends pulumi.ComponentResource {
         );
 
         const hcloudCcm =
-            project_settings.server.os !== "Talos" &&
             project_settings.server.loadBalancerProvider === "hetzner-ccm"
                 ? new helm.v3.Release(
                       "hcloud-ccm",
@@ -51,7 +108,7 @@ export class StorageComponent extends pulumi.ComponentResource {
             "hcloud-csi",
             {
                 chart: "hcloud-csi",
-                version: "2.21.2",
+                version: "2.21.1",
                 namespace: "kube-system",
                 repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                 values: {
@@ -170,18 +227,54 @@ export class StorageComponent extends pulumi.ComponentResource {
                 namespace: "longhorn-system",
                 repositoryOpts: { repo: "https://charts.longhorn.io" },
                 values: {
+                    // Edge nodes carry the ecc/edge=true:NoSchedule taint. Longhorn must
+                    // tolerate it on BOTH component families or the edge node stays
+                    // storage-dead (no manager → edge disk never initialized → longhorn-edge
+                    // PVCs fail with "specified disk tag edge does not exist"):
+                    //   - global.tolerations → user-deployed components (manager + CSI plugin
+                    //     DaemonSets, driver-deployer, UI).
+                    //   - defaultSettings.taintToleration → system-managed components
+                    //     (instance-manager, engine-image, share-manager); semicolon-
+                    //     separated kubectl-taint syntax, NOT a list.
+                    // Tolerations only PERMIT scheduling — DaemonSets still land on every
+                    // node, which is exactly what we want so the edge node gets a manager
+                    // that initializes its edge-tagged disk. Only set when edge nodes exist
+                    // so cloud-only clusters are byte-identical (no needless DaemonSet roll).
+                    ...(hasEdgeNodes
+                        ? {
+                              global: {
+                                  tolerations: [
+                                      {
+                                          key: "ecc/edge",
+                                          operator: "Equal",
+                                          value: "true",
+                                          effect: "NoSchedule",
+                                      },
+                                  ],
+                              },
+                          }
+                        : {}),
                     defaultSettings: {
-                        defaultReplicaCount: 2,
+                        // Replica count tracks node topology (see project_settings.ts).
+                        // Single node → 1 (no pointless double-reservation on one disk);
+                        // grows as control-plane/edge nodes are added.
+                        defaultReplicaCount: longhornReplicaCount,
                         createDefaultDiskLabeledNodes: true,
                         dataLocality: "best-effort",
                         replicaSoftAntiAffinity: true,
+                        // Auto-spread replicas onto newly-added nodes so redundancy
+                        // self-corrects on scale-out without manual rebalancing.
+                        replicaAutoBalance: "best-effort",
                         recurringFailedJobsHistoryLimit: 14,
                         recurringSuccessfulJobsHistoryLimit: 14,
+                        // System-managed component toleration for the edge taint (see above).
+                        ...(hasEdgeNodes ? { taintToleration: "ecc/edge=true:NoSchedule" } : {}),
                     },
+                    // Don't let the chart create its default class named "longhorn";
+                    // we create an explicit `longhorn-cloud` default class below
+                    // (cloud disk/node selectors) plus `longhorn-edge`.
                     persistence: {
-                        defaultClass: true,
-                        defaultClassReplicaCount: 2,
-                        reclaimPolicy: "Retain",
+                        defaultClass: false,
                     },
                 },
             },
@@ -193,6 +286,65 @@ export class StorageComponent extends pulumi.ComponentResource {
                 customTimeouts: { create: "10m" },
             },
         );
+
+        // Default StorageClass `longhorn-cloud` (replaces the chart's "longhorn").
+        // Replicas pinned to cloud-tagged disks/nodes when edge nodes exist, so
+        // cloud-app replicas never land on an edge node across the WAN. On cloud-only
+        // clusters the selector is omitted (every disk is a cloud disk).
+        new k8s.storage.v1.StorageClass(
+            "longhorn-cloud",
+            {
+                metadata: {
+                    name: "longhorn-cloud",
+                    annotations: { "storageclass.kubernetes.io/is-default-class": "true" },
+                },
+                provisioner: "driver.longhorn.io",
+                allowVolumeExpansion: true,
+                reclaimPolicy: "Retain",
+                volumeBindingMode: "Immediate",
+                parameters: {
+                    numberOfReplicas: String(longhornReplicaCount),
+                    staleReplicaTimeout: "30",
+                    dataLocality: "best-effort",
+                    fsType: "ext4",
+                    // diskSelector only (NOT nodeSelector): Longhorn nodeSelector matches
+                    // NODE tags, which we don't set — we tag DISKS (see nodes-k3s). A disk
+                    // tag is sufficient to keep cloud replicas off edge disks.
+                    ...(hasEdgeNodes ? { diskSelector: "cloud" } : {}),
+                },
+            },
+            { provider: k8sProvider, parent: this, dependsOn: [this.longhornChart] },
+        );
+
+        // Edge-local StorageClass: replicas pinned to edge-tagged disks/nodes so
+        // both reads and writes stay within the edge LAN (never cross the WAN).
+        // Created only when Pulumi-managed edge nodes exist. Replica count is
+        // capped at the edge node count so a single edge node doesn't double-book.
+        if (hasEdgeNodes) {
+            const edgeReplicaCount = Math.max(1, Math.min(3, project_settings.nodes.edge.length));
+            new k8s.storage.v1.StorageClass(
+                "longhorn-edge",
+                {
+                    metadata: { name: "longhorn-edge" },
+                    provisioner: "driver.longhorn.io",
+                    allowVolumeExpansion: true,
+                    reclaimPolicy: "Retain",
+                    volumeBindingMode: "Immediate",
+                    parameters: {
+                        numberOfReplicas: String(edgeReplicaCount),
+                        staleReplicaTimeout: "30",
+                        dataLocality: "best-effort",
+                        // diskSelector only (see longhorn-cloud note): edge disks are
+                        // tagged "edge" by the edge node's post-join step.
+                        diskSelector: "edge",
+                        // Join the "edge" RecurringJob group (see deployment/infrastructure/longhorn/
+                        // recurring-jobs.yaml) so edge volumes get their own backup cadence.
+                        recurringJobSelector: '[{"name":"edge","isGroup":true}]',
+                    },
+                },
+                { provider: k8sProvider, parent: this, dependsOn: [this.longhornChart] },
+            );
+        }
 
         // Wait until Longhorn engine images are deployed and longhorn-manager is fully ready.
         // Must complete before the backup target is configured and before ArgoCD wave 2
@@ -232,6 +384,47 @@ exit 1`,
                 environment: { KUBECONFIG_CONTENT: kubeconfigRaw },
             },
             { parent: this, dependsOn: [this.longhornChart], customTimeouts: { create: "12m" } },
+        );
+
+        // Reconcile replica count on EXISTING volumes to match the topology-derived
+        // default. The Helm `defaultReplicaCount` only applies to newly-created
+        // volumes, so without this a scale-out (1→2→3 nodes) would never add
+        // replicas to volumes that already exist. Re-runs whenever the desired
+        // count changes (triggers); `replicaAutoBalance` then places the extra
+        // replica on the new node. Patching down (e.g. 2→1) frees space immediately.
+        new command.local.Command(
+            "longhorn-reconcile-replica-count",
+            {
+                create: `TMPKC=$(mktemp)
+cleanup() { rm -f "$TMPKC"; }
+trap cleanup EXIT
+printf '%s\\n' "$KUBECONFIG_CONTENT" > "$TMPKC"
+export KUBECONFIG="$TMPKC"
+
+TARGET=${longhornReplicaCount}
+echo "Reconciling Longhorn volumes to numberOfReplicas=$TARGET"
+for v in $(kubectl get volumes.longhorn.io -n longhorn-system -o name 2>/dev/null); do
+  kubectl -n longhorn-system patch "$v" --type=merge \\
+    -p "{\\"spec\\":{\\"numberOfReplicas\\":$TARGET}}" >/dev/null 2>&1 \\
+    && echo "  patched $v -> $TARGET" || echo "  WARN: failed to patch $v"
+done
+kubectl get replicas.longhorn.io -n longhorn-system -o json 2>/dev/null | python3 -c "
+import json,sys
+from collections import defaultdict
+data=json.load(sys.stdin)
+by_vol=defaultdict(list)
+for r in data['items']:
+    by_vol[r['spec']['volumeName']].append(r['metadata']['name'])
+for vol,replicas in by_vol.items():
+    for extra in replicas[$TARGET:]:
+        print(extra)
+" | xargs -r kubectl delete replica.longhorn.io -n longhorn-system
+echo "  Extra replicas removed"`,
+                delete: "true",
+                environment: { KUBECONFIG_CONTENT: kubeconfigRaw },
+                triggers: [longhornReplicaCount],
+            },
+            { parent: this, dependsOn: [longhornReady] },
         );
 
         // Configure the S3 backup target before the restore step runs.

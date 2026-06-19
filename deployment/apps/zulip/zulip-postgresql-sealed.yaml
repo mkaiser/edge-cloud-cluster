@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zulip-postgresql
+  namespace: zulip
+spec:
+  encryptedData:
+    password: AgBWwzbBCqTV5CGYMdLbGFxH+upZO62olh2QOppySENMfHSbkoPUsszRPacmnZzWWQz9lEr8xoKHaG7Gizt0+/SjbQcuMSTdlMitai4Sx4XEZAMgB0OXCd0KTPHxlFW8j8y1cGbEOyiGJA0P5nekmZJ745wsM2Nj3dIn8fEVk9doYz9rPp+JniwQd0jVk84a55cYEGzXJfUTPd98pSUnCvhfzdpu6CfZXsrTkbhKtND01L9tfgDTH549Pl8JsuVarZQM3vZRHNLbfvNP86eVXhq7isgCvLHnNqqj2KMkKGUHI++/Il0ZEW2midLgBg40brD1ifZvrTGLHVpwazru9g9tsTbDkUhatv3bskV2vgYI2vXFJKs3Wxes3JWiKzxRsuqvi0z6+LfaSp8tWawirk3UO+QYC0MtzwX+TAJeKr51GcfgvZtAkFK8qyjDXV4eXEKJ4ga+9kWyChgg9wWyjqlyRUi7t5OkebjV0/Ec+mti1bMATfAbI4fsAfv5EzJhin38JGYfeLY8VV+nuCPAk8Jtf8f1TXDiK2yY407j8vZ+we8tFEhdZbseQhwwZLnl3cfiwOZAPjHRBfxl9ddrYQbM/5hzZ10d/0licSLnuXBUg6KwYThd3Jk1V/vR6ZbeuUgoAUJcfckPUgfp4NQSWTBmFLUCn45pUk47jDr0mQXSrdfzN9LYBz/toAFjSvN/whDV486O+oKpC6dCxkASYGzDIWwD7FHpqSnjJmEwZyHK6sjR3GLoPMPRGojhuoiOyAY=
+  template:
+    metadata:
+      name: zulip-postgresql
+      namespace: zulip

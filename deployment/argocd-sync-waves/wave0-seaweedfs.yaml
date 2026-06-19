@@ -1,0 +1,36 @@
+# ArgoCD Application: SeaweedFS — S3-backed file layer for cloud↔edge apps.
+# Wave 0 so the SeaweedFS cluster + S3 gateway are up early — before essential apps
+# (e.g. authentik, wave 6) that may use SeaweedFS S3/media storage. Only hard
+# dependency is the longhorn-cloud StorageClass (Pulumi-bootstrapped, pre-ArgoCD).
+# NB: as a wave-0 app it must become Healthy before the wave-1 barrier releases.
+# The `seaweedfs` StorageClass (CSI driver) is a separate Application at wave 2.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seaweedfs
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  sources:
+    - repoURL: https://seaweedfs.github.io/seaweedfs/helm
+      chart: seaweedfs
+      targetRevision: "4.34.0" # renovate: datasource=helm depName=seaweedfs registryUrl=https://seaweedfs.github.io/seaweedfs/helm
+      helm:
+        valueFiles:
+          - $values/deployment/infrastructure/seaweedfs/values.yaml
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: seaweedfs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

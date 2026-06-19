@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: pulumiHelloWorld.ts
+ * Purpose: Minimal Pulumi hello-world component.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
@@ -26,7 +37,7 @@ export class pulumiHelloWorldComponent extends pulumi.ComponentResource {
         },
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:pulumiHelloWorld", name, {}, opts);
+        super("ecc:infra:pulumiHelloWorld", name, {}, opts);
 
         const pulumiHelloWorldUrl = `${projectSettings.pulumiHelloWorld.subdomain}.${projectSettings.dns.tld}`;
 
@@ -51,7 +62,7 @@ export class pulumiHelloWorldComponent extends pulumi.ComponentResource {
                             containers: [
                                 {
                                     name: "hello-pulumi",
-                                    image: "nginx:alpine",
+                                    image: "nginx:alpine", // renovate: datasource=docker depName=nginx
                                     ports: [{ containerPort: 80 }],
                                     volumeMounts: [
                                         { name: "html", mountPath: "/usr/share/nginx/html" },
@@ -61,7 +72,7 @@ export class pulumiHelloWorldComponent extends pulumi.ComponentResource {
                             initContainers: [
                                 {
                                     name: "init-html",
-                                    image: "busybox:1.36",
+                                    image: "busybox:1.36", // renovate: datasource=docker depName=busybox
                                     command: [
                                         "sh",
                                         "-c",

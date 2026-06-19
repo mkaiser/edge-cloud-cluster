@@ -1,0 +1,56 @@
+provider:
+  name: webhook
+  webhook:
+    image:
+      repository: ghcr.io/mconfalonieri/external-dns-hetzner-webhook
+      tag: v1.0.0  # https://github.com/mconfalonieri/external-dns-hetzner-webhook/pkgs/container/external-dns-hetzner-webhook
+    env:
+      - name: HETZNER_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: hetzner-dns-token
+            key: token
+      - name: USE_CLOUD_API
+        value: "true"
+      # BULK_MODE disabled: the zonefile parser in v0.11.0+ treats the SOA serial
+      # as a calendar date and rejects it when Hetzner auto-increments it to a
+      # future date (e.g. "20260320" on 2026-03-19), breaking all record updates.
+      # Re-enable once https://github.com/mconfalonieri/external-dns-hetzner-webhook
+      # ships a fix for the SOA serial validation.
+      - name: BULK_MODE
+        value: "false"
+      - name: ZONE_CACHE_TTL
+        value: "1800"       # cache zone list for 30 minutes
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: http-webhook
+      initialDelaySeconds: 10
+      timeoutSeconds: 5
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: http-webhook
+      initialDelaySeconds: 10
+      timeoutSeconds: 5
+interval: 5m
+extraArgs:
+  - --webhook-provider-url=http://127.0.0.1:8888
+
+serviceMonitor:
+  # Disabled here: ServiceMonitor CRD is installed by kube-prometheus-stack
+  # (wave 3) which hasn't run yet at wave 1.  The ServiceMonitor is instead
+  # deployed by a separate wave-3 patch in deployment/infrastructure/kube-prometheus-stack/.
+  enabled: false
+
+txtOwnerId: edgecloudinfra
+domainFilters:
+  - cape-project.eu
+policy: sync
+sources:
+  # ingress source intentionally disabled: wildcard *.SUBDOMAIN covers all hosts.
+  # Exception: gitlab.SUBDOMAIN needs an explicit record (see deployment/apps/gitlab/pages-dns.yaml)
+  # because *.pages.gitlab.SUBDOMAIN creates an empty non-terminal node that shadows the wildcard.
+  - service
+  # crd source: manages records declared via DNSEndpoint CRDs
+  - crd

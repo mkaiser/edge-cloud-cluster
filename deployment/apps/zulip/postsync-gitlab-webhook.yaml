@@ -1,0 +1,218 @@
+# PostSync: create a Zulip GitLab notification bot and register a GitLab system hook.
+#
+# Flow (idempotent):
+#   1. Wait for Zulip REST API to respond
+#   2. Exec into Zulip pod — create bot user "gitlab-bot" via Django ORM if not present
+#   3. Get bot's API key
+#   4. Create stream "gitlab" via Zulip REST API if not present
+#   5. Construct Zulip GitLab integration webhook URL
+#   6. Register (or update) GitLab system hook pointing at it
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zulip-gitlab-hook
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zulip-gitlab-hook
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "watch", "create"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zulip-gitlab-hook
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zulip-gitlab-hook
+subjects:
+- kind: ServiceAccount
+  name: zulip-gitlab-hook
+  namespace: zulip
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zulip-gitlab-hook
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: zulip-gitlab-hook
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: hook
+        image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: ZULIP_URL
+          value: "https://zulip.ecc135.cape-project.eu"
+        - name: ZULIP_INTERNAL
+          value: "http://zulip.zulip.svc.cluster.local"
+        - name: GITLAB_INTERNAL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+        - name: GITLAB_URL
+          value: "https://gitlab.ecc135.cape-project.eu"
+        - name: BOT_EMAIL
+          value: "gitlab-bot@zulip.ecc135.cape-project.eu"
+        - name: BOT_NAME
+          value: "GitLab Bot"
+        - name: STREAM_NAME
+          value: "gitlab"
+        # Zulip/GitLab ingress certs are LE STAGING (untrusted CA) while testing,
+        # so curl rejects them; "-k" skips verification. Cleared to "" (verify) by
+        # updateConfigFromProjectSettings.sh when certIssuerType is letsencrypt-prod.
+        - name: CURL_INSECURE
+          value: "-k"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # ---- 1. Wait for Zulip REST API ----
+          # Use the PUBLIC ingress host, NOT the in-cluster Service: a direct http://svc
+          # call makes Zulip 500 (it rejects its canonical host over what it treats as
+          # insecure transport; the haproxy ingress supplies the needed X-Forwarded-*
+          # headers). The ingress host resolves in-cluster; CURL_INSECURE (-k) tolerates
+          # the LE-staging cert. (If zulip.<tld> ever NXDOMAINs, fix the DNS zone.)
+          echo "Waiting for Zulip at ${ZULIP_URL}..."
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s $CURL_INSECURE -o /dev/null -w "%{http_code}" --max-time 5 \
+              "${ZULIP_URL}/api/v1/server_settings" || true)
+            [ "$STATUS" = "200" ] && { echo "Zulip ready."; break; }
+            echo "  Attempt $i/60 — HTTP ${STATUS}, retrying in 10s..."
+            sleep 10
+          done
+          [ "$STATUS" = "200" ] || { echo "ERROR: Zulip not ready"; exit 1; }
+
+          # ---- 2. Create/get bot user + API key via Django ORM ----
+          ZULIP_POD=$(kubectl -n zulip get pods \
+            -l app.kubernetes.io/name=zulip \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          [ -n "$ZULIP_POD" ] || { echo "ERROR: no running Zulip pod"; exit 1; }
+          echo "Using pod: $ZULIP_POD"
+
+          MANAGE="/home/zulip/deployments/current/manage.py"
+
+          # The Python is piped on stdin into `su zulip -c "manage.py shell"`:
+          # manage.py refuses to run as root, and feeding the code via stdin avoids
+          # a second shell-quoting layer around Python that contains single quotes.
+          # YAML strips the block's common indent, so Python sees top-level
+          # statements at column 0 — keep the indentation consistent.
+          # API names current for the zulip 11.x image: do_create_user (the
+          # low-level create_user_profile changed signature), and the empty
+          # string_id realm created by postsync-create-sync-bot.yaml (NOT 'zulip').
+          OUT=$(kubectl -n zulip exec -i "$ZULIP_POD" -- su zulip -c "python3 $MANAGE shell" 2>&1 <<PYEOF
+          from zerver.models import UserProfile, Realm
+          from zerver.actions.create_user import do_create_user
+          from zerver.lib.streams import ensure_stream
+          realm = Realm.objects.filter(string_id='').first()
+          owner = UserProfile.objects.filter(realm=realm, is_bot=False,
+                  role=UserProfile.ROLE_REALM_ADMINISTRATOR).first()
+          user = UserProfile.objects.filter(delivery_email='${BOT_EMAIL}', realm=realm).first()
+          if user is None:
+              user = do_create_user('${BOT_EMAIL}', None, realm, '${BOT_NAME}',
+                                    bot_type=UserProfile.INCOMING_WEBHOOK_BOT,
+                                    bot_owner=owner, acting_user=None)
+          ensure_stream(realm, '${STREAM_NAME}', acting_user=owner)
+          print(user.api_key)
+          PYEOF
+          )
+          API_KEY=$(echo "$OUT" | tail -1)
+          # The bot api_key is a 32-char token; a longer last line means we captured
+          # a traceback/banner instead — fail loudly with the full output.
+          case "$API_KEY" in
+            ?????????????????????????????????*) API_KEY="" ;;
+            "") ;;
+          esac
+          [ -n "$API_KEY" ] || { echo "ERROR: failed to create/get bot API key:"; echo "$OUT"; exit 1; }
+          echo "Bot API key obtained."
+
+          # ---- 3. Register or update GitLab system hook ----
+          # Create a GitLab admin PAT via rails runner
+          WEBSERVICE_POD=$(kubectl -n gitlab get pods -l app=webservice \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          [ -n "$WEBSERVICE_POD" ] || { echo "ERROR: no running GitLab webservice pod"; exit 1; }
+
+          PAT=$(kubectl -n gitlab exec "$WEBSERVICE_POD" -c webservice -- \
+            /srv/gitlab/bin/rails runner "
+              user = User.find_by(username: 'root')
+              user.personal_access_tokens.find_by(name: 'zulip-hook-setup')&.revoke!
+              pat = user.personal_access_tokens.create!(
+                name: 'zulip-hook-setup', scopes: ['api'], expires_at: Date.today + 1
+              )
+              puts pat.token
+            " 2>/dev/null | tail -1)
+          [ -n "$PAT" ] || { echo "ERROR: failed to create admin PAT"; exit 1; }
+
+          # HOOK_URL stays PUBLIC: GitLab POSTs to it on events, and Zulip's
+          # ALLOWED_HOSTS check requires the public realm host (can't set a custom Host
+          # on a stored webhook). This requires zulip.<tld> to resolve in-cluster.
+          HOOK_URL="${ZULIP_URL}/api/v1/external/gitlab?api_key=${API_KEY}&stream=${STREAM_NAME}"
+
+          # Remove existing Zulip system hook if present
+          EXISTING_ID=$(curl -sf -H "PRIVATE-TOKEN: $PAT" \
+            "${GITLAB_INTERNAL}/api/v4/hooks" 2>/dev/null | \
+            grep -o '"id":[0-9]*[^}]*"zulip[^}]*' | \
+            grep -o '"id":[0-9]*' | grep -o '[0-9]*' | head -1 || true)
+          [ -n "$EXISTING_ID" ] && \
+            curl -sf -X DELETE -H "PRIVATE-TOKEN: $PAT" \
+              "${GITLAB_INTERNAL}/api/v4/hooks/${EXISTING_ID}" && \
+            echo "Removed old Zulip system hook (id=${EXISTING_ID})."
+
+          echo "Registering GitLab system hook → Zulip..."
+          curl -sf -X POST \
+            -H "PRIVATE-TOKEN: $PAT" \
+            -H "Content-Type: application/json" \
+            "${GITLAB_INTERNAL}/api/v4/hooks" \
+            -d "{
+              \"url\": \"${HOOK_URL}\",
+              \"push_events\": true,
+              \"issues_events\": true,
+              \"merge_requests_events\": true,
+              \"tag_push_events\": true,
+              \"pipeline_events\": true,
+              \"releases_events\": true,
+              \"enable_ssl_verification\": true
+            }"
+          echo ""
+          echo "GitLab system hook registered."
+
+          # Revoke PAT
+          kubectl -n gitlab exec "$WEBSERVICE_POD" -c webservice -- \
+            /srv/gitlab/bin/rails runner \
+            "User.find_by(username:'root')&.personal_access_tokens&.find_by(name:'zulip-hook-setup')&.revoke!" \
+            2>/dev/null || true
+
+          echo "Done."

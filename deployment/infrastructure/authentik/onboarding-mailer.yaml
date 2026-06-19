@@ -1,0 +1,123 @@
+# Onboarding mailer — automatically emails every NEW user a "set your password"
+# link, with zero admin clicks. Fills the gap that Authentik has no built-in
+# "welcome email on user-create" trigger.
+#
+# Every 5 min it scans the Authentik API and, for each eligible user that hasn't
+# been emailed yet, calls POST /core/users/{id}/recovery_email/ (the same email the
+# admin "Email recovery link" button sends — uses the recovery flow + recovery-email
+# stage from blueprint-recovery.yaml). It then marks the user with
+# attributes.onboarding_email_sent=true so it fires EXACTLY ONCE per user.
+#
+# Eligibility (skipped otherwise):
+#   - must be active and have an email address
+#   - never akadmin
+#   - not already marked onboarding_email_sent
+#
+# Auth: AUTHENTIK_BOOTSTRAP_TOKEN (akadmin) from the authentik-secrets sealed secret.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: authentik-onboarding-mailer
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: authentik-onboarding-mailer
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 300
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: authentik-onboarding-mailer
+          restartPolicy: Never
+          containers:
+            - name: mailer
+              image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+              resources:
+                requests: { cpu: 10m, memory: 48Mi }
+                limits: { memory: 96Mi }
+              env:
+                - name: AUTHENTIK_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: authentik-secrets
+                      key: AUTHENTIK_BOOTSTRAP_TOKEN
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  export AUTHENTIK_TOKEN
+                  python3 - <<'PY'
+                  import json, os, urllib.request, urllib.error
+
+                  API = "http://authentik-server.authentik.svc.cluster.local/api/v3"
+                  TOKEN = os.environ["AUTHENTIK_TOKEN"]
+                  HDRS = {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"}
+
+                  def req(method, path, body=None):
+                      data = json.dumps(body).encode() if body is not None else None
+                      r = urllib.request.Request(API + path, data=data, headers=HDRS, method=method)
+                      with urllib.request.urlopen(r, timeout=30) as resp:
+                          raw = resp.read()
+                          return resp.status, (json.loads(raw) if raw else {})
+
+                  # Resolve the recovery-email stage created by blueprint-recovery.yaml.
+                  try:
+                      _, r = req("GET", "/stages/email/?name=recovery-email")
+                  except urllib.error.URLError as e:
+                      print("Authentik API not reachable yet:", e); raise SystemExit(0)
+                  results = r.get("results", [])
+                  if not results:
+                      print("recovery-email stage not found yet — skipping this run"); raise SystemExit(0)
+                  email_stage = results[0]["pk"]
+
+                  # Page through all users.
+                  users, page = [], 1
+                  while True:
+                      _, r = req("GET", f"/core/users/?page_size=100&page={page}")
+                      users += r["results"]
+                      nxt = (r.get("pagination") or {}).get("next") or 0
+                      if not nxt or nxt in (0, "null"):
+                          break
+                      page += 1
+
+                  sent = skipped = 0
+                  for u in users:
+                      attrs = u.get("attributes") or {}
+                      if (
+                          not u.get("is_active")
+                          or not u.get("email")
+                          or u.get("username") == "akadmin"
+                          or attrs.get("onboarding_email_sent")
+                      ):
+                          skipped += 1
+                          continue
+                      uid = u["pk"]
+                      try:
+                          req("POST", f"/core/users/{uid}/recovery_email/", {"email_stage": email_stage})
+                      except urllib.error.HTTPError as e:
+                          print(f"  FAILED to email {u['username']}: {e.read().decode()[:200]}")
+                          continue
+                      # Mark as onboarded so we never email them again (merge attributes).
+                      attrs["onboarding_email_sent"] = True
+                      req("PATCH", f"/core/users/{uid}/", {"attributes": attrs})
+                      print(f"  onboarding email sent to {u['username']} <{u['email']}>")
+                      sent += 1
+
+                  print(f"Done. emailed={sent} skipped={skipped} total={len(users)}")
+                  PY

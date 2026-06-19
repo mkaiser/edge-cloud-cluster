@@ -1,0 +1,12 @@
+# Headscale VPN server deployed via wrenix helm chart.
+# https://wrenix.eu/docs/helm-charts/headscale/
+#
+# The ArgoCD Application (deployment/apps/wave8-headscale.yaml) now sources the Helm chart from:
+#   https://codeberg.org/wrenix/helm-charts.git (path: headscale)
+#
+# This file is no longer used as an ArgoCD source path.
+# It is kept for reference / supplementary resources only.
+#
+# NOTE: The postgres password (headscale.config.database.postgres.pass) must be
+# injected via a sealed-secret values override before activating the Application.
+# See sealSecrets.sh for the sealing workflow.

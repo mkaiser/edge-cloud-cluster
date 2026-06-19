@@ -1,0 +1,72 @@
+# HelmForge Guacamole Helm values (https://github.com/helmforgedev/charts)
+# Provides browser-based RDP access to the dockur/windows VM via Authentik OIDC.
+# Redirect URI and OIDC endpoints use the cluster subdomain —
+# updated automatically by updateConfigFromProjectSettings.sh.
+
+guacamole:
+  # Serve at / instead of /guacamole
+  contextPath: ROOT
+  # Skip Guacamole's own login page; redirect directly to Authentik
+  extraEnv:
+    - name: EXTENSION_PRIORITY
+      value: "openid"
+
+# guacd runs as a sidecar inside the Guacamole pod (HelmForge default)
+guacd:
+  logLevel: info
+
+# =============================================================================
+# OIDC — Authentik as IdP (implicit flow, public client, no client secret)
+# =============================================================================
+oidc:
+  enabled: true
+  authorizationEndpoint: "https://id.ecc135.cape-project.eu/application/o/authorize/"
+  # Use cluster-internal HTTP to avoid LE staging cert validation failure in JVM
+  jwksEndpoint: "http://authentik-server.authentik.svc.cluster.local/application/o/windows/jwks/"
+  # Issuer must match the 'iss' claim in Authentik JWTs (external URL)
+  issuer: "https://id.ecc135.cape-project.eu/application/o/windows/"
+  clientId: "guacamole"
+  redirectUri: "https://windows.ecc135.cape-project.eu"
+  scope: "openid email profile groups"
+  usernameClaim: "email"
+  groupsClaim: "groups"
+
+# =============================================================================
+# Database — external PostgreSQL (postgres.yaml in this folder)
+# =============================================================================
+postgresql:
+  enabled: false
+
+database:
+  type: postgresql
+  external:
+    # CNPG read-write (primary) service; see postgres.yaml (Cluster guacamole-pg).
+    host: "guacamole-pg-rw"
+    port: "5432"
+    name: "guacamole_db"
+    username: "guacamole_user"
+    existingSecret: "windows-secrets"
+    existingSecretPasswordKey: "db-password"
+
+# DB schema is initialized on first install by the HelmForge initDb job
+initDb:
+  enabled: true
+
+# =============================================================================
+# Ingress — HAProxy + cert-manager
+# =============================================================================
+ingress:
+  enabled: true
+  ingressClassName: haproxy
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+  hosts:
+    - host: windows.ecc135.cape-project.eu
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - windows.ecc135.cape-project.eu
+      secretName: guacamole-tls

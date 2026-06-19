@@ -45,7 +45,9 @@
             ]
         }
     },
-    "postCreateCommand": "make install && echo 'Devcontainer started. Invoke source initPulumi.sh now' && echo pwd ",
+    // Added 1.1.1.1/8.8.8.8 as fallbacks after intermittent DNS timeouts on the WSL2 gateway during pulumi up
+    "runArgs": ["--dns=1.1.1.1", "--dns=8.8.8.8"],
+    "postCreateCommand": "make install && echo 'Devcontainer started. Invoke source initPulumiStack.sh now' && echo pwd ",
     "containerEnv": {
         "TZ": "Europe/Berlin"
     },

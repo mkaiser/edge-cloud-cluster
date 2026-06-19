@@ -1,0 +1,83 @@
+# SeaweedFS — S3-backed file layer for cloud↔edge mobile apps.
+# See docs/cloud-edge-architecture.md.
+#
+# Phase 1: single CLOUD cluster (master + volume + filer with embedded S3).
+# Volume data and filer metadata are persisted on longhorn-cloud so they survive
+# pod reschedule. Per-site (edge) filers + active-active xDC replication are added
+# once edge nodes exist (project_settings.ts nodes.edge) — not configurable now
+# because there are no edge nodes to place them on.
+#
+# Replica placement "000" = a single copy (one cloud node today); raise when more
+# cloud volume servers exist.
+#
+# REPLICAS scale with CP-node count — do NOT hardcode high. On the current single
+# control-plane cluster, replicas MUST be 1 (3 masters can't form a raft quorum on
+# one node → Pending pods). When running HA (>=3 CP nodes, project_settings.ts
+# general.highAvailability), raise: master -> 3 (raft quorum), volume -> 2,
+# filer -> 2, and set defaultReplicaPlacement "001"+ for in-SeaweedFS redundancy.
+# NOTE durability is already safe at replicas:1 — volume blobs sit on a
+# longhorn-cloud PVC that Longhorn replicates; a pod/node loss reattaches the PVC
+# (no data loss), only brief unavailability.
+
+global:
+  enableSecurity: false
+
+master:
+  replicas: 1 # project-settings: ha.seaweedfsMaster
+  defaultReplicaPlacement: "000"
+  # Override the chart's default HARD podAntiAffinity with a soft spread so the extra
+  # HA replicas prefer distinct nodes but never wedge Pending below node count.
+  topologySpreadConstraints: |
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: master
+  affinity: ""
+
+volume:
+  replicas: 2 # project-settings: ha.seaweedfsVolume
+  topologySpreadConstraints: |
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: volume
+  affinity: ""
+  # Persist volume blobs on Longhorn (cloud) instead of the default hostPath, so
+  # data survives node reschedule. maxVolumes 0 = auto.
+  dataDirs:
+    - name: data1
+      type: "persistentVolumeClaim"
+      storageClass: "longhorn-cloud"
+      size: "50Gi"
+      maxVolumes: 0
+
+filer:
+  replicas: 2 # project-settings: ha.seaweedfsFiler
+  defaultReplicaPlacement: "000"
+  topologySpreadConstraints: |
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: filer
+  affinity: ""
+  # Filer metadata store (embedded leveldb) on a durable PVC.
+  data:
+    type: "persistentVolumeClaim"
+    storageClass: "longhorn-cloud"
+    size: "10Gi"
+  # Embedded S3 gateway (app-native S3 access on port 8333). No auth for now;
+  # in-cluster only. CSI access (the `seaweedfs` StorageClass) is added separately.
+  s3:
+    enabled: true
+    port: 8333
+    enableAuth: false
+
+# Standalone S3 deployment not needed — the filer's embedded S3 gateway is used.
+s3:
+  enabled: false

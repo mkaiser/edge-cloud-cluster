@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: network.ts
+ * Purpose: Network component for Pulumi infra.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
 import { project_settings } from "../project_settings";
@@ -13,7 +24,7 @@ export class NetworkComponent extends pulumi.ComponentResource {
         projectSettings: typeof project_settings,
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:Network", name, {}, opts);
+        super("ecc:infra:Network", name, {}, opts);
 
         this.network = new hcloud.Network(
             `${projectSettings.general.name}-net`,
@@ -37,70 +48,38 @@ export class NetworkComponent extends pulumi.ComponentResource {
         );
 
         // Bootstrap rules: open ports needed during initial cluster setup.
-        const bootstrapFirewallRules =
-            projectSettings.server.os === "Talos"
-                ? [
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "50000",
-                          description: "Talos API (apid) for talosctl management",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "6443",
-                          description: "Kubernetes API server",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "2380",
-                          description: "etcd peer (HA control plane, private network only)",
-                          sourceIps: [projectSettings.network.privateRange],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "udp",
-                          port: "8472",
-                          description: "Flannel VXLAN (pod network overlay between nodes)",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                  ]
-                : [
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "22",
-                          description: "SSH login",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "6443",
-                          description: "Kubernetes API server",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "tcp",
-                          port: "2380",
-                          description: "etcd peer (HA control plane, private network only)",
-                          sourceIps: [projectSettings.network.privateRange],
-                      },
-                      {
-                          direction: "in",
-                          protocol: "udp",
-                          port: "8472",
-                          description: "Flannel VXLAN (pod network overlay between nodes)",
-                          sourceIps: ["0.0.0.0/0", "::/0"],
-                      },
-                  ];
+        const additionalFirewallRulesForBootstrap = [
+            {
+                direction: "in",
+                protocol: "tcp",
+                port: "22",
+                description: "SSH login",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "tcp",
+                port: "6443",
+                description: "Kubernetes API server",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "tcp",
+                port: "2380",
+                description: "etcd peer (HA control plane, private network only)",
+                sourceIps: [projectSettings.network.privateRange],
+            },
+            {
+                direction: "in",
+                protocol: "udp",
+                port: "8472",
+                description: "Flannel VXLAN (pod network overlay between nodes)",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+        ];
 
-        // Production rules: only HTTP(S), Jitsi Meet and WireGuard exposed publicly.
+        // Production rules: only HTTP(S), Jitsi Meet and VPN stuff (Admin-Wireguard, tailscale/headscale) exposed publicly.
         const productionFirewallRules = [
             {
                 direction: "in",
@@ -133,8 +112,32 @@ export class NetworkComponent extends pulumi.ComponentResource {
             {
                 direction: "in",
                 protocol: "udp",
+                port: "3478",
+                description: "Jitsi Coturn STUN/TURN (media fallback)",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "udp",
                 port: "51820",
                 description: "WireGuard VPN tunnel",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "udp",
+                port: "3479",
+                description:
+                    "Headscale embedded DERP STUN (endpoint discovery for direct WireGuard paths)",
+                sourceIps: ["0.0.0.0/0", "::/0"],
+            },
+            {
+                direction: "in",
+                protocol: "udp",
+                // Must match the tailscaled --port in mesh-gateway/daemonset.yaml.
+                port: `${projectSettings.network.tailscalePort}`,
+                description:
+                    "Tailscale WireGuard direct data port (NAT hole-punch; falls back to DERP if blocked)",
                 sourceIps: ["0.0.0.0/0", "::/0"],
             },
         ];
@@ -144,7 +147,7 @@ export class NetworkComponent extends pulumi.ComponentResource {
             {
                 rules:
                     projectSettings.general.rolloutType !== "Production"
-                        ? [...bootstrapFirewallRules, ...productionFirewallRules]
+                        ? [...additionalFirewallRulesForBootstrap, ...productionFirewallRules]
                         : [...productionFirewallRules],
             },
             { provider: hProvider, parent: this },

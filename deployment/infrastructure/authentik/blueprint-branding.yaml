@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-branding
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  branding.yaml: |
+    version: 1
+    metadata:
+      name: cluster-branding
+    entries:
+      - model: authentik_brands.brand
+        identifiers:
+          default: true
+        attrs:
+          branding_title: "CAPE Edge-Cloud Cluster"
+          branding_logo: "branding/logo-%(theme)s.svg"  # top-left icon; resolves to logo-light.svg or logo-dark.svg
+          branding_favicon: "branding/favicon-%(theme)s.svg"  # browser tab icon; resolves to favicon-light.svg or favicon-dark.svg
+          # branding_custom_css: ""                           # injected CSS for full UI customization
+          branding_default_flow_background: "branding/background-light.png"  # login/flow page background; use background-%(theme)s.png for light/dark variants
+
+      - model: authentik_flows.flow
+        identifiers:
+          slug: default-authentication-flow
+        attrs:
+          title: "CAPE's Edge-Cloud Cluster"
+      - model: authentik_flows.flow
+        identifiers:
+          slug: default-source-authentication
+        attrs:
+          title: "CAPE's Edge-Cloud Cluster"

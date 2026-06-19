@@ -16,7 +16,7 @@ completely destory all
 PULUMI_K8S_DELETE_UNREACHABLE=true && pulumi destroy -y || true \
 && pulumi stack rm --force mystack -y && pulumi stack init mystack  && pulumi stack select mystack \
 && git restore {Pulumi.mystack.yaml,.pulumi-state/.pulumi/stacks/edgecloudinfra/mystack.json,.pulumi-state/.pulumi/stacks/edgecloudinfra/mystack.json.attrs} \
-&& ./scripts/deleteDnsRecords.sh
+&& ./scripts/misc/deleteDnsRecords.sh
 
 ```
 
@@ -56,7 +56,7 @@ kubectl get applications.argoproj.io -A \
 
 ## Deadlocked ArgoCD sync
 
-`kubectl patch application opendesk -n argocd --type merge -p '{"status":{"operationState":null}`
+`kubectl patch application <app> -n argocd --type merge -p '{"status":{"operationState":null}`
 
 Restart it
 
@@ -100,28 +100,22 @@ View helmfile manifest generation
 
 `kubectl logs -n argocd -l app.kubernetes.io/component=repo-server -c helmfile-plugin -f`
 
-Check opendesk pod status
-`kubectl get pods -n opendesk --no-headers 2>&1`
+Check an app's pod status
+`kubectl get pods -n <app> --no-headers 2>&1`
 
-kubectl get applications -n argocd | grep opendesk
+kubectl get applications -n argocd | grep <app>
 
 # with sync time
 
-kubectl get applications -n argocd -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,LAST_SYNC:.status.operationState.finishedAt' | grep opendesk
+kubectl get applications -n argocd -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,LAST_SYNC:.status.operationState.finishedAt' | grep <app>
 
 kubectl rollout restart deployment argocd-repo-server -n argocd
 
-argocd app get opendesk --hard-refresh
+argocd app get <app> --hard-refresh
 
 ## DNS
 
 kubectl get ingress hello-pulumi-ingress -n default -o jsonpath='{.status.loadBalancer}'
-
-# OPendesk
-
-get initial keycloak password:
-
-`kubectl get secret -n opendesk opendesk-keycloak-bootstrap-admin-creds -o jsonpath='{.data}' 2>&1 | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print({k:base64.b64decode(v).decode() for k,v in d.items()})" 2>/dev/null`
 
 ## unreachable resources
 
@@ -151,7 +145,7 @@ kubectl delete namespace argocd
 put this into another terminal
 
 ```
-source scripts/getKubeConfig.sh
+source scripts/runtime/getKubeConfig.sh
 for NS in cert-manager argocd traefik; do
   kubectl get namespace $NS -o json | grep -v "\"kubernetes\"" > /tmp/$NS.json
   sed -i "s/\"finalizers\": \[.*\]/\"finalizers\": []/" /tmp/$NS.json

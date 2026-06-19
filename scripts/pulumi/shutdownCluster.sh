@@ -8,12 +8,11 @@
 #   4. Trigger Longhorn S3 backup for all volumes
 #   5. Drain and cordon all nodes
 #   6. pulumi dn (destroys servers/DNS/network, keeps S3 buckets)
-#   7. Set restoreClusterFromS3Backup=true in project_settings.ts
+#      + Set restoreClusterFromS3Backup=true in project_settings.ts
 #
 # After this script: run 'make create' to restore the cluster from S3 backup.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SETTINGS="$SCRIPT_DIR/../../project_settings.ts"
 
 if [ -z "${PULUMI_CONFIG_PASSPHRASE:-}" ]; then
     read -rsp "Enter Pulumi passphrase: " PULUMI_CONFIG_PASSPHRASE; echo ""
@@ -30,20 +29,45 @@ read -rp "Proceed with graceful shutdown? Type 'yes' to confirm: " confirm
 [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
 
 # ── Step 1a: ensure completeClusterTeardown=false ───────────────────────────────
-if grep -qE 'completeClusterTeardown\s*:\s*true' "$SETTINGS"; then
+current_teardown=$(pulumi config get completeClusterTeardown 2>/dev/null || echo "false")
+if [[ "$current_teardown" == "true" ]]; then
     echo ""
-    echo "Setting completeClusterTeardown: false in project_settings.ts..."
-    sed -i 's/completeClusterTeardown\s*:\s*true/completeClusterTeardown: false/' "$SETTINGS"
+    echo "Setting completeClusterTeardown: false in Pulumi config..."
+    pulumi config set completeClusterTeardown false
     echo "  Done."
 
     # ── Step 1b: pulumi up (sync teardown flag to stack) ────────────────────────────
     echo ""
     echo "=== Step 2/7: pulumi up (sync stack) ==="
-    CI=true pulumi up -y
+    CI=true pulumi up -y --skip-preview
 else
     echo "completeClusterTeardown already false — no change needed."
 fi
 
+
+# ── Step 2b: reduce Longhorn replicas to 1 before backup ─────────────────────
+# Ensures backups (and subsequent restores) never have stale multi-replica
+# objects that over-schedule disk space on a single-node cluster.
+echo ""
+echo "=== Step 2b/7: Reduce Longhorn replicas to 1 ==="
+echo "  Patching all volumes to numberOfReplicas=1..."
+for v in $(kubectl get volumes.longhorn.io -n longhorn-system -o name 2>/dev/null); do
+    kubectl -n longhorn-system patch "$v" --type=merge \
+        -p '{"spec":{"numberOfReplicas":1}}' >/dev/null 2>&1 || true
+done
+echo "  Deleting extra replica objects..."
+kubectl get replicas.longhorn.io -n longhorn-system -o json 2>/dev/null | python3 -c "
+import json, sys
+from collections import defaultdict
+data = json.load(sys.stdin)
+by_vol = defaultdict(list)
+for r in data['items']:
+    by_vol[r['spec']['volumeName']].append(r['metadata']['name'])
+for vol, replicas in by_vol.items():
+    for extra in replicas[1:]:
+        print(extra)
+" | xargs -r kubectl delete replica.longhorn.io -n longhorn-system
+echo "  Longhorn replicas reduced to 1."
 
 # ── Steps 3+4: etcd snapshot + Longhorn backup ────────────────────────────────
 echo ""
@@ -86,48 +110,47 @@ for NODE in $NODES; do
 done
 echo "  All nodes drained."
 
-# ── Step 5c: delete external-dns managed DNS records ──────────────────────────
-echo ""
-echo "=== Step 5c/7: Delete external-dns managed DNS records ==="
-"$SCRIPT_DIR/../misc/cleanExternalDnsRecords.sh"
-
 # ── Step 6: pulumi dn (tears down servers, keeps S3 since teardown=false) ─────
 echo ""
-echo "=== Step 6/7: pulumi dn (destroy servers, DNS, network — S3 buckets preserved) ==="
-# Strip ArgoCD finalizers so the argocd namespace doesn't hang in Terminating.
-if kubectl get namespace argocd >/dev/null 2>&1; then
-    echo "  Stripping ArgoCD application finalizers..."
-    kubectl get applications.argoproj.io -n argocd -o name 2>/dev/null \
-        | while read -r r; do
-            kubectl patch "$r" -n argocd --type=merge \
-                -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+echo "=== Step 6/6: pulumi dn (destroy servers, DNS, network — S3 buckets preserved) ==="
+# Delete DNSEndpoint CRDs first so external-dns can remove the records from
+# Hetzner DNS before the pod is killed. Records created via DNSEndpoint are
+# outside Pulumi state and won't be cleaned up by pulumi destroy otherwise.
+echo "  Deleting DNSEndpoints so external-dns can clean up Hetzner DNS records..."
+kubectl delete dnsendpoint --all -A --ignore-not-found 2>/dev/null || true
+echo "  Waiting for external-dns to confirm cleanup (up to 120s)..."
+DEADLINE=$(($(date +%s) + 120))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    if kubectl logs -n external-dns -l app.kubernetes.io/name=external-dns \
+        --since=30s 2>/dev/null | grep -q "All changes applied"; then
+        echo "  external-dns cleanup confirmed."
+        break
+    fi
+    sleep 5
+done
+[ "$(date +%s)" -ge "$DEADLINE" ] && echo "  WARNING: timed out waiting for external-dns — continuing anyway."
+
+bash "$SCRIPT_DIR/preDestroyCleanup.sh"
+
+_force_finalize_terminating_namespaces() {
+    kubectl get apiservice -o json 2>/dev/null \
+        | jq -r '.items[] | select(.status.conditions[]? | select(.type=="Available" and .status!="True")) | .metadata.name' \
+        | while read -r svc; do kubectl delete apiservice "$svc" --ignore-not-found 2>/dev/null || true; done
+    kubectl get ns -o json 2>/dev/null \
+        | jq -r '.items[] | select(.status.phase=="Terminating") | .metadata.name' \
+        | while read -r ns; do
+            echo "    Force-finalizing $ns..."
+            kubectl get ns "$ns" -o json \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
+                | kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f - 2>/dev/null || true
           done
-    kubectl delete applications.argoproj.io --all -n argocd \
-        --force --grace-period=0 2>/dev/null || true
-    echo "  Done."
-fi
-
-# Remove stale metrics-server APIService — its endpoint disappears after drain
-# and blocks namespace garbage collection (NamespaceDeletionDiscoveryFailure).
-echo "  Removing stale metrics APIService..."
-kubectl delete apiservice v1beta1.metrics.k8s.io --ignore-not-found 2>/dev/null || true
-
-# Force-finalize any namespace already stuck in Terminating before pulumi destroy.
-echo "  Force-finalizing Terminating namespaces..."
-kubectl get ns -o json 2>/dev/null \
-    | jq -r '.items[] | select(.status.phase=="Terminating") | .metadata.name' \
-    | while read -r ns; do
-        echo "    Finalizing $ns..."
-        kubectl get ns "$ns" -o json \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); d['spec']['finalizers']=[]; print(json.dumps(d))" \
-            | kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f - 2>/dev/null || true
-      done
-echo "  Done."
+}
 
 _pulumi_destroy_with_retry() {
     PULUMI_K8S_DELETE_UNREACHABLE=true pulumi dn -y && return 0
 
     echo "  First destroy pass failed — cleaning orphaned k8s namespace state and retrying..."
+    _force_finalize_terminating_namespaces
     # Remove any namespace resources that errored because k8s already deleted them.
     pulumi stack --show-urns 2>/dev/null \
         | grep 'kubernetes:core/v1:Namespace' \
@@ -140,13 +163,27 @@ _pulumi_destroy_with_retry() {
             fi
           done
 
+    PULUMI_K8S_DELETE_UNREACHABLE=true pulumi dn -y && return 0
+
+    echo "  Second destroy pass failed — force-finalizing again and removing all stuck namespace URNs..."
+    _force_finalize_terminating_namespaces
+    pulumi stack --show-urns 2>/dev/null \
+        | grep 'kubernetes:core/v1:Namespace' \
+        | grep -oP 'urn:[^\s]+' \
+        | while read -r urn; do
+            ns_name=$(echo "$urn" | grep -oP '(?<=::)[^:]+$')
+            kubectl get ns "$ns_name" -o jsonpath='{.status.phase}' 2>/dev/null | grep -q 'Terminating' \
+                && { echo "    Removing stuck Terminating ns from state: $urn"; pulumi state delete "$urn" --yes 2>/dev/null || true; } \
+                || true
+          done
+
     PULUMI_K8S_DELETE_UNREACHABLE=true pulumi dn -y
 }
 _pulumi_destroy_with_retry
 
-# ── Step 7: set restoreClusterFromS3Backup=true in Pulumi config ───────────────
+# ── Step 6 (final): set restoreClusterFromS3Backup=true in Pulumi config ───────
 echo ""
-echo "=== Step 7/7: Set restoreClusterFromS3Backup=true ==="
+echo "=== Step 6 (final): Set restoreClusterFromS3Backup=true ==="
 pulumi config set restoreClusterFromS3Backup true
 echo "  Done."
 

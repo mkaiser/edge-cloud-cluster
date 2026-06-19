@@ -1,0 +1,256 @@
+# Self-managed datastores for Zulip — replace the chart's four bundled bitnami
+# subcharts (postgresql, redis, rabbitmq, memcached), whose images moved to the
+# unmaintained bitnamilegacy catalog (the chart already pinned redis/rabbitmq/
+# memcached to bitnamilegacy/*:latest). The chart is pointed at these via the
+# external* blocks in values.yaml.
+#
+# PostgreSQL uses Zulip's OWN image (zulip/zulip-postgresql) — Zulip requires
+# custom full-text-search extensions/dictionaries that plain postgres lacks. This
+# is a Zulip-published image, not Bitnami.
+#
+# Passwords reuse the existing sealed secrets: zulip-postgresql (key password) and
+# zulip-rabbitmq-auth (key rabbitmq-password). Redis + memcached run without auth
+# (internal cluster traffic only, matching the gitlab-redis pattern).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zulip-postgresql
+  namespace: zulip
+spec:
+  selector:
+    app: zulip-postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zulip-postgresql
+  namespace: zulip
+spec:
+  serviceName: zulip-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zulip-postgresql
+  template:
+    metadata:
+      labels:
+        app: zulip-postgresql
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: postgres
+          image: zulip/zulip-postgresql:14  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: zulip
+            - name: POSTGRES_USER
+              value: zulip
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zulip-postgresql
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "zulip", "-d", "zulip"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zulip-redis
+  namespace: zulip
+spec:
+  selector:
+    app: zulip-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zulip-redis
+  namespace: zulip
+spec:
+  serviceName: zulip-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zulip-redis
+  template:
+    metadata:
+      labels:
+        app: zulip-redis
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: redis
+          image: redis:8.8-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 6379
+          command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zulip-rabbitmq
+  namespace: zulip
+spec:
+  selector:
+    app: zulip-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zulip-rabbitmq
+  namespace: zulip
+spec:
+  serviceName: zulip-rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zulip-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: zulip-rabbitmq
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4.3-management-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - name: amqp
+              containerPort: 5672
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              value: zulip
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: zulip-rabbitmq-auth
+                  key: rabbitmq-password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zulip-memcached
+  namespace: zulip
+spec:
+  selector:
+    app: zulip-memcached
+  ports:
+    - port: 11211
+      targetPort: 11211
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zulip-memcached
+  namespace: zulip
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zulip-memcached
+  template:
+    metadata:
+      labels:
+        app: zulip-memcached
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: memcached
+          image: memcached:1.6-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          args: ["-m", "256"]
+          ports:
+            - containerPort: 11211
+          readinessProbe:
+            tcpSocket:
+              port: 11211
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 320Mi

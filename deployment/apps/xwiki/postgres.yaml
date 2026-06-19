@@ -1,0 +1,44 @@
+# CloudNativePG cluster for XWiki (cloud-side CNPG conversion — see
+# docs/cloud-edge-architecture.md "Databases (CNPG)"). Replaces the previous plain
+# postgres:18 StatefulSet so XWiki's DB is a CNPG-managed Cluster: the prerequisite
+# for the deferred cross-tier replica-cluster mobility (async edge replica +
+# `kubectl cnpg promote` cutover) once edge nodes exist.
+#
+# App connects via the CNPG-managed read-write service `xwiki-pg-rw` (see
+# values.yaml externalDB.host). Bootstrap creates the `xwiki` database + owner from
+# the xwiki-pg-user secret (username/password keys), password kept equal to
+# xwiki-db:db-password so the app and CNPG share one credential.
+#
+# Backup: XWiki has no dedicated S3 bucket (project_settings.ts), so barman S3 WAL
+# archiving + scheduled backups are intentionally OMITTED. Add an `xwiki` bucket +
+# barmanObjectStore (pattern: infra/authentik/postgres.yaml) when enabling
+# backup/recovery — deferred alongside the edge replica cluster.
+#
+# DO NOT EDIT directly for the user secret — xwiki-pg-user-sealed.yaml is generated
+# by sealSecrets.sh; this manifest only references it.
+# Image versions: https://github.com/cloudnative-pg/postgres-containers/releases
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: xwiki-pg
+  namespace: xwiki
+  annotations:
+    # xwiki-pg-user sealed secret syncs at wave -1 (see sealSecrets.sh) so it
+    # exists before CNPG reconciles this Cluster.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  priorityClassName: standard
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18 # renovate: datasource=docker depName=ghcr.io/cloudnative-pg/postgresql
+
+  storage:
+    storageClass: longhorn-cloud
+    size: 8Gi
+
+  bootstrap:
+    initdb:
+      database: xwiki
+      owner: xwiki
+      secret:
+        name: xwiki-pg-user

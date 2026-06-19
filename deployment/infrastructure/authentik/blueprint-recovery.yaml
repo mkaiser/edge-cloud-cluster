@@ -1,0 +1,133 @@
+# Authentik blueprint: password-recovery flow (email-driven).
+#
+# Gives every user an email path to access their account:
+#   - Admin creates a user → on the user, click "Email recovery link" → the user
+#     gets a "set your password" email (this flow), sets a password, is logged in.
+#   - Login page gains a "Forgot password?" link (recovery_flow on the identification
+#     stage) so users can self-recover.
+#
+# Flow (designation: recovery, slug: recovery):
+#   10 identification  — user enters email/username
+#   20 email           — send recovery link (global SMTP), 30-min token
+#   30 prompt          — set new password (+ repeat)
+#   40 user-write      — never_create (recovery only updates existing users)
+#  100 user-login      — log the user in
+#
+# Wires the default brand's flow_recovery + the authentication identification stage's
+# recovery_flow to this flow. Uses the cluster's global SMTP (authentik-smtp secret).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-recovery
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  recovery.yaml: |
+    version: 1
+    metadata:
+      name: password-recovery
+    entries:
+      - id: flow
+        model: authentik_flows.flow
+        identifiers:
+          slug: recovery
+        attrs:
+          name: Password recovery
+          title: Reset your password
+          designation: recovery
+          authentication: require_unauthenticated
+
+      # ---- prompt fields (new password) ----
+      - id: field-password
+        model: authentik_stages_prompt.prompt
+        identifiers:
+          name: recovery-field-password
+        attrs:
+          field_key: password
+          label: Password
+          type: password
+          required: true
+          placeholder: Password
+          order: 0
+      - id: field-password-repeat
+        model: authentik_stages_prompt.prompt
+        identifiers:
+          name: recovery-field-password-repeat
+        attrs:
+          field_key: password_repeat
+          label: Password (repeat)
+          type: password
+          required: true
+          placeholder: Password (repeat)
+          order: 1
+
+      # ---- stages ----
+      - id: identification
+        model: authentik_stages_identification.identificationstage
+        identifiers:
+          name: recovery-identification
+        attrs:
+          user_fields:
+            - email
+            - username
+      - id: email
+        model: authentik_stages_email.emailstage
+        identifiers:
+          name: recovery-email
+        attrs:
+          use_global_settings: true
+          activate_user_on_success: true
+          subject: "Set your password — cape-project"
+          template: email/email-password-reset.html
+          token_expiry: minutes=30
+      - id: prompt-password
+        model: authentik_stages_prompt.promptstage
+        identifiers:
+          name: recovery-prompt-password
+        attrs:
+          fields:
+            - !KeyOf field-password
+            - !KeyOf field-password-repeat
+      - id: user-write
+        model: authentik_stages_user_write.userwritestage
+        identifiers:
+          name: recovery-user-write
+        attrs:
+          user_creation_mode: never_create
+      - id: user-login
+        model: authentik_stages_user_login.userloginstage
+        identifiers:
+          name: recovery-user-login
+
+      # ---- bindings ----
+      - model: authentik_flows.flowstagebinding
+        identifiers: { target: !KeyOf flow, stage: !KeyOf identification, order: 10 }
+        attrs: { re_evaluate_policies: true, invalid_response_action: retry }
+      - model: authentik_flows.flowstagebinding
+        identifiers: { target: !KeyOf flow, stage: !KeyOf email, order: 20 }
+        attrs: { re_evaluate_policies: true, invalid_response_action: retry }
+      - model: authentik_flows.flowstagebinding
+        identifiers: { target: !KeyOf flow, stage: !KeyOf prompt-password, order: 30 }
+        attrs: { invalid_response_action: retry }
+      - model: authentik_flows.flowstagebinding
+        identifiers: { target: !KeyOf flow, stage: !KeyOf user-write, order: 40 }
+      - model: authentik_flows.flowstagebinding
+        identifiers: { target: !KeyOf flow, stage: !KeyOf user-login, order: 100 }
+
+      # ---- wire it up: brand recovery flow + "Forgot password?" link on login ----
+      - model: authentik_brands.brand
+        identifiers:
+          domain: authentik-default
+        attrs:
+          default: true
+          flow_recovery: !KeyOf flow
+      - model: authentik_stages_identification.identificationstage
+        identifiers:
+          name: default-authentication-identification
+        attrs:
+          # user_fields repeated to satisfy the stage serializer (see enrollment blueprint).
+          user_fields:
+            - email
+            - username
+          recovery_flow: !Find [authentik_flows.flow, [slug, recovery]]

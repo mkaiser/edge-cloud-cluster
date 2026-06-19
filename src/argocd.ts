@@ -1,26 +1,24 @@
+/**
+ * Project: edgecloudinfra
+ * File: argocd.ts
+ * Purpose: ArgoCD application and bootstrap components.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
-import * as fs from "fs";
-import * as path from "path";
-import * as jsyaml from "js-yaml";
 import { project_settings } from "../project_settings";
-
-// Read ConfigMap data from deployment files so the CMP ConfigMaps can be seeded by Pulumi
-// before argocd-self syncs and adds volume references for them to argocd-repo-server.
-function loadConfigMapData(relPath: string): Record<string, string> {
-    const fullPath = path.join(__dirname, "..", relPath);
-    const manifest = jsyaml.load(fs.readFileSync(fullPath, "utf8")) as {
-        data: Record<string, string>;
-    };
-    return manifest.data;
-}
 
 // "App of Apps" structure with self-managed ArgoCD Helm release at the bottom.
 // Pulumi
-//   └── argocd-main-app     (watches deployment/apps/)
+//   └── argocd-main-app     (watches deployment/argocd-sync-waves/)
 //         └── argocd-infra  (watches deployment/argocd/)
 //               └── argocd-self  (reconciles the ArgoCD Helm release)
 export class ArgoCDComponent extends pulumi.ComponentResource {
@@ -40,7 +38,7 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
         },
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:ArgoCD", name, {}, opts);
+        super("ecc:infra:ArgoCD", name, {}, opts);
         const { waitForHaproxyIngress, waitForCertManager, sealedSecretsChart } = dependencies;
 
         const argocdUrl = `argocd.${projectSettings.dns.tld}`;
@@ -124,10 +122,10 @@ export class ArgoCDComponent extends pulumi.ComponentResource {
             {
                 create: "echo 'TLS cert save/clear ready (runs on destroy only)'",
                 delete: projectSettings.general.completeClusterTeardown
-                    ? `pulumi config rm wildcardTlsCert --stack edgecloudinfra 2>/dev/null || true; \
-pulumi config rm wildcardTlsKey --stack edgecloudinfra 2>/dev/null || true; \
-pulumi config rm argocdServerTlsCert --stack edgecloudinfra 2>/dev/null || true; \
-pulumi config rm argocdServerTlsKey --stack edgecloudinfra 2>/dev/null || true; \
+                    ? `pulumi config rm wildcardTlsCert --stack mystack 2>/dev/null || true; \
+pulumi config rm wildcardTlsKey --stack mystack 2>/dev/null || true; \
+pulumi config rm argocdServerTlsCert --stack mystack 2>/dev/null || true; \
+pulumi config rm argocdServerTlsKey --stack mystack 2>/dev/null || true; \
 echo "TLS cert config cleared (complete teardown)"`
                     : pulumi.interpolate`export KUBECONFIG=~/.kube/config; \
 WILDCARD_CRT=$(kubectl get secret infra-wildcard-tls -n argocd -o jsonpath='{.data.tls\\.crt}' 2>/dev/null || true); \
@@ -135,15 +133,15 @@ WILDCARD_KEY=$(kubectl get secret infra-wildcard-tls -n argocd -o jsonpath='{.da
 ARGOCD_CRT=$(kubectl get secret argocd-server-tls -n argocd -o jsonpath='{.data.tls\\.crt}' 2>/dev/null || true); \
 ARGOCD_KEY=$(kubectl get secret argocd-server-tls -n argocd -o jsonpath='{.data.tls\\.key}' 2>/dev/null || true); \
 if [ -n "$WILDCARD_CRT" ] && [ -n "$WILDCARD_KEY" ]; then \
-  pulumi config set --secret wildcardTlsCert "$WILDCARD_CRT" --stack edgecloudinfra; \
-  pulumi config set --secret wildcardTlsKey "$WILDCARD_KEY" --stack edgecloudinfra; \
+  pulumi config set --secret wildcardTlsCert "$WILDCARD_CRT" --stack mystack; \
+  pulumi config set --secret wildcardTlsKey "$WILDCARD_KEY" --stack mystack; \
   echo "Saved infra-wildcard-tls to Pulumi config"; \
 else \
   echo "WARNING: infra-wildcard-tls not found, skipping save"; \
 fi; \
 if [ -n "$ARGOCD_CRT" ] && [ -n "$ARGOCD_KEY" ]; then \
-  pulumi config set --secret argocdServerTlsCert "$ARGOCD_CRT" --stack edgecloudinfra; \
-  pulumi config set --secret argocdServerTlsKey "$ARGOCD_KEY" --stack edgecloudinfra; \
+  pulumi config set --secret argocdServerTlsCert "$ARGOCD_CRT" --stack mystack; \
+  pulumi config set --secret argocdServerTlsKey "$ARGOCD_KEY" --stack mystack; \
   echo "Saved argocd-server-tls to Pulumi config"; \
 else \
   echo "WARNING: argocd-server-tls not found, skipping save"; \
@@ -188,7 +186,7 @@ echo "Force-finalize completed"`,
             {
                 name: "argocd",
                 chart: "argo-cd",
-                version: "9.5.20", // renovate: datasource=helm depName=argo/argo-cd registryUrl=https://argoproj.github.io/argo-helm
+                version: "9.5.15", // renovate: datasource=helm depName=argo/argo-cd registryUrl=https://argoproj.github.io/argo-helm
                 namespace: "argocd",
                 repositoryOpts: { repo: "https://argoproj.github.io/argo-helm" },
                 values: {
@@ -243,39 +241,6 @@ echo "Force-finalize completed"`,
             },
         );
 
-        // Seed both CMP ConfigMaps immediately after the ArgoCD chart is installed.
-        // argocd-self (wave 0) adds volume references for these to argocd-repo-server.
-        // Without this, new repo-server pods get FailedMount until opendesk-cmp (wave 6)
-        // creates them — a ~15 min window with no helmfile-opendesk sidecar.
-        // ArgoCD's opendesk-cmp app takes over ownership at wave 6 and keeps them updated.
-        new k8s.core.v1.ConfigMap(
-            "cmp-opendesk-plugin",
-            {
-                metadata: { name: "cmp-opendesk-plugin", namespace: "argocd" },
-                data: loadConfigMapData("deployment/opendesk-cmp/plugin-config.yaml"),
-            },
-            {
-                provider: k8sProvider,
-                parent: this,
-                dependsOn: [argocdChart],
-                ignoreChanges: ["data", "metadata.annotations"],
-            },
-        );
-
-        new k8s.core.v1.ConfigMap(
-            "opendesk-chart-overrides",
-            {
-                metadata: { name: "opendesk-chart-overrides", namespace: "argocd" },
-                data: loadConfigMapData("deployment/opendesk-cmp/chart-overrides.yaml"),
-            },
-            {
-                provider: k8sProvider,
-                parent: this,
-                dependsOn: [argocdChart],
-                ignoreChanges: ["data", "metadata.annotations"],
-            },
-        );
-
         const waitForArgocdCrds = new command.local.Command(
             "wait-for-argocd-crds",
             {
@@ -327,8 +292,11 @@ KUBECFG
                     project: "default",
                     source: {
                         repoURL: project_settings.argocd.gitRepoUrl,
-                        targetRevision: "main",
-                        path: "deployment/apps",
+                        targetRevision: require("child_process")
+                            .execSync("git rev-parse --abbrev-ref HEAD")
+                            .toString()
+                            .trim(),
+                        path: "deployment/argocd-sync-waves",
                     },
                     destination: { name: "in-cluster", namespace: "default" },
                     syncPolicy: { automated: { prune: true, selfHeal: true } },

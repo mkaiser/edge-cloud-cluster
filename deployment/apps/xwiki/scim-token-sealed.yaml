@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: xwiki-scim-token
+  namespace: xwiki
+spec:
+  encryptedData:
+    scim-token: AgCs9zZLFOYR91/aaDMP7YyoVogqZ3VVtcL8qJdY5tJ5tfqgwm85T/sYF7xCJO2T+bBkzJ2+kN7nwvmLxKtwo36P8XDHpvYnoBvP4MsKzYQ8fnp1sq7R82F+9yafZkKleMvj4IFxbzm3Xv7bF7NT98ekc+pmRJ8WE6wdf5L/KsuQzELb2z10cN8R3tK72Phoe5jlhnmVDNHCw68AuZJ5/GNMMOS9HJ9bNTKCHt/Xl1eRa39djOYU7SG2pu9BfIuKEFgzNhTl7II5SNa2pOz2KJ4e6Q4S+ZvPSipvXyQvurGTja1ztX6Sri7EjRoMvkdg98CWRtl9rcDZTwTRybdS7dtYZP3UjI2N5AmNlnE0l3huj0fT6VvA+nYNpsRbIq0bx7eUXEU5m7rx/Zz6qSpfmzwxiUZjwHQFvEF/VSjFE0qFNP8qkYD/URuKebmt2pWZY1jjvooIX7Kls59J/H/wz1dQcpJwxPRhkUJvccoXbxgkLVCuM3TZXH2lID+26wZPmgG9as5NzI84fjwftv+TWCF1eTXChGTrZ6Q0bU5bCZAhmH6aYDX9Jz0byIGwjlWyUnRfmRMH8dLUSE+IpUnlEa7v/9LqIApSemKCDySpVs+90fIdE4ZTQRyY0tR3835ZCZLG1p/r4hNeWtH1Fd+zu0whCseWZjCI7h8L32stT8M0/24d7P/aj7qNryADqVSdSygXw2cQ+2qhBmb+rrVtJFt0+Gzej/vjjSACNkN4nx8qibjuHWM2qXCFYX66BKli7808ksV7eUkA8wE4AcRP/pSo
+  template:
+    metadata:
+      name: xwiki-scim-token
+      namespace: xwiki

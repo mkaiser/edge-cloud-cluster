@@ -1,0 +1,63 @@
+# Authentik blueprint: Zulip OIDC provider + dashboard tile.
+#
+# Per-app blueprint — shipped by THIS app's ArgoCD Application into the authentik
+# namespace and mounted optionally into the Authentik worker
+# (deployment/infrastructure/authentik/values.yaml → worker.volumes: bp-zulip).
+# If zulip is removed from the sync waves, this ConfigMap is never created and no
+# Zulip tile appears.
+#
+# client_secret comes from the authentik-secrets sealed bundle (!Env). Redirect
+# URI uses the cluster subdomain — rewritten by updateConfigFromProjectSettings.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-zulip
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  zulip.yaml: |
+    version: 1
+    metadata:
+      name: app-zulip
+    entries:
+      - id: provider-zulip
+        model: authentik_providers_oauth2.oauth2provider
+        identifiers:
+          name: zulip
+        attrs:
+          client_type: confidential
+          client_id: zulip
+          client_secret: !Env ZULIP_OIDC_CLIENT_SECRET
+          signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+          grant_types:
+            - authorization_code
+            - refresh_token
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+          redirect_uris:
+            - matching_mode: strict
+              url: https://zulip.ecc135.cape-project.eu/complete/oidc/
+          property_mappings:
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+      - model: authentik_core.application
+        identifiers:
+          slug: zulip
+        attrs:
+          name: Zulip
+          group: Communication
+          provider: !KeyOf provider-zulip
+          meta_launch_url: https://zulip.ecc135.cape-project.eu/login/oidc/?idp=authentik&subdomain=
+          meta_icon: https://cdn.jsdelivr.net/gh/selfhst/icons/svg/zulip.svg
+      # Access control: employees / employees-extended / admins only.
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, zulip]]
+          policy: !Find [authentik_policies_expression.expressionpolicy, [name, access-employee-apps]]
+        attrs:
+          order: 0
+          enabled: true

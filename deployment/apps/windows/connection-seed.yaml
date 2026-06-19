@@ -1,0 +1,121 @@
+# PostSync Job: seeds the Windows RDP connection into Guacamole's PostgreSQL.
+# Runs once after each ArgoCD sync (idempotent — all INSERTs use ON CONFLICT DO NOTHING).
+# Creates a 'windows-users' Guacamole group, inserts the Windows 11 RDP connection,
+# and grants READ permission to that group. OIDC users whose JWT contains
+# "windows-users" in the groups claim are automatically mapped to this group by
+# Guacamole's openid extension (OPENID_GROUPS_CLAIM_TYPE=groups).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guacamole-connection-seed
+  namespace: windows
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: postgres:18-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: windows-secrets
+                  key: db-password
+            - name: WINDOWS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: windows-secrets
+                  key: WINDOWS_USERNAME
+            - name: WINDOWS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: windows-secrets
+                  key: WINDOWS_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              PGHOST=guacamole-pg-rw
+              PGPORT=5432
+              PGUSER=guacamole_user
+              PGDB=guacamole_db
+
+              echo "Waiting for Guacamole DB..."
+              until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDB"; do
+                sleep 3
+              done
+
+              # Wait for initDb job to have applied the schema (guacamole_entity must exist)
+              until psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "\d guacamole_entity" > /dev/null 2>&1; do
+                echo "Schema not ready yet, retrying in 5s..."
+                sleep 5
+              done
+
+              psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" <<'SQL'
+              -- Create group entities (match Authentik group names)
+              INSERT INTO guacamole_entity (name, type)
+              VALUES ('windows-users', 'USER_GROUP'), ('authentik-admins', 'USER_GROUP')
+              ON CONFLICT (type, name) DO NOTHING;
+
+              INSERT INTO guacamole_user_group (entity_id, disabled)
+              SELECT entity_id, false FROM guacamole_entity
+              WHERE name IN ('windows-users', 'authentik-admins') AND type = 'USER_GROUP'
+              ON CONFLICT (entity_id) DO NOTHING;
+
+              -- Create Windows 11 RDP connection (parent_id IS NULL — ON CONFLICT ignores NULLs,
+              -- so use WHERE NOT EXISTS to stay idempotent)
+              INSERT INTO guacamole_connection (connection_name, protocol, parent_id)
+              SELECT 'Windows 11', 'rdp', NULL
+              WHERE NOT EXISTS (
+                SELECT 1 FROM guacamole_connection
+                WHERE connection_name = 'Windows 11' AND parent_id IS NULL
+              );
+              SQL
+
+              # Use shell vars for the RDP parameters (psql heredoc can't interpolate env)
+              psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, 'hostname', 'windows-vm'
+              FROM guacamole_connection c WHERE c.connection_name = 'Windows 11'
+              ON CONFLICT (connection_id, parameter_name) DO NOTHING;
+
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, 'port', '3389'
+              FROM guacamole_connection c WHERE c.connection_name = 'Windows 11'
+              ON CONFLICT (connection_id, parameter_name) DO NOTHING;
+
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, 'ignore-cert', 'true'
+              FROM guacamole_connection c WHERE c.connection_name = 'Windows 11'
+              ON CONFLICT (connection_id, parameter_name) DO NOTHING;
+
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, 'username', '$WINDOWS_USERNAME'
+              FROM guacamole_connection c WHERE c.connection_name = 'Windows 11'
+              ON CONFLICT (connection_id, parameter_name) DO UPDATE SET parameter_value = '$WINDOWS_USERNAME';
+
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, 'password', '$WINDOWS_PASSWORD'
+              FROM guacamole_connection c WHERE c.connection_name = 'Windows 11'
+              ON CONFLICT (connection_id, parameter_name) DO UPDATE SET parameter_value = '$WINDOWS_PASSWORD';
+              "
+
+              psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" <<'SQL'
+              -- Grant READ to both windows-users and authentik-admins groups
+              INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)
+              SELECT e.entity_id, c.connection_id, 'READ'
+              FROM guacamole_entity e
+              CROSS JOIN guacamole_connection c
+              WHERE e.name IN ('windows-users', 'authentik-admins') AND e.type = 'USER_GROUP'
+                AND c.connection_name = 'Windows 11'
+              ON CONFLICT (entity_id, connection_id, permission) DO NOTHING;
+              SQL
+
+              echo "Connection seed complete."

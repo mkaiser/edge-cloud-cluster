@@ -1,0 +1,164 @@
+# haproxy-ingress self-heal guard.
+#
+# WHY: ArgoCD's built-in Ingress health waits for status.loadBalancer.ingress to be
+# populated. Ingress is served by haproxy-ingress behind a fixed kube-vip VIP
+# (static --publish-address), and the controller writes that status best-effort on
+# its reconcile loop. Occasionally it misses one Ingress (seen: authentik-server),
+# which then never gets a loadBalancer status → ArgoCD holds that app "Progressing"
+# → the sync-wave barrier blocks → everything downstream stalls (incl. the wave-12
+# notify mail). A simple `kubectl rollout restart` of the controller makes it
+# re-publish status to all ingresses, so this CronJob does that automatically.
+#
+# WHAT: every 5 min, list haproxy-class Ingresses and check each has a loadBalancer
+# status. If any is missing AND the controller is not already mid-rollout AND it
+# wasn't restarted in the last 15 min (cooldown, so a genuinely broken Ingress can't
+# cause a restart loop), rollout-restart the haproxy-ingress DaemonSet.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: haproxy-ingress-guard
+  namespace: haproxy-ingress
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+---
+# Cluster-wide READ: see every Ingress and its loadBalancer status.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: haproxy-ingress-guard-read
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: haproxy-ingress-guard-read
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: haproxy-ingress-guard-read
+subjects:
+- kind: ServiceAccount
+  name: haproxy-ingress-guard
+  namespace: haproxy-ingress
+---
+# Namespaced WRITE: only allowed to read + restart the controller DaemonSet itself.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: haproxy-ingress-guard-restart
+  namespace: haproxy-ingress
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  resourceNames: ["haproxy-ingress"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: haproxy-ingress-guard-restart
+  namespace: haproxy-ingress
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: haproxy-ingress-guard-restart
+subjects:
+- kind: ServiceAccount
+  name: haproxy-ingress-guard
+  namespace: haproxy-ingress
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: haproxy-ingress-guard
+  namespace: haproxy-ingress
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      ttlSecondsAfterFinished: 300
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: haproxy-ingress-guard
+          restartPolicy: Never
+          containers:
+          - name: guard
+            image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+            resources:
+              requests: { cpu: 10m, memory: 48Mi }
+              limits: { memory: 96Mi }
+            command: ["/bin/sh", "-ec"]
+            args:
+            - |
+              NS=haproxy-ingress
+              DS=haproxy-ingress
+              COOLDOWN=900   # 15 min — bounds restarts if an Ingress is genuinely broken
+
+              # haproxy-class Ingresses missing a loadBalancer status.
+              MISSING=$(kubectl get ingress -A -o json | python3 -c "
+              import sys, json
+              miss = []
+              for i in json.load(sys.stdin)['items']:
+                  m = i['metadata']; s = i.get('spec', {})
+                  cls = s.get('ingressClassName') or (m.get('annotations') or {}).get('kubernetes.io/ingress.class')
+                  lb = ((i.get('status') or {}).get('loadBalancer') or {}).get('ingress') or []
+                  if cls == 'haproxy' and len(lb) == 0:
+                      miss.append(m['namespace'] + '/' + m['name'])
+              print('\n'.join(miss))
+              ")
+              if [ -z "$MISSING" ]; then
+                echo "OK: every haproxy Ingress has a loadBalancer status."
+                exit 0
+              fi
+              echo "Ingresses missing loadBalancer status:"; echo "$MISSING"
+
+              # Anti-thrash 1: don't kick a controller that is itself mid-rollout.
+              DESIRED=$(kubectl get ds "$DS" -n "$NS" -o jsonpath='{.status.desiredNumberScheduled}')
+              READY=$(kubectl get ds "$DS" -n "$NS" -o jsonpath='{.status.numberReady}')
+              UPDATED=$(kubectl get ds "$DS" -n "$NS" -o jsonpath='{.status.updatedNumberScheduled}')
+              if [ "${READY:-0}" != "${DESIRED:-0}" ] || [ "${UPDATED:-0}" != "${DESIRED:-0}" ]; then
+                echo "Controller mid-rollout (ready=${READY} updated=${UPDATED} desired=${DESIRED}) — skip."
+                exit 0
+              fi
+
+              # Anti-thrash 2: cooldown — skip if restarted within the last $COOLDOWN seconds.
+              LAST=$(kubectl get ds "$DS" -n "$NS" -o jsonpath='{.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}')
+              if [ -n "$LAST" ]; then
+                RECENT=$(LAST="$LAST" COOLDOWN="$COOLDOWN" python3 -c "
+              import os, datetime
+              try:
+                  dt = datetime.datetime.fromisoformat(os.environ['LAST'].replace('Z', '+00:00'))
+                  age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+                  print('yes' if age < float(os.environ['COOLDOWN']) else 'no')
+              except Exception:
+                  print('no')
+              ")
+                if [ "$RECENT" = "yes" ]; then
+                  echo "Controller restarted <${COOLDOWN}s ago — cooldown, skip."
+                  exit 0
+                fi
+              fi
+
+              echo "Restarting $DS to force re-publication of ingress loadBalancer status."
+              kubectl rollout restart ds/"$DS" -n "$NS"

@@ -1,0 +1,52 @@
+---
+# Hard gate: block GitLab sync until Authentik OIDC discovery is reachable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-wait-authentik-oidc
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 2000
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: wait-oidc
+        image: curlimages/curl:8.20.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: ISSUER
+          value: "http://authentik-server.authentik.svc.cluster.local/application/o/gitlab/"
+        # Authentik's ingress cert is LE STAGING (untrusted CA) while testing, so curl
+        # rejects it (HTTP 000). "-k" skips verification. updateConfigFromProjectSettings.sh
+        # clears this to "" (verify) when certIssuerType is letsencrypt-prod.
+        - name: CURL_INSECURE
+          value: "-k"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          URL="${ISSUER}.well-known/openid-configuration"
+          echo "Waiting for Authentik OIDC discovery endpoint: ${URL}"
+
+          max_tries=180
+          i=1
+          while [ "$i" -le "$max_tries" ]; do
+            code=$(curl $CURL_INSECURE -sS -o /dev/null -m 5 -w "%{http_code}" "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "OIDC endpoint reachable (HTTP 200)."
+              exit 0
+            fi
+            echo "Try ${i}/${max_tries}: HTTP ${code:-000}, retrying in 10s..."
+            i=$((i + 1))
+            sleep 10
+          done
+
+          echo "Timed out waiting for Authentik OIDC endpoint."
+          exit 1

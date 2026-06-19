@@ -41,7 +41,9 @@
       "Bash(echo \"exit: $?\")",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(e['name'],'=',e['value']\\) for e in d if e['name']=='DOMAIN']\")",
       "Bash(awk '{print $1, $2, $3}')",
-      "Bash(./scripts/argocdLoginCLI.sh)"
+      "Bash(./scripts/argocdLoginCLI.sh)",
+      "WebFetch(domain:docs.gitlab.com)",
+      "WebFetch(domain:about.gitlab.com)"
     ]
   },
   "enableAllProjectMcpServers": true,

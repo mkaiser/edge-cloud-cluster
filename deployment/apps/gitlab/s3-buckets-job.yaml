@@ -1,0 +1,71 @@
+# Sync Job: ensure GitLab's S3 bucket exists.
+# Ownership of this bucket moved from Pulumi (src/storage.ts ensure-s3-bucket loop)
+# to the app that uses it (GitLab object storage → s3://edgecloudinfra-gitlab).
+# Idempotent (head-bucket || create-bucket). NOT deleted on app removal (data-safe);
+# full-teardown wipe lives in scripts/environment/deleteS3Buckets.sh (discovers all
+# live buckets).
+#
+# Credentials come from the gitlab-s3-connection sealed secret, whose single
+# `connection` key holds a YAML blob (aws_access_key_id / aws_secret_access_key) —
+# the same secret + parse pattern the gitlab-runner bootstrap uses.
+#
+# Hook: Sync + sync-wave -1 (NOT PreSync, NOT PostSync):
+#   - Sync (not PreSync): the sealed secret is a normal synced resource, absent
+#     during PreSync — a PreSync job's secretKeyRef can't resolve and deadlocks.
+#   - wave -1 (not PostSync): GitLab has object_store.enabled=true, so the bucket
+#     must exist BEFORE the GitLab workloads boot. PostSync runs only after the app
+#     is Healthy — which it can't reach with broken object storage (deadlock). wave
+#     -1 runs during Sync, before GitLab's own resources.
+# The gitlab-s3-connection SealedSecret must carry sync-wave: "-2" so it is applied
+# and decrypted before this wave -1 job runs (avoids CreateContainerConfigError on fresh deploy).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-s3-buckets
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: ensure-buckets
+          image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # The whole connection blob; we parse the two keys out of it below.
+            - name: S3_CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-s3-connection
+                  key: connection
+            - name: AWS_DEFAULT_REGION
+              value: "nbg1"
+            - name: AWS_PAGER
+              value: ""
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ENDPOINT="https://nbg1.your-objectstorage.com"
+              # gitlab-s3-connection stores a YAML blob; extract the two keys.
+              AWS_ACCESS_KEY_ID=$(echo "$S3_CONNECTION" | sed -n 's/.*aws_access_key_id:[[:space:]]*//p' | head -1 | tr -d '"')
+              AWS_SECRET_ACCESS_KEY=$(echo "$S3_CONNECTION" | sed -n 's/.*aws_secret_access_key:[[:space:]]*//p' | head -1 | tr -d '"')
+              export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+              [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "ERROR: could not parse S3 creds from gitlab-s3-connection"; exit 1; }
+              for BUCKET in edgecloudinfra-gitlab; do
+                if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/dev/null; then
+                  echo "Bucket $BUCKET already exists."
+                else
+                  echo "Creating bucket $BUCKET ..."
+                  aws s3api create-bucket --bucket "$BUCKET" \
+                    --endpoint-url "$ENDPOINT" --region "$AWS_DEFAULT_REGION"
+                  echo "Created $BUCKET."
+                fi
+              done
+              echo "GitLab S3 buckets ready."

@@ -1,0 +1,58 @@
+# ArgoCD Application: Windows Desktop (dockur/windows + Guacamole browser RDP).
+# Accessible at https://windows.ecc135.cape-project.eu
+# Guacamole (HelmForge chart) provides browser-based RDP via Authentik OIDC (implicit flow).
+# dockur/windows provides Windows 11 LTSC VM via QEMU/KVM (windows-vm.yaml).
+# PostgreSQL for Guacamole lives in postgres.yaml (not the Helm subchart).
+# Authentik blueprint: deployment/apps/windows/authentik-blueprint.yaml (bp-windows mount).
+#
+# BEFORE FIRST DEPLOY: run deployment/apps/windows/sealSecrets.sh to generate
+# windows-secrets-sealed.yaml, then commit and push.
+#
+# Multi-source:
+#   1. HelmForge guacamole Helm chart
+#   2. ref source for $values
+#   3. Git directory for raw manifests (windows-vm, postgres, connection-seed, secrets, blueprint)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: windows
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: edge
+spec:
+  project: default
+  sources:
+    - repoURL: https://repo.helmforge.dev
+      chart: guacamole
+      targetRevision: "1.4.12" # renovate: datasource=helm depName=guacamole registryUrl=https://repo.helmforge.dev
+      helm:
+        releaseName: guacamole
+        valueFiles:
+          - $values/deployment/apps/windows/values.yaml
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/apps/windows
+      directory:
+        exclude: "{values.yaml,*.sh}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: windows
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: dns.ts
+ * Purpose: DNS component wiring for Pulumi.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
 import * as command from "@pulumi/command";
@@ -16,11 +27,13 @@ export class DnsComponent extends pulumi.ComponentResource {
         pulumiName: string,
         name: pulumi.Input<string>,
         type: string,
+        hcloudToken: pulumi.Input<string>,
     ): command.local.Command {
         return new command.local.Command(
             `clean-dns-${pulumiName}`,
             {
                 create: pulumi.interpolate`hcloud dns rrset list ${this._dnsZoneName} --type ${type} -o noheader -o columns=name | grep -qx "${name}" && hcloud dns rrset delete ${this._dnsZoneName} ${name} ${type} || true`,
+                environment: { HCLOUD_TOKEN: hcloudToken },
                 triggers: [name],
             },
             { parent: this },
@@ -38,7 +51,7 @@ export class DnsComponent extends pulumi.ComponentResource {
         additionalCpNodes: hcloud.Server[],
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:Dns", name, {}, opts);
+        super("ecc:infra:Dns", name, {}, opts);
         const wildcardName = projectSettings.dns.subdomain
             ? `*.${projectSettings.dns.subdomain}`
             : "*";
@@ -67,8 +80,9 @@ export class DnsComponent extends pulumi.ComponentResource {
         // Clean any orphaned RRset before creating — prevents "duplicate value" errors
         // when a prior pulumi up created the record on Hetzner but timed out before
         // recording it in state (so the next run tries to create it again).
-        const cleanA = this.cleanDnsRrset("wildcard-a", wildcardName, "A");
-        const cleanAAAA = this.cleanDnsRrset("wildcard-aaaa", wildcardName, "AAAA");
+        const token = projectSettings.general.hcloudToken;
+        const cleanA = this.cleanDnsRrset("wildcard-a", wildcardName, "A", token);
+        const cleanAAAA = this.cleanDnsRrset("wildcard-aaaa", wildcardName, "AAAA", token);
 
         ipv4.forEach(
             (ip, i) =>
@@ -114,9 +128,10 @@ export class DnsComponent extends pulumi.ComponentResource {
         // SPF record
         /////////////////////
 
-        const spfValue = projectSettings.mail.spfInclude
+        // smtpRelay is a secret (Output) — use interpolate so the SPF value resolves it.
+        const spfValue: pulumi.Input<string> = projectSettings.mail.spfInclude
             ? `v=spf1 ${projectSettings.mail.spfInclude} ~all`
-            : `v=spf1 a:${projectSettings.mail.smtpRelay} ~all`;
+            : pulumi.interpolate`v=spf1 a:${projectSettings.mail.smtpRelay} ~all`;
 
         new hcloud.ZoneRecord(
             "spf-txt",
@@ -125,7 +140,7 @@ export class DnsComponent extends pulumi.ComponentResource {
                 name: "@",
                 type: "TXT",
                 comment: "Pulumi-managed: SPF record for outbound mail relay",
-                value: `"${spfValue}"`,
+                value: pulumi.interpolate`"${spfValue}"`,
             },
             { provider: hProvider, parent: this, deleteBeforeReplace: true },
         );
@@ -140,7 +155,7 @@ export class DnsComponent extends pulumi.ComponentResource {
                     name: projectSettings.dns.subdomain,
                     type: "TXT",
                     comment: `Pulumi-managed: SPF for ${projectSettings.dns.subdomain} mail relay`,
-                    value: `"${spfValue}"`,
+                    value: pulumi.interpolate`"${spfValue}"`,
                 },
                 { provider: hProvider, parent: this, deleteBeforeReplace: true },
             );

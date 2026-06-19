@@ -16,13 +16,12 @@
 
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
-import * as k8s from "@pulumi/kubernetes";
 
 import { project_settings } from "./project_settings";
 
 import { NetworkComponent } from "./src/network";
-import { K3sNodesComponent } from "./src/nodes-k3s";
-import { TalosNodesComponent } from "./src/nodes-talos";
+import { K3sNodesComponent } from "./src/nodes-k3s-cloud";
+import { OnPremiseNodesComponent } from "./src/nodes-k3s-on-premise";
 import { StorageComponent } from "./src/storage";
 import { DnsComponent } from "./src/dns";
 import { CertManagerComponent } from "./src/certmanager";
@@ -32,9 +31,10 @@ import { SealedSecretsComponent } from "./src/sealedsecrets";
 import { ArgoCDComponent } from "./src/argocd";
 import { WireguardComponent } from "./src/wireguard";
 import { pulumiHelloWorldComponent } from "./src/pulumiHelloWorld";
+import { LonghornRestoreComponent } from "./src/longhorn-restore";
 
 // Hetzner provider
-const hProvider = new hcloud.Provider("hcloud", { token: project_settings.server.hcloudToken });
+const hProvider = new hcloud.Provider("hcloud", { token: project_settings.general.hcloudToken });
 
 /////////////////////
 // Network & Firewall
@@ -44,25 +44,33 @@ const networkComponent = new NetworkComponent("network", hProvider, project_sett
 /////////////////////
 // Nodes (OS-specific)
 /////////////////////
-const nodesComponent =
-    project_settings.server.os === "Talos"
-        ? new TalosNodesComponent("nodes", networkComponent, hProvider)
-        : new K3sNodesComponent("nodes", networkComponent, hProvider);
+const nodesComponent = new K3sNodesComponent("nodes", networkComponent, hProvider);
 
 const { controlPlane, k8sProvider, additionalCpNodes, cloudWorkers, kubeconfigRaw } =
     nodesComponent;
 
-// machineSecrets only exists on the Talos component — cast so TypeScript knows the shape.
-const machineSecrets =
-    project_settings.server.os === "Talos"
-        ? (nodesComponent as TalosNodesComponent).machineSecrets
-        : undefined;
+/////////////////////
+// On-premise edge nodes (second pass only)
+/////////////////////
+// Provisioned over SSH by `make provision-edge` AFTER the cloud cluster + VPN mesh
+// are up — gated off by default so `make create` never attempts edge SSH.
+if (project_settings.edgeProvisioning.enabled) {
+    new OnPremiseNodesComponent("edge-nodes", {
+        kubeconfigRaw,
+        controlPlaneSshHost: controlPlane.ipv4Address,
+    });
+}
 
 /////////////////////
 // Storage
 /////////////////////
 
-new StorageComponent("storage", k8sProvider, networkComponent);
+const storageComponent = new StorageComponent(
+    "storage",
+    k8sProvider,
+    networkComponent,
+    kubeconfigRaw,
+);
 
 /////////////////////
 // DNS
@@ -107,21 +115,21 @@ new ExternalDnsComponent("external-dns", k8sProvider);
 const sealedSecrets = new SealedSecretsComponent("sealed-secrets", k8sProvider);
 
 /////////////////////
-// OpenDesk secrets (injected into ArgoCD CMP env, not stored in git plaintext)
+// Longhorn volume restore (only when restoreClusterFromS3Backup=true)
+// Runs after Longhorn is up (storageComponent.longhornChart) but BEFORE ArgoCD
+// so restored PVCs are ready when application workloads start.
 /////////////////////
 
-// Credentials for the Nextcloud S3 object store
-new k8s.core.v1.Secret(
-    "hetzner-s3",
-    {
-        metadata: { name: "hetzner-s3", namespace: "argocd" },
-        stringData: {
-            accessKey: project_settings.storage.objectStorage.accessKey,
-            secretKey: project_settings.storage.objectStorage.secretKey,
+let longhornRestore: LonghornRestoreComponent | undefined;
+if (project_settings.general.restoreClusterFromS3Backup) {
+    longhornRestore = new LonghornRestoreComponent(
+        "longhorn-restore",
+        { kubeconfigRaw },
+        {
+            dependsOn: [storageComponent.longhornBackupTarget],
         },
-    },
-    { provider: k8sProvider },
-);
+    );
+}
 
 /////////////////////
 // ArgoCD
@@ -141,6 +149,7 @@ if (project_settings.argocd.enabled) {
             waitForCertManager: certManager.waitForCertManager,
             sealedSecretsChart: sealedSecrets.sealedSecretsChart,
         },
+        longhornRestore ? { dependsOn: [longhornRestore] } : undefined,
     );
 }
 
@@ -177,39 +186,7 @@ const wireguardComponent = new WireguardComponent("wireguard", k8sProvider, proj
 // Outputs — view with: pulumi stack output [--show-secrets]
 /////////////////////
 
-// Talos-specific
-export const connectTalosctlCommand =
-    project_settings.server.os === "Talos"
-        ? pulumi.interpolate`talosctl --talosconfig <(pulumi stack output talosconfig --show-secrets) --nodes ${controlPlane.ipv4Address} --endpoints ${controlPlane.ipv4Address}`
-        : "N/A (Debian/K3s — use SSH instead)";
-
-export const talosconfig =
-    project_settings.server.os === "Talos" && machineSecrets !== undefined
-        ? pulumi.secret(
-              pulumi
-                  .all([machineSecrets.clientConfiguration, controlPlane.ipv4Address])
-                  .apply(([cc, nodeIp]) =>
-                      JSON.stringify({
-                          context: "default",
-                          contexts: {
-                              default: {
-                                  endpoints: [nodeIp],
-                                  nodes: [nodeIp],
-                                  ca: cc.caCertificate,
-                                  crt: cc.clientCertificate,
-                                  key: cc.clientKey,
-                              },
-                          },
-                      }),
-                  ),
-          )
-        : "N/A (Debian/K3s)";
-
-// Debian-specific
-export const connectSshControlPlaneCommand =
-    project_settings.server.os !== "Talos"
-        ? pulumi.interpolate`ssh root@${controlPlane.ipv4Address} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`
-        : "N/A (Talos — use talosctl instead)";
+export const connectSshControlPlaneCommand = pulumi.interpolate`ssh root@${controlPlane.ipv4Address} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`;
 
 // Common
 export const server_controlPlaneIPs_compact = pulumi
@@ -247,6 +224,8 @@ export const kubeConfigCmd =
 
 export const certIssuerType = project_settings.tls.certIssuerType;
 
+export const portalURL = `https://id.${project_settings.dns.tld}`;
+
 export const argocdURL = project_settings.argocd.enabled
     ? pulumi.interpolate`https://${argocdComponent!.url}`
     : "ArgoCD disabled";
@@ -256,10 +235,13 @@ export const argocdCliCommand = project_settings.argocd.enabled
 export const argocdAdminPasswordPlain = "pulumi config get argocdAdminPasswordPlain";
 
 // WireGuard admin client config — copy to ~/.config/wireguard/wg0.conf or import into your WireGuard client.
-// Routes only the cluster subnet through the VPN.
+// Split-tunnel: only VPN subnet + cluster private range route through VPN.
+// DNS = VPN server IP: dnsmasq sidecar resolves *.ecc93.cape-project.eu → 10.0.2.1 so cluster
+// hostnames resolve to the VPN IP without needing the server's public IP in AllowedIPs.
 export const wireguardClientConfig = pulumi.secret(pulumi.interpolate`[Interface]
 Address = ${project_settings.wireguard.adminAddr}
 PrivateKey = ${project_settings.wireguard.wgAdminPrivateKey}
+DNS = ${project_settings.wireguard.serverAddr.split("/")[0]}
 
 [Peer]
 PublicKey = ${project_settings.wireguard.wgServerPublicKey}

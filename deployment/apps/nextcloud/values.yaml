@@ -1,0 +1,133 @@
+# Nextcloud Helm values (official nextcloud/nextcloud chart).
+# Applied by the wave10-nextcloud Application via $values valueFiles.
+#
+# Secrets (NOT in git), provided by sealed secrets:
+#   nextcloud-admin                — admin username/password
+#   nextcloud-db                   — PostgreSQL password (also used by bundled subchart)
+#   nextcloud-s3                   — Hetzner S3 access/secret key (primary object store)
+#   nextcloud-oidc-client-secret   — Authentik OIDC client secret (sealed by authentik/sealSecrets.sh)
+
+# Apache flavor = single self-contained container (Apache serves HTTP + runs PHP).
+# The 'fpm' flavor is FastCGI-only and REQUIRES a separate nginx container
+# (nginx.enabled), without which the HTTP liveness probe kills it → CrashLoopBackOff.
+image:
+  flavor: apache
+
+nextcloud:
+  host: nextcloud.ecc135.cape-project.eu
+  existingSecret:
+    enabled: true
+    secretName: nextcloud-admin
+    usernameKey: username
+    passwordKey: password
+  trustedDomains:
+    - nextcloud.ecc135.cape-project.eu
+    - files.ecc135.cape-project.eu
+
+  # Point the Nextcloud image at our own redis (redis.yaml). Setting REDIS_HOST
+  # makes the entrypoint wire redis for local/distributed cache + file locking.
+  extraEnv:
+    - name: REDIS_HOST
+      value: nextcloud-redis
+    - name: REDIS_HOST_PORT
+      value: "6379"
+
+  # Primary object storage on Hetzner S3 (bulk file data). Metadata stays in PostgreSQL.
+  objectStore:
+    s3:
+      enabled: true
+      host: nbg1.your-objectstorage.com
+      bucket: edgecloudinfra-nextcloud
+      usePathStyle: true
+      ssl: true
+      existingSecret: nextcloud-s3
+      secretKeys:
+        accessKey: accessKey
+        secretKey: secretKey
+
+  # Outgoing SMTP + per-user IMAP defaults are configured by the PostSync job
+  # (deployment/nextcloud/postsync-configure.yaml) from the nextcloud-smtp secret,
+  # so host/port/credentials are never stored in plaintext here.
+
+  # Extra config.php snippets.
+  configs:
+    proxy.config.php: |
+      <?php
+      $CONFIG = array(
+        'overwriteprotocol' => 'https',
+        'overwrite.cli.url' => 'https://nextcloud.ecc135.cape-project.eu',
+        'default_phone_region' => 'DE',
+      );
+
+internalDatabase:
+  enabled: false
+
+# External PostgreSQL: we run our own CloudNativePG cluster
+# (deployment/apps/nextcloud/postgres.yaml, service `nextcloud-pg-rw`) instead of
+# the chart's bundled subchart. The bundled subchart in chart 9.1.x ships
+# bitnamilegacy images AND mis-wires its secret (the app's nextcloud-db secret uses
+# db-username/db-password while the subchart expects password/postgres-password).
+# externalDatabase.existingSecret natively uses db-username/db-password, so this is clean.
+externalDatabase:
+  enabled: true
+  type: postgresql
+  # CNPG read-write (primary) service; see postgres.yaml (Cluster nextcloud-pg).
+  host: nextcloud-pg-rw
+  database: nextcloud
+  existingSecret:
+    enabled: true
+    secretName: nextcloud-db
+    usernameKey: db-username
+    passwordKey: db-password
+
+postgresql:
+  enabled: false
+
+# Use our own official-image redis (deployment/nextcloud/redis.yaml) instead of
+# the chart's bundled bitnami redis subchart (unmaintained). The Nextcloud image
+# auto-configures redis (local + distributed cache, file locking) from REDIS_HOST.
+redis:
+  enabled: false
+
+# First-boot install (maintenance:install + trusted_domains setup) can take a few
+# minutes. Without a startupProbe, the liveness probe kills the pod mid-install,
+# leaving a partial config.php (no trusted_domains) → status.php 400 → CrashLoopBackOff.
+# The startupProbe gives install up to ~10 min before liveness/readiness engage.
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 60
+  successThreshold: 1
+
+persistence:
+  enabled: true
+  storageClass: longhorn-cloud
+  size: 10Gi
+
+ingress:
+  enabled: true
+  className: haproxy
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    haproxy-ingress.github.io/timeout-server: "3600s"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10G"
+  tls:
+    - hosts:
+        - nextcloud.ecc135.cape-project.eu
+      secretName: nextcloud-tls
+
+cronjob:
+  enabled: true
+
+metrics:
+  enabled: true
+  https: true
+  tlsSkipVerify: true
+  serviceMonitor:
+    enabled: true
+    additionalLabels:
+      release: kube-prometheus-stack
+    namespace: prometheus

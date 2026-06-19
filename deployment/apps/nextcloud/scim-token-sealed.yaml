@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: nextcloud-scim-token
+  namespace: nextcloud
+spec:
+  encryptedData:
+    scim-token: AgCT/2X5kPCaQVkkfjIp6idmAkJsgYnA+gu0fpPY2q2ijOUjm7IIUTLEZDlvpGWErTroWAl4ASSvq5YbeXnJMJ4vZ8ucSozYld0zX/AOq7TyAV7EUgsUW05pSUqYfj7a5waxdU7ASuY9WLVaYuCmIXzy8vH12wS2pCG3L43x5RNOk30AJ1BoM1dVz3yvAzIi00eaLro/PS+plMtoBOIFczsv/OCfS03UrErviFuOgfdiiHvNAzgpwbv44hownjM4hiSwk8tv/Pcho4Vk+/WCgmM25NBkdY8if5Ysin9A/W8LrMKslUHlMTnyFbZB6v/gMOvRh7kvPNP9oRsl1bOL1nwp/d/4x8el3CLs8mC4Polv3T0FQmPcOdPYML/y5ofliegxg+xG94GqUzhiM5eDKWP6UFK5cFQ2+HFlIIBw7eT7jIArjwssv+mqw0BmTvBBJMzAfbimViLttIyQqP+B52XUCVdKU3UrAxMu1vhPaWEfGZ2dZr0KNJgxjWaO/XT0Jgh/nVLWXAXiySFmkzwjJcLktDMqobaCK76vAkDGyLgdM4iaQsvw5TePKidmzn3lQZ+UHpKz6rFIidwNdehPgfLzhQcoj5PzrE81lgkX3TmlkgvPkFGywC8TbNnzCHliV5ZGrtvFxHd3UCWH3ZR79rBC6eN5vznqit3D3NhzVPFO1tM5CBBEtluokrHxM4vfJV0KQ9V987HMV+n9W0jlTvsUwMxuWVBgPnWrnhWyNn0aGQMu8Eziz8fh9mXFvi7EZkpYyDtx7u88t1GPiRG64jUz
+  template:
+    metadata:
+      name: nextcloud-scim-token
+      namespace: nextcloud

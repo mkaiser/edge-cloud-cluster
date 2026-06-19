@@ -1,6 +1,7 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
     "extends": ["config:recommended"],
+
     "argocd": {
         "managerFilePatterns": ["/deployment/apps/.+\\.yaml$/", "/deployment/.+/.+\\.yaml$/"]
     },
@@ -16,7 +17,7 @@
         },
         {
             "customType": "regex",
-            "description": "Tool versions in scripts/install.sh",
+            "description": "Tool versions in scripts/environment/install.sh",
             "managerFilePatterns": ["/scripts/install\\.sh/"],
             "matchStrings": [
                 "[A-Z_]+=\"(?<currentValue>[^\"]+)\"\\s+# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)"
@@ -24,18 +25,10 @@
         },
         {
             "customType": "regex",
-            "description": "Talos versions in project_settings.ts",
-            "managerFilePatterns": ["/project_settings\\.ts$/"],
-            "matchStrings": [
-                "(?:talosVersion|talosKubernetesVersion): \"(?<currentValue>[^\"]+)\",\\s+// renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)(?: extractVersion=(?<extractVersion>[^\\s]+))?"
-            ]
-        },
-        {
-            "customType": "regex",
             "description": "ArgoCD Helm Application targetRevision in deployment manifests",
             "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
             "matchStrings": [
-                "repoURL:\\s*\"?(?<registryUrl>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,12}?chart:\\s*\"?(?<depName>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,8}?targetRevision:\\s*\"?(?<currentValue>[^\"\\n# ]+)"
+                "repoURL:\\s*\"?(?<registryUrl>https?://[^\"\\n]+)\"?(?:[^\\n]*\\n){0,12}?chart:\\s*\"?(?<depName>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,8}?targetRevision:\\s*\"?(?<currentValue>[^\"\\n# ]+)"
             ],
             "datasourceTemplate": "helm"
         },
@@ -57,6 +50,14 @@
         },
         {
             "customType": "regex",
+            "description": "YAML tag fields annotated with renovate comments",
+            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
+            "matchStrings": [
+                "tag:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+            ]
+        },
+        {
+            "customType": "regex",
             "description": "Container image tags in deployment manifests",
             "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
             "matchStrings": [
@@ -67,25 +68,85 @@
     ],
     "packageRules": [
         {
-            "description": "Group all updates into one catch-all PR",
+            "description": "Catch-all: group everything not matched by a specific rule",
             "matchFileNames": ["**/*"],
-            "groupName": "update all"
+            "groupName": "Update all"
         },
         {
-            "description": "Group deployment manifest updates separately",
-            "matchFileNames": ["deployment/**"],
-            "groupName": "deployment updates"
+            "description": "Suppress bad ArgoCD OCI depName for zulip helm chart (chart name equals last path segment, causing double-append)",
+            "matchDepNames": ["ghcr.io/zulip/helm-charts/zulip/zulip"],
+            "enabled": false
         },
         {
-            "description": "Automerge minor updates after checks pass",
+            "description": "Fix double https:// in sourceUrl for external-dns-hetzner-webhook (OCI label already contains https://)",
+            "matchDepNames": ["ghcr.io/mconfalonieri/external-dns-hetzner-webhook"],
+            "sourceUrl": "https://github.com/mconfalonieri/external-dns-hetzner-webhook"
+        },
+        {
+            "description": "Suppress ArgoCD git-tags lookup for system-upgrade-controller (git source without chart; github-releases annotation handles it)",
+            "matchDepNames": ["https://github.com/rancher/system-upgrade-controller"],
+            "matchDatasources": ["git-tags"],
+            "enabled": false
+        },
+        {
+            "description": "Pulumi infrastructure – minor updates",
+            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
             "matchUpdateTypes": ["minor"],
-            "automerge": true
+            "groupName": "Pulumi infrastructure (minor)"
         },
         {
-            "description": "Exclude non-v tags for openDesk deployment (bad revisions seen: 23.12 and 24.03; valid tags are v-prefixed like v1.13.2)",
-            "matchDatasources": ["gitlab-tags"],
-            "matchPackageNames": ["bmi/opendesk/deployment/opendesk"],
-            "allowedVersions": "/^v.*$/"
+            "description": "Pulumi infrastructure – patch updates (automerge)",
+            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
+            "matchUpdateTypes": ["patch"],
+            "groupName": "Pulumi infrastructure (patch)",
+            "automerge": true,
+            "automergeType": "branch"
+        },
+        {
+            "description": "Pulumi infrastructure – major updates",
+            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
+            "matchUpdateTypes": ["major"],
+            "groupName": "Pulumi infrastructure"
+        },
+        {
+            "description": "Kubernetes infrastructure – minor updates",
+            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
+            "matchUpdateTypes": ["minor"],
+            "groupName": "Kubernetes infrastructure (minor)"
+        },
+        {
+            "description": "Kubernetes infrastructure – patch updates (automerge)",
+            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
+            "matchUpdateTypes": ["patch"],
+            "groupName": "Kubernetes infrastructure (patch)",
+            "automerge": true,
+            "automergeType": "branch"
+        },
+        {
+            "description": "Kubernetes infrastructure – major updates",
+            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
+            "matchUpdateTypes": ["major"],
+            "groupName": "Kubernetes infrastructure"
+        },
+        {
+            "description": "Apps – minor updates",
+            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
+            "matchUpdateTypes": ["minor"],
+            "groupName": "Apps (minor)"
+        },
+        {
+            "description": "Apps – patch updates (automerge)",
+            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
+            "matchUpdateTypes": ["patch"],
+            "groupName": "Apps (patch)",
+            "automerge": true,
+            "automergeType": "branch"
+        },
+        {
+            "description": "Apps – major updates",
+            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
+            "matchUpdateTypes": ["major"],
+            "groupName": "Apps"
         }
     ]
 }

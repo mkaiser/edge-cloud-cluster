@@ -44,19 +44,19 @@ if [ ${#curl_tls_flags[@]} -eq 0 ]; then
 fi
 
 dns_wait_min=0
-timeout_min=60
+timeout_min=2
 echo -n "Waiting for DNS resolution of $argocd_host (timeout: $timeout_min minutes): "
+echo -n "Sometimes this works instantly, sometimes never... It is an devContainer / DNS proxy issue. Don't know why."
 until nslookup "$argocd_host" >/dev/null 2>&1; do
     dns_wait_min=$((dns_wait_min + 1))
     if [ "$dns_wait_min" -ge $timeout_min ]; then
         echo ""
         echo "ERROR: $argocd_host still not resolvable after $timeout_min minutes — check external-dns and DNS TTL."
-        exit 1
+        break
     fi
     printf "."
     sleep 60
 done
-echo -e "\n  DNS resolved after $dns_wait_min minutes."
 
 if ! argocd_admin_password=$(pulumi config get argocdAdminPasswordPlain --non-interactive 2>/dev/null); then
     echo "Failed to read Pulumi config 'argocdAdminPasswordPlain'."
@@ -70,50 +70,62 @@ if [ "$cert_issuer_type" = "letsencrypt-staging" ]; then
     login_tls_flags+=("--insecure")
 fi
 
-# WSL2 has no IPv6 routing. Hetzner DNS returns AAAA records; Go's gRPC dialer
-# picks IPv6, gets "network is unreachable", and doesn't fall back to IPv4.
-# Use the resolved IPv4 address as the transport target and keep TLS/SNI
-# pointed at the DNS name. This avoids writing to /etc/hosts, which is not
-# writable in some devcontainer setups.
-argocd_ipv4=$(getent ahostsv4 "$argocd_host" 2>/dev/null | awk 'NR==1{print $1}' || true)
+# WSL2/devcontainers usually have no IPv6 routing. Hetzner DNS returns AAAA
+# records and the argocd CLI's gRPC dialer prefers IPv6 → "network is
+# unreachable". Connecting by raw IPv4 instead breaks haproxy-ingress Host
+# routing (it routes by HTTP Host, so an IP target gets a 404). The robust fix
+# is to pin the hostname to its IPv4 in /etc/hosts: the CLI then dials IPv4 but
+# keeps the correct SNI + Host header. If /etc/hosts can't be edited, fall back
+# to a kubectl port-forward (no DNS/ingress/IPv6 involved at all).
+# Override IPv4 auto-detection with ARGOCD_LOGIN_IP=<ipv4> if needed.
+resolve_ipv4() {
+    local host="$1" ip
+    if [ -n "${ARGOCD_LOGIN_IP:-}" ]; then printf '%s' "$ARGOCD_LOGIN_IP"; return; fi
+    ip=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+    ip=$(nslookup -type=A "$host" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+    # Last resort: control-plane IPv4 from the Pulumi stack (argocd ingress = CP node IP).
+    pulumi stack output server_controlPlaneIPs_compact --non-interactive 2>/dev/null \
+        | grep -oE 'ipv4: [0-9.]+' | head -1 | awk '{print $2}'
+}
+
+pin_host_to_ipv4() {  # $1=host $2=ipv4 ; returns 0 if /etc/hosts now maps host→ipv4
+    local host="$1" ip="$2" line="$2 $1  # argocd-ipv4-pin"
+    local writer="tee"
+    if [ ! -w /etc/hosts ]; then
+        sudo -n true 2>/dev/null && writer="sudo tee" || return 1
+    fi
+    # Remove any prior pin for this host, then append the fresh one.
+    { grep -v "[[:space:]]${host}\([[:space:]]\|$\)" /etc/hosts 2>/dev/null; echo "$line"; } \
+        | $writer /etc/hosts >/dev/null 2>&1 || return 1
+    getent ahostsv4 "$host" 2>/dev/null | grep -q "$ip"
+}
 
 argocd context delete "$argocd_host" 2>/dev/null && echo "Deleted existing context for $argocd_host" || true
 
-argocd_login_target="$argocd_host"
-argocd_login_flags=()
-if [ -n "$argocd_ipv4" ]; then
-    argocd_login_flags+=(--server-name "$argocd_host")
-    argocd_login_flags+=(--header "Host: $argocd_host")
-    echo "IPv4 fallback available: $argocd_ipv4 for $argocd_host (no /etc/hosts write)."
-fi
+login_args=(--username admin --password "$argocd_admin_password" --grpc-web)
+[ ${#login_tls_flags[@]} -gt 0 ] && login_args+=("${login_tls_flags[@]}")
 
-if ! argocd login "$argocd_login_target" \
-    --username admin \
-    --password "$argocd_admin_password" \
-    --grpc-web "${login_tls_flags[@]}"; then
-    if [ ${#login_tls_flags[@]} -eq 0 ]; then
-        echo "argocd login failed with strict TLS, retrying with --insecure ..."
-        if ! argocd login "$argocd_login_target" \
-            --username admin \
-            --password "$argocd_admin_password" \
-            --grpc-web --insecure; then
-            if [ -n "$argocd_ipv4" ]; then
-                echo "Hostname login failed, trying IPv4 fallback target $argocd_ipv4 ..."
-                argocd login "$argocd_ipv4" \
-                    --username admin \
-                    --password "$argocd_admin_password" \
-                    --grpc-web "${argocd_login_flags[@]}" --insecure
-            else
-                exit 1
-            fi
-        fi
-    elif [ -n "$argocd_ipv4" ]; then
-        echo "Hostname login failed, trying IPv4 fallback target $argocd_ipv4 ..."
-        argocd login "$argocd_ipv4" \
-            --username admin \
-            --password "$argocd_admin_password" \
-            --grpc-web "${argocd_login_flags[@]}" "${login_tls_flags[@]}"
-    else
-        exit 1
-    fi
+argocd_ipv4=$(resolve_ipv4 "$argocd_host")
+
+if [ -n "$argocd_ipv4" ] && pin_host_to_ipv4 "$argocd_host" "$argocd_ipv4"; then
+    echo "Pinned $argocd_host → $argocd_ipv4 in /etc/hosts; logging in over IPv4."
+    argocd login "$argocd_host" "${login_args[@]}"
+else
+    echo "Could not pin /etc/hosts; falling back to kubectl port-forward."
+    pf_port=18080
+    kubectl port-forward svc/argocd-server -n argocd "${pf_port}:443" --address=127.0.0.1 >/tmp/argocd-pf.log 2>&1 &
+    pf_pid=$!
+    trap 'kill "$pf_pid" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 15); do
+        curl -sk --max-time 2 "https://127.0.0.1:${pf_port}/healthz" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    argocd login "127.0.0.1:${pf_port}" \
+        --username admin --password "$argocd_admin_password" --grpc-web --insecure
+    echo "NOTE: logged in via port-forward (pid $pf_pid). The context targets"
+    echo "      127.0.0.1:${pf_port} and only works while a port-forward is running."
 fi

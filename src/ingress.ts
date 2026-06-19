@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: ingress.ts
+ * Purpose: Ingress configuration helpers (HAProxy etc.).
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as hcloud from "@pulumi/hcloud";
 import * as k8s from "@pulumi/kubernetes";
@@ -20,7 +31,7 @@ export class IngressComponent extends pulumi.ComponentResource {
         },
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:Ingress", name, {}, opts);
+        super("ecc:infra:Ingress", name, {}, opts);
         const { letsEncryptStagingIssuer, letsEncryptProdIssuer } = certIssuers;
 
         // haproxy-ingress in DaemonSet + hostNetwork mode: binds to port 80/443 on each node.
@@ -76,7 +87,7 @@ export class IngressComponent extends pulumi.ComponentResource {
                             requests: { cpu: "100m", memory: "90Mi" },
                             limits: { cpu: "500m", memory: "256Mi" },
                         },
-                        // openDesk recommends tuning bufsize and maxhdr
+                        // Tune bufsize and maxhdr for large OIDC headers/cookies.
                         // bind-ip-addr-http: "[::]" creates a dual-stack socket (IPv4 + IPv6) on Linux
                         config: {
                             "config-global": "tune.bufsize 65536\ntune.http.maxhdr 256",

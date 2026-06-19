@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-ui
+  namespace: longhorn-system
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    # Commented out so the UI is reachable from the public internet (not only
+    # via VPN/internal ranges). Auth is no longer provided by IP allow-listing
+    # but by Authentik OIDC: this ingress routes to the Authentik embedded
+    # outpost (proxy provider "longhorn"), which authenticates the user before
+    # proxying to longhorn-frontend. Longhorn's UI has no native auth, so the
+    # outpost is what protects it. Re-enable this line to fall back to
+    # VPN-only access.
+    # haproxy-ingress.github.io/whitelist-source-range: "10.0.10.0/23,10.0.2.0/24"
+spec:
+  ingressClassName: haproxy
+  tls:
+  - hosts:
+    - longhorn.ecc135.cape-project.eu
+    secretName: longhorn-ui-tls
+  rules:
+  - host: longhorn.ecc135.cape-project.eu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            # Route to the Authentik embedded outpost instead of longhorn-frontend
+            # directly. The outpost (proxy provider, see authentik/blueprint-apps.yaml)
+            # enforces OIDC login, then proxies to longhorn-frontend via the
+            # provider's internal_host. authentik-server lives in the authentik
+            # namespace, so it is exposed here through an ExternalName service.
+            # Chicken/egg: longhorn-config is sync-wave 2, authentik is wave 6 —
+            # until Authentik is up this backend returns 503, then self-heals.
+            name: authentik-embedded-outpost
+            port:
+              number: 80

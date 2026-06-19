@@ -1,0 +1,272 @@
+# Authentik blueprint: shared OIDC entries + always-on infra apps + proxy/outpost.
+#
+# Per-app tiles for the toggleable apps (headscale, nextcloud, xwiki, zulip,
+# gitlab) live in each app's own folder as `authentik-blueprint.yaml`, shipped by
+# that app's ArgoCD Application and mounted optionally into the Authentik worker
+# (see deployment/infrastructure/authentik/values.yaml → worker.volumes). A disabled app
+# (no sync-wave Application) ships no ConfigMap, so its tile never appears.
+#
+# This file keeps only:
+#   - the shared `groups` scope mapping (referenced cross-blueprint by !Find)
+#   - ArgoCD + Grafana providers (always-on infra, deployed before Authentik's
+#     namespace exists, so they can't ship from their own folders)
+#   - the Longhorn/Prometheus proxy providers + embedded-outpost assignment
+#
+# Redirect URIs use the cluster subdomain — update via updateConfigFromProjectSettings.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-apps
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  apps.yaml: |
+    version: 1
+    metadata:
+      name: cluster-oidc-apps
+    context:
+      authorization_flow: default-provider-authorization-implicit-consent
+    entries:
+      # ---- Custom scope: groups ----
+      # Authentik 2026.5 rejects scopes not registered on the provider ("invalid_request").
+      # ArgoCD/GitLab/Nextcloud/XWiki request the "groups" scope for RBAC; this mapping
+      # supplies it. Per-app blueprints reference it via:
+      #   !Find [authentik_providers_oauth2.scopemapping, [scope_name, groups]]
+      - id: scope-groups
+        model: authentik_providers_oauth2.scopemapping
+        identifiers:
+          managed: "custom.scope-groups"
+        attrs:
+          name: "Custom - Groups scope"
+          scope_name: groups
+          description: "Returns the user's group memberships as a list"
+          # is_admin: Nextcloud's oidc_login app has NO "admin group" setting — it
+          # only grants admin when a configured is_admin claim is truthy (then it
+          # adds the user to NC's built-in `admin` group). Emit it here so NC can map
+          # oidc_login_attributes.is_admin -> this claim. Members of employees-extended
+          # are Nextcloud admins. Harmless for other apps (ArgoCD/GitLab/XWiki ignore it).
+          # rc_roles: Rocket.Chat maps an OIDC claim → RC roles (roles_claim=rc_roles,
+          # roles_to_sync=admin in oauth-config.yaml). Members of rocketchat-admins or
+          # employees-extended get the RC "admin" role; everyone else "user".
+          expression: |
+            groups = list(request.user.groups.values_list("name", flat=True))
+            rc_admin = bool({"rocketchat-admins", "employees-extended"} & set(groups))
+            return {
+                "groups": groups,
+                "is_admin": "employees-extended" in groups,
+                "rc_roles": ["admin"] if rc_admin else ["user"],
+            }
+
+      # ---- Access-control policies (per-app authorization) ----
+      # Bound to each Application below (and !Find-referenced by per-app blueprints).
+      # Authentik denies access to an application as soon as ≥1 binding exists and the
+      # user matches none — so unassigned/`external` users get the portal but no apps.
+      # NOTE: superusers do NOT bypass application policy bindings, hence authentik-admins
+      # is included explicitly everywhere it should have access.
+      - id: policy-access-employee-apps
+        model: authentik_policies_expression.expressionpolicy
+        identifiers:
+          name: access-employee-apps
+        attrs:
+          expression: |
+            groups = set(request.user.groups.values_list("name", flat=True))
+            return bool(groups & {"employees", "employees-extended", "authentik-admins"})
+      - id: policy-access-infra-view
+        model: authentik_policies_expression.expressionpolicy
+        identifiers:
+          name: access-infra-view
+        attrs:
+          expression: |
+            groups = set(request.user.groups.values_list("name", flat=True))
+            return bool(groups & {"employees-extended", "argocd-admins", "authentik-admins"})
+      - id: policy-access-admin-only
+        model: authentik_policies_expression.expressionpolicy
+        identifiers:
+          name: access-admin-only
+        attrs:
+          expression: |
+            groups = set(request.user.groups.values_list("name", flat=True))
+            return "authentik-admins" in groups
+      - id: policy-access-ryax
+        model: authentik_policies_expression.expressionpolicy
+        identifiers:
+          name: access-ryax
+        attrs:
+          expression: |
+            groups = set(request.user.groups.values_list("name", flat=True))
+            return bool(groups & {"ryax", "authentik-admins"})
+
+      # ---- ArgoCD (always-on infra, wave 0 — before authentik namespace) ----
+      - id: provider-argocd
+        model: authentik_providers_oauth2.oauth2provider
+        identifiers:
+          name: argocd
+        attrs:
+          client_type: confidential
+          client_id: argocd
+          client_secret: !Env ARGOCD_OIDC_CLIENT_SECRET
+          signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+          grant_types:
+            - authorization_code
+            - refresh_token
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+          redirect_uris:
+            - matching_mode: strict
+              url: https://argocd.ecc135.cape-project.eu/auth/callback
+          property_mappings:
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+            - !KeyOf scope-groups
+      - model: authentik_core.application
+        identifiers:
+          slug: argocd
+        attrs:
+          name: ArgoCD
+          group: Infrastructure
+          provider: !KeyOf provider-argocd
+          meta_launch_url: https://argocd.ecc135.cape-project.eu/auth/login?return_url=https%3A%2F%2Fargocd.ecc135.cape-project.eu%2Fapplications
+          meta_icon: https://cdn.jsdelivr.net/gh/selfhst/icons/svg/argo-cd.svg
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, argocd]]
+          policy: !KeyOf policy-access-infra-view
+        attrs:
+          order: 0
+          enabled: true
+
+      # ---- Grafana (always-on infra, wave 2 — before authentik namespace) ----
+      - id: provider-grafana
+        model: authentik_providers_oauth2.oauth2provider
+        identifiers:
+          name: grafana
+        attrs:
+          client_type: confidential
+          client_id: grafana
+          client_secret: !Env GRAFANA_OIDC_CLIENT_SECRET
+          signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+          grant_types:
+            - authorization_code
+            - refresh_token
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+          redirect_uris:
+            - matching_mode: strict
+              url: https://grafana.ecc135.cape-project.eu/login/generic_oauth
+          property_mappings:
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+      - model: authentik_core.application
+        identifiers:
+          slug: grafana
+        attrs:
+          name: Grafana
+          group: Infrastructure
+          provider: !KeyOf provider-grafana
+          meta_launch_url: https://grafana.ecc135.cape-project.eu
+          meta_icon: https://cdn.jsdelivr.net/gh/selfhst/icons/svg/grafana.svg
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, grafana]]
+          policy: !KeyOf policy-access-infra-view
+        attrs:
+          order: 0
+          enabled: true
+
+      # ---- Longhorn (full proxy — embedded outpost protects the auth-less UI) ----
+      # Proxy mode (not forward_single): haproxy-ingress's forward-auth doesn't
+      # send the headers Authentik needs to match the provider (it rewrites Host
+      # to the svc name → /auth/nginx 404s). Instead longhorn.subdomain routes
+      # straight to the embedded outpost (via an ExternalName service in
+      # longhorn-system), which authenticates and proxies to longhorn-frontend.
+      - id: provider-longhorn
+        model: authentik_providers_proxy.proxyprovider
+        identifiers:
+          name: longhorn
+        attrs:
+          mode: proxy
+          external_host: https://longhorn.ecc135.cape-project.eu
+          internal_host: http://longhorn-frontend.longhorn-system.svc.cluster.local:80
+          internal_host_ssl_validation: false
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      - model: authentik_core.application
+        identifiers:
+          slug: longhorn
+        attrs:
+          name: Longhorn
+          group: Infrastructure
+          provider: !KeyOf provider-longhorn
+          meta_launch_url: https://longhorn.ecc135.cape-project.eu
+          meta_icon: https://raw.githubusercontent.com/longhorn/website/master/static/img/icon-longhorn.svg
+      # Longhorn has no read-only mode → admins only (no employees-extended access).
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, longhorn]]
+          policy: !KeyOf policy-access-admin-only
+        attrs:
+          order: 0
+          enabled: true
+
+      # ---- Prometheus (full proxy — embedded outpost protects the auth-less UI) ----
+      # Prometheus has no native auth; the chart's own ingress is disabled and
+      # prometheus.subdomain routes to the embedded outpost (via an ExternalName
+      # service in the prometheus namespace), which authenticates then proxies to
+      # the prometheus server service.
+      - id: provider-prometheus
+        model: authentik_providers_proxy.proxyprovider
+        identifiers:
+          name: prometheus
+        attrs:
+          mode: proxy
+          external_host: https://prometheus.ecc135.cape-project.eu
+          internal_host: http://kube-prometheus-stack-prometheus.prometheus.svc.cluster.local:9090
+          internal_host_ssl_validation: false
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      - model: authentik_core.application
+        identifiers:
+          slug: prometheus
+        attrs:
+          name: Prometheus
+          group: Infrastructure
+          provider: !KeyOf provider-prometheus
+          meta_launch_url: https://prometheus.ecc135.cape-project.eu
+          meta_icon: https://cdn.jsdelivr.net/gh/selfhst/icons/svg/prometheus.svg
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, prometheus]]
+          policy: !KeyOf policy-access-infra-view
+        attrs:
+          order: 0
+          enabled: true
+
+
+      # Assign the proxy providers to the embedded outpost — without this the
+      # /outpost.goauthentik.io/* forward-auth endpoints 404 ("Not Found").
+      - model: authentik_outposts.outpost
+        identifiers:
+          managed: goauthentik.io/outposts/embedded
+        attrs:
+          providers:
+            - !KeyOf provider-longhorn
+            - !KeyOf provider-prometheus
+          # Without an explicit browser host the embedded outpost builds login
+          # redirects against http://localhost (broken). Point it at the public
+          # Authentik URL (rewritten on subdomain change by the update script).
+          config:
+            authentik_host: https://id.ecc135.cape-project.eu
+            authentik_host_browser: https://id.ecc135.cape-project.eu
+            authentik_host_insecure: false
+            log_level: info

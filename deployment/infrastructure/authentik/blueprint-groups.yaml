@@ -1,0 +1,90 @@
+# Authentik blueprint: permission groups (config-as-code).
+# Mounted into the worker via blueprints.configMaps and applied automatically.
+#
+# Group model (roles):
+#   authentik-admins     — full Authentik platform admin (is_superuser); = "clusteradmin"
+#                          role: access to every app + full admin everywhere incl. Longhorn.
+#   employees            — standard staff; access to all NON-infra apps (nextcloud, xwiki,
+#                          gitlab, zulip, rocketchat, jitsi, headscale). No infra apps.
+#   employees-extended   — employees + admin on Nextcloud/GitLab/Rocket.Chat + infra
+#                          VIEW-only (ArgoCD readonly, Grafana Viewer, Prometheus). No Longhorn.
+#   external             — external users/contractors; authentication only. NO app access
+#                          until an admin binds them to an application (per-app policy binding).
+#   ryax                 — access to the Ryax application only.
+#   mfa-exempt           — skips forced MFA (bootstrap/test accounts only; remove to enforce).
+#
+#   zulip                — members synced to Zulip (cronjob-sync-users watches this group).
+#
+#   Granular per-app admin groups (kept alongside employees-extended for fine control):
+#   argocd-admins        — ArgoCD role:admin (see argocd-infra/values.yaml rbac)
+#   gitlab-admins        — GitLab admin (via cronjob-sync-admins, with employees-extended)
+#   xwiki-oidc-admins    — XWiki.XWikiAdminGroup (via oidc.groups.mapping)
+#   rocketchat-admins    — Rocket.Chat admin role (via OAuth role-sync, with employees-extended)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-groups
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  groups.yaml: |
+    version: 1
+    metadata:
+      name: cluster-groups
+    entries:
+      - model: authentik_core.group
+        identifiers:
+          name: authentik-admins
+        attrs:
+          is_superuser: true
+      - model: authentik_core.group
+        identifiers:
+          name: employees
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: employees-extended
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: external
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: ryax
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: mfa-exempt
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: argocd-admins
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: xwiki-oidc-admins
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: gitlab-admins
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: rocketchat-admins
+        attrs:
+          is_superuser: false
+      - model: authentik_core.group
+        identifiers:
+          name: zulip
+        attrs:
+          is_superuser: false

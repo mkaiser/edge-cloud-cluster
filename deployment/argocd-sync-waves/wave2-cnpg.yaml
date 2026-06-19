@@ -1,0 +1,41 @@
+# CloudNativePG operator — manages CNPG Cluster CRDs used by authentik (wave 6) and headscale (wave 8).
+# Wave 2 ensures the operator is healthy before the wave-3 barrier releases further waves.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cloudnative-pg
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cloudnative-pg
+    targetRevision: "0.28.3" # renovate: datasource=helm depName=cloudnative-pg registryUrl=https://cloudnative-pg.github.io/charts
+    helm:
+      valuesObject:
+        # HA operator (leader-elected active/standby). Single replica was a SPOF: when
+        # its node died, DB failover stalled ~3-4min until the operator rescheduled.
+        # replicaCount is kept in sync with project_settings.ha by
+        # updateConfigFromProjectSettings.sh. Unpinned + soft spread so the standby can
+        # live on any node (CP or worker) → a CP loss always leaves an operator running.
+        replicaCount: 2 # project-settings: ha.cnpgOperator
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: cloudnative-pg
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

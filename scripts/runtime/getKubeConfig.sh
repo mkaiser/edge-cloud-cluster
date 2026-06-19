@@ -22,25 +22,6 @@ if [[ "$mode" == "vpn" ]]; then
         return 1
     fi
     echo "✓ Kubeconfig saved to $KUBECONFIG (using private IP via WireGuard VPN)"
-elif [[ "$mode" == "talosctl" ]]; then
-    echo "Fetching kubeconfig via talosctl (Talos only)..."
-    if ! CP_IP=$(pulumi stack output controlPlaneIP); then
-        echo "Error: Failed to fetch controlPlaneIP from Pulumi stack." >&2
-        return 1
-    fi
-    TALOSCONFIG=$(mktemp)
-    if ! pulumi stack output talosconfig --show-secrets > "$TALOSCONFIG"; then
-        echo "Error: Failed to fetch talosconfig from Pulumi stack." >&2
-        rm -f "$TALOSCONFIG"
-        return 1
-    fi
-    if ! talosctl --talosconfig "$TALOSCONFIG" --nodes "$CP_IP" --endpoints "$CP_IP" kubeconfig "$KUBECONFIG"; then
-        echo "Error: Failed to fetch kubeconfig via talosctl from $CP_IP." >&2
-        rm -f "$TALOSCONFIG"
-        return 1
-    fi
-    rm -f "$TALOSCONFIG"
-    echo "✓ Kubeconfig saved to $KUBECONFIG (via talosctl)"
 elif [[ "$mode" == "ssh" ]]; then
     echo "Fetching kubeconfig via SSH (Debian/K3s only)..."
     if ! CP_IP=$(pulumi stack output controlPlaneIP); then

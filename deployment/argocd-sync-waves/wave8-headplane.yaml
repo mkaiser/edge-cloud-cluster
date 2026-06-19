@@ -1,0 +1,37 @@
+# ArgoCD Application: headplane (moved from wave 14).
+# Admin GUI for Headscale, accessible at https://headplane.subdomain.domain.tld/admin/
+# Depends on headplane-secrets (api-key key) being seeded by the headscale App's PostSync job.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: headplane
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "8"
+spec:
+  project: default
+  info:
+    - name: Admin
+      value: https://headplane.ecc135.cape-project.eu/admin/
+  sources:
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/infrastructure/headplane
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    - group: ""
+      kind: PersistentVolumeClaim
+      name: headplane-data
+      namespace: headscale
+      jsonPointers:
+        - /spec/storageClassName

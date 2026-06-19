@@ -1,0 +1,175 @@
+# Wave-20 Ryax bootstrap: breaks the fresh-install PreSync deadlock.
+#
+# The ryax-engine chart ships its DB-migration / scale-down jobs as helm
+# `pre-upgrade` hooks (datastore/runner/studio subcharts). ArgoCD has no
+# install/upgrade distinction and runs them as PreSync on the FIRST sync — before
+# postgres exists — so they fail and the Sync phase never applies the DB. This Job
+# patches the Application directly via kubectl to:
+#   Phase 1: disable automated sync, force-terminate any stuck operation (status patch),
+#            trigger skip-hooks sync (DB + secrets come up)
+#   Phase 2: trigger normal sync (migration hooks run against the live DB)
+#   Phase 3: re-enable automated sync + mark done
+# Idempotent via `ryax-bootstrap-done` ConfigMap marker.
+# See deployment/apps/ryax/README.md.
+#
+# Runs in the SAME wave (20) as wave20-ryax.yaml — NOT a later wave — so the app-of-apps
+# does not gate a later wave behind the ryax Application becoming Healthy (which can only
+# happen once this Job has run). Both are applied together; the Job polls for the app.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ryax-bootstrap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ryax-bootstrap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create"]
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "patch"]
+- apiGroups: ["argoproj.io"]
+  resources: ["applications/status"]
+  verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ryax-bootstrap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ryax-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: ryax-bootstrap
+  namespace: argocd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-bootstrap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "20"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: ryax-bootstrap
+      restartPolicy: Never
+      containers:
+      - name: bootstrap
+        image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/bash", "-ec"]
+        args:
+        - |
+          MARKER="ryax-bootstrap-done"
+          if kubectl get configmap "$MARKER" -n argocd >/dev/null 2>&1; then
+            echo "Ryax already bootstrapped (ConfigMap $MARKER exists) — skipping."
+            exit 0
+          fi
+
+          # wait_phase: poll until Application operationState.phase is not Running.
+          wait_phase() {
+            local deadline=$(($(date +%s) + ${1:-900}))
+            until [[ "$(kubectl get application ryax -n argocd \
+                -o jsonpath='{.status.operationState.phase}' 2>/dev/null)" =~ ^(Succeeded|Failed|Error|)$ ]]; do
+              [ "$(date +%s)" -ge "$deadline" ] && return 1
+              sleep 5
+            done
+          }
+
+          # force_terminate: set operationState.phase=Failed via status subresource to unblock a stuck sync.
+          force_terminate() {
+            echo "Force-terminating stuck operation via status patch..."
+            kubectl patch application ryax -n argocd --subresource=status --type json -p \
+              '[{"op":"replace","path":"/status/operationState/phase","value":"Failed"},
+                {"op":"replace","path":"/status/operationState/message","value":"Terminated by ryax-bootstrap job"}]' \
+              2>/dev/null || true
+          }
+
+          # trigger_sync: patch Application operation to request a sync.
+          # $1 = "true" to add SkipHooks=true to syncOptions.
+          trigger_sync() {
+            local opts='[]'
+            [ "${1:-false}" = "true" ] && opts='["SkipHooks=true"]'
+            kubectl patch application ryax -n argocd --type merge -p \
+              "{\"operation\":{\"initiatedBy\":{\"username\":\"ryax-bootstrap\"},\"sync\":{\"prune\":true,\"syncOptions\":${opts}}}}"
+          }
+
+          echo "Waiting for the ryax Application to exist..."
+          i=0
+          until kubectl get application ryax -n argocd >/dev/null 2>&1; do
+            i=$((i+1)); [ "$i" -ge 60 ] && { echo "ERROR: ryax Application never appeared"; exit 1; }
+            sleep 5
+          done
+
+          # Disable automated sync first to prevent selfHeal races.
+          echo "Disabling automated sync..."
+          kubectl patch application ryax -n argocd --type merge -p \
+            '{"spec":{"syncPolicy":{"automated":null}}}'
+
+          # Terminate any stuck in-progress operation (e.g. PreSync hooks stuck waiting for
+          # secrets that only exist after the Sync phase — the classic fresh-install deadlock).
+          PHASE="$(kubectl get application ryax -n argocd -o jsonpath='{.status.operationState.phase}' 2>/dev/null)"
+          if [ "$PHASE" = "Running" ]; then
+            force_terminate
+            wait_phase 60 || force_terminate
+          fi
+
+          # Phase 1: apply all Sync-phase resources WITHOUT hooks (creates the DB + secrets).
+          echo "Phase 1: skip-hooks sync (initialise DB and secrets)..."
+          trigger_sync true
+          if ! wait_phase 1200; then
+            echo "ERROR: skip-hooks sync timed out"
+            exit 1
+          fi
+          PHASE="$(kubectl get application ryax -n argocd -o jsonpath='{.status.operationState.phase}')"
+          echo "Phase 1 completed: phase=$PHASE"
+
+          # Wait for workloads to become Healthy before running migration hooks.
+          echo "Waiting for ryax to become Healthy..."
+          deadline=$(($(date +%s) + 1200))
+          until [[ "$(kubectl get application ryax -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null)" == "Healthy" ]]; do
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "ERROR: ryax never became Healthy"; exit 1; }
+            sleep 10
+          done
+
+          # Phase 2: normal sync — migration/scale-down hooks now run against the live DB.
+          echo "Phase 2: full sync (run migration hooks)..."
+          trigger_sync false
+          if ! wait_phase 1200; then
+            echo "ERROR: full sync timed out"
+            exit 1
+          fi
+          PHASE="$(kubectl get application ryax -n argocd -o jsonpath='{.status.operationState.phase}')"
+          echo "Phase 2 completed: phase=$PHASE"
+
+          # Re-enable automated sync.
+          echo "Re-enabling automated sync..."
+          kubectl patch application ryax -n argocd --type merge -p \
+            '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+
+          kubectl create configmap "$MARKER" -n argocd \
+            --from-literal=status=done \
+            --from-literal=timestamp="$(date -Iseconds)" \
+            2>/dev/null || true
+          echo "Ryax bootstrap complete — automated selfHeal takes over from here."

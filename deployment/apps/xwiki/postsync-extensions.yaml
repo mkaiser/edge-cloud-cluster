@@ -1,0 +1,391 @@
+---
+# PostSync job: install OIDC extension, block anonymous access, set up testadmin as admin.
+#
+# Flow (idempotent on every sync):
+#   1. Wait for XWiki REST to respond
+#   2. Poll GET /rest/wikis/xwiki/spaces/Main until HTTP 200 (flavor done)
+#   3. Install OIDC + draw.io extensions via the extension script service (Groovy)
+#   4. Block anonymous access (deny view for XWikiGuest)
+#   5. Add testadmin to XWikiAdminGroup (if user exists from prior OIDC login)
+#
+# Extension install runs a Groovy script (superadmin has programming rights) that calls
+#   services.extension.install(id, version, "wiki:xwiki") and joins the job. This is far
+#   more reliable than driving the AJAX-based admin Extensions web UI (which never exposes
+#   a usable install form for not-yet-installed remote extensions). Installed state is
+#   checked against the InstalledExtensionRepository, also via Groovy.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xwiki-postsync
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+---
+# Allow postsync to delete the xwiki-0 pod (needed to restart XWiki after OIDC install)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: xwiki-postsync
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: xwiki-postsync
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: xwiki-postsync
+subjects:
+  - kind: ServiceAccount
+    name: xwiki-postsync
+    namespace: xwiki
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xwiki-postsync
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: xwiki-postsync
+      restartPolicy: Never
+      containers:
+      - name: setup
+        image: python:3.14-slim  # renovate: datasource=docker depName=python
+        env:
+        - name: XWIKI_BASE
+          value: "http://xwiki"
+        - name: ADMIN_USER
+          value: "superadmin"
+        - name: ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: xwiki-db
+              key: superadmin-password
+        # Extension versions — update here to upgrade; Renovate tracks these.
+        - name: EXT_OIDC_ID
+          value: "org.xwiki.contrib.oidc:oidc-authenticator"
+        - name: EXT_OIDC_VERSION
+          # renovate: datasource=maven depName=org.xwiki.contrib.oidc:oidc-authenticator registryUrl=https://nexus.xwiki.org/nexus/content/repositories/releases
+          value: "2.21.1"
+        - name: EXT_DRAWIO_ID
+          value: "org.xwiki.contrib:draw.io"
+        - name: EXT_DRAWIO_VERSION
+          # renovate: datasource=maven depName=org.xwiki.contrib:draw.io registryUrl=https://nexus.xwiki.org/nexus/content/repositories/releases
+          value: "24.5.5-3"
+        - name: EXT_MERMAID_ID
+          value: "xinnj:mermaid-macro"
+        - name: EXT_MERMAID_VERSION
+          # Hosted on extensions.xwiki.org (not nexus maven), so resolved via that
+          # repository at install time; Renovate's maven datasource can't track it.
+          value: "1.1"
+        - name: EXT_SCIM_ID
+          value: "org.xwiki.contrib.scim:scim2-server"
+        - name: EXT_SCIM_VERSION
+          # renovate: datasource=maven depName=org.xwiki.contrib.scim:scim2-server registryUrl=https://nexus.xwiki.org/nexus/content/repositories/releases
+          value: "2.7.1"
+        - name: EXT_COMMONMARK_ID
+          value: "org.xwiki.contrib.markdown:syntax-markdown-commonmark12"
+        - name: EXT_COMMONMARK_VERSION
+          # renovate: datasource=maven depName=org.xwiki.contrib.markdown:syntax-markdown-commonmark12 registryUrl=https://nexus.xwiki.org/nexus/content/repositories/releases
+          value: "8.9"
+        - name: SCIM_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: xwiki-scim-token
+              key: scim-token
+        command: ["python3", "-u", "-c"]
+        args:
+        - |
+          import os, sys, time, ssl
+          from urllib import request, parse, error as urlerror
+          from urllib.parse import urljoin
+          import http.cookiejar, re, xml.etree.ElementTree as ET, base64, textwrap
+
+          K8S_HOST = "https://kubernetes.default.svc"
+          K8S_NS = "xwiki"
+          K8S_TOKEN = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+          K8S_CA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+          def k8s_delete_pod(pod_name):
+              url = f"{K8S_HOST}/api/v1/namespaces/{K8S_NS}/pods/{pod_name}"
+              ctx = ssl.create_default_context(cafile=K8S_CA)
+              r = request.Request(url, method="DELETE")
+              r.add_header("Authorization", f"Bearer {K8S_TOKEN}")
+              try:
+                  request.urlopen(r, context=ctx, timeout=10)
+                  print(f"  Deleted pod {pod_name}")
+                  return True
+              except Exception as e:
+                  print(f"  Pod delete failed: {e}")
+                  return False
+
+          def wait_pod_ready(pod_name, timeout=300):
+              url = f"{K8S_HOST}/api/v1/namespaces/{K8S_NS}/pods/{pod_name}"
+              ctx = ssl.create_default_context(cafile=K8S_CA)
+              deadline = time.time() + timeout
+              while time.time() < deadline:
+                  try:
+                      import json
+                      resp = request.urlopen(request.Request(url,
+                          headers={"Authorization": f"Bearer {K8S_TOKEN}"}),
+                          context=ctx, timeout=10)
+                      pod = json.loads(resp.read())
+                      conditions = pod.get("status", {}).get("conditions", [])
+                      ready = any(c.get("type") == "Ready" and c.get("status") == "True"
+                                  for c in conditions)
+                      if ready:
+                          return True
+                  except Exception:
+                      pass
+                  time.sleep(10)
+              return False
+
+          BASE        = os.environ["XWIKI_BASE"].rstrip("/")
+          ADMIN_USER  = os.environ["ADMIN_USER"]
+          ADMIN_PASS  = os.environ["ADMIN_PASSWORD"]
+          EXTENSIONS  = [
+              (os.environ["EXT_OIDC_ID"],        os.environ["EXT_OIDC_VERSION"]),
+              (os.environ["EXT_DRAWIO_ID"],      os.environ["EXT_DRAWIO_VERSION"]),
+              (os.environ["EXT_MERMAID_ID"],     os.environ["EXT_MERMAID_VERSION"]),
+              (os.environ["EXT_SCIM_ID"],        os.environ["EXT_SCIM_VERSION"]),
+              (os.environ["EXT_COMMONMARK_ID"],  os.environ["EXT_COMMONMARK_VERSION"]),
+          ]
+          SCIM_TOKEN  = os.environ.get("SCIM_TOKEN", "")
+
+          def make_opener():
+              jar = http.cookiejar.CookieJar()
+              opener = request.build_opener(request.HTTPCookieProcessor(jar))
+              opener.addheaders = [
+                  ("User-Agent", "xwiki-postsync/1.0"),
+                  ("Authorization", "Basic " + base64.b64encode(
+                      f"{ADMIN_USER}:{ADMIN_PASS}".encode()).decode()),
+              ]
+              return opener
+
+          def fetch(opener, url, data=None, timeout=60, method=None):
+              url = urljoin(BASE + "/", url.lstrip("/"))
+              req = request.Request(url, data=data, method=method)
+              resp = opener.open(req, timeout=timeout)
+              return resp.read().decode("utf-8", errors="replace")
+
+          def http_status(opener, url, timeout=15):
+              try:
+                  opener.open(request.Request(urljoin(BASE + "/", url.lstrip("/"))), timeout=timeout)
+                  return 200
+              except urlerror.HTTPError as e:
+                  return e.code
+              except Exception:
+                  return None
+
+          def wait_ready(opener, deadline):
+              print("Waiting for XWiki REST to respond...")
+              while time.time() < deadline:
+                  try:
+                      body = fetch(opener, "/rest/wikis/xwiki/spaces", timeout=15)
+                      if "<spaces" in body or '"spaces"' in body:
+                          print("XWiki is ready.")
+                          return True
+                  except Exception as e:
+                      print(f"  Not ready yet: {e}")
+                  time.sleep(15)
+              return False
+
+          def main_space_exists(opener):
+              return http_status(opener, "/rest/wikis/xwiki/spaces/Main") == 200
+
+          def extension_installed(opener, ext_id, ext_version):
+              """Check the InstalledExtensionRepository for ext_id on the main wiki."""
+              script = textwrap.dedent("""
+                  def ns = "wiki:xwiki"
+                  def repo = services.component.getInstance(
+                      org.xwiki.extension.repository.InstalledExtensionRepository.class)
+                  def ext = repo.getInstalledExtension("__ID__", ns)
+                  println("INSTALLED=" + (ext != null))
+              """).strip().replace("__ID__", ext_id)
+              result = run_groovy(opener, script)
+              return "INSTALLED=true" in result
+
+          def install_extension(opener, ext_id, ext_version):
+              """Install via services.extension.install(id, version, namespace) and join the job."""
+              if extension_installed(opener, ext_id, ext_version):
+                  print(f"  {ext_id} {ext_version} already installed — skip.")
+                  return True
+              print(f"  Installing {ext_id} {ext_version}...")
+              script = textwrap.dedent("""
+                  def ns = "wiki:xwiki"
+                  def repo = services.component.getInstance(
+                      org.xwiki.extension.repository.InstalledExtensionRepository.class)
+                  if (repo.getInstalledExtension("__ID__", ns) != null) {
+                      println("STATE=FINISHED"); println("ALREADY=true"); return
+                  }
+                  def job = services.extension.install("__ID__", "__VER__", ns)
+                  if (job == null) {
+                      println("STATE=FAILED")
+                      println("ERR=" + services.extension.getLastError())
+                      return
+                  }
+                  job.join()
+                  println("STATE=" + job.getStatus().getState())
+                  job.getStatus().getLogTail().getLogEvents(0, 300).each {
+                      if (it.getLevel().toString() == "ERROR")
+                          println("ERR: " + it.getFormattedMessage())
+                  }
+              """).strip().replace("__ID__", ext_id).replace("__VER__", ext_version)
+              # The install job downloads JARs from nexus.xwiki.org and joins synchronously,
+              # so the render request can take a while — give it a generous timeout.
+              result = run_groovy(opener, script, render_timeout=600)
+              print(f"    {result[:300]}")
+              if "STATE=FINISHED" in result:
+                  print(f"    {ext_id} {ext_version} installed.")
+                  return True
+              print(f"    ERROR: {ext_id} install did not finish (STATE!=FINISHED).")
+              return False
+
+          def run_groovy(opener, script, render_timeout=120):
+              page_url = "/rest/wikis/xwiki/spaces/Sandbox/pages/PostsyncSetup"
+              page = ET.Element("page")
+              page.set("xmlns", "http://www.xwiki.org")
+              ET.SubElement(page, "syntax").text = "xwiki/2.0"
+              ET.SubElement(page, "content").text = "{{groovy}}\n" + script + "\n{{/groovy}}"
+              xml_str = ET.tostring(page, encoding="unicode", xml_declaration=True)
+              try:
+                  r = request.Request(urljoin(BASE + "/", page_url.lstrip("/")),
+                      data=xml_str.encode("utf-8"), method="PUT")
+                  r.add_header("Content-Type", "application/xml")
+                  opener.open(r, timeout=30)
+              except Exception as e:
+                  print(f"    Groovy page PUT failed: {e}")
+                  return ""
+              try:
+                  result = fetch(opener, "/bin/view/Sandbox/PostsyncSetup?xpage=plain",
+                                 timeout=render_timeout)
+                  return re.sub(r"<[^>]+>", " ", result).strip()
+              except Exception as e:
+                  print(f"    Groovy execute failed: {e}")
+                  return ""
+
+          def setup_access_control(opener):
+              script = textwrap.dedent("""
+                  def rightClass = "XWiki.XWikiGlobalRights"
+                  def prefDoc = xwiki.getDocument("XWiki.XWikiPreferences")
+                  def objs = prefDoc.getObjects(rightClass)
+                  boolean guestDenyExists = objs?.any { obj ->
+                      obj != null &&
+                      obj.get("users")?.toString()?.contains("XWikiGuest") &&
+                      obj.get("allow")?.toString() == "0"
+                  }
+                  if (!guestDenyExists) {
+                      def newRight = prefDoc.newObject(rightClass)
+                      newRight.set("allow", 0)
+                      newRight.set("users", "XWiki.XWikiGuest")
+                      newRight.set("groups", "")
+                      newRight.set("levels", "view")
+                      prefDoc.save("Deny view for anonymous users")
+                      println "ACCESS: Added deny-view for XWikiGuest"
+                  } else {
+                      println "ACCESS: deny-view already present"
+                  }
+                  // Admin rights are managed via Authentik groups (xwiki-oidc-admins → XWikiAdminGroup)
+                  // via oidc.groups.mapping — no manual assignment needed here.
+                  println "DONE"
+              """).strip()
+              result = run_groovy(opener, script)
+              print(f"  Access control: {result[:200]}")
+              return "DONE" in result
+
+          # ---- main ----
+          deadline = time.time() + 3500
+          opener = make_opener()
+
+          if not wait_ready(opener, time.time() + 300):
+              print("ERROR: XWiki did not become ready in time.")
+              sys.exit(1)
+
+          if main_space_exists(opener):
+              print("Standard Flavor already installed — skipping wait.")
+          else:
+              print("Waiting for Standard Flavor installation (up to 40 min)...")
+              while time.time() < deadline:
+                  if main_space_exists(opener):
+                      print("Standard Flavor installed — Main space exists.")
+                      break
+                  print(f"  Still installing... ({int((deadline - time.time())/60)}m left)")
+                  time.sleep(30)
+              else:
+                  print("ERROR: Standard Flavor did not install in time.")
+                  sys.exit(1)
+
+          print("=== Installing extensions ===")
+          time.sleep(15)
+          newly_installed = []
+          for ext_id, ext_version in EXTENSIONS:
+              if extension_installed(opener, ext_id, ext_version):
+                  print(f"  {ext_id} {ext_version} already installed — skip.")
+                  continue
+              if install_extension(opener, ext_id, ext_version):
+                  newly_installed.append(ext_id)
+              time.sleep(10)
+
+          # Restart XWiki pod if OIDC or CommonMark was just installed:
+          # - OIDC: auth class (xwiki.cfg xwiki.authentication.authclass) takes effect on restart
+          # - CommonMark: xwiki.defaultDocumentSyntax=markdown+commonmark/1.2 (xwiki.cfg) requires
+          #   the syntax to be registered; it only becomes available after the extension loads on boot
+          oidc_id       = os.environ["EXT_OIDC_ID"]
+          commonmark_id = os.environ["EXT_COMMONMARK_ID"]
+          if oidc_id in newly_installed or commonmark_id in newly_installed:
+              print("OIDC or CommonMark was just installed — restarting xwiki-0...")
+              k8s_delete_pod("xwiki-0")
+              time.sleep(5)
+              if wait_pod_ready("xwiki-0", timeout=300):
+                  print("xwiki-0 is ready. Reconnecting...")
+                  time.sleep(15)
+                  opener = make_opener()
+                  if not wait_ready(opener, time.time() + 180):
+                      print("ERROR: XWiki did not recover after restart.")
+                      sys.exit(1)
+              else:
+                  print("WARNING: xwiki-0 did not become ready in time after restart.")
+
+          if SCIM_TOKEN:
+              print("=== Configuring SCIM bearer token ===")
+              scim_script = textwrap.dedent("""
+                  import org.xwiki.contrib.scim.api.SCIMConfiguration
+                  def cfg = services.component.getInstance(SCIMConfiguration.class)
+                  cfg.setBearerToken("__TOKEN__")
+                  println("SCIM_TOKEN_SET=true")
+              """).strip().replace("__TOKEN__", SCIM_TOKEN)
+              result = run_groovy(opener, scim_script)
+              if "SCIM_TOKEN_SET=true" in result:
+                  print("  SCIM bearer token configured.")
+              else:
+                  print(f"  WARNING: SCIM token configure result: {result[:200]}")
+
+          print("=== Configuring access control ===")
+          setup_access_control(opener)
+
+          print("Done.")

@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: certmanager.ts
+ * Purpose: cert-manager setup and ClusterIssuer configuration.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
@@ -22,7 +33,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
         projectSettings: typeof project_settings,
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:CertManager", name, {}, opts);
+        super("ecc:infra:CertManager", name, {}, opts);
 
         this.certManagerNs = new k8s.core.v1.Namespace(
             "cert-manager-ns",
@@ -42,6 +53,12 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 repositoryOpts: { repo: "https://charts.jetstack.io" },
                 values: {
                     crds: { enabled: true },
+                    // HA replica counts — kept in sync with project_settings.ha by
+                    // scripts/environment/updateConfigFromProjectSettings.sh (ha.<key> anchors).
+                    // The webhook is in the admission path, so its HA matters most.
+                    replicaCount: 2, // project-settings: ha.certManager
+                    webhook: { replicaCount: 2 }, // project-settings: ha.certManagerWebhook
+                    cainjector: { replicaCount: 2 }, // project-settings: ha.certManagerCainjector
                     // Use public DNS for ACME DNS-01 challenge verification instead of in-cluster CoreDNS
                     extraArgs: [
                         "--dns01-recursive-nameservers-only",
@@ -60,6 +77,39 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                 waitForJobs: true,
             },
             { provider: k8sProvider, parent: this, dependsOn: [this.certManagerNs] },
+        );
+
+        this.waitForCertManager = new command.local.Command(
+            "wait-for-cert-manager",
+            {
+                create: pulumi.interpolate`
+        KUBECONFIG_FILE=$(mktemp)
+        cat > "$KUBECONFIG_FILE" << 'KUBECFG'
+${kubeconfigRaw}
+KUBECFG
+        trap "rm -f $KUBECONFIG_FILE" EXIT
+        # Wait for all three cert-manager deployments to be available
+        KUBECONFIG="$KUBECONFIG_FILE" kubectl -n cert-manager wait --for=condition=Available \
+            deployment/cert-manager \
+            deployment/cert-manager-webhook \
+            deployment/cert-manager-cainjector \
+            --timeout=120s
+        # Wait for cainjector to populate the webhook caBundle (proves API server can trust the webhook)
+        for i in $(seq 1 60); do
+            bundle=$(KUBECONFIG="$KUBECONFIG_FILE" kubectl get validatingwebhookconfiguration cert-manager-webhook \
+                -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null)
+            if [ -n "$bundle" ]; then
+                echo "cert-manager webhook CA injected and ready"
+                exit 0
+            fi
+            echo "Waiting for cert-manager caBundle injection... ($i/60)" >&2
+            sleep 2
+        done
+        echo "cert-manager caBundle not injected within 120s" >&2
+        exit 1`,
+                triggers: [this.certManager.status],
+            },
+            { parent: this, dependsOn: [this.certManager, k8sProvider] },
         );
 
         const certManagerWebhookHetzner = new helm.v3.Release(
@@ -82,7 +132,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             {
                 provider: k8sProvider,
                 parent: this,
-                dependsOn: [this.certManager, this.certManagerNs],
+                dependsOn: [this.certManager, this.certManagerNs, this.waitForCertManager],
             },
         );
 
@@ -157,30 +207,6 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             letsEncryptStagingIssuer: this.letsEncryptStagingIssuer,
             letsEncryptProdIssuer: this.letsEncryptProdIssuer,
         };
-
-        this.waitForCertManager = new command.local.Command(
-            "wait-for-cert-manager",
-            {
-                create: pulumi.interpolate`
-        KUBECONFIG_FILE=$(mktemp)
-        cat > "$KUBECONFIG_FILE" << 'KUBECFG'
-${kubeconfigRaw}
-KUBECFG
-        trap "rm -f $KUBECONFIG_FILE" EXIT
-        for i in $(seq 1 30); do
-            if KUBECONFIG="$KUBECONFIG_FILE" kubectl -n cert-manager get pods -l app.kubernetes.io/name=cert-manager -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q 'Running'; then
-                echo "cert-manager is ready"
-                exit 0
-            fi
-            echo "Waiting for cert-manager... ($i/30)" >&2
-            sleep 2
-        done
-        echo "cert-manager did not become ready in 60s" >&2
-        exit 1`,
-                triggers: [this.certManager.status],
-            },
-            { parent: this, dependsOn: [this.certManager, k8sProvider] },
-        );
 
         this.registerOutputs({
             certManager: this.certManager,

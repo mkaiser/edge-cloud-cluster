@@ -1,0 +1,79 @@
+# External PostgreSQL 17 for GitLab — required by chart 10.0+ (bundled PG removed).
+# Service name 'gitlab-postgresql' matches global.psql.host in values.yaml.
+# Password from gitlab-db sealed secret (db-password key).
+# GitLab's migrations CREATE required extensions (pg_trgm, btree_gist, etc.)
+# automatically because POSTGRES_USER is a superuser.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab-postgresql
+  namespace: gitlab
+spec:
+  selector:
+    app: gitlab-postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gitlab-postgresql
+  namespace: gitlab
+spec:
+  serviceName: gitlab-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab-postgresql
+  template:
+    metadata:
+      labels:
+        app: gitlab-postgresql
+    spec:
+      priorityClassName: high
+      containers:
+        - name: postgres
+          image: postgres:18-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: gitlabhq_production
+            - name: POSTGRES_USER
+              value: gitlab
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-db
+                  key: db-password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gitlab", "-d", "gitlabhq_production"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gitlab", "-d", "gitlabhq_production"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 20Gi

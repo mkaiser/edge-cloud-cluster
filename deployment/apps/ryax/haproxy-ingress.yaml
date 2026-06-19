@@ -1,0 +1,166 @@
+---
+# ryax-front: HAProxy terminates TLS, strips /app prefix before forwarding to nginx.
+# nginx document root is /data; Angular app has <base href="/app/"> so all asset
+# requests arrive with /app prefix — rewrite-target:/ strips it.
+# cert issuer updated by scripts/environment/updateConfigFromProjectSettings.sh.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy-front
+  namespace: ryaxns
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    haproxy-ingress.github.io/rewrite-target: /
+    haproxy-ingress.github.io/app-root: "/app/"
+spec:
+  ingressClassName: haproxy
+  rules:
+    - host: ryax.ecc135.cape-project.eu
+      http:
+        paths:
+          - path: /app
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-front
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - ryax.ecc135.cape-project.eu
+      secretName: ryax-main-cert
+---
+# Ryax services: strip path prefix so each service receives requests at its own root.
+# e.g. /authorization/login → /login, /studio/workflow → /workflow
+# Mirrors Traefik's strip-prefix middleware from the original ssl-passthrough setup.
+# cert issuer updated by scripts/environment/updateConfigFromProjectSettings.sh.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy
+  namespace: ryaxns
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    haproxy-ingress.github.io/timeout-server: "600s"
+    haproxy-ingress.github.io/rewrite-target: /
+spec:
+  ingressClassName: haproxy
+  rules:
+    - host: ryax.ecc135.cape-project.eu
+      http:
+        paths:
+          - path: /authorization
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-authorization
+                port:
+                  name: api
+          - path: /api/authorization
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-authorization
+                port:
+                  name: api
+          - path: /studio
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-studio
+                port:
+                  name: api
+          - path: /api/studio
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-studio
+                port:
+                  name: api
+          - path: /repository
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-repository
+                port:
+                  name: api
+          - path: /api/repository
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-repository
+                port:
+                  name: api
+          - path: /runner
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-runner
+                port:
+                  name: api
+          - path: /api/runner
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-runner
+                port:
+                  name: api
+          - path: /user-api
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-runner
+                port:
+                  name: user-api
+  tls:
+    - hosts:
+        - ryax.ecc135.cape-project.eu
+      secretName: ryax-main-cert
+---
+# Grafana: served WITHOUT prefix stripping. Grafana runs with
+# serve_from_sub_path=true and root_url=.../grafana, so it expects requests to
+# arrive with the /grafana prefix intact. A rewrite-target:/ here would strip it,
+# causing grafana to 301-redirect / -> /grafana/ in an infinite loop.
+# Separate ingress because rewrite-target is a per-ingress annotation.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryax-haproxy-grafana
+  namespace: ryaxns
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+spec:
+  ingressClassName: haproxy
+  rules:
+    - host: ryax.ecc135.cape-project.eu
+      http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: ryax-grafana
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - ryax.ecc135.cape-project.eu
+      secretName: ryax-main-cert
+---
+# registry.ryax.* — HAProxy terminates TLS (cert via cluster letsencrypt-staging, DNS-01).
+# cert issuer updated by scripts/environment/updateConfigFromProjectSettings.sh.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ryax-registry-cert
+  namespace: ryaxns
+spec:
+  secretName: ryax-registry-ingress-cert
+  issuerRef:
+    name: letsencrypt-staging
+    kind: ClusterIssuer
+  dnsNames:
+    - registry.ryax.ecc135.cape-project.eu

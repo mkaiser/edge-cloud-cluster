@@ -1,0 +1,34 @@
+# ArgoCD Application: mesh-gateway
+# Runs the Tailscale daemon on every control-plane host so CP nodes join the
+# headscale VPN and act as the gateway between the Hetzner private plane
+# (10.0.0.0/23) and the mesh plane (10.0.10.0/23).  Required for edge workers to
+# join k3s: flannel VXLAN overlay traffic is routed via tailscale0 between CP
+# nodes and edge workers behind NAT.  Also repairs the VXLAN-over-WireGuard
+# datapath (SNAT edge-bound VXLAN to the node mesh IP + disable flannel.1 tx
+# offload) so cloud→edge pod traffic isn't dropped by WireGuard / checksum.
+# Depends on headscale-preauthkey-cloud secret created by the wave-8 headscale PostSync job
+# (wave-9 barrier blocks until that secret exists).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mesh-gateway
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: default
+  sources:
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/infrastructure/mesh-gateway
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

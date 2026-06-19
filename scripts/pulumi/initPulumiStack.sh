@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # Check if script is being sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -36,9 +36,3 @@ if [[ ! "$store_env" =~ ^[Yy]$ ]]; then
     echo "PULUMI_CONFIG_PASSPHRASE cleared from environment."
 fi
 
-
-# NOTE HINT FIXME I think this is bad, but I often forget this...
-export HCLOUD_TOKEN=$(pulumi config get hcloudToken)
-
-hcloud context create default --token-from-env  
-# mabye test --quiet 

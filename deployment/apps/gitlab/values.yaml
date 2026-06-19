@@ -1,0 +1,257 @@
+# GitLab CE Helm values — deployed via ArgoCD (deployment/apps/gitlab.yaml).
+#
+# Secrets NOT included here (provided via helm-values-secret.yaml):
+#   global.appConfig.omniauth.providers[].secret contents
+#   global.railsSecrets
+#   global.initialRootPassword
+#
+# Sensitive S3 credentials are provided via gitlab-s3-secret sealed secret.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  edition: ce
+
+  hosts:
+    domain: ecc135.cape-project.eu
+    gitlab:
+      name: gitlab.ecc135.cape-project.eu
+    registry:
+      name: registry.gitlab.ecc135.cape-project.eu
+    pages:
+      name: pages.gitlab.ecc135.cape-project.eu
+
+  ingress:
+    # Required when the bundled nginx-ingress is disabled — otherwise the chart
+    # renders no Ingress objects and GitLab is unreachable (404 at the ingress).
+    enabled: true
+    class: haproxy
+    annotations:
+      haproxy-ingress.github.io/ssl-redirect: "true"
+    configureCertmanager: false
+    tls:
+      enabled: true
+      secretName: gitlab-tls
+
+  # Disable Gateway API + Envoy Gateway (chart 10.0 default) — haproxy-ingress is used instead.
+  # Without this, Envoy Gateway creates a LoadBalancer on ports 80/443,
+  # conflicting with haproxy-ingress on single-node clusters.
+  gatewayApi:
+    enabled: false
+    installEnvoy: false
+
+  # Use existing cert-manager ClusterIssuer for all TLS
+  certmanager:
+    installCRDs: false
+
+  # Trust the Authentik ingress CA so OmniAuth OIDC (discovery:true) can verify
+  # its backend TLS calls. The gitlab-trusted-ca secret is populated by the
+  # gitlab-oidc-presync hook (fetches the served chain from the OIDC issuer).
+  certificates:
+    customCAs:
+      - secret: gitlab-trusted-ca
+
+  # ---------------------------------------------------------------------------
+  # Object Storage — Hetzner S3 (consolidated connection)
+  # ---------------------------------------------------------------------------
+  minio:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # External PostgreSQL 17 (bundled sub-chart removed in chart 10.0)
+  # ---------------------------------------------------------------------------
+  psql:
+    host: gitlab-postgresql
+    port: 5432
+    database: gitlabhq_production
+    username: gitlab
+    password:
+      secret: gitlab-db
+      key: db-password
+
+  # ---------------------------------------------------------------------------
+  # External Redis 7 (bundled sub-chart removed in chart 10.0)
+  # ---------------------------------------------------------------------------
+  redis:
+    host: gitlab-redis
+    port: 6379
+    auth:
+      enabled: false
+
+  appConfig:
+    object_store:
+      enabled: true
+      proxy_download: true
+      connection:
+        secret: gitlab-s3-connection
+        key: connection
+
+    # Per-category bucket configuration
+    lfs:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-lfs
+    artifacts:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-artifacts
+    uploads:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-uploads
+    packages:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-packages
+    externalDiffs:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-external-diffs
+    terraformState:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-terraform-state
+    ciSecureFiles:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-ci-secure-files
+    dependencyProxy:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-dependency-proxy
+
+    # GitLab Pages
+    pages:
+      enabled: true
+      host: pages.gitlab.ecc135.cape-project.eu
+      objectStore:
+        bucket: edgecloudinfra-gitlab
+        prefix: gitlab-pages
+
+    # Backups
+    backups:
+      bucket: edgecloudinfra-gitlab
+      prefix: gitlab-backups
+      tmpBucket: edgecloudinfra-gitlab
+
+    # ---------------------------------------------------------------------------
+    # Authentik OIDC
+    # ---------------------------------------------------------------------------
+    omniauth:
+      enabled: true
+      autoSignInWithProvider: openid_connect
+      # SSO auto-provisioning ON: a first-time Authentik login auto-creates the
+      # GitLab account (only Authentik-known users can authenticate). Public
+      # self-registration is blocked separately via signupEnabled:false below.
+      allowSingleSignOn:
+        - openid_connect
+      blockAutoCreatedUsers: false
+      providers:
+        - secret: gitlab-oidc-provider
+          key: provider
+
+  # ---------------------------------------------------------------------------
+  # Container Registry — S3 storage
+  # ---------------------------------------------------------------------------
+  registry:
+    bucket: edgecloudinfra-gitlab
+    prefix: gitlab-registry
+
+# ---------------------------------------------------------------------------
+# Disabled bundled sub-charts (using existing cluster services)
+# ---------------------------------------------------------------------------
+# Chart condition for bundled cert-manager is `installCertmanager` (not certmanager.enabled).
+installCertmanager: false
+
+certmanager-issuer:
+  email: kontakt@martinkaiser.net
+
+nginx-ingress:
+  enabled: false
+
+# Disable bundled Redis — external gitlab-redis StatefulSet used instead (deployment/gitlab/redis.yaml).
+redis:
+  enabled: false
+
+# Bundled runner disabled — Chart.yaml condition is gitlab-runner.install (top-level).
+# Use wave7-gitlab-runner.yaml instead (token-based auth, no registration tokens).
+gitlab-runner:
+  install: false
+
+# ---------------------------------------------------------------------------
+# Gitaly — Git repository storage on NFS SSD
+# ---------------------------------------------------------------------------
+gitlab:
+  gitaly:
+    persistence:
+      storageClass: longhorn-cloud
+      size: 50Gi
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  gitlab-shell:
+    enabled: false
+
+  # gitlab-exporter image tag 16.8.0 doesn't exist in registry.gitlab.com/gitlab-org/build/cng
+  gitlab-exporter:
+    enabled: false
+
+  gitlab-pages:
+    ingress:
+      tls: {}
+      annotations:
+        kubernetes.io/ingress.class: haproxy
+
+  webservice:
+    ingress:
+      annotations:
+        kubernetes.io/ingress.class: haproxy
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  sidekiq:
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  toolbox:
+    backups:
+      objectStorage:
+        config:
+          secret: gitlab-s3-connection
+          key: connection
+
+# ---------------------------------------------------------------------------
+# Container Registry
+# ---------------------------------------------------------------------------
+registry:
+  enabled: true
+  storage:
+    secret: gitlab-registry-storage
+    key: config
+  ingress:
+    annotations:
+      kubernetes.io/ingress.class: haproxy
+
+# ---------------------------------------------------------------------------
+# Prometheus (disable bundled — use existing kube-prometheus-stack)
+# ---------------------------------------------------------------------------
+prometheus:
+  install: false
+
+grafana:
+  install: false
+
+# Disabled: ArgoCD uses `helm upgrade --install`, so the pre-upgrade hook always
+# runs — including on fresh installs where no previous chart-info ConfigMap exists,
+# causing the script to fail unconditionally. Upgrade path verification is the
+# operator's responsibility when changing targetRevision in deployment/apps/gitlab.yaml.
+upgradeCheck:
+  enabled: false

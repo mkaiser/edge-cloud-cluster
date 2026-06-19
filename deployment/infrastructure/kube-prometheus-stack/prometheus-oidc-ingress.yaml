@@ -1,0 +1,34 @@
+# Public ingress for the Prometheus UI, protected by Authentik OIDC.
+# Prometheus has no native auth, so instead of routing straight to the prometheus
+# server this routes to the Authentik embedded outpost (proxy provider
+# "prometheus", see authentik/blueprint-apps.yaml), which enforces login then
+# proxies to the prometheus server via the provider's internal_host.
+# The chart's own ingress is disabled (prometheus.ingress.enabled=false).
+#
+# Chicken/egg: kube-prometheus-stack is sync-wave 2, authentik is wave 6 — until
+# Authentik is up this backend returns 503, then self-heals.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-oidc
+  namespace: prometheus
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+spec:
+  ingressClassName: haproxy
+  tls:
+  - hosts:
+    - prometheus.ecc135.cape-project.eu
+    secretName: prometheus-tls
+  rules:
+  - host: prometheus.ecc135.cape-project.eu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: authentik-embedded-outpost
+            port:
+              number: 80

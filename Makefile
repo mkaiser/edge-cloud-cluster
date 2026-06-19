@@ -1,13 +1,10 @@
-.PHONY: install install-tools check precommit precommit-all hooks up dn destroy shutdown prepare-release
+.PHONY: install check backup precommit precommit-all hooks up destroy shutdown prepare-release create restore provision-edge
 
-install: install-tools
+install: hooks
 	# npm packages (requires mounted filesystem for package.json)
 	npm ci
-	# ensure nested submodules are available on fresh clones
-	git submodule update --init --recursive
-
-install-tools:
-	bash scripts/install.sh
+	# install more tools directly from github
+	bash scripts/environment/install.sh
 
 check:
 	npx tsc --noEmit 2>&1
@@ -17,34 +14,36 @@ precommit-all:
 	npx tsc --noEmit 2>&1
 
 precommit:
-	@bash scripts/precommit.sh
+	bash scripts/environment/precommit.sh
 
 hooks:
 	git config core.hooksPath .githooks
 	chmod +x .githooks/pre-commit
 
 create:
-	@bash scripts/createCluster.sh
+	bash scripts/pulumi/createCluster.sh new
+
+restore:
+	bash scripts/pulumi/createCluster.sh restore
+
+# Second-pass on-premise edge provisioning (run after the VPN/mesh is up).
+#   make provision-edge              # all edge nodes
+#   make provision-edge ARGS=ubuntu-vm   # one node by id
+provision-edge:
+	bash scripts/pulumi/provisionEdgeNodes.sh $(ARGS)
 
 up: 
 	pulumi up -y
-	@bash scripts/getKubeConfig.sh
+	bash scripts/runtime/getKubeConfig.sh
 
-dn:
-	@printf "Run pulumi up -y before pulumi dn -y? [y/N] "; \
-	read run_up; \
-	if [ "$$run_up" = "y" ] || [ "$$run_up" = "Y" ]; then \
-		echo "Running pulumi up -y..."; \
-		pulumi up -y; \
-	fi; \
-	pulumi dn -y
-	
 shutdown:
-	@bash scripts/shutdownCluster.sh
+	bash scripts/pulumi/shutdownCluster.sh
+
+backup:
+	bash scripts/pulumi/backupCluster.sh
 
 destroy:
-	./scripts/destroyCluster.sh
-
+	bash scripts/pulumi/destroyCluster.sh $(ARGS)
 
 prepare-release:
-	@bash scripts/prepareRelease.sh
+	bash scripts/environment/prepareRelease.sh

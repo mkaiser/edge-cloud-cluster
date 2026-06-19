@@ -12,7 +12,12 @@ case "$TYPE" in
         ;;
     new)
         echo "Type: new"
-        pulumi config rm restoreClusterFromS3Backup 2>/dev/null || true
+        # Explicitly DISABLE restore for a fresh cluster. (Just removing the override
+        # is not enough: project_settings defaults restoreClusterFromS3Backup to
+        # `?? true`, so an unset key still triggers the Longhorn volume restore. It
+        # only no-ops today because the buckets are empty after destroy — but leftover
+        # backups would otherwise be restored onto a "new" cluster unexpectedly.)
+        pulumi config set restoreClusterFromS3Backup false
         ;;
     *)
         echo "Usage: $0 <type>"
@@ -52,8 +57,14 @@ if [ -n "$upstream_branch" ]; then
     fi
 fi
 
-CI=true pulumi up -y
+# Ensure completeClusterTeardown is false before creating the cluster
+current_teardown=$(pulumi config get completeClusterTeardown 2>/dev/null || echo "false")
+if [[ "$current_teardown" == "true" ]]; then
+    echo "Resetting completeClusterTeardown to false in Pulumi config to prevent accidental cluster teardown..."
+    pulumi config set completeClusterTeardown false
+fi
 
+CI=true pulumi up -y --skip-preview
 source "$SCRIPT_DIR/../runtime/getKubeConfig.sh"
 
 end=$(date +%s)
@@ -62,5 +73,9 @@ minutes=$((elapsed / 60))
 seconds=$((elapsed % 60))
 echo "Infrastructure deployed. You can now run 'kubectl get nodes' to see the cluster nodes."
 echo "$(date) Elapsed time: ${minutes}m ${seconds}s"
+
+echo "#########################################"
+echo "Portal: $(pulumi stack output portalURL)"
+echo "#########################################"
 
 source "$SCRIPT_DIR/../runtime/argocdLoginCLI.sh"

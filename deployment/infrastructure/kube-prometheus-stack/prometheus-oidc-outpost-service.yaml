@@ -1,0 +1,16 @@
+# ExternalName service so the Prometheus OIDC Ingress (prometheus namespace) can
+# route to the Authentik embedded outpost, which lives in the authentik namespace.
+# Ingress backends must be in the same namespace as the Ingress, hence this alias.
+# The embedded outpost is served by the authentik-server service on port 80.
+apiVersion: v1
+kind: Service
+metadata:
+  name: authentik-embedded-outpost
+  namespace: prometheus
+spec:
+  type: ExternalName
+  externalName: authentik-server.authentik.svc.cluster.local
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80

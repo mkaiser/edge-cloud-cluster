@@ -1,0 +1,59 @@
+# ArgoCD Application: Nextcloud (vanilla official Helm chart).
+# Accessible at https://nextcloud.subdomain.domain.tld (alias files.subdomain.domain.tld...).
+# OIDC login via Authentik (oidc_login app, configured by PostSync job).
+# Bundled PostgreSQL + Redis; data on Longhorn; object store on Hetzner S3.
+#
+# Document editing: Collabora Online (richdocuments) — see deployment/nextcloud/values.yaml.
+# Antivirus (ClamAV) is foreseen but disabled — enable via one-liner (see postsync job).
+#
+# Multi-source:
+#   1. Helm chart (nextcloud/nextcloud)
+#   2. ref source for $values
+#   3. Git directory for PostSync config job + sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nextcloud
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://nextcloud.github.io/helm/
+      chart: nextcloud
+      targetRevision: "9.1.2" # renovate: datasource=helm depName=nextcloud registryUrl=https://nextcloud.github.io/helm/
+      helm:
+        releaseName: nextcloud
+        valueFiles:
+          - $values/deployment/apps/nextcloud/values.yaml
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/apps/nextcloud
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nextcloud
+  # Our postgres StatefulSet's volumeClaimTemplates get k8s-added defaults ArgoCD
+  # can't reconcile (immutable) — ignore that path to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

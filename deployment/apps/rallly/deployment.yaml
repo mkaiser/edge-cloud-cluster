@@ -1,0 +1,103 @@
+# Rallly — group availability polling (Doodle replacement).
+# Accessible at https://rallly.ecc135.cape-project.eu
+# OIDC via Authentik (OIDC_DISCOVERY_URL / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET).
+# PostgreSQL self-managed in postgres.yaml.
+# Secrets from rallly-secrets (db-password, secret-password) and
+# rallly-oidc-client-secret (client-secret) — both SealedSecrets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rallly
+  namespace: rallly
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rallly
+  template:
+    metadata:
+      labels:
+        app: rallly
+    spec:
+      priorityClassName: low
+      containers:
+        - name: rallly
+          image: lukevella/rallly:4  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NEXT_PUBLIC_BASE_URL
+              value: "https://rallly.ecc135.cape-project.eu"
+            - name: RALLLY_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              # CNPG read-write (primary) service; see postgres.yaml (Cluster rallly-pg).
+              value: "postgresql://rallly:$(RALLLY_DB_PASSWORD)@rallly-pg-rw:5432/rallly"
+            - name: SECRET_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-secrets
+                  key: secret-password
+            - name: OIDC_DISCOVERY_URL
+              value: "https://id.ecc135.cape-project.eu/application/o/rallly/.well-known/openid-configuration"
+            - name: OIDC_CLIENT_ID
+              value: "rallly"
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-oidc-client-secret
+                  key: client-secret
+            - name: SUPPORT_EMAIL
+              value: "it@cape-project.eu"
+            - name: NEXT_PUBLIC_SELF_HOSTED
+              value: "true"
+            - name: REGISTRATION_ENABLED
+              value: "false"
+            - name: EMAIL_LOGIN_ENABLED
+              value: "false"
+            - name: OIDC_NAME_CLAIM_PATH
+              value: "preferred_username"
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/ssl/staging-ca/ca-bundle.pem"
+          volumeMounts:
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1500Mi
+      volumes:
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rallly
+  namespace: rallly
+spec:
+  selector:
+    app: rallly
+  ports:
+    - port: 3000
+      targetPort: 3000

@@ -1,0 +1,57 @@
+# ArgoCD Application: XWiki (official xwiki-contrib Helm chart).
+# Accessible at https://wiki.subdomain.domain.tld
+# OIDC via Authentik (xwiki OIDC extension, configured post-install).
+# DB: our own official postgres (deployment/xwiki/postgres.yaml) via externalDB;
+# Solr runs internally (chart default). Data on Longhorn.
+#
+# Multi-source:
+#   1. Helm chart (xwiki)
+#   2. ref source for $values
+#   3. Git directory for our postgres + sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: xwiki
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://xwiki-contrib.github.io/xwiki-helm
+      chart: xwiki
+      targetRevision: "1.6.8" # renovate: datasource=helm depName=xwiki registryUrl=https://xwiki-contrib.github.io/xwiki-helm
+      helm:
+        releaseName: xwiki
+        valueFiles:
+          - $values/deployment/apps/xwiki/values.yaml
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:paraXent/infra.git
+      targetRevision: main
+      path: deployment/apps/xwiki
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: xwiki
+  # xwiki + our postgres are StatefulSets; k8s mutates immutable volumeClaimTemplates
+  # with defaults ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

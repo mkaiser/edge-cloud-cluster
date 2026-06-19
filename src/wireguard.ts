@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: wireguard.ts
+ * Purpose: Wireguard VPN configuration component.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import { project_settings as projectSettingsConfig } from "../project_settings";
@@ -13,7 +24,7 @@ export class WireguardComponent extends pulumi.ComponentResource {
         project_settings: typeof projectSettingsConfig,
         opts?: pulumi.ComponentResourceOptions,
     ) {
-        super("pxCloud:infra:Wireguard", name, {}, opts);
+        super("ecc:infra:Wireguard", name, {}, opts);
         this.url = `${project_settings.wireguard.subDomain}.${project_settings.dns.tld}`;
 
         const wgNs = new k8s.core.v1.Namespace(
@@ -22,6 +33,30 @@ export class WireguardComponent extends pulumi.ComponentResource {
                 metadata: { name: "wireguard-infra" },
             },
             { provider: k8sProvider, parent: this, customTimeouts: { delete: "60s" } },
+        );
+
+        const wgServerIp = project_settings.wireguard.serverAddr.split("/")[0]; // "10.0.2.1"
+
+        // CoreDNS resolves *.ecc93.cape-project.eu → wgServerIp so VPN clients with split
+        // tunnel can reach cluster services via hostname without needing the server's public IP.
+        const dnsmasqConfigMap = new k8s.core.v1.ConfigMap(
+            "wireguard-dnsmasq",
+            {
+                metadata: { name: "wireguard-dnsmasq", namespace: "wireguard-infra" },
+                data: {
+                    Corefile: `.:53 {
+    bind ${wgServerIp}
+    template IN A ${project_settings.dns.tld} {
+        answer "{{ .Name }} 60 IN A ${wgServerIp}"
+    }
+    forward . 8.8.8.8 1.1.1.1
+    cache 30
+    errors
+}
+`,
+                },
+            },
+            { provider: k8sProvider, parent: this, dependsOn: [wgNs] },
         );
 
         // wg0.conf mounted into the container — server private key + admin peer public key pre-configured.
@@ -114,11 +149,33 @@ AllowedIPs = ${project_settings.wireguard.adminAddr}
                                     },
                                 },
                                 {
+                                    // CoreDNS: resolves cluster hostnames to wgServerIp for split-tunnel VPN clients.
+                                    name: "coredns",
+                                    image: "docker.io/coredns/coredns:1.12.1", // renovate: datasource=docker depName=coredns/coredns
+                                    args: ["-conf", "/etc/coredns/Corefile"],
+                                    securityContext: {
+                                        capabilities: { add: ["NET_BIND_SERVICE"] },
+                                    },
+                                    ports: [
+                                        { name: "dns-udp", containerPort: 53, protocol: "UDP" },
+                                    ],
+                                    volumeMounts: [
+                                        {
+                                            name: "dnsmasq-config",
+                                            mountPath: "/etc/coredns",
+                                        },
+                                    ],
+                                    resources: {
+                                        requests: { cpu: "5m", memory: "32Mi" },
+                                        limits: { cpu: "50m", memory: "64Mi" },
+                                    },
+                                },
+                                {
                                     // Prometheus exporter for WireGuard peer statistics.
                                     // Reads wg0.conf to annotate peers with names; requires NET_ADMIN to call `wg show`.
                                     // https://github.com/MindFlavor/prometheus_wireguard_exporter
                                     name: "wg-exporter",
-                                    image: "mindflavor/prometheus-wireguard-exporter:3.6.6",
+                                    image: "mindflavor/prometheus-wireguard-exporter:3.6.6", // renovate: datasource=docker depName=mindflavor/prometheus-wireguard-exporter
                                     args: [
                                         "--prepend_sudo=false",
                                         "--extract_names_config_files=/etc/wireguard/wg0.conf",
@@ -147,6 +204,10 @@ AllowedIPs = ${project_settings.wireguard.adminAddr}
                             volumes: [
                                 { name: "wg-config", secret: { secretName: "wireguard-config" } },
                                 {
+                                    name: "dnsmasq-config",
+                                    configMap: { name: "wireguard-dnsmasq" },
+                                },
+                                {
                                     name: "host-modules",
                                     hostPath: { path: "/lib/modules", type: "Directory" },
                                 },
@@ -155,7 +216,11 @@ AllowedIPs = ${project_settings.wireguard.adminAddr}
                     },
                 },
             },
-            { provider: k8sProvider, parent: this, dependsOn: [wgNs, wgConfigSecret] },
+            {
+                provider: k8sProvider,
+                parent: this,
+                dependsOn: [wgNs, wgConfigSecret, dnsmasqConfigMap],
+            },
         );
 
         // ClusterIP Service exposes the exporter port so Prometheus can scrape it.

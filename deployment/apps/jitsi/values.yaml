@@ -1,0 +1,104 @@
+# Jitsi Meet (jitsi-contrib/jitsi-helm) — secure video conferencing.
+# Accessible at https://meet.ecc135.cape-project.eu
+#
+# Auth: OIDC via Authentik using the jitsi-oidc-adapter (its own Deployment in
+# this folder, oidc-adapter.yaml, exposed at /oidc through a second ingress).
+# Prosody runs JWT token auth; after the user authenticates against Authentik
+# the adapter mints a JWT signed with the shared JWT_APP_SECRET. Guests are
+# allowed and gated by the "wait for host" lobby.
+#
+# All Authentik wiring lives in THIS folder (authentik-provider.yaml): the
+# OAuth2 provider + application tile are created/removed via the Authentik API
+# (PostSync / PreDelete hooks), NOT via a worker-mounted blueprint, so nothing
+# jitsi-specific leaks into the authentik folder.
+#
+# Secrets (jitsi namespace, sealed in this folder):
+#   jitsi-jwt                 key JWT_APP_SECRET     — shared prosody <-> adapter
+#   jitsi-oidc-client-secret  key OIDC_CLIENT_SECRET — Authentik OIDC client secret
+
+# Clean resource names (release name is "jitsi-meet" → fullname "jitsi-meet").
+fullnameOverride: jitsi-meet
+
+publicURL: https://meet.ecc135.cape-project.eu
+
+enableAuth: true
+enableGuests: true
+
+# JWT token auth (validated by prosody) + lobby modules for "wait for host".
+# Injected into every component through the shared config map.
+extraCommonEnvs:
+  AUTH_TYPE: jwt
+  JICOFO_ENABLE_AUTH: "false"
+  JWT_APP_ID: jitsi
+  JWT_ACCEPTED_ISSUERS: jitsi
+  JWT_ACCEPTED_AUDIENCES: jitsi
+  TOKEN_AUTH_URL: https://meet.ecc135.cape-project.eu/oidc/auth?state={state}
+  XMPP_MODULES: persistent_lobby
+  XMPP_MUC_MODULES: muc_wait_for_host
+  # Disable the pre-join screen so JWT auth users skip the name prompt.
+  # With OIDC auth the name comes from context.user.name in the JWT token;
+  # the pre-join screen was appearing before the JWT was obtained (empty name).
+  ENABLE_PREJOIN_PAGE: "false"
+
+web:
+  replicaCount: 1
+  # Jitsi web UI at "/". The /oidc adapter is routed by a separate ingress
+  # (oidc-adapter.yaml) sharing this host + TLS secret.
+  ingress:
+    enabled: true
+    ingressClassName: haproxy
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-staging"
+      haproxy-ingress.github.io/ssl-redirect: "true"
+    hosts:
+      - host: meet.ecc135.cape-project.eu
+        paths:
+          - "/"
+    tls:
+      - secretName: jitsi-web-tls
+        hosts:
+          - meet.ecc135.cape-project.eu
+
+prosody:
+  jwt:
+    # Sealed in this folder (oidc/jwt secrets). Must carry key JWT_APP_SECRET.
+    existingSecretName: jitsi-jwt
+
+# JVB: a single bridge using host UDP/10000 (opened in the Pulumi firewall,
+# src/network.ts). The public IP is auto-discovered via the default STUN
+# server, so the Hetzner node IP never needs hard-coding here.
+jvb:
+  replicaCount: 1
+  service:
+    enabled: false
+  useHostPort: true
+  UDPPort: 10000
+
+# Coturn: STUN/TURN over UDP/3478 (opened in the Pulumi firewall) as a media
+# fallback for participants on restrictive networks. TURNS (TCP/443) stays
+# disabled — it would clash with the haproxy ingress already on 443.
+coturn:
+  enabled: true
+  turn:
+    transport: "udp"
+  turns:
+    enabled: false
+  service:
+    type: LoadBalancer
+    ports:
+      turn: 3478
+
+# Jibri: local meeting recording onto Longhorn. Livestreaming disabled (no
+# external stream key needed).
+jibri:
+  enabled: true
+  singleUseMode: false
+  replicaCount: 1
+  recording: true
+  livestreaming: false
+  persistence:
+    enabled: true
+    size: 32Gi
+    storageClassName: longhorn-cloud
+  shm:
+    enabled: true

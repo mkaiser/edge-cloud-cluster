@@ -1,3 +1,14 @@
+/**
+ * Project: edgecloudinfra
+ * File: externaldns.ts
+ * Purpose: ExternalDNS integration for Hetzner.
+ *
+ * Author: Martin Kaiser
+ * Copyright (c) 2026 Martin Kaiser
+ * License: MIT
+ * SPDX-License-Identifier: MIT
+ */
+
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import { project_settings } from "../project_settings";
@@ -6,7 +17,7 @@ import { project_settings } from "../project_settings";
 // (deployed via ArgoCD) expects. The secret is created here so it never touches git.
 export class ExternalDnsComponent extends pulumi.ComponentResource {
     constructor(name: string, k8sProvider: k8s.Provider, opts?: pulumi.ComponentResourceOptions) {
-        super("pxCloud:infra:ExternalDns", name, {}, opts);
+        super("ecc:infra:ExternalDns", name, {}, opts);
 
         const externalDnsNs = new k8s.core.v1.Namespace(
             "external-dns-ns",

@@ -47,7 +47,7 @@ spec:
           hostPath: { path: /tmp }
       containers:
         - name: snapshot
-          image: alpine:3.20
+          image: alpine:3.20  # renovate: datasource=docker depName=alpine
           securityContext:
             privileged: true
           volumeMounts:
@@ -83,7 +83,7 @@ S3_SECRET=$(kubectl get secret longhorn-s3-credentials -n longhorn-system \
 S3_ENDPOINT="https://nbg1.your-objectstorage.com"
 if [ -n "$S3_ACCESS" ] && [ -n "$S3_SECRET" ]; then
     ETCD_S3_LINE=$(AWS_ACCESS_KEY_ID="$S3_ACCESS" AWS_SECRET_ACCESS_KEY="$S3_SECRET" \
-        aws s3 ls "s3://edgecloud-etcd/k3s-etcd/" \
+        aws s3 ls "s3://edgecloudinfra-etcd/k3s-etcd/" \
         --endpoint-url "$S3_ENDPOINT" 2>/dev/null \
         | grep -i "shutdown-snapshot" | sort | tail -1 || true)
     if [ -n "$ETCD_S3_LINE" ]; then

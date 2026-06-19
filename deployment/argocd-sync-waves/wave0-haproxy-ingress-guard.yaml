@@ -1,0 +1,27 @@
+# ArgoCD Application: haproxy-ingress-guard
+# Self-heal CronJob that restarts the haproxy-ingress controller if any haproxy
+# Ingress is missing its loadBalancer status (a best-effort field behind kube-vip
+# that occasionally races, leaving an app stuck "Progressing" and blocking the
+# sync-wave barriers). Wave 0 so the guard runs early. See guard.yaml for rationale.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: haproxy-ingress-guard
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:paraXent/infra.git
+    targetRevision: main
+    path: deployment/infrastructure/haproxy-ingress-guard
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: haproxy-ingress
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

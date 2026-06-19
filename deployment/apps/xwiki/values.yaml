@@ -1,0 +1,122 @@
+# XWiki Helm values (xwiki-contrib/xwiki chart 1.6.x).
+#
+# DB: external CNPG cluster (deployment/apps/xwiki/postgres.yaml, svc xwiki-pg-rw).
+#
+# OIDC: Authentik is the IdP. The OIDC authenticator is installed by the PostSync job
+#   postsync-extensions.yaml on first sync. xwiki.authentication.authclass is set at
+#   startup; the class is loaded from the extension repository on restart after install.
+#
+# SSL with letsencrypt-staging: The JVM does not trust the staging CA by default.
+#   cluster.enabled is used as a hook to inject truststore setup into start.sh
+#   (the chart entrypoint). On first pod start the letsencrypt staging root CAs are
+#   downloaded from letsencrypt.org and imported into a custom JKS at
+#   /usr/local/xwiki/data/cacerts-custom.jks. javaOpts points the JVM at this store.
+#   cluster.jgroups.kube_ping.url: the URL before the first ";" sets KUBEPING_URL;
+#   the code after ";" runs inline in start.sh before Tomcat starts.
+#   Switch to letsencrypt-production → remove cluster section + javaOpts.
+#
+# Secrets (NOT in git):
+#   xwiki-db               — db-password + superadmin-password (SealedSecret xwiki-db-sealed.yaml)
+#   xwiki-oidc-client-secret — OIDC client secret (SealedSecret oidc-client-secret-sealed.yaml)
+
+cluster:
+  enabled: true
+  replicas: 1
+  jgroups:
+    port: 7800
+    kube_ping:
+      version: "2.0.1.Final"
+      # The URL value up to the first ";" sets KUBEPING_URL (the actual JAR download URL).
+      # Code after ";" runs inline in start.sh before Tomcat — used to bootstrap the
+      # letsencrypt-staging truststore. Idempotent: skipped if cacerts-custom.jks exists.
+      # Remove this block (set cluster.enabled: false) when switching to production certs.
+      url: "https://nexus.xwiki.org/nexus/service/local/repositories/central/content/org/jgroups/kubernetes/jgroups-kubernetes/2.0.1.Final/jgroups-kubernetes-2.0.1.Final.jar; if [ ! -f /usr/local/xwiki/data/cacerts-custom.jks ]; then cp /opt/java/openjdk/lib/security/cacerts /usr/local/xwiki/data/cacerts-custom.jks; for SURL in https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem; do SFILE=/tmp/$(basename $SURL); curl -sf $SURL -o $SFILE && /opt/java/openjdk/bin/keytool -importcert -noprompt -keystore /usr/local/xwiki/data/cacerts-custom.jks -storepass changeit -alias $(basename $SURL .pem) -file $SFILE 2>/dev/null || true; done; echo 'Truststore ready'; fi; SETUP_DONE="
+
+javaOpts:
+  - -Djavax.net.ssl.trustStore=/usr/local/xwiki/data/cacerts-custom.jks
+  - -Djavax.net.ssl.trustStorePassword=changeit
+
+image:
+  name: xwiki
+  tag: "18.4.0-postgres-tomcat"  # renovate: datasource=docker depName=xwiki
+
+customConfigs:
+  xwiki.cfg:
+    # Set after oidc-authenticator extension is installed by postsync-extensions job.
+    xwiki.authentication.authclass: org.xwiki.contrib.oidc.auth.OIDCAuthServiceImpl
+    # Default syntax for new pages — requires syntax-markdown-commonmark12 extension.
+    xwiki.defaultDocumentSyntax: markdown+commonmark/1.2
+  xwiki.properties:
+    distribution.defaultUI: "org.xwiki.platform:xwiki-platform-distribution-flavor-mainwiki/17.10.8"
+    distribution.job.interactive: "false"
+    oidc.provider: https://id.ecc135.cape-project.eu/application/o/xwiki/
+    oidc.endpoint.authorization: https://id.ecc135.cape-project.eu/application/o/authorize/
+    oidc.endpoint.token: https://id.ecc135.cape-project.eu/application/o/token/
+    oidc.endpoint.userinfo: https://id.ecc135.cape-project.eu/application/o/userinfo/
+    oidc.endpoint.userinfo.method: GET
+    oidc.endpoint.token.auth_method: client_secret_basic
+    oidc.scope: "openid,profile,email,groups"
+    # Authentik sends the group list in a "groups" claim; the authenticator defaults
+    # to "xwiki_groups", so it must be told the claim name or group sync silently no-ops.
+    oidc.groups.claim: "groups"
+    oidc.groups.mapping: "XWiki.XWikiAdminGroup=xwiki-oidc-admins"
+    oidc.clientid: xwiki
+    oidc.skipped: "false"
+    oidc.user.nameFormater: ${oidc.user.preferredUsername._clean._lowerCase}
+    oidc.user.subjectFormater: ${oidc.user.subject}
+    oidc.insecure: "true"
+
+customConfigsSecrets:
+  xwiki.cfg:
+    xwiki.superadminpassword:
+      secret:
+        name: xwiki-db
+        key: superadmin-password
+  xwiki.properties:
+    oidc.secret:
+      secret:
+        name: xwiki-oidc-client-secret
+        key: client-secret
+
+mysql:
+  enabled: false
+mariadb:
+  enabled: false
+postgresql:
+  enabled: false
+
+externalDB:
+  user: xwiki
+  database: xwiki
+  # CNPG read-write (primary) service; see postgres.yaml (Cluster xwiki-pg).
+  host: xwiki-pg-rw
+  type: postgresql
+  customKeyRef:
+    enabled: true
+    name: xwiki-db
+    key: db-password
+
+solr:
+  enabled: false
+
+persistence:
+  enabled: true
+  storageClass: longhorn-cloud
+  size: 5Gi
+
+ingress:
+  enabled: true
+  className: haproxy
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    haproxy-ingress.github.io/ssl-redirect: "true"
+    haproxy-ingress.github.io/timeout-server: "600s"
+  hosts:
+    - host: wiki.ecc135.cape-project.eu
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    - secretName: xwiki-tls
+      hosts:
+        - wiki.ecc135.cape-project.eu

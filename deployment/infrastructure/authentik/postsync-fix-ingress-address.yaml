@@ -1,0 +1,107 @@
+# PostSync hook: ensure HAProxy assigns an address to the Authentik ingress.
+#
+# Problem: HAProxy ingress controller occasionally misses the initial "add"
+# event for an ingress object during cluster bring-up (race between the
+# controller watch stream and the resource creation). When this happens the
+# ingress gets no .status.loadBalancer.ingress entry, ArgoCD's built-in
+# ingress health check stays Progressing indefinitely, and the sync never
+# completes — blocking all downstream wave barriers.
+#
+# Fix: after every sync, patch a no-op annotation on the ingress. This
+# generates an update event that HAProxy cannot miss, causing it to
+# (re-)reconcile the object and write the node address into the status.
+# The annotation value is the current epoch second so re-runs always diff.
+#
+# This is safe to run on every sync: kubectl patch is idempotent for the
+# purpose of triggering a controller reconcile.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: authentik-fix-ingress
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: authentik-fix-ingress
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: authentik-fix-ingress
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+subjects:
+  - kind: ServiceAccount
+    name: authentik-fix-ingress
+    namespace: authentik
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: authentik-fix-ingress
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: authentik-fix-ingress
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 60
+  ttlSecondsAfterFinished: 120
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: authentik-fix-ingress
+      restartPolicy: Never
+      containers:
+        - name: fix-ingress
+          image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              INGRESS="authentik-server"
+              NS="authentik"
+
+              # Check whether the ingress already has an address assigned.
+              # If HAProxy processed it correctly this is a no-op log line.
+              ADDR=$(kubectl get ingress "$INGRESS" -n "$NS" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+              if [ -n "$ADDR" ]; then
+                echo "Ingress $INGRESS already has address $ADDR — nothing to do."
+                exit 0
+              fi
+
+              # No address: HAProxy missed the creation event. Touch the ingress
+              # with a timestamped annotation to force a reconcile.
+              echo "Ingress $INGRESS has no address — touching to trigger HAProxy reconcile..."
+              kubectl annotate ingress "$INGRESS" -n "$NS" \
+                haproxy-ingress.github.io/refresh="$(date +%s)" --overwrite
+
+              # Give HAProxy a moment to react, then report the outcome.
+              sleep 5
+              ADDR=$(kubectl get ingress "$INGRESS" -n "$NS" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+              if [ -n "$ADDR" ]; then
+                echo "Address assigned: $ADDR"
+              else
+                # Not fatal — HAProxy may still be catching up. ArgoCD will
+                # re-sync on the next selfHeal cycle and run this hook again.
+                echo "WARNING: address not yet assigned after touch. HAProxy may still be reconciling."
+              fi

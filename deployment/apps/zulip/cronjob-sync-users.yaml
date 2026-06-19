@@ -1,0 +1,183 @@
+# CronJob: sync Authentik "zulip" group members → Zulip users every 15 minutes.
+#
+# Logic:
+#   1. GET Authentik /api/v3/core/users/?groups__name=zulip → active_set (by email)
+#   2. GET Zulip     /api/v1/users                          → zulip_set
+#   3. Deactivate any Zulip user whose email is not in active_set (skip bots)
+#   4. Pre-provision Zulip users in active_set not yet in zulip_set
+#
+# Auth:
+#   Authentik: AUTHENTIK_BOOTSTRAP_TOKEN read from authentik-secrets (authentik ns) via kubectl
+#   Zulip:     bot-email + bot-api-key from zulip-sync-bot secret (same ns)
+#
+# NOTE: SETTING_SESSION_COOKIE_AGE: "28800" in values.yaml caps stale session window to 8 h.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zulip-sync-users
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zulip-sync-users-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["authentik-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zulip-sync-users-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zulip-sync-users-authentik-secrets
+subjects:
+- kind: ServiceAccount
+  name: zulip-sync-users
+  namespace: zulip
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zulip-sync-users
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: zulip-sync-users
+          restartPolicy: Never
+          containers:
+          - name: sync
+            image: docker.io/alpine/k8s:1.36.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            # Authentik API: in-cluster Service (proven to work, no public-DNS dep).
+            - name: AUTHENTIK_URL
+              value: "http://authentik-server.authentik.svc.cluster.local"
+            # Zulip MUST be reached via the public ingress host, NOT the in-cluster
+            # Service: a direct http://svc call makes Zulip 500 ("Internal server
+            # error" — it rejects its canonical host over what it treats as insecure
+            # transport; the haproxy ingress supplies the X-Forwarded-* headers it
+            # needs). The ingress host resolves in-cluster; CURL_INSECURE (-k) covers
+            # the LE-staging cert. (If zulip.<tld> ever NXDOMAINs, fix the DNS zone.)
+            - name: ZULIP_URL
+              value: "https://zulip.ecc135.cape-project.eu"
+            - name: ZULIP_BOT_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: zulip-sync-bot
+                  key: bot-email
+            - name: ZULIP_BOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zulip-sync-bot
+                  key: bot-api-key
+            # Authentik/Zulip ingress certs are LE STAGING (untrusted CA) while
+            # testing, so curl rejects them (exit 60). "-k" skips verification.
+            # updateConfigFromProjectSettings.sh clears this to "" (verify) when
+            # certIssuerType is letsencrypt-prod.
+            - name: CURL_INSECURE
+              value: "-k"
+            command:
+            - /bin/sh
+            - -ec
+            - |
+              apk add --no-cache curl jq >/dev/null 2>&1
+
+              AUTHENTIK_TOKEN=$(kubectl get secret authentik-secrets -n authentik \
+                -o jsonpath='{.data.AUTHENTIK_BOOTSTRAP_TOKEN}' | base64 -d)
+              [ -z "$AUTHENTIK_TOKEN" ] && { echo "ERROR: could not read AUTHENTIK_BOOTSTRAP_TOKEN"; exit 1; }
+
+              echo "Fetching Authentik 'zulip' group members..."
+              ACTIVE_EMAILS=""
+              PAGE=1
+              while true; do
+                RESP=$(curl -sf $CURL_INSECURE \
+                  -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+                  "$AUTHENTIK_URL/api/v3/core/users/?groups__name=zulip&page_size=100&page=${PAGE}")
+                BATCH=$(echo "$RESP" | jq -r '.results[].email // empty')
+                [ -n "$BATCH" ] && ACTIVE_EMAILS=$(printf '%s\n%s' "$ACTIVE_EMAILS" "$BATCH")
+                NEXT=$(echo "$RESP" | jq -r '.pagination.next // 0')
+                [ "$NEXT" = "0" ] || [ "$NEXT" = "null" ] && break
+                PAGE=$((PAGE + 1))
+              done
+              ACTIVE_EMAILS=$(echo "$ACTIVE_EMAILS" | tr '[:upper:]' '[:lower:]' | sort -u | grep -v '^$')
+              echo "Active Authentik users: $(echo "$ACTIVE_EMAILS" | wc -l | tr -d ' ')"
+
+              echo "Fetching Zulip users..."
+              ZULIP_USERS=$(curl -sf $CURL_INSECURE \
+                -u "$ZULIP_BOT_EMAIL:$ZULIP_BOT_API_KEY" \
+                "$ZULIP_URL/api/v1/users")
+
+              echo "Checking for users to deactivate or re-activate..."
+              echo "$ZULIP_USERS" | jq -r \
+                '.members[] | select(.is_bot == false) | "\(.user_id) \(.is_active) \(.delivery_email // .email)"' \
+                | while read -r uid is_active email; do
+                    email_lc=$(echo "$email" | tr '[:upper:]' '[:lower:]')
+                    in_active=$(echo "$ACTIVE_EMAILS" | grep -cxF "$email_lc" || true)
+                    if [ "$is_active" = "true" ] && [ "$in_active" = "0" ]; then
+                      echo "  Deactivating: $email (id=$uid)"
+                      curl -sf $CURL_INSECURE -X DELETE \
+                        -u "$ZULIP_BOT_EMAIL:$ZULIP_BOT_API_KEY" \
+                        "$ZULIP_URL/api/v1/users/$uid" >/dev/null \
+                        && echo "    OK" \
+                        || echo "    WARNING: deactivate failed for $email"
+                    elif [ "$is_active" = "false" ] && [ "$in_active" != "0" ]; then
+                      echo "  Re-activating: $email (id=$uid)"
+                      curl -sf $CURL_INSECURE -X POST \
+                        -u "$ZULIP_BOT_EMAIL:$ZULIP_BOT_API_KEY" \
+                        "$ZULIP_URL/api/v1/users/$uid/reactivate" >/dev/null \
+                        && echo "    OK" \
+                        || echo "    WARNING: reactivate failed for $email"
+                    fi
+                  done
+
+              echo "Checking for users to pre-provision..."
+              echo "$ACTIVE_EMAILS" | while read -r email; do
+                [ -z "$email" ] && continue
+                EXISTS=$(echo "$ZULIP_USERS" | jq --arg e "$email" \
+                  '[.members[] | select(((.delivery_email // .email) | ascii_downcase) == $e)] | length')
+                if [ "$EXISTS" = "0" ]; then
+                  FULL_NAME=$(curl -sf $CURL_INSECURE \
+                    -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+                    "$AUTHENTIK_URL/api/v3/core/users/?email=${email}&page_size=1" \
+                    | jq -r '.results[0].name // empty')
+                  [ -z "$FULL_NAME" ] && FULL_NAME="$email"
+                  echo "  Pre-provisioning: $email ($FULL_NAME)"
+                  # Zulip rejects an empty/weak password ("The password is too
+                  # weak") even though OIDC users never use it — send a strong
+                  # random one. Creating users also needs the bot's
+                  # can_create_users permission (granted in postsync-create-sync-bot).
+                  RANDPW=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
+                  RESP=$(curl -s $CURL_INSECURE \
+                    -u "$ZULIP_BOT_EMAIL:$ZULIP_BOT_API_KEY" \
+                    --data-urlencode "email=$email" \
+                    --data-urlencode "password=$RANDPW" \
+                    --data-urlencode "full_name=$FULL_NAME" \
+                    "$ZULIP_URL/api/v1/users")
+                  echo "$RESP" | grep -q '"result":"success"' \
+                    && echo "    Provisioned." \
+                    || echo "    INFO: $RESP"
+                fi
+              done
+
+              echo "Sync complete."
