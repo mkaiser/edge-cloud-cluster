@@ -1,0 +1,194 @@
+# APPS ArgoCD core Helm values — the second ArgoCD instance, deployed by the INFRA
+# instance via deployment/argocd-infra/app-of-apps/wave19-argocd-apps.yaml.
+#
+# This instance lives in namespace argocd-apps at host argocd-apps.<tld> and
+# manages ONLY the user-facing apps in deployment/argocd-apps/app-of-apps/ (no waves).
+#
+# Co-existence with the infra instance (same cluster):
+#   - crds.install: false            — CRDs are installed once by the infra release.
+#   - fullnameOverride: argocd-apps  — prefixes ClusterRoles/Bindings/SAs/Services
+#                                      so they don't collide with the infra release.
+#
+# global.domain is set below (argocd-apps.<tld>). The admin password hash +
+# server secret key are NOT rendered from these git values: configs.secret.createSecret
+# is false and Pulumi pre-creates the "argocd-secret" Secret in ns argocd-apps with
+# the SAME admin hash as the infra instance (see src/argocd.ts).
+
+# Service/RBAC names become argocd-apps-* (e.g. svc argocd-apps-server,
+# SA argocd-apps-application-controller).
+fullnameOverride: argocd-apps
+
+crds:
+  # CRDs (applications/applicationsets/appprojects) are owned by the infra release.
+  install: false
+
+global:
+  domain: argocd-apps.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  env:
+    - name: TZ
+      value: "Europe/Berlin"
+
+configs:
+  secret:
+    # argocd-secret (admin password hash + server secret key) is pre-created by
+    # Pulumi in this namespace (shared admin hash with the infra instance). Don't
+    # render it from these git-tracked values.
+    createSecret: false
+  cm:
+    # Local account for the argocd-mcp server running in the devcontainer
+    # (.mcp.json). apiKey ONLY, deliberately no `login`: it mints API tokens and
+    # must never be able to open a UI session. Grants are the explicit
+    # `p, mcp-reader, ...` rules in configs.rbac below -- NOT role:readonly, which
+    # would also carry exec and repository read.
+    accounts.mcp-reader: apiKey
+    timeout.reconciliation: "5m"
+    # Same OIDC TLS handling as the infra instance: skip verify on LE staging.
+    # updateConfigFromProjectSettings.sh flips this to "false" on letsencrypt-prod.
+    oidc.tls.insecure.skip.verify: "false" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcSkipVerify}
+    oidc.config: |
+      name: Authentik
+      issuer: https://id.subdomain1.your-domain.tld/application/o/argocd-apps/ # automatically updated from project-settings:{general.subdomain,general.domain}
+      clientID: argocd-apps
+      clientSecret: $argocd-oidc-client-secret:oidc.clientSecret
+      requestedScopes:
+        - openid
+        - profile
+        - email
+        - groups
+
+  rbac:
+    # Same group → role mapping as the infra instance.
+    # mcp-reader is the local apiKey account for argocd-mcp (see configs.cm above).
+    # `logs` is its OWN resource, not an action on `applications` -- writing
+    # `p, mcp-reader, applications, logs, ...` is accepted and silently does nothing.
+    policy.csv: |
+      g, argocd-admins, role:admin
+      g, authentik-admins, role:admin
+      g, employees-extended, role:readonly
+      p, mcp-reader, applications, get, */*, allow
+      p, mcp-reader, logs, get, */*, allow
+      p, mcp-reader, projects, get, *, allow
+      p, mcp-reader, clusters, get, *, allow
+    policy.default: ""
+
+  params:
+    # The Gateway handles TLS termination; ArgoCD serves plain HTTP internally
+    server.insecure: "true"
+
+  # Bootstrap app-of-apps: an Application this instance creates in its own
+  # namespace that watches deployment/argocd-apps/app-of-apps/. Shipped via the chart's
+  # extraObjects so the apps instance self-bootstraps from these Helm values
+  # (no separate "-main" pointer Application from Pulumi).
+
+server:
+  replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.argocdServer}
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: argocd-server
+  service:
+    type: ClusterIP
+  extraArgs:
+    - --insecure
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  # Native Gateway API support (argo-cd chart server.httproute). TLS terminates at
+  # the shared Gateway's wildcard listener, so no tls block and no ssl-redirect
+  # annotation — the redirect is handled once by argocd-infra/gateway.
+  ingress:
+    enabled: false
+  httproute:
+    enabled: true
+    annotations:
+      external-dns.alpha.kubernetes.io/exclude: "true"
+    parentRefs:
+      - name: main
+        namespace: argocd-infra
+        sectionName: https-wildcard
+    hostnames:
+      - argocd-apps.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+controller:
+  replicas: 2 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.argocdController}
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: argocd-application-controller
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+applicationSet:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+# Notifications are handled by the infra instance only (it watches all apps).
+notifications:
+  enabled: false
+
+# extraObjects: bootstrap the apps app-of-apps + the repo SSH creds.
+# - apps-root Application watches deployment/argocd-apps/app-of-apps/ (prune + selfHeal),
+#   creating one child Application per file there.
+# - The git repo credentials secret is duplicated into this namespace so the
+#   apps instance can pull the private repo (the infra creds live in argocd-infra).
+extraObjects:
+  - apiVersion: argoproj.io/v1alpha1
+    kind: Application
+    metadata:
+      name: apps-root
+      namespace: argocd-apps
+      annotations:
+        argocd.argoproj.io/refresh-interval: "3m"
+    spec:
+      project: default
+      source:
+        repoURL: git@github.com:YourProject/yourGit.git
+        targetRevision: main
+        path: deployment/argocd-apps/app-of-apps
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: argocd-apps
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

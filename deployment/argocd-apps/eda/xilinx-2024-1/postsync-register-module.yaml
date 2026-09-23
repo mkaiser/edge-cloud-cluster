@@ -1,0 +1,312 @@
+# PostSync: register this module with the remote-desktop broker.
+#
+# WHY THIS EXISTS — a cluster recreate silently un-publishes every module. Registration is
+# the broker's AUTHORISATION record: a module is loadable iff
+# <store>/modules/<name>/<version>/module.yaml exists (broker.sh allowed(), fail-closed).
+# That store is a TrueNAS dataset, and a recreate starts it EMPTY. Until now the only way
+# back was a human running register-module.sh four times, and the failure mode if they
+# forgot is `module load xilinx/2024.1` reporting "not registered" — indistinguishable from
+# a module that was never built, with nothing in any log explaining why.
+#
+# Git already holds the manifest, so the registry can be rebuilt from it. This Job does
+# that for THIS module only: each app owns its own registration, so a disabled app
+# registers nothing and there is no central list to drift.
+#
+# ⚠ Reads the manifest from this app's build-files ConfigMap, NOT from module.yaml on
+# disk: that file is `exclude`d from the ArgoCD apply (it is manifest-shaped but is not a
+# k8s manifest), so it never reaches the cluster. The ConfigMap copy is kept byte-identical
+# to it by sync-build-files.sh.
+#
+# ⚠ Registration authorises the PRIVILEGED broker to pull and run this image AS ROOT. That
+# is exactly why it is driven from git rather than from the image: the image is whatever
+# the registry currently serves, while git is reviewed. Do not change this to
+# `broker register` without --from-stdin (which reads the manifest from the image itself).
+#
+# Idempotent: `broker register` overwrites the same path, so a re-sync is a no-op in
+# effect. PostSync because the desktop's broker must be running to accept it.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-xilinx-2024-1-register
+  namespace: eda-xilinx-2024-1
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eda-xilinx-2024-1-register
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# exec into the broker sidecar, which lives in the remote-desktop namespace
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+# `kubectl exec deploy/gitlab-toolbox` resolves the Deployment before it execs, so the
+# pipeline-status probe in the wait loop needs this. Missing it does not fail the hook —
+# the probe is fail-open — it just silently restores the old "poll for 4.5 h" behaviour.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+# ⚠ REQUIRED — without it every register hook fails.
+# The script reads module.yaml out of THIS namespace's build-files ConfigMap — the
+# manifest on disk is `exclude`d from the ArgoCD apply, so the ConfigMap is the only
+# copy that reaches the cluster. Without this the job dies with
+#   configmaps "eda-xilinx-2024-1-build-files" is forbidden
+# AFTER it has already found a healthy broker, so the failure reads like a broker
+# problem rather than an RBAC one. Scoped to the single ConfigMap by name: this SA
+# also holds pods/exec into a PRIVILEGED sidecar, so it gets no blanket configmap read.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["eda-xilinx-2024-1-build-files"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eda-xilinx-2024-1-register
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eda-xilinx-2024-1-register
+subjects:
+- kind: ServiceAccount
+  name: eda-xilinx-2024-1-register
+  namespace: eda-xilinx-2024-1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-xilinx-2024-1-register
+  namespace: eda-xilinx-2024-1
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ 5h, not minutes. On a FRESH cluster the desktop image is BUILT first (its Deployment
+  # allows 4h via progressDeadlineSeconds), so there is no broker to register against for
+  # hours. A short deadline here does not merely fail this Job — it fails the app's PostSync
+  # and so the whole sync, on a cluster where nothing is actually wrong.
+  activeDeadlineSeconds: 18000
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: eda-xilinx-2024-1-register
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: register
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: MODULE_NAME
+          value: "xilinx"
+        - name: MODULE_VERSION
+          value: "2024.1"
+        - name: RD_NS
+          value: remote-desktop
+        # For the pipeline-status probe below. In-cluster address, like the build trigger's.
+        - name: GITLAB_API
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080/api/v4"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # ⚠ THE LABEL IS PER-DESKTOP. Each desktop Deployment labels its pods after
+          # itself (app=remote-desktop-gvisor), so a bare `app=remote-desktop` selector
+          # matches NOTHING even with a healthy desktop running — the same trap
+          # register-module.sh documents. Match the prefix and take the first Running pod.
+          # Poll for up to ~4.5h. See activeDeadlineSeconds above: on a fresh cluster the
+          # desktop image has to be built before any broker exists.
+          echo "Waiting for a remote-desktop pod with a broker sidecar (up to ~4.5h)..."
+          i=1
+          while [ "$i" -le 1620 ]; do
+            POD=$(kubectl -n "$RD_NS" get pod \
+              -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{" "}{.metadata.labels.app}{"\n"}{end}' \
+              2>/dev/null | awk '$2 ~ /^remote-desktop/ {print $1; exit}')
+            [ -n "${POD:-}" ] && break
+            # Log sparsely — one line per 10 min rather than 1620 lines.
+            [ $((i % 60)) -eq 1 ] && echo "  try ${i}/1620: no running desktop yet (still building?), retrying every 10s..."
+            i=$((i + 1)); sleep 10
+          done
+          [ -n "${POD:-}" ] || { echo "ERROR: no running remote-desktop pod — cannot register"; exit 1; }
+          echo "Using $POD"
+
+          # The manifest ships in this app's build-files ConfigMap; module.yaml on disk is
+          # excluded from the ArgoCD apply and never reaches the cluster.
+          kubectl -n "$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" \
+            get configmap eda-xilinx-2024-1-build-files -o jsonpath='{.data.module\.yaml}' > /tmp/module.yaml
+          [ -s /tmp/module.yaml ] || { echo "ERROR: module.yaml missing from eda-xilinx-2024-1-build-files"; exit 1; }
+
+          echo "Registering ${MODULE_NAME}/${MODULE_VERSION}..."
+          kubectl -n "$RD_NS" exec -i "$POD" -c broker -- \
+            /usr/local/bin/broker register "$MODULE_NAME" "$MODULE_VERSION" --from-stdin < /tmp/module.yaml
+
+          # `allowed` is the authoritative check and is cache-immune — list-modules can
+          # serve a stale directory listing for minutes after a register.
+          if kubectl -n "$RD_NS" exec "$POD" -c broker -- \
+               /usr/local/bin/broker allowed "$MODULE_NAME" "$MODULE_VERSION"; then
+            echo "Registered: ${MODULE_NAME}/${MODULE_VERSION}"
+          else
+            echo "ERROR: registration did not take — broker still reports it as not allowed"
+            exit 1
+          fi
+
+          # ── The image must actually EXIST in the registry ────────────────────────────
+          # ⚠ `allowed` ABOVE IS NOT AN AVAILABILITY CHECK. It is the AUTHORISATION gate:
+          # `[ -f $MODULE_STORE/<name>/<ver>/module.yaml ]` — i.e. it reads back the file
+          # this very Job just wrote, so on its own it CANNOT fail and cannot report
+          # anything about whether a user can load the module.
+          #
+          # That gap is the worst possible state for this app: if the build pipeline is
+          # CANCELED (auto_cancel on the trigger's own mirror push) no image is ever pushed,
+          # yet every EDA module app still shows Synced/Healthy in ArgoCD because their only
+          # workloads are these two fire-and-forget hook Jobs. The module then reports
+          # ALLOWED right up until a user runs `module load` and gets a 404 from the
+          # registry.
+          #
+          # `broker digest` is the right probe and needs no new plumbing: it lives in the
+          # sidecar that already holds the pull credential and the private CA, and it
+          # resolves <name>/<ver> through the SAME module_image()/`image:` logic the load
+          # path uses — so this cannot drift from what a real pull would resolve. It prints
+          # "<share-digest> <registry-digest>"; field 1 is always "-" (there are no
+          # archives), field 2 is "-" when the registry has no such tag.
+          #
+          # POLL, do not fail fast. On a FRESH cluster the image legitimately does not exist
+          # for the ~20-60 min its GitLab pipeline runs (the PreSync trigger only STARTS that
+          # build and exits). Failing immediately would paint every module app red during a
+          # normal bootstrap, which just teaches you to ignore red. Same budget as the broker
+          # wait above — activeDeadlineSeconds (5h) remains the real backstop.
+
+          # ── The build's own verdict, so a DEAD build is not waited out ───────────────
+          # WHY: the loop below cannot tell "still building" from "the build died twenty
+          # minutes ago" — both look like a missing digest, and it waits 4.5 h either way.
+          # That wait is not merely slow. While this hook runs, the app's sync operation is
+          # in flight, and an ArgoCD operation is PINNED to the revision it started with:
+          # it ignores new sync requests and re-mirrors the SAME build files on every
+          # retry. So a fix pushed to git cannot reach the cluster until this hook ends.
+          # Measured 2026-09-04 on the first petalinux build — two pipelines died on the
+          # same packaging bug because the corrected Dockerfile could not be mirrored.
+          #
+          # The project path comes from the manifest's own `image:` key, so an app that
+          # publishes to a non-default repo probes the right project. The token is minted
+          # the way the build trigger mints its own, read-only.
+          #
+          # ⚠ FAIL-OPEN at every step: no `image:` key, no token, an API blip, an
+          # unparseable answer — the wait simply continues. A probe fault must never fail
+          # a build that is only slow.
+          PIPE_PROJECT=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' /tmp/module.yaml | tr -d '"'"'"' \r' | head -1)
+          PIPE_PAT=""
+          if [ -n "${PIPE_PROJECT:-}" ]; then
+            PIPE_PAT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner \
+              "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'xilinx-register-$(date +%s)',scopes:['read_api'],expires_at:1.year.from_now); puts t.token" \
+              2>/dev/null | tail -1)
+          fi
+          PIPE_ENC=$(printf '%s' "${PIPE_PROJECT:-}" | sed 's#/#%2F#g')
+          [ -n "${PIPE_PAT:-}" ] \
+            && echo "Pipeline-status probe armed for ${PIPE_PROJECT}." \
+            || echo "NOTE: no GitLab token — pipeline-status probe disabled; falling back to the plain wait."
+          echo "Waiting for ${MODULE_NAME}/${MODULE_VERSION} to appear in the registry (up to ~4.5h)..."
+          i=1
+          REG_DIGEST=""
+          while [ "$i" -le 1620 ]; do
+            REG_DIGEST=$(kubectl -n "$RD_NS" exec "$POD" -c broker -- \
+              /usr/local/bin/broker digest "$MODULE_NAME" "$MODULE_VERSION" 2>/dev/null \
+              | awk '{print $2}')
+            [ -n "${REG_DIGEST:-}" ] && [ "$REG_DIGEST" != "-" ] && break
+            # ⚠ ON THE 3rd MISS, SAY *WHY*. `broker digest` swallows skopeo's stderr, so a
+            # BROKEN probe (no CA, bad credential, unreachable registry) is indistinguishable
+            # from a build that is legitimately still running — and this loop waits 4.5h
+            # either way. Measured 2026-09-04 on ecc196: a missing image-registry-ca left the
+            # broker unable to verify TLS, and the app simply read as "syncing" for 45 min
+            # with nothing anywhere naming the CA. Do not shorten the wait (a real module
+            # build IS hours); just make the reason visible.
+            if [ "$i" = "3" ]; then
+              echo "  --- diagnostic: the probe has failed 3x; showing the underlying error once ---"
+              kubectl -n "$RD_NS" exec "$POD" -c broker -- \
+                /usr/local/bin/broker digest "$MODULE_NAME" "$MODULE_VERSION" 2>&1 \
+                | sed 's/^/    /' | tail -5 || true
+              echo "  --- if that names a certificate or credential, the build is NOT the problem ---"
+            fi
+            # Ask GitLab roughly every 3 min — one REST call, and the answer only
+            # changes on the timescale of a build.
+            # ⚠ ONLY `failed` ends the wait. `canceled` does not: auto_cancel cancels a
+            # superseded pipeline, and the run replacing it may not exist yet at the moment
+            # we look, so treating it as fatal would kill a build that is about to start.
+            # Say it and keep waiting.
+            if [ -n "${PIPE_PAT:-}" ] && [ $((i % 18)) -eq 0 ]; then
+              PIPE_JSON=$(curl -sS --max-time 15 -H "PRIVATE-TOKEN: ${PIPE_PAT}" \
+                "${GITLAB_API}/projects/${PIPE_ENC}/pipelines?per_page=1" 2>/dev/null || true)
+              # grep -o, not sed: a greedy `.*` would return the LAST match on the line.
+              PIPE_STATUS=$(printf '%s' "$PIPE_JSON" | grep -o '"status":"[a-z_]*"' | head -1 | cut -d'"' -f4)
+              PIPE_URL=$(printf '%s' "$PIPE_JSON" | grep -o '"web_url":"[^"]*"' | head -1 | cut -d'"' -f4)
+              case "${PIPE_STATUS:-}" in
+                failed)
+                  echo "ERROR: the newest pipeline for ${PIPE_PROJECT} is FAILED — the image will never appear."
+                  echo "  ${PIPE_URL:-<no url>}"
+                  echo "  Failing this hook now instead of polling for 4.5 h: while it waits, this app's"
+                  echo "  sync is pinned to the revision it started with, so a fix pushed to git cannot be"
+                  echo "  mirrored to GitLab. Fix the build, push, and sync this app again."
+                  exit 1 ;;
+                canceled)
+                  echo "  NOTE: the newest pipeline is CANCELED (superseded?) — still waiting." ;;
+              esac
+            fi
+            [ $((i % 60)) -eq 1 ] && echo "  try ${i}/1620: no image in the registry yet (build still running?), retrying every 10s..."
+            i=$((i + 1)); sleep 10
+          done
+
+          if [ -z "${REG_DIGEST:-}" ] || [ "$REG_DIGEST" = "-" ]; then
+            echo "ERROR: ${MODULE_NAME}/${MODULE_VERSION} is registered but its image is NOT in the registry."
+            echo "  A user running 'module load ${MODULE_NAME}/${MODULE_VERSION}' would pass the"
+            echo "  authorisation gate and then fail on the pull. Failing this hook so the app"
+            echo "  reports Degraded instead of a green light over a module nobody can load."
+            echo "  Recover by running that module's GitLab pipeline (it rebuilds from the"
+            echo "  installer media on the artifacts export); check it was not auto-canceled."
+            exit 1
+          fi
+          # ── Re-register now that the image exists, so the module is DIGEST-pinned ──
+          # Registration has to happen BEFORE the image exists: on a fresh cluster this
+          # app's own PreSync hook only STARTS the build, which then takes minutes to
+          # hours. So the `broker register` above cannot resolve a digest and records the
+          # manifest TAG-PINNED, after which the broker warns on EVERY load —
+          #   "pinned by TAG, not digest — whoever can overwrite <repo>:<tag> controls
+          #    what runs as root here. Re-register to pin it."
+          # — and nothing ever did, because this hook only re-runs when the app changes.
+          # The digest is known now, so close that window here. Same command, same
+          # manifest; `broker register` overwrites the same path, so it is idempotent.
+          #
+          # ⚠ FAIL-OPEN. The module is already registered and loadable; a failure here
+          # leaves it exactly as it was a second ago (tag-pinned, and loudly so). Failing
+          # the hook would turn a hardening step into a red app over a module that works.
+          echo "Re-registering to pin ${MODULE_NAME}/${MODULE_VERSION} to ${REG_DIGEST}..."
+          if kubectl -n "$RD_NS" exec -i "$POD" -c broker -- \
+               /usr/local/bin/broker register "$MODULE_NAME" "$MODULE_VERSION" --from-stdin < /tmp/module.yaml; then
+            echo "Registered and verified: ${MODULE_NAME}/${MODULE_VERSION} -> ${REG_DIGEST} (digest-pinned)"
+          else
+            echo "WARNING: the re-registration failed — ${MODULE_NAME}/${MODULE_VERSION} stays TAG-pinned."
+            echo "  It still loads; the broker will warn on every load until someone re-registers."
+            echo "Registered and verified: ${MODULE_NAME}/${MODULE_VERSION} -> ${REG_DIGEST}"
+          fi

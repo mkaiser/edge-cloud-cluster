@@ -1,0 +1,80 @@
+# A STATIC PV on the ai-models export, plus the claim the seed initContainer reads.
+#
+# WHAT THIS IS FOR: model weights are ~23.4 GiB per checkpoint and the serving cache is a
+# node-local local-path PVC, which a GPU-node reimage wipes — after which vLLM re-downloads
+# the whole tree from HuggingFace over the mesh link. This export is the SEED that makes
+# that survivable. It is a sibling of the image-registry blob store, not a child: that one
+# is an OCI store written by the registry Deployment, this one holds HuggingFace-format
+# weight trees.
+#
+# ⚠ MOUNTED READ-ONLY BY THE SERVING POD. Populating it is a separate, deliberate act (see
+# the seed initContainer in deployment.yaml) — a serving pod that could write here could
+# also corrupt the copy every future pod restores from.
+#
+# ⚠ THE THOR CAN ONLY MOUNT THIS BECAUSE csi-driver-nfs NOW TOLERATES ecc/gpu. The node
+# DaemonSet previously tolerated ecc/mesh only, so it never scheduled on thor-eval (which
+# carries BOTH taints) and every mount there failed while the app reported Healthy. If this
+# volume ever fails to mount on the GPU node, check that toleration FIRST —
+# argocd-infra/csi-driver-nfs/values.yaml carries the measurements.
+#
+# ⚠ THE `server:` VALUE ONLY TAKES EFFECT ON A FRESH CLUSTER — a PV's
+# spec.persistentvolumesource is IMMUTABLE, so on a cluster whose PV exists this change
+# cannot be applied and ArgoCD reports it OutOfSync. That drift is expected; do NOT "fix" it
+# by deleting a Bound PV.
+#
+# ⚠ storageClassName is EMPTY STRING, not omitted. Empty explicitly means "no dynamic
+# provisioning"; omitting it lets the default class (longhorn-cloud) claim it, which would
+# hand this pod a Longhorn volume instead of the export.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-ai-models
+  labels:
+    # The claim selects on this, so it cannot bind to another app's NFS PV.
+    ecc/volume: nfs-ai-models
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size; the real limit is the datapool.
+    storage: 500Gi
+  accessModes:
+    # RWX: several GPU nodes may read the same seed concurrently.
+    - ReadWriteMany
+  # Retain: re-downloadable in principle, but a 23 GiB pull over the mesh link is exactly
+  # what this store exists to avoid, so never let the CSI driver remove it with the claim.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    # ⚠ Keep in step with the other static NFS PVs — there is no StorageClass to inherit
+    # mountOptions from, so every PV repeats the set. nfsvers is load-bearing: the export
+    # still offers NFSv3, and a client left to negotiate could land on v3.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # ⚠ The driver treats volumeHandle as the volume's IDENTITY — reusing another PV's
+    # handle for the same share is what orphans a binding.
+    volumeHandle: fs-1-datapool-ai-models
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/ai-models # automatically updated from project-settings:storage.fileserver.datasets.aiModels.dataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-ai-models
+  namespace: vllm
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 500Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-ai-models

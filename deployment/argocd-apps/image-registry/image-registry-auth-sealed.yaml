@@ -1,0 +1,15 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-auth
+  namespace: image-registry
+spec:
+  encryptedData:
+    htpasswd: AgBmPPlGc/cwjzGDUNr9UZuFyvdVNtox7dVzX1aOBEb5yKSXZq2J0FkFaNOvapFaZjbJ2e9Mo/HfyHZ2NP5Ka+MMCMhUfUY2l3uLsfD4tnrsUIpWS/VdtUZ1rVeesYVoxSZjeuD05eNamKvVyrOo5DKf1/xA9TUkw4BKwWw5DJRrWAIRPW3lZlH0I6HwYIwDkfTAWQ7j4PYeOddWj7NR+6ZuTjesRYMkJgroH2Mbkchq8xcaf2KtKoPS0mLuilyaY2kGvOMJBjJ0liqydY2KNMpm6xzxYxdxSLUPORPLWZ5nAYlDqBw8s1G7H8TfPv0XWxSLhnetwnD3azNZb3Mab9MbWSMLu4dS1TOt+8zl62yXUmfxUgfFalSRJev5b/ZlX4HFR/OOEQzF4VoC1NO4/7LLS1R7FxDRd/sLC9nzyBj4PfQ0N2S7SQ3Naq7t5NMRStLDtLZpq+/9QhoWBxhYfy8sDadou2e16p9vs7MzBigVKjp62ohUN9+oJlyZRQXqLOjNXqFr0NGvceCEbtI9xzmoKgxPuPOSk5WGcCM/9kyEgfE2+Em3F1Brk3blUyyYx/Ac4dYiWxs6zVYEVhh7ErTnuBYVfoaZW+LnRImg8s6h+CXoVMXh8892Azk9Rhdy3dRZWSarXr3abGrGl69wxrwdriFDiAfRjOO0CQWw3jdG1uEX+IHLRcIF6G/x+yL+fPdoRxBzDIbEsoVaVDs5Uy50mWOukWFRUdCPyA8jLZ3Q36puhqo/g3M6g16jkBluAC3kMT0Dj4n4piWv+DZ7ze1pegaXPPypStNUkj/gl54ocfbCzOIEGU+3Pdj8W0IB/MZxQWqjChL4IEz2nD8fvkZ/9k0Wq/7hAW4637HKGF6P2JIP9prFUoOtKW7n
+    pull-password: ""
+    push-password: ""
+  template:
+    metadata:
+      name: image-registry-auth
+      namespace: image-registry

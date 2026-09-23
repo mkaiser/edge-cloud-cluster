@@ -1,0 +1,68 @@
+# ArgoCD Application: Rocket.Chat (RocketChat/helm-charts).
+# Accessible at https://rocketchat.<subdomain>.<domain>
+# OIDC via Authentik as a Custom OAuth service, configured through the Rocket.Chat
+# REST API (oauth-config.yaml). Authentik provider + tile created/removed via the
+# Authentik API (authentik-provider.yaml). MongoDB bundled (replica set).
+# All config lives in deployment/argocd-apps/rocketchat. Wave 16 (Messaging, with zulip).
+#
+# Multi-source:
+#   1. rocketchat Helm chart
+#   2. ref source for $values
+#   3. Git directory for authentik provider jobs, oauth-config job, sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rocketchat
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://rocketchat.github.io/helm-charts
+      chart: rocketchat
+      targetRevision: "7.0.2" # renovate: datasource=helm depName=rocketchat registryUrl=https://rocketchat.github.io/helm-charts
+      helm:
+        releaseName: rocketchat
+        valueFiles:
+          - $values/deployment/argocd-apps/rocketchat/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/rocketchat
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rocketchat
+  # bundled mongodb is a StatefulSet; k8s mutates immutable volumeClaimTemplates
+  # with defaults ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

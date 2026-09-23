@@ -1,0 +1,93 @@
+# headscale ACL policy (HuJSON) — mesh nodes vs. human users.
+#
+# Delivery: this ConfigMap is mounted at /etc/headscale/policy by the Sync-hook Job in
+# args-patch.yaml (the Wrenix chart has NO policy support: there is no `policy` key in
+# external/git_wrenix_helm-charts/headscale/values.yaml, only an unrelated
+# service.ipFamilyPolicy). `policy.mode: file` + `policy.path` live in the chart's
+# headscale.config in app-of-apps/wave8-headscale.yaml.
+#
+# headscale does NOT hot-reload the policy (docs/ref/policy.md: "Headscale needs to be
+# reloaded ... systemd service or by sending a SIGHUP"). The args-patch Job stamps a
+# checksum annotation on the pod template, so an edit here rolls the pod — that IS the
+# reload. Existing tailnet sessions survive the roll; new registrations pause for it.
+#
+# ALWAYS validate before committing:
+#   kubectl exec -n headscale deploy/headscale -- headscale policy check -f /etc/headscale/policy/policy.hujson
+#
+# Rollback: replace the grants/ssh blocks with `{}` (upstream-documented allow-all) and
+# let the pod roll. Nothing else in the cluster depends on this file existing.
+#
+# WHY the node-fabric grant is deliberately wide: Cilium's VXLAN pod network runs OVER
+# tailscale here, so an over-tight node-to-node rule does not merely block a service — it
+# partitions the cluster. Node reach stays unrestricted; only humans are constrained.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headscale-policy
+  namespace: headscale
+data:
+  policy.hujson: |
+    {
+      // Tags, not node names: node names churn on every cluster recreate (that is where
+      // the `-1`/`-2` suffixed duplicates come from), so a name-based policy silently
+      // stops matching after a rebuild.
+      "tagOwners": {
+        "tag:k8s-node": ["k3s-cloud@", "on-premise-resident@", "on-premise-transient@"],
+        "tag:desktop":  ["k3s-cloud@", "on-premise-resident@"],
+      },
+
+      "grants": [
+        // ---- Cluster fabric: UNRESTRICTED, both directions. ----
+        // Carries the Cilium VXLAN overlay, Longhorn replication, the k3s API and Samba
+        // DRS. The `src`/`dst` lists name the raw users AS WELL AS tag:k8s-node so this
+        // grant keeps working while nodes are still untagged — that is what makes the
+        // rollout non-breaking, and what lets a recreated (hence untagged) node join.
+        //
+        // The LAN CIDRs are the subnet routes advertised by mesh nodes
+        // (project_settings.ts nodes.mesh[].advertiseRoutes) plus the cloud private
+        // plane (network.subnetRange), which the CP mesh-gateway serves. Losing
+        // 10.0.0.0/23 here breaks edge->cloud private-plane access.
+        // BEGIN policy-cidrs (auto-generated from project-settings:{network.subnetRange,nodes.mesh[].advertiseRoutes})
+        {
+          "src": ["tag:k8s-node", "k3s-cloud@", "on-premise-resident@", "on-premise-transient@"],
+          "dst": ["tag:k8s-node", "k3s-cloud@", "on-premise-resident@", "on-premise-transient@", "10.0.0.0/23", "192.168.1.0/24"], // automatically updated from project-settings:{network.subnetRange,nodes.mesh[].advertiseRoutes}
+          "ip":  ["*"],
+        },
+
+        // ---- Operators: full reach (kubectl on 6443, node SSH, everything). ----
+        {
+          "src": ["operator@"],
+          "dst": ["tag:k8s-node", "tag:desktop", "10.0.0.0/23", "192.168.1.0/24"], // automatically updated from project-settings:{network.subnetRange,nodes.mesh[].advertiseRoutes}
+          "ip":  ["*"],
+        },
+
+        // ---- Humans: the lab SMB fileserver, reachable only via a mesh subnet route. ----
+        // autogroup:member = every untagged (personal) device, NOT a named user: OIDC
+        // self-service creates one headscale user PER PERSON, so a "human@" grant would
+        // match nobody — silently, since headscale no-ops undefined users in grants.
+        { "src": ["autogroup:member"], "dst": ["192.168.1.0/24"], "ip": ["445"] }, // automatically updated from project-settings:{network.subnetRange,nodes.mesh[].advertiseRoutes}
+
+        // END policy-cidrs
+
+        // ---- Humans (continued): the grants with no derived CIDR. ----
+        // Every one of the web UIs is already public through the wildcard Gateway and
+        // gated by Authentik, so a human on the tailnet needs only the things that have
+        // NO public route. Broad tailnet access would add risk without adding capability.
+        //
+        // Remote desktop, native clients: RDP 3389 and SSH 22 (SSH/SFTP + X11 forwarding,
+        // sshd added in base-r29 — see remote-desktop/startup-configmap.yaml). Both
+        // authenticate per-user against Authentik LDAP through the same PAM/SSSD stack;
+        // there is no shared VNC password or NodePort path any more.
+        // Targets tag:desktop, NOT the service CIDR: advertising 10.43.0.0/16 would make
+        // EVERY ClusterIP in the cluster routable from the tailnet and leave this file as
+        // the only thing containing it. Note this 22 is the DESKTOP's sshd (container port
+        // 2222 behind the Service), NOT a node's sshd — node SSH stays operator-only.
+        { "src": ["autogroup:member"], "dst": ["tag:desktop"], "ip": ["22", "3389"] },
+        // Samba AD: DNS, Kerberos, LDAP(S), SMB, kpasswd, global catalog. hostNetwork on
+        // a mesh node, hence tag:k8s-node rather than a tag of its own.
+        { "src": ["autogroup:member"], "dst": ["tag:k8s-node"], "ip": ["53", "88", "389", "445", "464", "636", "3268", "3269"] },
+        // A user's own devices (laptop <-> their phone/desktop). Used sparingly: upstream
+        // warns autogroup:self compiles filter rules per-node.
+        { "src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"] },
+      ],
+    }

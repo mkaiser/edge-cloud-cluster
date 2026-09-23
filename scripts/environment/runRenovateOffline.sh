@@ -9,65 +9,73 @@
 # every branch via renovate.json's baseBranchPatterns). Use --all-branches to
 # honor the repo config instead.
 #
-# Token (GitHub PAT, 'repo' scope): ALWAYS decrypted from the Pulumi stack —
-# offline-unseal of deployment/renovate/renovate-token-sealed.yaml using the
-# sealed-secrets private key (edgecloudinfra:sealedSecretsTlsKey) via
-# `kubeseal --recovery-unseal`. Prompts for PULUMI_CONFIG_PASSPHRASE if not
-# already exported. Works whether the cluster is up or down.
+# Token (GitHub PAT, 'repo' scope): ALWAYS read from the Pulumi stack config
+# value `githubPatToken` (set via scripts/secrets/setGithubPatToken.sh). Prompts
+# for PULUMI_CONFIG_PASSPHRASE if not already exported. Works whether the cluster
+# is up or down.
 # Set $RENOVATE_TOKEN only if you deliberately want to bypass the stack.
 #
 # Engine: Docker image ghcr.io/renovatebot/renovate:43 (preferred — bundles the
 # required Node), otherwise npx under fnm Node 24.
 #
 # Usage:
-#   ./scripts/misc/runRenovatePR.sh                # create PRs against current branch
-#   ./scripts/misc/runRenovatePR.sh --all-branches # honor renovate.json baseBranchPatterns
-#   ./scripts/misc/runRenovatePR.sh --dry-run      # preview only: no push, no PRs
-#   ./scripts/misc/runRenovatePR.sh --debug        # verbose logs
+#   ./scripts/environment/runRenovateOffline.sh                # create PRs against current branch
+#   ./scripts/environment/runRenovateOffline.sh --all-branches # honor renovate.json baseBranchPatterns
+#   ./scripts/environment/runRenovateOffline.sh --dry-run      # preview only: no push, no PRs
+#   ./scripts/environment/runRenovateOffline.sh --debug        # verbose logs
+#   ./scripts/environment/runRenovateOffline.sh --update-all   # collapse ALL pending updates into one "Update All" PR
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-IMAGE="ghcr.io/renovatebot/renovate:43"  # keep in sync with deployment/renovate/cronjob.yaml
+IMAGE="ghcr.io/renovatebot/renovate:43"  # keep in sync with deployment/argocd-infra/renovate/cronjob.yaml
 NPM_SPEC="renovate@43"
-REPOSITORY="paraXent/infra"
+# Derived from argocd.git.repoUrl rather than duplicated: that setting is the single source
+# of truth for the repo slug (the anchor engine rewrites every manifest occurrence from it),
+# so a hardcoded copy here would be one more literal to drift — and one more place the repo
+# owner's name leaks into a public release.
+REPOSITORY="$(sed -nE 's#.*repoUrl: "git@github\.com:([^"]+)\.git".*#\1#p' \
+    "$REPO_ROOT/project_settings.ts" | head -n1)"
+[ -n "$REPOSITORY" ] || { echo "ERROR: could not read argocd.git.repoUrl from project_settings.ts" >&2; exit 1; }
+
+# Same reason as REPOSITORY above: mail.senderEmail is the one address project_settings.ts
+# owns, so the commit author follows a domain change instead of being a literal that leaks
+# into a public release.
+GIT_AUTHOR_ADDR="$(sed -nE 's#.*senderEmail: "([^"]+)".*#\1#p' \
+    "$REPO_ROOT/project_settings.ts" | head -n1)"
+[ -n "$GIT_AUTHOR_ADDR" ] || { echo "ERROR: could not read mail.senderEmail from project_settings.ts" >&2; exit 1; }
+RENOVATE_AUTHOR="Renovate Bot <$GIT_AUTHOR_ADDR>"
 
 LOG_LEVEL="info"
 DRY=0
 ALL_BRANCHES=0
+UPDATE_ALL=0
 for arg in "$@"; do
     case "$arg" in
         --debug)        LOG_LEVEL="debug" ;;
         --dry-run)      DRY=1 ;;
         --all-branches) ALL_BRANCHES=1 ;;
+        --update-all)   UPDATE_ALL=1 ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
 
 # --- Resolve the GitHub PAT ---------------------------------------------------
-# Offline-decrypt the sealed renovate-token using the sealed-secrets controller
-# private key stored in the Pulumi stack. Works even when the cluster is down.
-unseal_token_from_stack() {
-    command -v kubeseal >/dev/null 2>&1 || return 1
-    command -v pulumi   >/dev/null 2>&1 || return 1
-    local sealed="$REPO_ROOT/deployment/renovate/renovate-token-sealed.yaml"
-    [ -f "$sealed" ] || return 1
+# Read the GitHub PAT straight from the Pulumi stack config (githubPatToken).
+# Works even when the cluster is down — no unsealing needed.
+token_from_stack() {
+    command -v pulumi >/dev/null 2>&1 || return 1
 
     if [ -z "${PULUMI_CONFIG_PASSPHRASE:-}" ]; then
-        read -rsp "  Enter PULUMI_CONFIG_PASSPHRASE to unseal the token: " PULUMI_CONFIG_PASSPHRASE
+        read -rsp "  Enter PULUMI_CONFIG_PASSPHRASE to read the token: " PULUMI_CONFIG_PASSPHRASE
         echo >&2
         export PULUMI_CONFIG_PASSPHRASE
     fi
     pulumi -C "$REPO_ROOT" login "file://$REPO_ROOT/.pulumi-state" >/dev/null 2>&1 || true
     pulumi -C "$REPO_ROOT" stack select mystack >/dev/null 2>&1 || true
 
-    local keyfile token
-    keyfile="$(mktemp)"; chmod 600 "$keyfile"
-    trap 'rm -f "$keyfile"' RETURN
-    pulumi -C "$REPO_ROOT" config get edgecloudinfra:sealedSecretsTlsKey >"$keyfile" 2>/dev/null || return 1
-    [ -s "$keyfile" ] || return 1
-    token="$(kubeseal --recovery-unseal --recovery-private-key "$keyfile" -o json <"$sealed" 2>/dev/null \
-        | python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)["data"]["token"]).decode())' 2>/dev/null)"
+    local token
+    token="$(pulumi -C "$REPO_ROOT" config get githubPatToken 2>/dev/null)" || return 1
     [ -n "$token" ] && printf '%s' "$token"
 }
 
@@ -75,9 +83,9 @@ resolve_token() {
     # Explicit override (deliberate opt-out of the stack).
     if [ -n "${RENOVATE_TOKEN:-}" ]; then printf '%s' "$RENOVATE_TOKEN"; return 0; fi
 
-    # Always decrypt the token from the Pulumi stack (works cluster up or down).
-    echo "  Unsealing token from the Pulumi stack..." >&2
-    local t; t="$(unseal_token_from_stack)" && [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+    # Always read the token from the Pulumi stack (works cluster up or down).
+    echo "  Reading githubPatToken from the Pulumi stack..." >&2
+    local t; t="$(token_from_stack)" && [ -n "$t" ] && { printf '%s' "$t"; return 0; }
     return 1
 }
 
@@ -85,8 +93,8 @@ echo "Resolving GitHub token..."
 if ! TOKEN="$(resolve_token)" || [ -z "$TOKEN" ]; then
     cat >&2 <<EOF
 ERROR: could not obtain the GitHub PAT from the Pulumi stack.
-  - Provide the correct PULUMI_CONFIG_PASSPHRASE (the sealed token is decrypted
-    via kubeseal using edgecloudinfra:sealedSecretsTlsKey), or
+  - Provide the correct PULUMI_CONFIG_PASSPHRASE and ensure githubPatToken is set
+    (run scripts/secrets/setGithubPatToken.sh), or
   - set RENOVATE_TOKEN to deliberately bypass the stack.
 EOF
     exit 1
@@ -97,13 +105,20 @@ echo "Token resolved (length ${#TOKEN}, prefix ${TOKEN:0:4}****)."
 # 'force' has the highest precedence and overrides renovate.json — used here to
 # guarantee automerge stays OFF and (by default) to pin the base branch.
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+# --update-all: a single highest-precedence packageRule (force outranks
+# renovate.json) groups every pending update into one "Update All" PR.
+PR_FRAG=""
+if [ "$UPDATE_ALL" -eq 1 ]; then
+    PR_FRAG=',"packageRules":[{"matchPackageNames":["*"],"groupName":"Update All","groupSlug":"update-all"}]'
+    echo "Grouping: ALL pending updates collapsed into one \"Update All\" PR."
+fi
 if [ "$ALL_BRANCHES" -eq 1 ]; then
-    FORCE='{"automerge":false,"platformAutomerge":false}'
+    FORCE="{\"automerge\":false,\"platformAutomerge\":false${PR_FRAG}}"
     echo "Base branches: per renovate.json baseBranchPatterns (all branches)."
 else
     # Renovate 43 renamed baseBranches -> baseBranchPatterns; a value without
     # surrounding slashes is matched exactly (not as a regex).
-    FORCE="{\"automerge\":false,\"platformAutomerge\":false,\"baseBranchPatterns\":[\"$CURRENT_BRANCH\"]}"
+    FORCE="{\"automerge\":false,\"platformAutomerge\":false,\"baseBranchPatterns\":[\"$CURRENT_BRANCH\"]${PR_FRAG}}"
     echo "Base branch: $CURRENT_BRANCH (use --all-branches to override)."
 fi
 
@@ -122,7 +137,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         -e RENOVATE_TOKEN="$TOKEN" \
         -e RENOVATE_REPOSITORIES="$REPOSITORY" \
         -e RENOVATE_FORCE="$FORCE" \
-        -e RENOVATE_GIT_AUTHOR="Renovate Bot <renovate@cape-project.eu>" \
+        -e RENOVATE_GIT_AUTHOR="$RENOVATE_AUTHOR" \
         -e LOG_LEVEL="$LOG_LEVEL" \
         "${dry_args[@]}" \
         "$IMAGE"
@@ -138,11 +153,11 @@ elif command -v npx >/dev/null 2>&1; then
         RENOVATE_TOKEN="$TOKEN"
         RENOVATE_REPOSITORIES="$REPOSITORY"
         RENOVATE_FORCE="$FORCE"
-        RENOVATE_GIT_AUTHOR="Renovate Bot <renovate@cape-project.eu>"
+        RENOVATE_GIT_AUTHOR="$RENOVATE_AUTHOR"
         LOG_LEVEL="$LOG_LEVEL"
     )
     [ "$DRY" -eq 1 ] && env_args+=(RENOVATE_DRY_RUN=full)
-    env "${env_args[@]}" "${fnm_cmd[@]}" npx --yes "$NPM_SPEC"
+    env "${env_args[@]}" "${fnm_cmd[@]}" npx --force "$NPM_SPEC"
 else
     echo "ERROR: need a running Docker daemon or npx (Node.js) to run Renovate." >&2
     exit 1

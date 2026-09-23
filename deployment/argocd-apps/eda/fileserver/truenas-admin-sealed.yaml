@@ -1,0 +1,44 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: truenas-admin
+  namespace: eda-fileserver
+  # ⚠ PreSync, NOT a plain Sync-phase resource — and the reason is a DEADLOCK, not tidiness.
+  # provision-job.yaml's Job is a PreSync hook that reads secret/truenas-admin to bootstrap
+  # its scoped API key. PreSync runs BEFORE the Sync phase, so as an ordinary resource this
+  # SealedSecret did not exist yet when the Job looked for it: the Job exited 1 ("no cached
+  # API key and no admin credential to mint one with"), the failed PreSync hook aborted the
+  # sync, and the abort is what stopped this SealedSecret from ever being created. Nothing
+  # in the namespace was ever applied.
+  #
+  # Only bites when the API-key cache starts empty — i.e. on a fresh cluster. A recreate is
+  # exactly that, which is why this survived until ecc179.
+  #
+  # ⚠ hook-weight ORDERS THE APPLY, IT DOES NOT ORDER THE DECRYPTION — and that distinction
+  # is what broke ecc182. -20 does put this SealedSecret ahead of the Job at 0, but applying
+  # a SealedSecret only creates the CUSTOM RESOURCE. secret/truenas-admin appears later,
+  # whenever the sealed-secrets controller gets round to decrypting it — an ASYNCHRONOUS
+  # step no hook weight can wait for. Measured: Job pod created 06:12:07, secret
+  # unsealed 06:14:00. The Job's 120s init wait expired 113s too early, and because
+  # `hook-delete-policy: BeforeHookCreation` recreates the pod on every retry, all five
+  # retries lost the same race.
+  #
+  # So the ordering here is necessary but NOT sufficient. The Job is what has to tolerate
+  # the delay: its init container waits for the decrypted Secret and then re-reads the
+  # credential from the API, because a secretKeyRef is resolved at POD CREATION and would
+  # otherwise be empty even after a successful wait. See provision-job.yaml.
+  #
+  # Do NOT add hook-delete-policy here — the secret must OUTLIVE the hook phase; the Job
+  # re-reads it on every later sync until the scoped key is cached.
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-20"
+spec:
+  encryptedData:
+    TRUENAS_ADMIN_PASSWORD: AgCRhWSjgNDcLG/BR35tR42pNbFk0iPUZ7LRZM7degI9ATs3+BlTweXlSvpOhC4QE5BBpvETq+6J6KxWT6r71q0eqjCZY06nohUq38pUf753OEut8+3hNGV3k9QQ0w++laZYmABlBtsXjG+vOj+85lXLdW9YdtaV/OFQvnPF8RVZeMuSTaAysFMuQT6nhDTiSrWpOae3q5D8VFeu1niIC+PepOZR4RxSobxltSmmirfvZCEramOam/DuKQ25PN43RnyFQQ7g6UhFDBn423Jr4ttX6zHwxHUgROaVvN54Y/fAaytjvlnK9dUvAT14YSwftwBI3u8Y9QrWD4Cnm7CaxVdm24oVGs8XhhFvdimN/hfLiF0r0V++NIqkkkGVumwh0d1APt7sJmzng7np56VN99Kiw0OaGAInOpYtFyLlbmQfuK2Hy3jcC3USOoDych3WAbVtYfy2wTG0YX5x9sfW8hvFMXFwI6h8fPrg+ul/Fnae2efXnN3PcwhX4isPcaCwLON+TURZCEJXaa8E2KUthewC4fUrWndDxJvQ/BnX61EdX+xM46ChGEfijr+ADcXGm2BgYQ/VC81TY8XqjpXY/pK/UGDQerxPW+27e9IbfOt6ZdaTziPvLZh2jzN7egZscSwRVyuDMshMM4kj/1UaxHFJ9AwYLuu0aCfi/GwwjmHN1x+QTSK+ICriOS2IPgnCY2/FDh/+NJvcJlP9vSkhJsAfut0=
+    TRUENAS_ADMIN_USER: ""
+  template:
+    metadata:
+      name: truenas-admin
+      namespace: eda-fileserver

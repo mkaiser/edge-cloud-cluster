@@ -1,0 +1,366 @@
+# Detect and repair a TrueNAS AD join that is wedged AFTER a successful sync.
+#
+# WHY THIS EXISTS. configure-job.yaml already carries both halves of the cure:
+# _identity_works() probes whether the appliance can resolve a domain USER, and
+# ALLOW_AD_REPAIR arms a leave+rejoin when it cannot. What is missing is anything that RUNS
+# them. Both live in an ArgoCD Sync hook, and ArgoCD syncs on a git change or a failed sync —
+# so a wedge that develops after a successful sync produces no drift, no failure, and
+# therefore no sync. The repair never fires and nothing reports a problem.
+#
+# Measured 2026-09-23: every SMB login failed with NT_STATUS_LOGON_FAILURE (eda-pcb-agent,
+# testadmin and testuser alike) while the same credentials authenticated fine against the
+# DCs, the FS-1$ machine account was intact, and the truenas Application read Synced/Healthy
+# throughout. The appliance had been in that state for an unknown number of days.
+#
+# ⚠ THIS IS A PROBE ON A TIMER, NOT A REPAIR ON A TIMER. dc-set-watch.yaml states the rule
+# this job obeys: configure-job's repair path DELETES FS-1$, and running it every tick would
+# arm that permanently (it has fired unattended before — 2026-08-31). So the schedule drives
+# a cheap read-only probe, and the destructive rung is reached only after the probe has
+# failed on TWO CONSECUTIVE TICKS, on top of the three internal sweeps _identity_works()
+# already does before it will report broken.
+#
+# ⚠ ESCALATION IS CHEAPEST-FIRST, and it stops the moment a probe passes:
+#     1. directoryservices.cache_refresh   no domain impact
+#     2. restart the cifs service          no domain impact
+#     3. clone and run truenas-configure   the existing repair path; may delete FS-1$
+#   After rung 3, it STOPS and shouts. Looping a destructive repair against an appliance that
+#   is broken for some other reason would turn one wedge into a rejoin storm.
+#
+# ⚠ IT RE-RUNS THE JOB DIRECTLY, IT DOES NOT SYNC THE APPLICATION — same reason
+# dc-set-watch.yaml does: forcing a sync on an already-Synced app does not reliably re-run
+# its hooks (measured repeatedly 2026-09-03, where a sync reported "successfully synced (no
+# more tasks)" and left the hook untouched).
+#
+# ⚠ AUTH BUDGET. The appliance locks out for TEN MINUTES cluster-wide (/home included) after
+# 20 auth attempts in 60s. One tick opens ONE websocket and reuses it for every probe call,
+# so a tick costs a single auth. That is also why the interval is 15m and not 1m: the wedge
+# persists until repaired, so there is nothing to gain from polling hard.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: truenas-identity-watch
+  namespace: samba-ad
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: truenas-identity-watch
+  namespace: samba-ad
+rules:
+# the Job to clone, and the ConfigMap holding the consecutive-failure streak
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  # ⚠ watch, not just get/list: `kubectl wait --for=condition=complete` opens a WATCH, and
+  # without it the wait still succeeds by falling back to polling while printing a wall of
+  # "Failed to watch ... is forbidden" that makes a healthy run look broken.
+  verbs: ["get", "list", "create", "watch"]
+# the backstop alert when every rung has been tried and the probe still fails
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: truenas-identity-watch
+  namespace: samba-ad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: truenas-identity-watch
+subjects:
+- kind: ServiceAccount
+  name: truenas-identity-watch
+  namespace: samba-ad
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truenas-identity-watch-src
+  namespace: samba-ad
+data:
+  probe.py: |
+    """Is the appliance able to resolve a domain USER right now?
+
+    Exits 0 when identity works, 1 when it does not, 2 when the probe itself could not run
+    (unreachable appliance, missing credentials) — which is NOT evidence of a wedge and must
+    never escalate.
+
+    ⚠ THE CLIENT IS IMPORTED, NOT COPIED. tnclient.py comes from the truenas-configure-src
+    ConfigMap that configure-job.yaml owns, so there is exactly one websocket client in the
+    repo and this job cannot drift from the one that does the repair.
+
+    ⚠ THE PROBE MUST BE A USER, AND ONE KNOWN TO HAVE A uidNumber. configure-job.yaml's
+    _identity_works() documents both traps at length and they apply here verbatim:
+      * a GROUP probe is not a substitute — a wedged member resolves AD\\Domain Users to its
+        gid while EVERY user returns "does not exist". A group fallback once reported
+        "identity works" and hid exactly the failure it existed to catch.
+      * Administrator/krbtgt are useless — neither has a uidNumber under idmap_backend AD,
+        so both correctly fail on a HEALTHY member.
+    So probe the users this repo provisions, read from the same truenas-home-users ConfigMap
+    configure-job reads. Empty list => exit 2, never 1: on a first bring-up there is
+    genuinely nothing to probe and "broken" would be a guess.
+    """
+    import os, sys
+
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS  # noqa: E402
+
+    NETBIOS = os.environ.get("AD_NETBIOS", "ad").upper()
+
+    def probes():
+        users = [u for u in os.environ.get("HOME_USERS", "").replace(",", " ").split() if u]
+        if users:
+            return users
+        path = os.environ.get("HOME_USERS_FILE", "")
+        if path and os.path.exists(path):
+            with open(path) as fh:
+                return [u for u in fh.read().replace(",", " ").split() if u]
+        return []
+
+    def main():
+        names = probes()
+        if not names:
+            print("no provisioned users to probe — cannot judge identity")
+            return 2
+
+        # ⚠ TrueNAS is a CONTEXT MANAGER — it connects in __enter__ and has no connect()
+        # or close(). One `with` block covers every probe call, which is also what keeps a
+        # tick to a SINGLE auth against the 20-per-60s lockout.
+        try:
+            tn_ctx = TrueNAS(os.environ["TN_HOST"], os.environ["TN_USER"], os.environ["TN_PASS"])
+        except Exception as exc:                                    # noqa: BLE001
+            print(f"cannot build the appliance client: {exc}")
+            return 2
+
+        try:
+            with tn_ctx as tn:
+                for name in names:
+                    try:
+                        tn.rpc("user.get_user_obj", [{"username": f"{NETBIOS}\\{name}"}])
+                        print(f"identity OK — {NETBIOS}\\{name} resolves")
+                        return 0
+                    except Exception:                               # noqa: BLE001
+                        print(f"  {NETBIOS}\\{name}: does not resolve")
+        except Exception as exc:                                    # noqa: BLE001
+            # Unreachable is NOT wedged. A lab outage must not spend a rung.
+            print(f"cannot reach the appliance: {exc}")
+            return 2
+
+        print(f"identity BROKEN — none of {len(names)} provisioned users resolve")
+        return 1
+
+    if __name__ == "__main__":
+        sys.exit(main())
+  repair.py: |
+    """Escalate one rung of the cheapest-first repair ladder. Rung is argv[1]: 1 or 2.
+
+    Rung 3 (clone truenas-configure) is deliberately NOT here — it is a kubectl operation the
+    shell does, so that the destructive step stays visible in the CronJob body rather than
+    buried in a python module.
+    """
+    import os, sys
+
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS  # noqa: E402
+
+    def main():
+        rung = sys.argv[1]
+        # ⚠ Context manager, not connect()/close() — see probe.py.
+        with TrueNAS(os.environ["TN_HOST"], os.environ["TN_USER"],
+                     os.environ["TN_PASS"]) as tn:
+            if rung == "1":
+                print("rung 1: directoryservices.cache_refresh")
+                tn.job("directoryservices.cache_refresh", [])
+            elif rung == "2":
+                print("rung 2: restarting cifs")
+                tn.rpc("service.control", ["RESTART", "cifs"])
+            else:
+                print(f"unknown rung {rung!r}")
+                return 2
+        return 0
+
+    if __name__ == "__main__":
+        sys.exit(main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: truenas-identity-watch
+  namespace: samba-ad
+spec:
+  # 15 minutes. The wedge persists until repaired, so a tighter interval buys nothing and
+  # costs auth budget against the 20-per-60s lockout.
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: truenas-identity-watch
+          restartPolicy: Never
+          # ⚠ MANDATORY, NOT A PREFERENCE — cloud pods cannot reach 192.168.1.0/24, so this
+          # must land on a lab node. Same selector and toleration as configure-job; without
+          # the mesh toleration the pod stays Pending FOREVER rather than failing, which is
+          # the worst diagnostic outcome.
+          nodeSelector:
+            ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+          - name: watch
+            # alpine/k8s carries both kubectl and python3, so one container covers the probe
+            # and the Job cloning.
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            command: ["/bin/sh", "-c"]
+            env:
+              - name: TN_HOST
+                value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+              # The AD NetBIOS DOMAIN (users type AD\alice). Not anchored, for the same
+              # reason configure-job.yaml gives: netbiosName reaches nothing through the
+              # anchor mechanism. Keep in step with project_settings.ts
+              # activeDirectory.netbiosName.
+              - name: AD_NETBIOS
+                value: "ad"
+              - name: HOME_USERS_FILE
+                value: /home-users/users
+              - name: TN_USER
+                valueFrom:
+                  secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER }
+              - name: TN_PASS
+                valueFrom:
+                  secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD }
+            volumeMounts:
+              - { name: src,        mountPath: /src,        readOnly: true }
+              - { name: watch-src,  mountPath: /watch,      readOnly: true }
+              - { name: home-users, mountPath: /home-users, readOnly: true }
+            args:
+              - |
+                set -eu
+                CM=truenas-identity-watch-state
+
+                streak=$(kubectl -n samba-ad get cm "$CM" -o jsonpath='{.data.failStreak}' 2>/dev/null || true)
+                streak=${streak:-0}
+                rung=$(kubectl -n samba-ad get cm "$CM" -o jsonpath='{.data.lastRung}' 2>/dev/null || true)
+                rung=${rung:-0}
+
+                record() {
+                  kubectl -n samba-ad create configmap "$CM" \
+                    --from-literal=failStreak="$1" \
+                    --from-literal=lastRung="$2" \
+                    --from-literal=lastResult="$3" \
+                    --from-literal=updated="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                }
+
+                set +e
+                python3 /watch/probe.py
+                rc=$?
+                set -e
+
+                # rc=2 means the probe could not judge (appliance unreachable, no users yet).
+                # NOT evidence of a wedge: leave the streak untouched so a lab outage cannot
+                # walk the ladder on its own.
+                if [ "$rc" = "2" ]; then
+                  echo "probe inconclusive — leaving the streak at $streak"
+                  record "$streak" "$rung" inconclusive
+                  exit 0
+                fi
+
+                if [ "$rc" = "0" ]; then
+                  if [ "$streak" != "0" ] || [ "$rung" != "0" ]; then
+                    echo "identity recovered — clearing the streak"
+                  fi
+                  record 0 0 ok
+                  exit 0
+                fi
+
+                streak=$((streak + 1))
+                echo "identity probe FAILED (consecutive ticks: $streak)"
+
+                # ⚠ ONE TICK IS NEVER ENOUGH. _identity_works() already retries three times
+                # 20s apart inside a single probe; this second gate spans ticks, so a DC
+                # restart or a winbind bounce that outlives one probe still cannot escalate.
+                if [ "$streak" -lt 2 ]; then
+                  echo "waiting for a second consecutive failure before acting."
+                  record "$streak" "$rung" failed
+                  exit 0
+                fi
+
+                next=$((rung + 1))
+                case "$next" in
+                  1|2)
+                    echo "escalating to rung $next"
+                    python3 /watch/repair.py "$next"
+                    record "$streak" "$next" "repaired-rung-$next"
+                    echo "rung $next applied; the next tick re-probes."
+                    ;;
+                  3)
+                    echo "escalating to rung 3 — re-running truenas-configure."
+                    echo "⚠ this may leave the domain and recreate FS-1\$."
+                    RUN="truenas-configure-identity-$(date +%s)"
+                    # Clone the hook Job's spec. Everything the API server owns or the batch
+                    # controller injects has to go, or the create is rejected: the generated
+                    # selector and the controller-uid/batch labels most of all. The ArgoCD
+                    # hook annotations go too — this copy is ours, and ArgoCD must not adopt
+                    # or prune it.
+                    # ⚠ RUN passed as a command-scoped env var: the python reads os.environ,
+                    # and a plain shell variable is not in the child's environment.
+                    kubectl -n samba-ad get job truenas-configure -o json \
+                      | RUN="$RUN" python3 -c '
+                import json, sys, os
+                j = json.load(sys.stdin)
+                j["metadata"] = {"name": os.environ["RUN"], "namespace": "samba-ad",
+                                 "labels": {"app": "truenas-configure-identity"}}
+                spec = j["spec"]
+                spec.pop("selector", None)
+                spec.pop("manualSelector", None)
+                tmpl = spec["template"]
+                tmpl["metadata"] = {"labels": {"app": "truenas-configure-identity"}}
+                j.pop("status", None)
+                json.dump({"apiVersion": "batch/v1", "kind": "Job",
+                           "metadata": j["metadata"], "spec": spec}, sys.stdout)
+                    ' > /tmp/job.json
+                    kubectl create -f /tmp/job.json
+                    record "$streak" 3 "repaired-rung-3"
+                    echo "waiting for $RUN ..."
+                    if kubectl -n samba-ad wait --for=condition=complete "job/$RUN" --timeout=900s; then
+                      echo "truenas-configure completed; the next tick re-probes."
+                    else
+                      echo "ERROR: $RUN did not complete." >&2
+                    fi
+                    ;;
+                  *)
+                    # ⚠ STOP. Every rung has been tried and identity is still broken, so the
+                    # cause is not one this job knows how to fix. Looping rung 3 would rejoin
+                    # the domain every 15 minutes forever.
+                    echo "IDENTITY WEDGED — MANUAL ACTION REQUIRED" >&2
+                    echo "  every repair rung has been applied and users still do not resolve." >&2
+                    echo "  Investigate before clearing $CM: see doc/truenas-vm.md." >&2
+                    kubectl -n samba-ad create event truenas-identity-wedged \
+                      --type=Warning --reason=IdentityWedged \
+                      --note="TrueNAS AD identity still broken after every repair rung; manual action required." \
+                      >/dev/null 2>&1 || true
+                    record "$streak" "$rung" wedged-manual
+                    exit 1
+                    ;;
+                esac
+          volumes:
+            - name: src
+              configMap: { name: truenas-configure-src }
+            - name: watch-src
+              configMap: { name: truenas-identity-watch-src }
+            - name: home-users
+              configMap:
+                name: truenas-home-users
+                optional: true

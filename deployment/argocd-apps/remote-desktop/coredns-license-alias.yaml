@@ -1,0 +1,177 @@
+# CoreDNS alias: `licence.internal` → the CURRENT FlexNet/SALT license host.
+#
+# WHY AN ALIAS AT ALL. The license host is TEMPORARY: a future license server will live
+# inside the cluster. The license VALUE is already indirect — it is a sealed secret
+# (`remote-desktop-secrets:license-server`) injected as env at container start, and NEITHER
+# tool bakes it into its image (hyperlynx writes registrator.ini from $SALT_LICENSE_SERVER in
+# an entrypoint shim; vivado reads $XILINXD_LICENSE_FILE). So switching servers never needs an
+# image rebuild.
+#
+# What the alias adds is indirection at the NAME level, so the cutover is a one-line DNS edit
+# here instead of resealing a secret and restarting every desktop:
+#     today:  licence.internal → the site licence host (eda-secrets:license-server)
+#     later:  licence.internal → <in-cluster license Service>.svc.cluster.local
+#
+# ⚠ A `rewrite`, not a hosts entry with a literal IP. The target is a name, so the answer
+# follows whatever that name resolves to — no IP pinned here to go stale. `answer auto`
+# rewrites the response name back to licence.internal so the client sees what it asked for.
+#
+# ── WHY A PATCH JOB AND NOT A ConfigMap MANIFEST ──────────────────────────────────────────
+# k3s mounts exactly ONE ConfigMap for CoreDNS customisation — `coredns-custom` in
+# kube-system, by hardcoded name (k3s manifests/coredns.yaml, volume `custom-config-volume`).
+# So every app's snippet has to land in that one object; a volume cannot merge several
+# ConfigMaps, and editing the CoreDNS Deployment to add one is reverted by the k3s addon
+# controller within ~15s.
+#
+# That object therefore has three contributors: samba-ad (`ad.server`), gitlab
+# (`gitlab-internal.override`) and this file. They MUST NOT be shipped as ConfigMap
+# manifests, because ALL ArgoCD Applications on one instance apply under the SAME
+# server-side-apply field manager, `argocd-controller`. When app A applies the object with
+# only its own key in `data`, SSA reads that as "argocd-controller no longer owns app B's
+# key" and DELETES it. That is correct SSA semantics, not a conflict, so nothing errors and
+# nothing retries: the losing app just sits OutOfSync while reporting a successful sync.
+#
+# Measured: as a plain ConfigMap manifest here, gitlab's sync stripped
+# `license-alias.override` and `licence.internal` went NXDOMAIN cluster-wide with no error
+# anywhere.
+#
+# So every contributor needs a DISTINCT field manager, which only a `kubectl patch` gives —
+# ArgoCD cannot be made to vary its manager per app. Each contributor owns its own key and
+# never the object: this app, gitlab, and `argocd-infra/samba-ad/dns-config-job.yaml`.
+#
+# ⚠ THE KEY MUST END IN `.override`. The Corefile imports `custom/*.override` INSIDE the
+# `.:53` block and `custom/*.server` at top level. A `rewrite` belongs inside the existing
+# block, so `.override` is correct here — whereas samba-ad's zone `forward` opens its own
+# server block and must be `.server`. Getting this wrong does not fail loudly: CoreDNS keeps
+# serving the OLD config and logs a parse error.
+#
+# NOTE ON REACHABILITY: the licence host IS reachable from the pod network — verified
+# Confirmed from both a plain runc pod and the gVisor desktop (cilium masquerades pod egress
+# with no exclusions, so no SNAT rule is needed). An earlier reading of "unreachable" was a
+# FALSE NEGATIVE taken while a broken `hostNetwork: true` was live on the desktop, which had
+# killed all of its networking — see [[gvisor-hostnetwork-breaks-clusterip-and-dns]].
+# This alias is therefore purely about the future cutover, not about connectivity.
+#
+# ⚠ FlexNet caveat, untested against the alias: lmgrd redirects clients to the license
+# server's own SHORT hostname — see [[hyperlynx-linux-launch-quirks]] item 5.
+# The redirect target must therefore still resolve from the pod, which it does. If a tool
+# ever rejects the alias, that redirect is the first thing to check.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-dns-alias
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+---
+# Cluster-scoped because the target object lives in kube-system, not in this app's namespace.
+# Narrowed to the single ConfigMap by name: this SA must never be able to touch another one.
+# No `delete` — this Job only ever patches its own key, and removing the object would take
+# the other two contributors' keys with it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: remote-desktop-dns-alias
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["coredns-custom"]
+    verbs: ["get", "patch"]
+  # `create` cannot be restricted by resourceName (the name does not exist yet at admission
+  # time), so it is granted separately and used only for the create-if-absent bootstrap.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: remote-desktop-dns-alias
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: remote-desktop-dns-alias
+subjects:
+  - kind: ServiceAccount
+    name: remote-desktop-dns-alias
+    namespace: remote-desktop
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-dns-alias
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: remote-desktop-dns-alias
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: dns-alias
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          # The licence host comes from the SEALED secret, not a literal: `license-server`
+          # is `<port>@<host>` (SALT_LICENSE_SERVER's shape), so the host is everything
+          # after the `@`. Same secret and namespace the desktop itself reads, so the alias
+          # can never point somewhere the desktops do not. A plaintext hostname here put a
+          # third party's licence server in git for no reason — and duplicated a value that
+          # already had one source of truth.
+          env:
+            - name: LICENSE_SERVER
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-server } }
+          args:
+            - |
+              set -euo pipefail
+
+              # Strip the `<port>@` prefix; tolerate a bare host if the secret ever holds one.
+              LICENSE_HOST="${LICENSE_SERVER##*@}"
+              if [ -z "$LICENSE_HOST" ]; then
+                echo "ERROR: eda-secrets:license-server is empty — no licence host to alias." >&2
+                exit 1
+              fi
+
+              read -r -d '' ALIAS_BLOCK <<EOF || true
+              rewrite stop {
+                name exact licence.internal ${LICENSE_HOST}
+                answer auto
+              }
+              EOF
+
+              # Create the object if absent. k3s mounts it `optional: true`, so an empty
+              # ConfigMap is harmless — and without this the patch below fails with
+              # `configmaps "coredns-custom" not found` whenever this app happens to sync
+              # before gitlab and samba-ad on a fresh cluster.
+              #
+              # A SEPARATE field manager from the patch: this only ever asserts the object's
+              # existence, never its `data`, so it can never own — and therefore never drop —
+              # another contributor's key.
+              kubectl create configmap coredns-custom -n kube-system \
+                --dry-run=client -o yaml | kubectl apply --server-side \
+                --field-manager=remote-desktop-dns-alias-bootstrap -f - 2>/dev/null || true
+
+              # The actual write. `patch --type merge` touches ONLY this key, and the
+              # dedicated --field-manager is what keeps it out of argocd-controller's
+              # ownership set — see the header for why that is the whole point.
+              kubectl patch configmap coredns-custom -n kube-system \
+                --field-manager=remote-desktop-dns-alias --type merge \
+                -p "$(jq -n --arg v "$ALIAS_BLOCK" '{data:{"license-alias.override":$v}}')"
+
+              echo "CoreDNS alias licence.internal -> ${LICENSE_HOST} applied to coredns-custom"

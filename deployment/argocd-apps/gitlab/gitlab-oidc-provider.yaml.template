@@ -1,0 +1,31 @@
+# OmniAuth OIDC provider configuration for GitLab.
+# This file is a template — sealSecrets.sh substitutes the client secret
+# and seals it as gitlab-oidc-provider sealed secret.
+#
+# GitLab expects the provider config as a JSON blob in the 'provider' key.
+# Reference: https://docs.gitlab.com/ee/administration/auth/oidc.html
+name: openid_connect
+label: "Authentik SSO"
+# Map Authentik group membership to GitLab admin. These are provider-level keys
+# (siblings of args). The "groups" claim is emitted by the scope-groups mapping
+# on the gitlab provider (blueprint-apps.yaml) and requested via the groups scope.
+groups_attribute: groups
+admin_groups:
+  - gitlab-admins
+args:
+  name: openid_connect
+  scope:
+    - openid
+    - profile
+    - email
+    - groups
+  response_type: code
+  issuer: https://id.subdomain1.your-domain.tld/application/o/gitlab/ # automatically updated from project-settings:{general.subdomain,general.domain}
+  discovery: true
+  client_auth_method: query
+  uid_field: preferred_username
+  pkce: true
+  client_options:
+    identifier: gitlab
+    secret: OIDC_CLIENT_SECRET_PLACEHOLDER
+    redirect_uri: https://gitlab.subdomain1.your-domain.tld/users/auth/openid_connect/callback # automatically updated from project-settings:{general.subdomain,general.domain}

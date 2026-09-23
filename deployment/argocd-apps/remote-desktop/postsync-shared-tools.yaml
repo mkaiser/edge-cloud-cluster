@@ -1,0 +1,87 @@
+# PostSync: publish the curated scripts from git into /shared/tools on the fileserver.
+#
+# WHY A JOB AND NOT THE BASE IMAGE: baking these in would tie every script edit to a
+# base-image rebuild, which takes the whole desktop down for the build (Recreate
+# strategy — see build-files-configmap.yaml r30). These are plain text read at run time,
+# so the share is the right delivery: an edit here reaches users on the next sync with
+# no image build and no downtime.
+#
+# ⚠ THE CONFIGMAP IS THE SOURCE OF TRUTH, NOT THE .sh FILE NEXT TO IT. ArgoCD ships the
+# ConfigMap; the standalone script is what humans edit and what CI could lint. They are
+# kept in step by sync-shared-tools.sh. Editing only the .sh is a SILENT no-op — the
+# same trap [[build-files-configmap-is-the-real-source]] records for the build files.
+#
+# Idempotent and safe to re-run: it overwrites by content, and a failed copy leaves the
+# previous version in place rather than a truncated file (write to .tmp, then mv).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-shared-tools
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-shared-tools
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: remote-desktop-shared-tools
+      # The share is lab-only (networks: [LAB_CIDR] on the export), so this Job must run
+      # where that mount is reachable — the same site as the desktop.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: publish
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              DEST=/shared/tools
+              [ -d "$DEST" ] || { echo "ERROR: $DEST missing — has truenas/configure-job run?"; exit 1; }
+              for f in /files/*; do
+                n=$(basename "$f")
+                # .tmp + mv so a reader never sees a half-written script, and a failure
+                # leaves the previous version intact.
+                cp "$f" "$DEST/.$n.tmp"
+                chmod 0755 "$DEST/.$n.tmp"
+                mv -f "$DEST/.$n.tmp" "$DEST/$n"
+                echo "published $n"
+              done
+              ls -l "$DEST"
+          volumeMounts:
+            - { name: files, mountPath: /files, readOnly: true }
+            - { name: shared, mountPath: /shared }
+      volumes:
+        - name: files
+          configMap:
+            name: remote-desktop-shared-tools-files
+            defaultMode: 0755
+        - name: shared
+          persistentVolumeClaim: { claimName: nfs-shared-data }

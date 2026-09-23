@@ -1,0 +1,239 @@
+# PostSync: seed the HERMES DESKTOP's Guacamole tile into remote-desktop's Guacamole.
+#
+# ── WHY THE TILE LIVES HERE AND NOT IN remote-desktop/ ────────────────────────
+# This app owns its own tile so that disabling it removes the tile's source with it, and so
+# that nothing outside this folder has to change to add a workstation. Precedent:
+# eda-pcb-agent/connection-seed.yaml and windows/connection-seed.yaml are the same shape —
+# an app seeding its own tile from its own namespace, keying every INSERT on
+# connection_name so two independent seeders never collide.
+#
+# ⚠ THIS IS A REAL CROSS-APP RUNTIME DEPENDENCY. If remote-desktop is disabled or its
+# Postgres is down, this Job fails and the desktop has no tile. The AGENT is unaffected —
+# it keeps serving /v1 and its dashboard; only the GUI is unreachable. `retry` recovers the
+# tile when remote-desktop returns.
+#
+# ── THE AUDIENCE ──────────────────────────────────────────────────────────────
+# `eda-pcb-agent-users` and `authentik-admins`:
+#   • eda-pcb-agent — the shared agent account, already a member of eda-pcb-agent-users, so
+#     granting that group needs no new Authentik object;
+#   • testadmin — reaches it through `authentik-admins`, which it holds via the
+#     `ecc/seed: admin-only` sync. Nothing app-specific was needed for it.
+#
+# ⚠ TWO GRANTS ARE REQUIRED AND THEY LIVE IN DIFFERENT APPS. This one decides who sees the
+# TILE; `access-remote-desktop` in remote-desktop/authentik-provider.yaml decides who
+# reaches the Guacamole PORTAL AT ALL. Authentik denies an application outright once >=1
+# binding exists and the user matches none, so a group granted here but missing there is
+# seeded and never seen — a perfect silent failure.
+#
+# ⚠ NO NetworkPolicy work is needed: neither remote-desktop nor its CNPG cluster has one, so
+# cross-namespace 5432 is already open. If that ever changes, this Job breaks with a
+# connection timeout rather than an auth error.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-desktop-connection-seed
+  namespace: hermes
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+# ⚠ READ THE DB PASSWORD LIVE, DO NOT SEAL A SECOND COPY. A sealed copy would silently
+# diverge the moment remote-desktop's password is rotated, and the seed would then fail with
+# an auth error that reads like a database outage. Pinned to that one Secret, `get` only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hermes-desktop-guacamole-db
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["remote-desktop-secrets"]   # ⚠ this one Secret, nothing else
+    verbs: ["get"]                              # ⚠ get only — no list, no watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hermes-desktop-guacamole-db
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hermes-desktop-guacamole-db
+subjects:
+  - kind: ServiceAccount
+    name: hermes-desktop-connection-seed
+    namespace: hermes
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hermes-desktop-connection-seed
+  namespace: hermes
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # 5: after the Authentik provider job (0), because the Guacamole group entities below
+    # must match the Authentik group names that job creates.
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation, so a TTL buys nothing and COSTS the post-mortem:
+  # it deletes the pod, and with it the only copy of the logs. Alloy/Loki does not save you
+  # here — its pod discovery is a poll, so a short-lived Job can finish and be deleted before
+  # it is ever scraped.
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: hermes-desktop-connection-seed
+      initContainers:
+        # ⚠ A SEPARATE CONTAINER PURELY TO READ THE PASSWORD. The seed itself runs in the
+        # postgres image, which has psql but NO kubectl; this one has kubectl but no psql.
+        # remote-desktop's equivalent needs neither hop because its Secret is in its OWN
+        # namespace and reachable with a plain secretKeyRef — ours is cross-namespace, and a
+        # secretKeyRef cannot cross namespaces. Writing it to a shared emptyDir is what
+        # bridges the two images.
+        - name: fetch-db-password
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              kubectl get secret remote-desktop-secrets -n remote-desktop \
+                -o jsonpath='{.data.db-password}' | base64 -d > /creds/pgpassword
+              if [ ! -s /creds/pgpassword ]; then
+                echo "ERROR: could not read remote-desktop's Guacamole DB password." >&2
+                echo "  Is the remote-desktop app deployed? This tile lives in its Guacamole." >&2
+                exit 1
+              fi
+              chmod 0600 /creds/pgpassword
+              echo "read the Guacamole DB password ($(wc -c < /creds/pgpassword) bytes)"
+          volumeMounts:
+            - name: creds
+              mountPath: /creds
+      containers:
+        - name: seed
+          image: docker.io/postgres:18-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          # ⚠ NO RDP_USERNAME / RDP_PASSWORD, deliberately — unlike eda-pcb-agent's tile.
+          # This desktop serves PER-USER LDAP sessions: each employee authenticates to xrdp
+          # with their own AD credentials. Static credentials here would mean one shared
+          # account for everyone, which defeats the per-user identity the whole storage and
+          # home-directory design rests on. remote-desktop's tile omits them for the same
+          # reason; eda-pcb-agent carries them only because it IS one shared account.
+          volumeMounts:
+            - name: creds
+              mountPath: /creds
+              readOnly: true
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # ⚠ FQDN, not the bare Service name: this is a cross-namespace connection.
+              PGHOST=guacamole-pg-rw.remote-desktop.svc.cluster.local
+              PGPORT=5432
+              PGUSER=guacamole_user
+              PGDB=guacamole_db
+              # Written by the initContainer — this image has psql but no kubectl.
+              PGPASSWORD=$(cat /creds/pgpassword)
+              export PGPASSWORD
+              [ -n "$PGPASSWORD" ] || { echo "ERROR: empty Guacamole DB password" >&2; exit 1; }
+
+              echo "Waiting for the Guacamole DB..."
+              i=1
+              until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDB" >/dev/null 2>&1; do
+                if [ "$i" -ge 60 ]; then
+                  echo "ERROR: Guacamole DB unreachable after 5 min." >&2
+                  echo "  This app's tile lives in remote-desktop's Guacamole; if that app is" >&2
+                  echo "  disabled or down, this Job cannot succeed. The app's retry will" >&2
+                  echo "  recover it when remote-desktop returns." >&2
+                  exit 1
+                fi
+                echo "  try ${i}/60..."; i=$((i+1)); sleep 5
+              done
+
+              # ⚠ BOUNDED, and it FAILS rather than blocking. This is a PostSync hook, so an
+              # unbounded wait blocks the whole sync forever — that once wedged remote-desktop
+              # for 4+ days. Failing lets ArgoCD report it and retry later.
+              for _ in $(seq 1 60); do
+                psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "\d guacamole_entity" >/dev/null 2>&1 && break
+                echo "  schema not ready yet, retrying in 5s..."
+                sleep 5
+              done
+              if ! psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "\d guacamole_entity" >/dev/null 2>&1; then
+                echo "ERROR: guacamole_entity absent after 5 min — has the Guacamole chart's initDb run?" >&2
+                exit 1
+              fi
+
+              # ⚠ The heredoc is QUOTED (<<'SQL'): nothing in it is expanded by the shell.
+              # This seed passes no credentials at all, so there is nothing to bind.
+              psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" <<'SQL'
+              -- Group entities. ⚠ These names MUST match real Authentik GROUP names:
+              -- Guacamole's openid extension maps a user's `groups` claim onto user-group
+              -- names, so a mismatch silently grants nobody access.
+              -- Both groups already exist: eda-pcb-agent-users is created by that app's
+              -- authentik-provider.yaml, and authentik-admins centrally. Neither needs a new
+              -- Authentik object here — the shared provider's groups scope emits the user's
+              -- full group list already.
+              INSERT INTO guacamole_entity (name, type)
+              VALUES ('eda-pcb-agent-users', 'USER_GROUP'), ('authentik-admins', 'USER_GROUP')
+              ON CONFLICT (type, name) DO NOTHING;
+
+              INSERT INTO guacamole_user_group (entity_id, disabled)
+              SELECT entity_id, false FROM guacamole_entity
+              WHERE name IN ('eda-pcb-agent-users', 'authentik-admins') AND type = 'USER_GROUP'
+              ON CONFLICT (entity_id) DO NOTHING;
+
+              -- The tile. ⚠ parent_id IS NULL and ON CONFLICT ignores NULLs, so idempotency
+              -- is WHERE NOT EXISTS rather than ON CONFLICT.
+              -- ⚠ THE NAME STATES WHAT THIS IS: a GUI onto the Hermes agent's own pod,
+              -- not a general workstation. What you see in /opt/data IS the agent's state.
+              INSERT INTO guacamole_connection (connection_name, protocol, parent_id)
+              SELECT 'Hermes Agent Desktop', 'rdp', NULL
+              WHERE NOT EXISTS (
+                SELECT 1 FROM guacamole_connection
+                WHERE connection_name = 'Hermes Agent Desktop' AND parent_id IS NULL
+              );
+
+              -- ⚠ Cross-namespace, so the hostname is the FQDN.
+              -- ⚠ NO username/password rows: the user types their own AD credentials at
+              -- xrdp's greeter. See the env note above for why.
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, p.name, p.value
+              FROM guacamole_connection c
+              CROSS JOIN (VALUES
+                ('hostname', 'hermes.hermes.svc.cluster.local'),
+                ('port', '3389'),
+                ('security', 'any'),
+                ('ignore-cert', 'true'),
+                ('resize-method', 'display-update')
+              ) AS p(name, value)
+              WHERE c.connection_name = 'Hermes Agent Desktop'
+              ON CONFLICT (connection_id, parameter_name)
+                DO UPDATE SET parameter_value = EXCLUDED.parameter_value;
+
+              -- READ for both groups.
+              INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)
+              SELECT e.entity_id, c.connection_id, 'READ'
+              FROM guacamole_entity e
+              CROSS JOIN guacamole_connection c
+              WHERE e.name IN ('eda-pcb-agent-users', 'authentik-admins') AND e.type = 'USER_GROUP'
+                AND c.connection_name = 'Hermes Agent Desktop'
+              ON CONFLICT (entity_id, connection_id, permission) DO NOTHING;
+              SQL
+
+              echo "Hermes Agent Desktop tile seeded into remote-desktop's Guacamole."
+      volumes:
+        # In-memory: the DB password never touches a disk.
+        - name: creds
+          emptyDir:
+            medium: Memory

@@ -1,0 +1,356 @@
+# PreSync: make sure the `eda-pcb-agent` AD ACCOUNT exists before the pod that needs it.
+#
+# ── THE GAP THIS CLOSES ───────────────────────────────────────────────────────
+# authentik-user-job.yaml (weight -2) creates the Authentik user and puts it in `employees`.
+# That is only the first link. The chain the desktop actually depends on is:
+#
+#   Authentik user in `employees`
+#     -> samba-ad/postsync-provision-users.yaml   provisions the AD account (uidNumber=5000+pk)
+#     -> truenas/configure-job.yaml step_homes    creates /mnt/datapool/homes/eda-pcb-agent
+#     -> sssd resolves the user, the home mounts, the pod starts
+#
+# Links 2 and 3 are Jobs owned by OTHER apps, and both run only when THEIR app syncs. On a
+# recreate samba-ad is infra wave 13 and truenas wave 16 — both long finished by the time this
+# apps-wave app creates its Authentik user. So nothing ever provisions it, the desktop
+# crash-loops on "does not resolve after 60s" forever, and no amount of retrying this app
+# helps: the missing work is in a different Application. Measured on ecc208.
+#
+# ── WHY IT RE-RUNS THE JOBS AND DOES NOT SYNC THE APPS ────────────────────────
+# ⚠ `argocd app sync samba-ad` IS FORBIDDEN. It rolls EVERY domain controller and can deadlock
+# on the tls.key 0600 CVE check — samba-ad/replication-guard.yaml and replication-job.yaml
+# both say so in their failure output. Taking the site's directory down to add one user is not
+# a trade worth making.
+# ⚠ And it would not even work: forcing a sync on an already-Synced app does not reliably
+# re-run its hooks (measured repeatedly 2026-09-03 — "successfully synced (no more tasks)"
+# with the hook untouched).
+#
+# So it starts each one directly, by two mechanisms that differ only because the two owning
+# apps are shaped differently:
+#   • samba-ad provisioning — `kubectl create job --from=cronjob/samba-ad-provision-users`.
+#     That app keeps its provisioning in a SUSPENDED CRONJOB precisely so anyone can launch a
+#     run without a sync; its header explains why a hook Job could not serve this, and why an
+#     already-self-deleted one could never be recovered.
+#   • truenas-configure — cloned from the live hook Job, the same spec surgery
+#     truenas/dc-set-watch.yaml performs on that very Job. It survives green runs (its
+#     hook-delete-policy is BeforeHookCreation only), so there is always something to copy.
+# ⚠ If truenas-configure ever gains `HookSucceeded`, the clone path here dies the same way
+# samba-ad's did. It would then need the same treatment: a suspended CronJob template.
+#
+# ⚠ ONLY ON A REAL CHANGE, NEVER ON EVERY SYNC. The fast path is a single read: if the AD
+# account already resolves with a directory uidNumber, this exits 0 having touched nothing.
+# That discipline is not tidiness, it is required twice over:
+#   - the appliance rate-limits authentication at 20 per 60s and then LOCKS OUT for ten
+#     minutes, cluster-wide, /home included;
+#   - truenas-configure carries a leave-and-rejoin repair path that deletes the appliance's
+#     machine account. Running it when a user was genuinely added is exactly when a human
+#     would have run it by hand. Running it every sync would arm that permanently.
+#
+# ⚠ truenas-configure runs ONLY in the branch that just created the account. If the account
+# was already there, its home was created by the same run that made it, and the desktop's own
+# `/home/$AGENT_USER` check is the backstop — with a FATAL that names truenas-configure.
+#
+# ── THE GRANT ─────────────────────────────────────────────────────────────────
+# ⚠ `jobs: create` in the samba-ad namespace is a real privilege: a Job created there runs
+# with that namespace's ServiceAccounts. It is the same order of authority this app already
+# holds for keytab-job.yaml, whose own header calls exec-into-the-DC "domain-admin adjacent",
+# and it is scoped as tightly as the verb allows — get/list/watch/create only, no delete, no
+# patch, in one namespace.
+# ⚠ NEVER bind this to the workload pod's ServiceAccount. That pod runs
+# automountServiceAccountToken: false and has no API identity at all, deliberately: it
+# executes LLM-generated shell. Only this short-lived PreSync Job may do any of the above.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-pcb-agent-ad-account
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-pcb-agent-ad-account
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  # Read the DC and ask it whether the account exists. Same shape as keytab-job.yaml's grant.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Start a provisioning run from samba-ad's suspended CronJob template.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get"]
+  # Create runs and wait for them.
+  # ⚠ `watch` is not optional: `kubectl wait --for=condition=complete` opens a WATCH, and
+  # without it the wait fails outright rather than falling back to polling.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+  # ⚠ THE HOME-PROVISIONING MARKER LIVES HERE, NOT IN eda-pcb-agent. It used to sit in this
+  # app's own namespace, which meant DELETING THE APP DELETED THE MARKER — and the next sync
+  # then read uid '<none>', concluded the homes had never been provisioned, and tried to
+  # repair a home that was already correct. That repair clones samba-ad/truenas-configure,
+  # which deletes itself on success, so the clone target is usually absent and the hook fails
+  # outright. Measured 2026-09-22: app Degraded, two ad-account pods in Error, while
+  # /home/eda-pcb-agent was present and correctly owned by uid 5021 the whole time.
+  # The marker was never ArgoCD-tracked (no tracking labels), so `prune` was not the cause —
+  # it died with the NAMESPACE. samba-ad owns identity and outlives this app, so the fact
+  # "which uid the homes were provisioned for" belongs here.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-pcb-agent-ad-account
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-pcb-agent-ad-account
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-ad-account
+    namespace: eda-pcb-agent
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-pcb-agent-ad-account
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # Wave 0: AFTER authentik-user-job, which is the ONE thing this Job must follow — it
+    # cannot provision an AD account for a user that does not exist yet. That Job declares
+    # sync-wave -2; everything else here is wave 0 and runs alongside this, which is fine
+    # because nothing else feeds it.
+    # ⚠ sync-wave, NOT hook-weight — see authentik-user-job.yaml. hook-weight is not an
+    # ArgoCD annotation at all; with it, this Job and that one ran in the same second.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # ⚠ backoffLimit 1. Each attempt can reach the appliance through truenas-configure, and the
+  # appliance locks out for ten minutes after 20 auth attempts per 60s. The app's own
+  # `retry: limit: -1` is the outer loop; this Job must not become an inner one.
+  backoffLimit: 1
+  # Long: provisioning plus an appliance reconfiguration, each waited on serially.
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-pcb-agent-ad-account
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: ad-account
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AGENT_USER
+              value: "eda-pcb-agent"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              # ⚠ The CLOUD DC, by pod name — the same target keytab-job.yaml uses. Any DC can
+              # answer this; naming one keeps the exec target deterministic.
+              DC=ad-cloud-0
+              MY_NS=eda-pcb-agent
+              # ⚠ THE MARKER NAMESPACE IS samba-ad, NOT MY_NS — see the Role above. Storing it
+              # in this app's own namespace made it die with the app, and a missing marker
+              # reads as "homes never provisioned", which triggers a repair that cannot run.
+              STATE_NS=samba-ad
+              STATE_CM=eda-pcb-agent-ad-account-state
+
+              # uidNumber straight out of the directory. EMPTY means "no account", and that is
+              # the only thing this function reports — a present account with no uidNumber is
+              # caught by the range assert below, not silently accepted.
+              ad_uid() {
+                kubectl exec -n samba-ad "$DC" -c samba -- \
+                  samba-tool user show "$AGENT_USER" 2>/dev/null \
+                  | sed -n 's/^uidNumber: //p' | head -1
+              }
+
+              i=1
+              until kubectl get pod -n samba-ad "$DC" >/dev/null 2>&1; do
+                [ "$i" -ge 60 ] && {
+                  echo "ERROR: $DC not found after 10m — cannot check or create the account." >&2
+                  echo "  On a first bring-up this is EXPECTED until wave13-samba-ad has synced;" >&2
+                  echo "  the app's retry brings us back." >&2
+                  exit 1
+                }
+                echo "  try ${i}/60: waiting for $DC..."; i=$((i+1)); sleep 10
+              done
+
+              # ── FAST PATH ────────────────────────────────────────────────────
+              # ⚠ "The account exists" is NOT sufficient, and assuming it was a real bug.
+              # uid = 5000 + Authentik pk, and the pk MOVES ON EVERY RECREATE — while the home
+              # on the fileserver is on a Retain dataset and survives. So a recreate routinely
+              # produces an existing account whose home is owned by the PREVIOUS uid: measured
+              # on ecc208, /home/eda-pcb-agent was owned by 5022 while the account was 5025,
+              # mode 0700, so the agent could not enter its own home. The desktop came up and
+              # every session was broken — no tmux, no profile.
+              #
+              # So the gate is on the uid we have actually PROVISIONED HOMES FOR, recorded in a
+              # ConfigMap this app owns. Same shape as truenas/dc-set-watch.yaml: compare live
+              # state against a marker I own, act only on a real change. truenas-configure
+              # chowns an existing home to the current uid (configure-job.yaml step_homes says
+              # so explicitly), which is exactly the repair needed.
+              UID_NOW=$(ad_uid || true)
+              UID_SEEN=$(kubectl -n "$STATE_NS" get cm "$STATE_CM" \
+                           -o jsonpath='{.data.homesProvisionedForUid}' 2>/dev/null || true)
+              if [ -n "$UID_NOW" ] && [ "$UID_NOW" = "$UID_SEEN" ]; then
+                echo "AD account ${AGENT_USER} exists (uidNumber=${UID_NOW}) and homes were"
+                echo "  provisioned for that uid — nothing to do"
+                exit 0
+              fi
+              if [ -n "$UID_NOW" ]; then
+                echo "AD account ${AGENT_USER} exists (uidNumber=${UID_NOW}) but homes were"
+                echo "  last provisioned for uid '${UID_SEEN:-<none>}' — reconciling the home."
+              else
+                echo "AD account ${AGENT_USER} is ABSENT — provisioning it."
+              fi
+
+              # Clone a hook Job's spec under a new name. Everything the API server owns or the
+              # batch controller injects has to go or the create is rejected: the generated
+              # selector and the controller-uid/batch labels most of all. The ArgoCD hook
+              # annotations go too — this copy is OURS, and ArgoCD must not adopt or prune it.
+              # ⚠ RUN is passed as a COMMAND-SCOPED env var: the python reads os.environ, and a
+              # plain shell variable is not in the child's environment.
+              # Used for truenas-configure ONLY (samba-ad provisioning goes via --from above).
+              clone_and_run() {
+                _src="$1"; _run="$2"; _timeout="$3"
+                # ⚠ THE CLONE SOURCE IS ROUTINELY ABSENT, AND THAT IS NORMAL. truenas-configure
+                # is another app's ArgoCD hook and deletes itself on success, so after any
+                # successful TrueNAS sync there is nothing here to clone. There is no CronJob
+                # form of it either (samba-ad has only provision-users/sites/replication-guard),
+                # so unlike samba-ad provisioning above this cannot fall back to --from=cronjob.
+                #
+                # Waiting is the right move rather than failing: truenas-configure is itself a
+                # hook, so the app that owns it recreates it on its next sync, and this hook is
+                # retried. Failing immediately turns a timing gap into a Degraded app.
+                if ! kubectl -n samba-ad get job "$_src" >/dev/null 2>&1; then
+                  echo "  Job samba-ad/$_src is absent (it deletes itself on success)."
+                  echo "  Waiting up to 5m for the owning app to recreate it..."
+                  _w=1
+                  until kubectl -n samba-ad get job "$_src" >/dev/null 2>&1; do
+                    [ "$_w" -ge 30 ] && {
+                      echo "ERROR: Job samba-ad/$_src did not reappear within 5m." >&2
+                      echo "  RECOVERY: re-apply it so a clone source exists, then sync this app:" >&2
+                      echo "    kubectl apply -f deployment/argocd-infra/truenas/configure-job.yaml" >&2
+                      echo "  ⚠ Check FIRST whether a repair is even needed: if /home/${AGENT_USER}" >&2
+                      echo "  is present and owned by uidNumber ${UID_NOW:-?}, nothing is broken and" >&2
+                      echo "  the marker (samba-ad/${STATE_CM}) is simply missing. Recording it is" >&2
+                      echo "  then the correct fix, NOT a full appliance reconfiguration:" >&2
+                      echo "    kubectl -n samba-ad create configmap ${STATE_CM} \\" >&2
+                      echo "      --from-literal=homesProvisionedForUid=${UID_NOW:-<uid>}" >&2
+                      return 1
+                    }
+                    echo "    try ${_w}/30: waiting for $_src..."; _w=$((_w+1)); sleep 10
+                  done
+                  echo "  $_src reappeared — cloning it."
+                fi
+                kubectl -n samba-ad get job "$_src" -o json \
+                  | RUN="$_run" python3 -c '
+              import json, sys, os
+              j = json.load(sys.stdin)
+              j["metadata"] = {"name": os.environ["RUN"], "namespace": "samba-ad",
+                               "labels": {"app": "eda-pcb-agent-ad-account"}}
+              spec = j["spec"]
+              spec.pop("selector", None)
+              spec.pop("manualSelector", None)
+              spec["template"]["metadata"] = {"labels": {"app": "eda-pcb-agent-ad-account"}}
+              j.pop("status", None)
+              json.dump({"apiVersion": "batch/v1", "kind": "Job",
+                         "metadata": j["metadata"], "spec": spec}, sys.stdout)
+              ' > /tmp/job.json
+                kubectl create -f /tmp/job.json
+                echo "waiting for $_run (up to ${_timeout})..."
+                kubectl -n samba-ad wait --for=condition=complete "job/$_run" --timeout="$_timeout"
+              }
+
+              TS=$(date +%s)
+
+              # ── 1. Authentik -> AD ───────────────────────────────────────────
+              # Skipped when the account is already there and only the home is stale — that
+              # run resets the authentik-sync account's password and touches every employee,
+              # so it is not something to do for a chown.
+              if [ -n "$UID_NOW" ]; then
+                echo "skipping AD provisioning — the account already exists"
+              else
+              # ⚠ --from=cronjob, NOT a clone. samba-ad keeps this work in a suspended CronJob
+              # exactly so that a launch needs no sync and no spec surgery; see its header.
+              PROV="pcbagent-provision-users-$TS"
+              if ! kubectl -n samba-ad get cronjob samba-ad-provision-users >/dev/null 2>&1; then
+                echo "ERROR: cronjob/samba-ad-provision-users does not exist." >&2
+                echo "  It is an ordinary resource of the samba-ad app (infra wave 13), so if" >&2
+                echo "  it is missing that app has not synced this revision yet." >&2
+                exit 1
+              fi
+              echo "starting $PROV from cronjob/samba-ad-provision-users"
+              kubectl -n samba-ad create job "$PROV" --from=cronjob/samba-ad-provision-users
+              if ! kubectl -n samba-ad wait --for=condition=complete "job/$PROV" --timeout=900s; then
+                echo "ERROR: provisioning run did not complete." >&2
+                echo "  Its logs: kubectl -n samba-ad logs job/$PROV" >&2
+                exit 1
+              fi
+
+              # ⚠ ASSERT, do not assume. A green provisioning run that skipped this user (not
+              # in `employees`, or filtered out by user.type) would otherwise hand a broken
+              # cluster to the Sync phase, where it reappears as a crash-looping desktop.
+              UID_NOW=$(ad_uid || true)
+              if [ -z "$UID_NOW" ]; then
+                echo "FATAL: ${AGENT_USER} STILL has no AD account after a successful run." >&2
+                echo "  The provisioning Job selects members of the 'employees' group and only" >&2
+                echo "  type=internal users. Check that authentik-user-job.yaml put this user" >&2
+                echo "  in 'employees' — that is the one thing it must do." >&2
+                exit 1
+              fi
+              # It came from the DIRECTORY, not a local account: uid = 5000 + Authentik pk, so
+              # only the RANGE is a stable invariant — the value moves on every recreate.
+              if [ "$UID_NOW" -lt 5000 ]; then
+                echo "FATAL: uidNumber $UID_NOW is below 5000 — that is not a directory uid." >&2
+                exit 1
+              fi
+              echo "AD account ${AGENT_USER} provisioned, uidNumber=${UID_NOW}"
+              fi
+
+              # ── 2. the home on the fileserver ────────────────────────────────
+              # step_homes creates /mnt/datapool/homes/<user> for every `employees` member.
+              # ⚠ Reached ONLY from this branch — see the header on the repair path.
+              if ! clone_and_run truenas-configure "pcbagent-truenas-configure-$TS" 1200s; then
+                echo "ERROR: the appliance reconfiguration did not complete." >&2
+                echo "  Its logs: kubectl -n samba-ad logs job/pcbagent-truenas-configure-$TS" >&2
+                echo "  The AD account EXISTS (uidNumber=${UID_NOW}); what is missing is the" >&2
+                echo "  home directory, so the desktop will FATAL naming truenas-configure." >&2
+                exit 1
+              fi
+              echo "home provisioning run complete for ${AGENT_USER}"
+
+              # ⚠ Record ONLY after the run succeeded, so a failure is retried on the next sync
+              # instead of being remembered as done. (dc-set-watch.yaml makes the same point
+              # about its own marker.)
+              kubectl -n "$STATE_NS" create configmap "$STATE_CM" \
+                --from-literal=homesProvisionedForUid="$UID_NOW" \
+                --dry-run=client -o yaml | kubectl -n "$STATE_NS" apply -f - >/dev/null
+              echo "recorded homesProvisionedForUid=${UID_NOW} in ${STATE_NS}/${STATE_CM}"
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }

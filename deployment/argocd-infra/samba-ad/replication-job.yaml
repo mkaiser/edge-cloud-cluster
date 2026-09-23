@@ -1,0 +1,941 @@
+# Sync Job: assert that AD replication is actually established, and repair it if not.
+#
+# WHY THIS EXISTS: an empty replication neighbour list is the quietest possible failure.
+# Both DCs answer authentication perfectly from their own local sam.ldb, `samba-tool
+# computer list` shows both machine accounts, and every pod reports Healthy — while the two
+# directories diverge silently. Authentik provisions users into the CLOUD DC
+# (postsync-provision-users.yaml), and the ON-PREM DC is the one TrueNAS and the laptops
+# authenticate against. So the end state without this Job is: Authentik creates a user, the
+# user cannot log into the file server, and nothing anywhere reports a problem.
+#
+# That is a correctness bug, not a tidiness one. Nothing else in this app touches
+# replication: dns-config-job fixes resolvers, sites-job creates sites/subnets, and
+# postsync-provision-users writes users. Samba's KCC normally builds the topology unaided,
+# but "normally" is not a mechanism — when it does not, nothing else in the repo notices.
+#
+# WHAT ACTUALLY BREAKS REPLICATION HERE: the on-prem DC's A records.
+# `ad-onprem-0` is a hostNetwork pod, so samba_dnsupdate self-registers EVERY address it
+# sees — the lab LAN address, the mesh address and the node's CNI address — and keeps
+# re-adding them on every run. Only the mesh address is routable from the cloud, so the
+# cloud DC round-robins onto a dead one and replication fails with WERR_SEM_TIMEOUT.
+#
+# Reprovisioning the on-prem node makes it worse: re-adoption assigns a NEW tailscale
+# address and a new pod CIDR slice, samba_dnsupdate only ever ADDS, and the old records
+# live on in sam.ldb, replicate, and never expire. The live address may not be registered
+# at all while every registered one is dead.
+#
+# THE PREDICATE IS THEREFORE REACHABILITY-BASED, NOT SUBNET-BASED: the only A record the
+# on-prem DC should carry is its CURRENT `status.hostIP`, read live from the API server.
+# Everything else is pruned regardless of which subnet it sits in, AND the current address
+# is ASSERTED PRESENT — pruning alone can strip the name bare, since none of the registered
+# records need be the live one. The cloud DC's own A record self-heals the same way in
+# dns-config-job.yaml step 3 (keyed on the live pod IP).
+#
+# It must RECONCILE, not fix once: samba_dnsupdate re-adds the bad records on every run, so
+# any manual delete decays. This Job re-prunes on every sync, then verifies.
+#
+# Why hostIP and not podIP: the on-prem DC is hostNetwork, so the two are the same value —
+# but hostIP states the intent, and it is the address the cloud DC can actually route to
+# over the mesh.
+#
+# Hook: Sync + sync-wave 3 — after dns-config-job (wave 1) and sites-job (wave 2). THE
+# ORDERING IS LOAD-BEARING: sites-job MOVES the on-prem DC's server object into the lab site
+# after the join, and replication agreements are built per site-link, so this must run after
+# the topology has settled or it validates a topology that is about to change.
+# NOT a negative wave — the deadlock documented in csi-driver-smb/storageclass-job.yaml.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: samba-ad-replication
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "3"
+    # A Job's spec.template is immutable and the Application sets ServerSideApply=true, so
+    # ArgoCD's delete+recreate would fail with "--force cannot be used with --server-side".
+    # Replace=true makes it delete+create instead. See sites-job.yaml.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  backoffLimit: 6
+  # Bounded: an unbounded Sync hook blocks the Application indefinitely (dns-config-job).
+  # Inter-site replication is SCHEDULED (default 180 min between sites vs 15 s intra-site),
+  # so this Job never waits for natural convergence — it forces, which is immediate.
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # Needed only by the initContainer below, to discover the on-prem DCs and read their
+      # live addresses.
+      serviceAccountName: samba-ad-replication
+      initContainers:
+        # WHY A SEPARATE CONTAINER: the main container runs the samba image, which has NO
+        # kubectl (verified: `command -v kubectl` fails; it has python3 and curl only), and
+        # samba-tool exists in no other image here. Rather than hand-rolling API calls with
+        # curl and the projected token, do the API work in the same alpine/k8s image the
+        # other two Jobs in this app already use and hand the result over on an emptyDir.
+        #
+        # WHAT IT DISCOVERS, and why none of it can be an env var:
+        #   pod name    the DC's AD identity. The SET of on-prem DCs is whatever landed on
+        #               the nodes labelled ecc/ad-dc — enrolling another is a label change,
+        #               so a hard-coded list here would go stale silently.
+        #   hostIP      the address that DC's own A record must be reconciled to (step 2).
+        #               Only the API server knows it: DNS is the thing being repaired, and
+        #               the downward API would report THIS pod's node, not the DC's.
+        #   ecc/lan-ip  the node's LAN address, for the LAN-only name in step 2b. It lives
+        #               on the NODE (project_settings nodes.mesh[].lanIp) because it is a
+        #               property of the box, not of the domain.
+        #
+        # Fails loudly on an empty result: reconciling DNS against an unknown target address
+        # would prune records with nothing correct to keep.
+        - name: read-onprem-dcs
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # One line per on-prem DC: "<pod> <hostIP> <nodeName>". Only pods that HAVE a
+              # hostIP are listed — an unscheduled one has no address to reconcile against,
+              # and guessing would prune live records.
+              kubectl get pods -n samba-ad -l dc=onprem \
+                -o jsonpath='{range .items[*]}{.metadata.name} {.status.hostIP} {.spec.nodeName}{"\n"}{end}' \
+                2>/dev/null | awk 'NF==3' > /shared/onprem-dcs.raw || true
+              if [ ! -s /shared/onprem-dcs.raw ]; then
+                echo "ERROR: no scheduled pods with label dc=onprem in namespace samba-ad." >&2
+                echo "       This Job cannot reconcile DNS against an unknown address." >&2
+                echo "       Retrying under backoffLimit." >&2
+                exit 1
+              fi
+              : > /shared/onprem-dcs
+              while read -r POD HOSTIP NODE; do
+                # ⚠ A DC node with no ecc/lan-ip is a CONFIGURATION ERROR, not a default.
+                # The LAN address is what every non-mesh client (the appliance first) uses;
+                # publishing nothing for it would leave the appliance with a DC it can
+                # discover and never reach — which reports as a DNS problem.
+                LANIP=$(kubectl get node "$NODE" \
+                          -o jsonpath='{.metadata.labels.ecc/lan-ip}' 2>/dev/null || true)
+                if [ -z "$LANIP" ]; then
+                  echo "ERROR: node $NODE runs on-prem DC $POD but has no ecc/lan-ip label." >&2  # automatically updated from project-settings:applicationPlacements.labels.lanIp
+                  echo "       Set lanIp on that node in project_settings.ts nodes.mesh and" >&2
+                  echo "       re-run the mesh-label reconcile (pulumi up)." >&2
+                  exit 1
+                fi
+                printf '%s %s %s\n' "$POD" "$HOSTIP" "$LANIP" >> /shared/onprem-dcs
+                echo "on-prem DC $POD: hostIP $HOSTIP, node $NODE, LAN $LANIP"
+              done < /shared/onprem-dcs.raw
+          volumeMounts:
+            - { name: shared, mountPath: /shared }
+      containers:
+        - name: assert-replication
+          # Same image as the DCs: it is the only one here that has samba-tool.
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_BASE_DN
+              value: "dc=ad,dc=base,dc=internal" # automatically updated from project-settings:activeDirectory.baseDn
+            - name: CLOUD_DC
+              value: "ad-cloud-0"
+            # ⚠ NO ONPREM_DC / LAB_DC_IP HERE. The on-prem DCs and their addresses are
+            # DISCOVERED by the read-onprem-dcs initContainer and handed over on
+            # /shared/onprem-dcs (one "<pod> <hostIP> <lanIp>" line each). A name here could
+            # only ever describe ONE DC, and would go stale the moment another node is
+            # labelled ecc/ad-dc.
+            #
+            # LAN-ONLY name PREFIX for clients that are not on the mesh — see step 2b. Each
+            # DC gets `<prefix>-<ordinal>`, e.g. dc-lan-0. SEPARATE names from the DCs' own
+            # on purpose: a DC's own name must keep resolving to exactly its mesh address or
+            # replication breaks, but non-mesh clients (the TrueNAS appliance, laptops) can
+            # only route the lab LAN address. Kept short and obviously non-DC so nobody
+            # mistakes one for a server object.
+            - name: LAN_DC_PREFIX
+              value: "dc-lan"
+            # The fileserver's name and address, asserted as an A record in the AD zone by
+            # step 2c. Same values as project_settings.ts fileserver.{hostname,endpoint}.
+            - name: FS_NAME
+              value: "fs-1" # automatically updated from project-settings:storage.fileserver.hostname
+            - name: FS_IP
+              value: "192.168.1.237" # automatically updated from project-settings:storage.fileserver.endpoint
+            # The on-prem AD site. Same value as sites-job.yaml LAB_SITE — the site the
+            # TrueNAS appliance is joined to (directoryservices.config `site`), and the
+            # scope whose SRV records step 2d retargets.
+            - name: LAB_SITE
+              value: "unibi-hclab"  # automatically updated from project-settings:applicationPlacements.meshSite
+            # The LANs that live in the on-prem AD site. Kept for the log line that
+            # explains WHY a pruned record was unreachable (a lab-LAN address is the
+            # expected case), but NO LONGER the prune predicate — see step 2. Same source
+            # as sites-job.yaml LAB_SUBNETS.
+            - name: LAB_SUBNETS
+              value: "192.168.1.0/24" # automatically updated from project-settings:network.labSubnets
+            - name: ADMIN_PASSWORD_FILE
+              value: "/etc/samba/container/config.json"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # The admin password lives inside the sealed sambacc config; pull it out
+              # rather than duplicating it into a second secret (as sites-job.yaml does).
+              ADMIN_PW=$(python3 -c "import json;print(json.load(open('$ADMIN_PASSWORD_FILE'))['domain_settings']['primary']['admin_password'])")
+              U="Administrator%$ADMIN_PW"
+              # Exported because the prune step below reads it via os.environ. The heredoc is
+              # deliberately quoted ('PYEOF') so the password is never interpolated into the
+              # script text, where a shell trace or an error echo could surface it.
+              export ADMIN_PW
+
+              CLOUD_SVC=ad-cloud.samba-ad.svc.cluster.local
+              # Per-pod stable names off the headless Services (service.yaml sets
+              # clusterIP: None). Used wherever a DC must be addressed WITHOUT depending on
+              # the AD zone, which dns-config-job forwards to the cloud DC.
+              CLOUD_AT="$CLOUD_DC.ad-cloud.samba-ad.svc.cluster.local"
+              # The on-prem DCs, discovered by the initContainer: "<pod> <hostIP> <lanIp>"
+              # per line. ONPREM_DCS is the pod-name list; the addresses are read per DC
+              # where they are needed. There is deliberately no single "the" on-prem DC.
+              ONPREM_DCS=$(awk '{print $1}' /shared/onprem-dcs)
+              if [ -z "$ONPREM_DCS" ]; then
+                echo "ERROR: /shared/onprem-dcs is empty — the initContainer should have" >&2
+                echo "       failed before this point. Refusing to reconcile DNS blind." >&2
+                exit 1
+              fi
+              echo "on-prem DCs: $(echo $ONPREM_DCS | tr '\n' ' ')"
+
+              # The five naming contexts. "10/10 healthy" in this app's language means these
+              # five, in both directions.
+              NCS="CN=Schema,CN=Configuration,$AD_BASE_DN
+              CN=Configuration,$AD_BASE_DN
+              $AD_BASE_DN
+              DC=DomainDnsZones,$AD_BASE_DN
+              DC=ForestDnsZones,$AD_BASE_DN"
+
+              # --- 1. wait for EVERY DC -------------------------------------------------
+              # Unlike sites-job (which must NOT wait for the on-prem DCs, so the lab subnet
+              # exists before they join), this Job is meaningless until they are all up:
+              # there is no replication agreement to assert with one DC.
+              echo "waiting for the cloud DC to answer..."
+              i=0
+              until samba-tool domain info "$CLOUD_SVC" >/dev/null 2>&1; do
+                i=$((i+1))
+                if [ "$i" -ge 60 ]; then
+                  echo "ERROR: cloud DC did not answer within 10 minutes." >&2
+                  exit 1
+                fi
+                sleep 10
+              done
+              echo "  cloud DC is up"
+
+              echo "waiting for the on-prem DCs to appear in the directory..."
+              # A machine account is listed with a TRAILING LITERAL '$' (AD-ONPREM-0$), so
+              # this must be a FIXED-string match (-F). With a regex match the '$' is read as
+              # the end-of-line anchor and the pattern then demands a line ending in
+              # "AD-ONPREM-0", which never matches — the wait then spins until the deadline
+              # on a domain where the DC has in fact joined.
+              #
+              # ⚠ ONE `computer list` PER SWEEP, not per DC: it is an LDAP round trip against
+              # the cloud DC and this loop runs every 10s for up to 15 min. Fetch once, match
+              # every DC against the same snapshot.
+              i=0
+              while :; do
+                MISSING=""
+                ACCOUNTS=$(samba-tool computer list -H "ldap://$CLOUD_SVC" -U "$U" 2>/dev/null || true)
+                for DC in $ONPREM_DCS; do
+                  ACC="$(echo "$DC" | tr '[:lower:]' '[:upper:]')\$"
+                  echo "$ACCOUNTS" | grep -qxF "$ACC" || MISSING="$MISSING $DC"
+                done
+                [ -z "$MISSING" ] && break
+                i=$((i+1))
+                if [ "$i" -ge 90 ]; then
+                  echo "ERROR: on-prem DC(s)$MISSING have not joined the domain within 15" >&2
+                  echo "       minutes. This Job asserts replication; it cannot create the" >&2
+                  echo "       join. A DC that never joins is usually stuck in wait-domain" >&2
+                  echo "       (no resolver) or refusing to start — check its pod logs." >&2
+                  exit 1
+                fi
+                sleep 10
+              done
+              echo "  all on-prem DCs have joined:$(echo $ONPREM_DCS | tr '\n' ' ' | sed 's/^/ /')"
+
+              # --- 2. reconcile the on-prem DC's A record set to its CURRENT hostIP -----
+              # THIS IS THE ACTUAL ROOT CAUSE (see header, both variants). The on-prem DC is
+              # hostNetwork, so samba_dnsupdate registers an A record for EVERY address the
+              # node has (lab LAN, mesh, CNI) and only ever ADDS. The cloud DC then
+              # round-robins across the set and stalls on any dead one with WERR_SEM_TIMEOUT.
+              #
+              # THE PREDICATE IS REACHABILITY, NOT SUBNET MEMBERSHIP. The desired state is
+              # exactly one A record: the pod's live `status.hostIP`. Anything else is stale
+              # or unroutable-from-cloud by construction —
+              #   - a lab-LAN address (192.168.1.x) the cloud cannot route to at all;
+              #   - a mesh address from a PREVIOUS adoption of this node — a subnet-based
+              #     rule whitelists this as "mesh, so reachable" and prunes nothing, which is
+              #     how a DC ends up with every registered address dead;
+              #   - a CNI/pod address belonging to a pod that no longer exists.
+              # Reading the live hostIP makes all three the same case and needs no per-cause
+              # rule, so a future reprovision cannot invent a fourth one.
+              #
+              # ASSERT-THEN-PRUNE, IN THAT ORDER, AND IT IS LOAD-BEARING. The old code refused
+              # to delete the last record ("never strip the name bare") and exited 1 — correct
+              # as far as it went, but the live address was not registered AT ALL, so
+              # that guard just failed the Job every run with nothing repairing it. Adding the
+              # current record FIRST means the name always resolves to something routable
+              # before anything is removed, and the bare-name case stops existing.
+              #
+              # Pruned on BOTH DCs, each against ITSELF, never via replication: the record is
+              # what makes replication work, so relying on replication to carry the correction
+              # deadlocks. Same reasoning as dns-config-job's cloud A-record repair.
+              #
+              # ⚠ EACH DC IS ADDRESSED BY ITS HEADLESS-SERVICE POD DNS NAME
+              # (<pod>.<svc>.samba-ad.svc.cluster.local), NOT by its AD FQDN. The AD zone is
+              # forwarded to the cloud DC (dns-config-job), so addressing a DC by its AD name
+              # makes this repair depend on the very DNS it is repairing: with a broken record
+              # set the connection fails with "The object name is not found" and the Job dies
+              # before reaching the DC it could still have fixed — which is exactly the
+              # all-records-unreachable case. Cluster DNS is a separate resolver and stays
+              # correct regardless of the AD zone's state.
+              echo
+              echo "reconciling on-prem A records to each DC's current hostIP..."
+
+              # Each on-prem DC's live address comes from the read-onprem-dcs initContainer
+              # (this image has no kubectl — see its comment), i.e. from the API server
+              # rather than from DNS, because DNS is the thing being repaired. hostIP (not
+              # podIP) states the intent: those pods are hostNetwork, so the two are equal,
+              # and hostIP is what the cloud DC routes to over the mesh.
+              python3 - <<'PYEOF' || exit 1
+              import ipaddress, os, subprocess, sys
+
+              domain = os.environ["AD_DOMAIN"]
+              # Only used to LABEL a pruned record in the log ("lab-only" vs "stale"), never
+              # to decide whether to prune it. See the header.
+              nets = [ipaddress.ip_network(n) for n in os.environ["LAB_SUBNETS"].split()]
+              user = "Administrator%" + os.environ["ADMIN_PW"]
+
+              # The on-prem DCs as discovered by the initContainer: [(pod, hostIP, lanIp)].
+              # ⚠ Read here rather than passed as env vars: the SET is whatever landed on the
+              # nodes labelled ecc/ad-dc, so it changes without this file changing.
+              onprem = []
+              with open('/shared/onprem-dcs') as fh:
+                  for line in fh:
+                      f = line.split()
+                      if len(f) == 3:
+                          onprem.append((f[0], f[1], f[2]))
+              if not onprem:
+                  sys.exit('/shared/onprem-dcs is empty — refusing to reconcile DNS blind')
+
+              # (short name, headless Service). The headless Service per DC set is named
+              # after the StatefulSet, so a pod's stable DNS name is <pod>.<sts>.<ns>.svc —
+              # see service.yaml, which sets clusterIP: None for exactly this.
+              ns = "samba-ad"
+              dcs = [(os.environ["CLOUD_DC"], "ad-cloud")] + \
+                    [(pod, "ad-onprem") for pod, _, _ in onprem]
+
+              def tool(server, *args):
+                  # `server` is the DNS server samba-tool sends the update to, and it must be
+                  # the DC BEING REPAIRED, not whichever DC DNS happens to resolve to. Each DC
+                  # is fixed against its own server so the repair never depends on the
+                  # replication it is repairing — the obvious alternative (fix it once and let
+                  # it replicate) deadlocks, since reaching the peer is exactly what the record
+                  # enables. Same approach as dns-config-job.
+                  return subprocess.run(
+                      ["samba-tool", "dns", args[0], server, *args[1:], "-U", user],
+                      capture_output=True, text=True)
+
+              def why(addr):
+                  """Log label only — NOT a prune decision."""
+                  try:
+                      ip = ipaddress.ip_address(addr)
+                  except ValueError:
+                      return "unparseable"
+                  if any(ip in n for n in nets):
+                      return "lab-only, unreachable from cloud"
+                  return "stale (previous node adoption or dead pod)"
+
+              failed = False
+              # TWO loops, and the nesting is deliberate: the OUTER one picks the DC the
+              # update is SENT TO (each DC is repaired against its own server — see the
+              # `tool` docstring), the INNER one picks WHICH on-prem DC's name is being
+              # reconciled. Every DC must hold a correct record for every other, so an
+              # N-DC domain needs N x (N+1) assertions, not N.
+              for dc, svc in dcs:
+                  # Cluster DNS, deliberately — see the header note above.
+                  host = "%s.%s.%s.svc.cluster.local" % (dc, svc, ns)
+                  for name, want, _lan in onprem:
+                      r = tool(host, "query", domain, name, "A")
+
+                      if r.returncode != 0:
+                          # A DC that is mid-restart answers nothing. Do not treat that as
+                          # clean: skipping silently is how a DC stays on a stale address.
+                          # Fail so the Job retries under backoffLimit.
+                          print("  ERROR: %s did not answer a dns query:" % dc,
+                                file=sys.stderr)
+                          print("    " + r.stderr.strip(), file=sys.stderr)
+                          sys.exit(1)
+
+                      addrs = [ln.split("A:")[1].split()[0]
+                               for ln in r.stdout.splitlines() if "A:" in ln]
+
+                      # --- assert the current address FIRST, before removing anything -----
+                      # Order matters: prune-then-add would leave the name unresolvable in
+                      # the window between the two, and (no correct record at all) a
+                      # prune-first pass would have had to refuse outright.
+                      if want not in addrs:
+                          a = tool(host, "add", domain, name, "A", want)
+                          if a.returncode == 0:
+                              print("  %s @%s: ADDED current A %s" % (name, dc, want))
+                              addrs.append(want)
+                          else:
+                              # Tolerate the benign race only: another pass (or
+                              # samba_dnsupdate itself) may have added it a moment ago.
+                              if "already exists" in (a.stderr + a.stdout).lower():
+                                  print("  %s @%s: current A %s already present (race)"
+                                        % (name, dc, want))
+                                  addrs.append(want)
+                              else:
+                                  print("  ERROR: %s @%s: could not add A %s: %s"
+                                        % (name, dc, want, a.stderr.strip()),
+                                        file=sys.stderr)
+                                  failed = True
+                                  continue
+                      else:
+                          print("  %s @%s: current A %s present" % (name, dc, want))
+
+                      # --- then prune everything that is not the current address ----------
+                      bad = [a for a in addrs if a != want]
+                      if not bad:
+                          print("  %s @%s: ok, exactly one A record (%s)"
+                                % (name, dc, want))
+                          continue
+
+                      for a in bad:
+                          d = tool(host, "delete", domain, name, "A", a)
+                          if d.returncode == 0:
+                              print("  %s @%s: deleted A %s — %s" % (name, dc, a, why(a)))
+                          else:
+                              print("  ERROR: %s @%s: could not delete A %s: %s"
+                                    % (name, dc, a, d.stderr.strip()), file=sys.stderr)
+                              failed = True
+
+              # --- 4. SEPARATE, LAN-ONLY names for clients that are not on the mesh ----
+              # ⚠ WHY SECOND NAMES INSTEAD OF SECOND A RECORDS ON THE DCs' OWN NAMES.
+              #
+              # The prune above exists because extra A records on a DC's own name broke
+              # replication: the cloud DC picks one at random and a lab-LAN address is
+              # unreachable from cloud (82 consecutive WERR_SEM_TIMEOUT). So a DC's own name
+              # must keep resolving to exactly its mesh address.
+              #
+              # But that leaves every NON-MESH client unable to use the domain by name.
+              # Measured from the TrueNAS appliance: it has only
+              # eno1 192.168.1.237/24 with default route 192.168.1.1 — no tailscale — and
+              #   ping 192.168.1.216 -> True     (the DC IS reachable on the LAN)
+              #   ping 10.0.10.4     -> False    (the address DNS actually returns)
+              #   ping 10.42.0.242   -> False
+              # so an AD join, which is SRV/DNS-driven, would dial an unroutable address and
+              # fail. The same applies to laptops mapping \\fs-1...\userhomes by name.
+              #
+              # `dc-lan-<n>.<realm>` is that address, one per on-prem DC, published for LAN
+              # consumers only. They are DIFFERENT names, so they are invisible to the SRV
+              # records the DCs publish for themselves and to DRS — the cloud DC never learns
+              # them and cannot dial them. Nothing about the replication fix changes.
+              #
+              # ⚠ ONE NAME PER DC, not one name with N addresses. Two A records on a single
+              # name make failover a client-side round-robin with no health signal: a client
+              # that lands on the down DC retries the SAME name and can get the same address
+              # again. Distinct names let the SRV layer (step 2d) list them as separate
+              # targets, which is how AD expresses "several DCs, try another" natively.
+              #
+              # The addresses come from each DC node's ecc/lan-ip label via the
+              # initContainer, so a re-addressed node is a settings change plus a label
+              # reconcile, never an edit here.
+              lan_prefix = os.environ.get("LAN_DC_PREFIX", "").strip()
+              # [(lan_name, lan_ip)] in DC order — reused by step 2d.
+              lan_targets = []
+              if lan_prefix:
+                  for idx, (pod, _hostip, lan_ip) in enumerate(onprem):
+                      lan_targets.append(("%s-%d" % (lan_prefix, idx), lan_ip))
+                  print()
+                  print("== 2b. LAN-only names -> %s ==" %
+                        ", ".join("%s=%s" % t for t in lan_targets))
+                  for lan_name, lan_ip in lan_targets:
+                      for dc, svc in dcs:
+                          host = "%s.%s.%s.svc.cluster.local" % (dc, svc, ns)
+                          q = tool(host, "query", domain, lan_name, "A")
+                          cur = [ln.split("A:")[1].split()[0]
+                                 for ln in q.stdout.splitlines() if "A:" in ln]
+                          if lan_ip in cur:
+                              print("  %s @%s: %s present" % (lan_name, dc, lan_ip))
+                          else:
+                              a = tool(host, "add", domain, lan_name, "A", lan_ip)
+                              if a.returncode == 0:
+                                  print("  %s @%s: ADDED A %s" % (lan_name, dc, lan_ip))
+                              elif "already exists" in (a.stderr + a.stdout).lower():
+                                  print("  %s @%s: %s already present (race)"
+                                        % (lan_name, dc, lan_ip))
+                              else:
+                                  print("  ERROR: %s @%s: could not add A %s: %s"
+                                        % (lan_name, dc, lan_ip, a.stderr.strip()),
+                                        file=sys.stderr)
+                                  failed = True
+                          # Prune any OTHER address on this name: each is single-purpose, and
+                          # a stale entry would send a LAN client somewhere unroutable — the
+                          # same failure these names exist to avoid.
+                          for a2 in [x for x in cur if x != lan_ip]:
+                              d = tool(host, "delete", domain, lan_name, "A", a2)
+                              if d.returncode == 0:
+                                  print("  %s @%s: deleted stale A %s" % (lan_name, dc, a2))
+                              else:
+                                  print("  ERROR: %s @%s: could not delete A %s: %s"
+                                        % (lan_name, dc, a2, d.stderr.strip()),
+                                        file=sys.stderr)
+                                  failed = True
+
+                  # ⚠ NO REACHABILITY PROBE HERE — it was tried and it CANNOT work.
+                  # This Job has no nodeSelector, so it lands wherever the scheduler puts it,
+                  # which in practice is the CLOUD control-plane. A cloud node has no route to
+                  # the lab LAN at all (mesh-gateway runs `tailscale up` WITHOUT
+                  # --accept-routes, deliberately — see the note in samba-ad/sealSecrets.sh),
+                  # so `connect(<lab-ip>, 389)` times out from here on a perfectly healthy DC.
+                  # Measured: all three lab addresses "timed out" while every DC was 2/2 Ready
+                  # and serving. A check that cannot distinguish healthy from broken is worse
+                  # than none — it trains the reader to ignore the log.
+                  #
+                  # The check lives in truenas/configure-job.yaml instead, which IS pinned to
+                  # ecc/fileserver-lan and is the actual consumer of these addresses.
+                  print("   Non-mesh clients (the TrueNAS appliance, laptops) cannot resolve")
+                  print("   the domain to a routable address without this.")
+
+              # --- 2c. publish the FILESERVER's A record in the AD zone ------------------
+              #
+              # WHY: every consumer of the appliance addresses it by IP today
+              # (project_settings.ts fileserver.endpoint, propagated to 9 manifests). That
+              # address is DHCP-assigned — verified on the box: `eno1 dhcp=True`, no static
+              # alias — so a lease change silently breaks every NFS PV mount, and the symptom
+              # (`mount.nfs:... failed`) points nowhere near the cause.
+              #
+              # ⚠ WHY NOT THE ROUTER NAME. The lab router now serves fs-1.lan -> the same
+              # address, which is tempting and WRONG for half the consumers: NFS mounts run
+              # in the KUBELET (host netns, nameserver 192.168.1.1, search `lan`) and would
+              # resolve it, but the truenas configure/verify jobs are PODS on cluster DNS,
+              # which has no `lan` zone — they fail with `gaierror: Name or service not
+              # known`. Measured. `ad.base.internal` is forwarded to the DC (coredns-custom
+              # ad.server), so a name in THIS zone resolves from both.
+              #
+              # The appliance already believes this is its name — network.configuration
+              # reports hostname=fs-1, domain=ad.base.internal — it is simply not registered.
+              # It WOULD self-register on a successful AD join (enable_dns_updates), but the
+              # join is exactly what breaks when the address moves, so asserting it here is
+              # what makes the name available BEFORE the join needs it.
+              #
+              # Single-purpose, like 2b: any other address on this name is pruned, since a
+              # stale entry would send NFS clients somewhere unroutable.
+              fs_name = os.environ.get("FS_NAME", "").strip()
+              fs_ip = os.environ.get("FS_IP", "").strip()
+              if fs_name and fs_ip:
+                  print()
+                  print("== 2c. fileserver %s.%s -> %s ==" % (fs_name, domain, fs_ip))
+                  for dc, svc in dcs:
+                      host = "%s.%s.%s.svc.cluster.local" % (dc, svc, ns)
+                      q = tool(host, "query", domain, fs_name, "A")
+                      cur = [ln.split("A:")[1].split()[0]
+                             for ln in q.stdout.splitlines() if "A:" in ln]
+                      if fs_ip in cur:
+                          print("  %s: %s present" % (dc, fs_ip))
+                      else:
+                          a = tool(host, "add", domain, fs_name, "A", fs_ip)
+                          if a.returncode == 0:
+                              print("  %s: ADDED %s A %s" % (dc, fs_name, fs_ip))
+                          elif "already exists" in (a.stderr + a.stdout).lower():
+                              print("  %s: %s already present (race)" % (dc, fs_ip))
+                          else:
+                              # Non-fatal: consumers still have the IP in their manifests, so
+                              # a failure here costs the name, not the mounts.
+                              print("  WARNING: %s: could not add %s A %s: %s"
+                                    % (dc, fs_name, fs_ip, a.stderr.strip()), file=sys.stderr)
+                      for a2 in [x for x in cur if x != fs_ip]:
+                          d2 = tool(host, "delete", domain, fs_name, "A", a2)
+                          if d2.returncode == 0:
+                              print("  %s: deleted stale %s A %s" % (dc, fs_name, a2))
+                          else:
+                              print("  WARNING: %s: could not delete %s A %s: %s"
+                                    % (dc, fs_name, a2, d2.stderr.strip()), file=sys.stderr)
+              else:
+                  print()
+                  print("== 2c. SKIPPED: FS_NAME / FS_IP not set ==")
+
+              # --- 2d. retarget the ON-PREM SITE's SRV records at the LAN name -----------
+              #
+              # WHY: an AD JOIN is SRV-driven, and 2b's `dc-lan` A record does NOT help it —
+              # `dc-lan` is deliberately a different NAME, so no SRV points at it. The SRV
+              # records resolve to AD-ONPREM-0.<realm>, whose only A record is the node's
+              # mesh IP (step 2 keeps exactly the live hostIP). The TrueNAS appliance sits on
+              # the lab LAN and cannot route to mesh or pod addresses, so DC *discovery*
+              # succeeds and every *connection* fails. TrueNAS reports that as
+              #   "Failed to discover Active Directory Domain Controller... may indicate a
+              #    DNS misconfiguration"
+              # which sends you looking at DNS, where nothing is wrong: the appliance
+              # resolves every SRV correctly and cannot ping a single target.
+              #
+              # ⚠ WHY THE SITE SCOPE AND NOT THE REALM-WIDE RECORD. Sites already partition DC
+              # location: _ldap._tcp.<site>._sites.<realm> lists ONLY that site's DC. The
+              # appliance is joined with site=unibi-hclab, so it reads the on-prem record; the
+              # cloud DC reads Default-First-Site-Name and never sees this one. Retargeting
+              # the REALM-WIDE record instead would be visible to the cloud DC.
+              #
+              # ⚠ WHY NOT JUST ADD THE LAN ADDRESS AS A SECOND A RECORD ON THE DC — the
+              # obvious fix, and it is WRONG. DRS resolves <DSA-GUID>._msdcs.<realm>, which is
+              # a CNAME **to that same name**, so the cloud DC would inherit the LAN address,
+              # round-robin onto it and stall with WERR_SEM_TIMEOUT. That is precisely the bug
+              # d628b21c fixed. Verified live: the GUID CNAME aliases AD-ONPREM-0.<realm>.
+              # The A-record set is SHARED between DRS and the join; only the SRV layer can
+              # separate them.
+              #
+              # ⚠ THIS DECAYS AND MUST BE RE-ASSERTED. samba_dnsupdate rebuilds every SRV from
+              # dns_update_list, where the target is a literal ${HOSTNAME} — so it re-adds the
+              # mesh-pointing target on its next run. Re-asserting here on every sync is the
+              # same treatment step 2 already gives the A records, and for the same reason.
+              site = os.environ.get("LAB_SITE", "").strip()
+              if site and lan_targets:
+                  print()
+                  print("== 2d. on-prem site SRV -> %s ==" %
+                        ", ".join(n for n, _ in lan_targets))
+                  # The four records a DC publishes per site. dc._msdcs duplicates the pair
+                  # under the _msdcs zone; a client may consult either, so both are retargeted
+                  # or the fix works only for whichever one it happened to pick.
+                  srvs = [("_ldap._tcp.%s._sites" % site, 389),
+                          ("_ldap._tcp.%s._sites.dc._msdcs" % site, 389),
+                          ("_kerberos._tcp.%s._sites" % site, 88),
+                          ("_kerberos._tcp.%s._sites.dc._msdcs" % site, 88)]
+                  # ⚠ ONE SRV PER DC, ALL AT EQUAL PRIORITY AND WEIGHT (0 100). This is what
+                  # makes the appliance's DC discovery failover-capable: a client picks among
+                  # equal-priority targets and, on a failed CONNECT, moves to the next one.
+                  # That is the whole point of running more than one lab DC — a single target
+                  # means a DC restart is a site-wide auth outage, which is also what arms
+                  # the TrueNAS FAULTED repair path (truenas/configure-job.yaml).
+                  for rec, port in srvs:
+                      for lan_name, _ip in lan_targets:
+                          lan_fqdn = "%s.%s." % (lan_name, domain)
+                          want = "%s %d 0 100" % (lan_fqdn, port)
+                          for dc, svc in dcs:
+                              host = "%s.%s.%s.svc.cluster.local" % (dc, svc, ns)
+                              q = tool(host, "query", domain, rec, "SRV")
+                              if lan_fqdn in q.stdout:
+                                  print("  %s @%s: already targets %s" % (rec, dc, lan_name))
+                                  continue
+                              a = tool(host, "add", domain, rec, "SRV", want)
+                              if a.returncode == 0:
+                                  print("  %s @%s: ADDED SRV -> %s:%d"
+                                        % (rec, dc, lan_name, port))
+                              elif "already exists" in (a.stderr + a.stdout).lower():
+                                  print("  %s @%s: %s already present (race)"
+                                        % (rec, dc, lan_name))
+                              else:
+                                  # NOT fatal: the mesh-targeted record still serves every
+                                  # in-cluster client, so a failure here degrades the
+                                  # appliance join, it does not break AD. Log and carry on.
+                                  print("  WARNING: %s @%s: could not add SRV: %s"
+                                        % (rec, dc, a.stderr.strip()), file=sys.stderr)
+              else:
+                  print()
+                  print("== 2d. SKIPPED: LAB_SITE / LAN_DC_PREFIX not set ==")
+                  print("   The TrueNAS appliance's AD join needs an SRV target it can route to.")
+
+              if failed:
+                  sys.exit(1)
+              PYEOF
+
+              # --- 3. read the current replication state --------------------------------
+              # WHAT showrepl ACTUALLY REPORTS, because the obvious reading is wrong and a
+              # gate built on it never passes:
+              #
+              # Samba tracks the PULL side of each agreement. A DC lists a partition under
+              # INBOUND for what it pulls from a peer, and under OUTBOUND for what the peer
+              # pulls from it. So with two DCs and five partitions the healthy steady state
+              # is ASYMMETRIC and neither DC ever reports ten:
+              #
+              #   ad-cloud-0 : 0 inbound, 5 outbound
+              #   ad-onprem-0: 5 inbound, 0 outbound
+              #
+              # (Verified, identical from a local exec and from a remote query, so it is the
+              # real topology and not an artifact of where showrepl runs.)
+              #
+              # ⚠ AND THE OLD "5 + 5 = 10" GATE DOES NOT GENERALISE — do not restore it. It
+              # is arithmetic for EXACTLY two DCs. With several on-prem DCs the KCC also
+              # builds intra-site agreements among them, and picks ONE bridgehead per site
+              # for the inter-site link. The resulting per-DC counts depend on a topology the
+              # KCC owns and re-computes; any fixed total is a number that happens to be
+              # right today.
+              #
+              # THE TOPOLOGY-INDEPENDENT INVARIANT, which is also the one that matters:
+              #   * every DC pulls all FIVE naming contexts from somewhere (inbound >= 5), and
+              #   * NO partition anywhere is failing.
+              # A DC missing an inbound partition is genuinely broken however the ring is
+              # wired, and a failing partition is broken regardless of the count.
+              #
+              # Counted with the failure line rather than 'was successful': a DC that
+              # restarted mid-replication briefly shows a non-zero count that clears on the
+              # next pass, and this distinguishes "present but failing" from "no agreement at
+              # all" — an empty neighbour list is the failure this whole Job exists to catch.
+              # Both read a CACHED showrepl file (see state()), never the network. Each DC is
+              # addressed by cluster DNS when that file is fetched, for the same reason as the
+              # prune step: the AD zone may be exactly what is broken. showrepl accepts a
+              # cluster name; `drs replicate` does NOT for its SOURCE argument (it resolves
+              # that in the directory, not via DNS) — see below.
+              counts() {
+                # $1 = cached showrepl file, $2 = INBOUND|OUTBOUND. Prints the number of
+                # partitions on that side at zero consecutive failures.
+                #
+                # ⚠ $1 == "0", NOT /0 consecutive failure/. The line is indented with TABS
+                # ("\t\t0 consecutive failure(s)."), so a pattern needing a literal space
+                # never matches — and as a bare substring it ALSO matches "10"/"20"
+                # consecutive failures, counting a badly broken partition as healthy. awk's
+                # default field split is whitespace-agnostic and compares the number itself.
+                awk -v want="$2" '
+                    /^==== .* NEIGHBORS ====/ { sec = ($2 == want); next }
+                    /^==== /                  { sec = 0; next }
+                    sec && /consecutive failure/ && $1 == "0" { n++ }
+                    END { print n + 0 }' "$1" 2>/dev/null
+              }
+              fails() {
+                # $1 = cached showrepl file. Prints the number of partitions (either
+                # direction) with a NON-zero consecutive-failure count. Same tab caveat as
+                # counts() above: written as "!/ 0 consecutive failure/" this counted EVERY
+                # partition as failing and failed the gate on a provably healthy domain.
+                awk '/consecutive failure/ && $1 != "0" { n++ }
+                     END { print n + 0 }' "$1" 2>/dev/null
+              }
+
+              # "<pod> <cluster-dns address>" per DC, cloud first.
+              DC_ADDRS="$CLOUD_DC $CLOUD_AT"
+              for DC in $ONPREM_DCS; do
+                DC_ADDRS="$DC_ADDRS
+              $DC $DC.ad-onprem.samba-ad.svc.cluster.local"
+              done
+
+              # Prints one line per DC and returns 0 when every on-prem DC pulls all five
+              # NCs and nothing anywhere is failing.
+              #
+              # ⚠ ONE showrepl PER DC PER PASS, cached to a file. `samba-tool drs showrepl` is
+              # an LDAP round trip against a remote DC and takes seconds; calling side() twice
+              # plus failing() once per DC, and then AGAIN for the return value, is 4x the
+              # round trips for the same snapshot — with 4 DCs and a 10-pass verify loop that
+              # is minutes of pure latency. It is also inconsistent: the printed numbers would
+              # come from a different sample than the ones the gate decides on.
+              #
+              # A file, not a variable, because the read loop must not run in a subshell — a
+              # `... | while read` pipeline cannot set a variable the caller sees, which is a
+              # classic and silent shell bug.
+              state() {
+                RC=0
+                echo "$DC_ADDRS" | while read -r POD AT; do
+                  [ -n "$POD" ] || continue
+                  samba-tool drs showrepl "$AT" -U "$U" 2>/dev/null > "/tmp/repl-$POD" || true
+                done
+                echo "$DC_ADDRS" | while read -r POD AT; do
+                  [ -n "$POD" ] || continue
+                  echo "  $POD  inbound: $(counts "/tmp/repl-$POD" INBOUND)" \
+                       " outbound: $(counts "/tmp/repl-$POD" OUTBOUND)" \
+                       " failing: $(fails "/tmp/repl-$POD")"
+                done
+                for ENTRY in $ONPREM_DCS; do
+                  [ "$(counts "/tmp/repl-$ENTRY" INBOUND)" -ge 5 ] || RC=1
+                  [ "$(fails "/tmp/repl-$ENTRY")" -eq 0 ] || RC=1
+                done
+                [ "$(counts "/tmp/repl-$CLOUD_DC" OUTBOUND)" -ge 5 ] || RC=1
+                [ "$(fails "/tmp/repl-$CLOUD_DC")" -eq 0 ] || RC=1
+                return $RC
+              }
+
+              echo
+              echo "current replication state (each DC must pull all 5 NCs; 0 failing):"
+              if state; then
+                echo
+                echo "replication is fully established — nothing to do."
+                exit 0
+              fi
+
+              # --- 4. converge, do not create ------------------------------------------
+              echo
+              echo "replication is incomplete — forcing all 5 partitions on every pair."
+              # Forced rather than waited on: once the DCs are in DIFFERENT sites (which is
+              # the entire point of sites-job) the default inter-site interval is 180 min, so
+              # waiting for the schedule would blow any sane hook deadline.
+              #
+              # ⚠ Only the CLOUD<->each-on-prem pairs are forced, not the full mesh. Those
+              # cross the slow inter-site link that the schedule would otherwise defer;
+              # on-prem DCs share a site, where the interval is seconds and the KCC converges
+              # them without help. Forcing N^2 pairs would multiply the runtime of a hook that
+              # already gates the sync, to re-do what the site topology already handles.
+              echo "$NCS" | while read -r nc; do
+                nc=$(echo "$nc" | sed 's/^[[:space:]]*//')
+                [ -n "$nc" ] || continue
+                for DC in $ONPREM_DCS; do
+                  AT="$DC.ad-onprem.samba-ad.svc.cluster.local"
+                  # "<destination> <source> <label>". The DESTINATION is addressed by cluster
+                  # DNS (it is just where the command is sent), but the SOURCE must be the
+                  # DC's real AD name: samba-tool looks the source up in the directory, and a
+                  # cluster name fails with "Failed to find source DC".
+                  for pair in "$CLOUD_AT $DC.$AD_DOMAIN $DC->$CLOUD_DC" \
+                              "$AT $CLOUD_DC.$AD_DOMAIN $CLOUD_DC->$DC"; do
+                    set -- $pair
+                    # $1 pulls FROM $2. Run against the destination so a one-sided network
+                    # fault is attributable to a direction.
+                    if samba-tool drs replicate "$1" "$2" "$nc" \
+                         -U "$U" >/dev/null 2>&1; then
+                      echo "  ok:     $3  ${nc%%,*}"
+                    else
+                      # Do not abort the loop: one partition failing is worth seeing
+                      # alongside the others rather than hiding them. Step 5 is the gate.
+                      echo "  FAILED: $3  ${nc%%,*}" >&2
+                    fi
+                  done
+                done
+              done
+
+              # --- 5. verify, and FAIL LOUDLY -------------------------------------------
+              # THIS IS THE POINT OF THE WHOLE JOB. The failure being fixed here is invisible
+              # precisely because nothing asserted it, so a Job that forces replication but
+              # reports success regardless would reproduce the same blind spot one layer up.
+              # Prefer failing the sync over a green tick that means nothing.
+              #
+              # Re-read AFTER forcing. A DC that restarted mid-replication shows a transient
+              # failure that clears on the next pass, so give it a few passes before calling
+              # it broken.
+              echo
+              echo "verifying..."
+              i=0
+              OK=1
+              while [ "$i" -lt 10 ]; do
+                if state >/dev/null 2>&1; then OK=0; break; fi
+                i=$((i+1)); sleep 15
+              done
+              state || true
+
+              if [ "$OK" -ne 0 ]; then
+                echo >&2
+                echo "ERROR: replication is STILL not fully established." >&2
+                echo "  A Job that ran is not evidence that replication works." >&2
+                echo >&2
+                echo "  First thing to check is addressing, not the KCC — an unreachable A" >&2
+                echo "  record for an on-prem DC is what caused this on ecc173 and on" >&2
+                echo "  2026-08-13, and it presents identically (WERR_SEM_TIMEOUT):" >&2
+                for DC in $ONPREM_DCS; do
+                  echo "    samba-tool dns query localhost $AD_DOMAIN $DC A -U Administrator" >&2
+                done
+                echo "  Run those on EVERY DC — host/getent lie here, they served a stale" >&2
+                echo "  address well after both DCs had the new one." >&2
+                echo >&2
+                echo "  Do NOT 'fix' this with 'argocd app sync samba-ad': that rolls every" >&2
+                echo "  DC and can deadlock on the tls.key 0600 CVE check." >&2
+                samba-tool drs showrepl "$CLOUD_AT" -U "$U" 2>&1 | tail -40 >&2 || true
+                exit 1
+              fi
+
+              echo
+              echo "replication established: every DC pulls all 5 naming contexts, 0 failing."
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: shared, mountPath: /shared, readOnly: true }
+      volumes:
+        - name: config
+          secret:
+            secretName: samba-ad-config
+        # Carries the discovered on-prem DC list (pod, hostIP, lanIp) from the
+        # initContainer to the main container.
+        - name: shared
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-replication
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    # Wave 0, ahead of the Job at wave 3: a hook Job whose ServiceAccount does not exist yet
+    # stays Pending on a serviceaccount-not-found admission error rather than failing, which
+    # is the worst diagnostic outcome.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-replication
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  # Read ONLY. `list` as well as `get`: the set of on-prem DCs is DISCOVERED from the live
+  # pods (label dc=onprem) rather than named in an env var, so that enrolling another DC
+  # node is a label change and not an edit here. Each pod contributes its status.hostIP (to
+  # reconcile that DC's A record against the address it actually has, step 2) and its
+  # spec.nodeName (to look up the node's ecc/lan-ip, step 2b). Namespace-scoped: every DC
+  # lives in this namespace. No `watch` needed — nothing here deletes an object, which is
+  # the case that would otherwise hang forever on a forbidden watch (see dns-config-job's
+  # ClusterRole).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+# Nodes are cluster-scoped, so reading one label needs a ClusterRole. `get` only, and only
+# because the DC's own LAN address lives on its node (ecc/lan-ip, from
+# project_settings.ts nodes.mesh[].lanIp) — a pod cannot see its node's labels through the
+# downward API, and copying the address into this Job as an env var is precisely the
+# per-node literal this design removes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: samba-ad-replication-nodes
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: samba-ad-replication-nodes
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: samba-ad-replication-nodes
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-replication
+    namespace: samba-ad
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-replication
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-replication
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-replication
+    namespace: samba-ad

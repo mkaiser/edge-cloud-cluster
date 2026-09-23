@@ -12,7 +12,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
-import { project_settings } from "../project_settings";
+import { project_settings, haReplicas } from "../project_settings";
 
 export class SealedSecretsComponent extends pulumi.ComponentResource {
     public readonly sealedSecretsChart: helm.v3.Release;
@@ -44,7 +44,7 @@ export class SealedSecretsComponent extends pulumi.ComponentResource {
             {
                 name: "sealed-secrets",
                 chart: "sealed-secrets",
-                version: "2.18.6", // renovate: datasource=helm depName=sealed-secrets registryUrl=https://bitnami.github.io/sealed-secrets
+                version: "2.20.0", // renovate: datasource=helm depName=sealed-secrets registryUrl=https://bitnami.github.io/sealed-secrets
                 namespace: "kube-system",
                 // Chart repo moved from bitnami-labs.github.io -> bitnami.github.io
                 // (the old GitHub Pages site now 404s).
@@ -52,9 +52,8 @@ export class SealedSecretsComponent extends pulumi.ComponentResource {
                 values: {
                     fullnameOverride: "sealed-secrets-controller",
                     secretName: "sealed-secrets-key",
-                    // HA replica count — kept in sync with project_settings.ha by
-                    // scripts/environment/updateConfigFromProjectSettings.sh (ha.<key> anchor).
-                    replicaCount: 2, // project-settings: ha.sealedSecrets
+                    // HA replica count read straight from project_settings (this is TS).
+                    replicaCount: haReplicas("sealedSecrets"),
                 },
                 waitForJobs: true,
             },

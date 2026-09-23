@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  name: zulip-s3
+  namespace: zulip
+spec:
+  encryptedData:
+    access-key: AgBSj/G7Oxvkt56DW6PvDobyKs2nxtviZg+DlEHeJy6c7QqRiu0hG+vM9BsFVmgK0xYsrsRIGfVBSwXCao+SQnttq+q6h7mj+z7fEhDe61yhlu2AsANuxHbek7/a2GvrlPZhfsPTeoIbUhoV8IOz6oiSyuHtFPGU+VYqPGf60WJR3nEHQ1x9IW2NsxHu1A5uO8WGsym9DfDMmWMkKNM+N4KcfptHuiNDv5qIcFKabz2bNwBk0Xs5hsMvOwdQL8l4aeQBu7HXTWpuAs7aw5k2+GQKFX7mj1/o6g5wC8KXKVbnPikQAGqXzzbFPTxmULOvLn6nR06ZF9NGgcM8juz5bFzVrPzDaBia2zKW8Z8NNqiLmnpEfAaNZBI5QkeWK45m011KUXs8wskbiu4hiQyxKdHYO/AfLNvuR2HnH1ntiSuW6lH3TA6bIom3ftSdfP5XuoenY3pofk4c4gYx2WXOz9yBREa8UrfYBCXkUCnps/aPI/yoqBzWVdmk2D3mW4yaXE+JVJuqBhpdXv7r8QXLPEv9uVVxV1BTRsvzMMmDO2o1/O5q/8n/s/JUM3pcNXrOcaDhgGT0rgCdMQH+kacvEohadPwhtSXyz9WjJ1b0vBX7XcG5i3STyhBFxSbw2Ygr3JbHXiOBv6yISkBUt1GGae45/SZ8lBViFkfj0uDwgFyUWo4BvQvLH1OEIAayTfFdSZyvpUte3w1BN+gpfwjAPvdrzKjOEA==
+    secret-key: ""
+  template:
+    metadata:
+      name: zulip-s3
+      namespace: zulip

@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: gitlab-db
+  namespace: gitlab
+spec:
+  encryptedData:
+    db-password: AgBbRkgPHE7MWEPNLCjKk2vhdB25KGQX2HmvSWyF+7kO1B/nBeDs4DMpupo5cGvSl86J5fDoREzl8NJ82SKaiygZgH/bL5Y3L6iDRssnUmhZbJGZWNSrkO797YK391bzRYCk8sUjf7+WvDDWLocb086PY2bXLmFj0HRyN+9Lh3CXx2APE00rBARtWoLhc5Wr9dEgfLw5j9RT/bKHgV+Jb6Ww3cWAT+AcX6wPV/8kAgeAh69R1oPC49eLWGUVvnei0d1oPpE8BT2gyLxfg4w0hu85fbEifvun2MEfVcZh1EAhUHv9YLQk44TzXV7MSGq/pP3NzXaC3VzN6I1rSulmmwQu5VlfpAsr2c9uFpYEvvi6/Jky8AMvao/byLbtRLr+W0GUS25At4SDtdkiymPm9FmkfcAbliXk00AU0phFo/C5iwHnsHLIctHMu4cQiL9KZyy7nYSkGH8h7bJui50m4iqpX75Pe19trL+iH+22Z8RUuGb321mnFT7u5d9lqJb/W/vbP3j+erAuWjrVJTyB6mQBFqfVCDfOftjWDUfg+2B5Ptg1UGymj3ez675IwlkF2YCx39GaNVMgUYqMcHy3vLTHm2fsNMoQkSfEAwfAciadOCDLA7Y1/UrecDKcflzH2re7vFwztH65d8UB3T3LxJZjXxlOcneSdIMz+utFtSy7KqgrzsWYXhB6bBtCZt2sg2OuNRLDItpM1xiGOC94ijFmf/RTiOPXTi4v/AsgUQg9Td8TIkCHGWL4Xr+1EMnadYU=
+  template:
+    metadata:
+      name: gitlab-db
+      namespace: gitlab

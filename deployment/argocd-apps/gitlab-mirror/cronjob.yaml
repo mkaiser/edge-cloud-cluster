@@ -1,0 +1,174 @@
+# Pull-side git mirror: every GitLab repository as a bare repo on the appliance.
+#
+# ⚠ THIS IS THE ONLY BACKUP OF THE REPOSITORIES THAT A HUMAN CAN USE WITHOUT GITLAB.
+# `backup-utility` produces one opaque archive that needs a matching GitLab version to
+# restore; this produces real bare repos you can `git clone` from an NFS mount with nothing
+# else running. The two answer different questions ("give me the code now" vs "rebuild the
+# instance") and neither replaces the other.
+#
+# ⚠ IT RUNS LAB-SIDE BECAUSE IT MUST. It needs the GitLab API (cloud, public) *and* the
+# appliance (192.168.1.0/24, lab-only). Only a mesh node reaches both — cloud pods have no
+# route to the lab LAN. `gitaly-backup create --path <dir>` would be the "right" tool, but it
+# lives in the gitaly container, which is cloud-side and cannot see the export.
+#
+# ⚠ REPOSITORIES ONLY. No issues, merge requests, wiki metadata, CI configuration, users or
+# settings — those live in Postgres and are covered only by the toolbox backup. Do not let
+# this be mistaken for a GitLab restore.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gitlab-mirror
+  namespace: gitlab-mirror
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # ⚠ NOT startingDeadlineSeconds-limited on purpose: a missed run should simply run late.
+  jobTemplate:
+    spec:
+      # ⚠ WITHOUT THIS, `concurrencyPolicy: Forbid` TURNS ONE STUCK RUN INTO A DEAD MIRROR.
+      # On the ecc193 bring-up a run started before the token secret existed and sat in
+      # CreateContainerConfigError for THREE HOURS; Forbid then suppressed every hourly run
+      # behind it, so the mirror was wedged while the CronJob looked scheduled and the
+      # staleness alert had not yet had time to fire. 50 minutes is under the hourly
+      # schedule, so a hung run always clears before the next one is due.
+      activeDeadlineSeconds: 3000
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # Only lab nodes reach the appliance, and only they have the NFS CSI node plugin.
+          nodeSelector:
+            ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          priorityClassName: low
+          containers:
+            - name: mirror
+              image: docker.io/alpine/git:2.54.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              env:
+                - name: GITLAB_HOST
+                  value: "gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+                # ⚠ EMPTY ON letsencrypt-prod, "-k" ON STAGING. This job is the ONLY thing in
+                # the artifacts/mirror work that talks to a PUBLICLY-signed endpoint: the
+                # appliance S3 path uses the appliance's own certificate via customCAs, and
+                # image-registry uses a private in-cluster CA, so neither notices the issuer.
+                # This one clones from gitlab.<tld>, so on a staging issuer both the API
+                # calls AND git itself reject the chain — git with "server certificate
+                # verification failed", which reads like a network fault.
+                - name: CURL_INSECURE
+                  value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+                - name: TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: gitlab-mirror-token
+                      key: token
+              volumeMounts:
+                - name: mirror
+                  mountPath: /mirror
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  API="https://${GITLAB_HOST}/api/v4"
+                  cd /mirror
+
+                  # ⚠ ONE SIGNAL DRIVES BOTH CLIENTS, AND THE VARIABLE IS NAMED FOR THE
+                  # GENERATOR, NOT FOR THE TOOL. updateConfigFromProjectSettings.sh rewrites
+                  # a value on a line named CURL_INSECURE, so that name is the contract;
+                  # this image has no curl (see below), so it is mapped to wget's spelling
+                  # and to git's environment variable here.
+                  WGET_TLS=""
+                  if [ -n "${CURL_INSECURE:-}" ]; then
+                    echo "staging issuer: disabling TLS verification for wget and git"
+                    WGET_TLS="--no-check-certificate"
+                    export GIT_SSL_NO_VERIFY=true
+                  fi
+
+                  # ⚠ KEYSET PAGINATION, NOT page=N. Offset pagination silently truncates
+                  # past 10 000 projects and, more immediately, SKIPS rows when the project
+                  # list changes between pages — so a mirror could quietly omit a repository
+                  # and still exit 0.
+                  # ⚠ The token must be an ADMIN token: /projects returns only what the
+                  # caller can see, so a normal user's token yields a silently partial
+                  # mirror. Archived projects are included by default and are KEPT — that is
+                  # exactly the state where the last copy matters.
+                  url="${API}/projects?pagination=keyset&per_page=100&order_by=id&sort=asc&simple=true"
+                  : > /tmp/repos
+                  while [ -n "$url" ]; do
+                    # ⚠ wget, NOT curl: the alpine/git image ships git and busybox and has
+                    # NO curl. The first version used curl and the Job died on
+                    # "/bin/sh: curl: not found" — before doing anything, so it looked like a
+                    # configuration fault rather than a missing binary.
+                    # `-S` writes the response headers to stderr, which is what keeps keyset
+                    # pagination possible here: the next page is only discoverable from the
+                    # Link header.
+                    hdr=$(mktemp); body=$(mktemp)
+                    if ! wget $WGET_TLS -S -O "$body" \
+                           --header="PRIVATE-TOKEN: ${TOKEN}" "$url" 2>"$hdr"; then
+                      echo "ERROR: project listing failed:"; sed 's/^/    /' "$hdr" | tail -5
+                      exit 1
+                    fi
+                    tr ',' '\n' < "$body" | sed -n 's/.*"http_url_to_repo":"\([^"]*\)".*/\1/p' >> /tmp/repos
+                    # The Link header carries the next keyset page; absent = done.
+                    url=$(sed -n 's/.*<\([^>]*\)>; *rel="next".*/\1/p' "$hdr" | tr -d '\r' | head -1)
+                    rm -f "$hdr" "$body"
+                  done
+                  total=$(wc -l < /tmp/repos)
+                  echo "projects discovered: $total"
+                  # Refuse to report success on an empty mirror: a token that authenticates
+                  # but sees nothing would otherwise look exactly like a healthy run.
+                  [ "$total" -gt 0 ] || { echo "ERROR: API returned no projects"; exit 1; }
+
+                  mirror_one() {
+                    # $1 = clone URL, $2 = local directory, $3 = "required" | "optional"
+                    src=$(echo "$1" | sed "s#https://#https://oauth2:${TOKEN}@#")
+                    if [ -d "$2" ]; then
+                      # --prune so branches deleted upstream disappear here too; without it
+                      # the mirror slowly diverges into a union of every branch ever pushed.
+                      git -C "$2" remote set-url origin "$src"
+                      git -C "$2" remote update --prune >/dev/null 2>&1 || return 1
+                    else
+                      git clone --quiet --mirror "$src" "$2" >/dev/null 2>&1 || return 1
+                    fi
+                    # Never leave the token on disk inside the repo config.
+                    git -C "$2" remote set-url origin "$1"
+                    return 0
+                  }
+
+                  ok=0; failed=0; wikis=0
+                  while read -r repo; do
+                    [ -n "$repo" ] || continue
+                    path=$(echo "$repo" | sed "s#https://${GITLAB_HOST}/##; s#\.git\$##")
+                    dir="/mirror/${path}.git"
+                    mkdir -p "$(dirname "$dir")"
+                    if mirror_one "$repo" "$dir" required; then
+                      ok=$((ok+1))
+                    else
+                      echo "FAILED: $repo"; failed=$((failed+1))
+                    fi
+                    # ⚠ WIKIS ARE SEPARATE REPOSITORIES AND ARE NOT LISTED BY /projects.
+                    # `wiki_enabled` only says the FEATURE is on; the repo is created lazily
+                    # on the first page, so "not found" is an EMPTY WIKI, not an error.
+                    # Treating it as a failure would fail this job on most projects.
+                    wiki_url="https://${GITLAB_HOST}/${path}.wiki.git"
+                    if mirror_one "$wiki_url" "/mirror/${path}.wiki.git" optional; then
+                      wikis=$((wikis+1))
+                    else
+                      rm -rf "/mirror/${path}.wiki.git"
+                    fi
+                  done < /tmp/repos
+
+                  echo "mirrored: $ok repositories, $wikis wikis, $failed failed"
+                  # Fail the Job if ANY repository failed: a partial mirror that exits 0 is
+                  # the failure mode this whole thing exists to avoid, and the staleness
+                  # alert keys off the CronJob's last SUCCESSFUL run.
+                  [ "$failed" -eq 0 ]
+          volumes:
+            - name: mirror
+              persistentVolumeClaim:
+                claimName: nfs-gitlab-mirror

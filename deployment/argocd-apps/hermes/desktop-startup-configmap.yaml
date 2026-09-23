@@ -1,0 +1,576 @@
+# Desktop startup script, shared by BOTH desktop Deployments.
+#
+# WHY A ConfigMap: the startup sequence — license pin, fallback user, SSSD against the
+# Authentik LDAP outpost, PAM mkhomedir, xrdp — is shared by every desktop Deployment.
+# Inlining ~75 lines into each guarantees they drift the first time either is edited.
+# Precedent in this pod: the broker sidecar already runs from /usr/local/bin/broker
+# rather than an inline args: block.
+#
+# ⚠ THIS FILE IS THE ONLY COPY. There is no mirrored source elsewhere — deliberately.
+# Memory build-files-configmap-is-the-real-source records a case where a Dockerfile was
+# edited while an excluded ConfigMap copy was the real build input, making the edit a
+# silent no-op. One script, one place.
+#
+# Modules run as inner podman containers, always.
+#
+# SESSION_MODE (env, set per Deployment) — "per-user" on BOTH desktops: xrdp spawns a
+# private X server + xfce session per LDAP login, and the image entrypoint (which would
+# start one always-on root VNC desktop on :1) is not run at all. Any other value falls
+# through to that entrypoint; nothing sets one. See the SESSION_MODE block at the end of
+# the script for why a shared desktop breaks every RDP login here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-desktop-startup
+  namespace: hermes
+data:
+  desktop-startup.sh: |
+    # REGISTRY_HOST/MODULE_IMAGE_BASE -> /etc/environment, so PAM (pam_env) injects them
+    # into every login session (sshd AND xrdp both authenticate through the same PAM/SSSD
+    # stack). Kubernetes' env: block only reaches PID 1 and its direct descendants
+    # (module-podmand, started below) — a login shell started via sshd/xrdp/`su -` gets a
+    # fresh PAM-built environment that does NOT inherit it. Without this, module-cli.sh's
+    # `: "${REGISTRY_HOST:=registry.gitlab...}"` fallback always fires for a real user
+    # login, silently pointing every module image pull at the wrong registry.
+    if [ -n "${REGISTRY_HOST:-}" ]; then
+      printf 'REGISTRY_HOST=%s\nMODULE_IMAGE_BASE=%s\n' \
+        "$REGISTRY_HOST" "${MODULE_IMAGE_BASE:-deployments/infrastructure/eda/modules}" \
+        >> /etc/environment
+    fi
+
+    # LE staging CA -> the SYSTEM trust store, ADDITIVELY.
+    #
+    # On letsencrypt-staging every in-cluster HTTPS host (llm.<tld>, id.<tld>, the
+    # GitLab registry) is signed by a root this image does not ship, so anything a
+    # USER runs fails at TLS. /shared/tools/hermes-setup could
+    # not validate a LiteLLM key —
+    #   curl: (60) SSL certificate problem: unable to get local issuer certificate
+    # and reported it as "LiteLLM rejected that key (HTTP 000000)", which reads like
+    # a bad key rather than a trust problem.
+    #
+    # ⚠ ADDITIVE, via update-ca-certificates — NOT the subPath mount the tailscale
+    # sidecar uses. staging-ca.yaml says so explicitly: that mount SHADOWS the whole
+    # system bundle, which is safe only for a container speaking to exactly one TLS
+    # endpoint. This container also needs PUBLIC roots (PyPI, GitHub, astral.sh for
+    # Hermes' managed uv), so shadowing them would break every user install.
+    # Verified after the change: llm.<tld> 200 AND pypi.org 200.
+    #
+    # Inert on letsencrypt-prod: the bundle is simply an extra unused root, and the
+    # public chain keeps validating against ISRG Root X1 as normal.
+    if [ -s /run/staging-ca/ca-bundle.pem ]; then
+      cp /run/staging-ca/ca-bundle.pem /usr/local/share/ca-certificates/le-staging.crt
+      update-ca-certificates >/dev/null 2>&1 \
+        && echo "startup: LE staging CA added to the system trust store" \
+        || echo "startup: WARNING update-ca-certificates failed — in-cluster TLS will fail"
+    fi
+
+    # License-server /etc/hosts pin (Vivado FlexNet -96 workaround). The
+    # license var is present as pod env (below) so it works the moment a
+    # user runs `module load vivado`; pinning at startup is harmless if
+    # Vivado is never loaded.
+    if [ -n "${XILINXD_LICENSE_FILE:-}" ]; then
+      LIC_HOST="${XILINXD_LICENSE_FILE#*@}"
+      LIC_SHORT=$(echo "$LIC_HOST" | cut -d. -f1-2)
+      LIC_IP=$(getent hosts "$LIC_HOST" | awk '{print $1; exit}')
+      if [ -n "$LIC_IP" ] && [ "$LIC_SHORT" != "$LIC_HOST" ]; then
+        echo "$LIC_IP $LIC_SHORT" >> /etc/hosts
+      fi
+    fi
+    # Local FALLBACK user `desktop` (works even when Authentik/mesh down).
+    id desktop >/dev/null 2>&1 || useradd -M -u 2001 -d /home/desktop -s /bin/bash desktop
+    echo "desktop:$RDP_PASSWORD" | chpasswd
+    chown desktop:desktop /home/desktop 2>/dev/null || true
+    echo startxfce4 > /home/desktop/.xsession; chown desktop:desktop /home/desktop/.xsession
+    # ⚠ /etc/krb5.conf MUST EXIST, and the base image does not ship one — krb5-user was only
+    # added in r30 and its default config is not installed. Without it sssd's GSSAPI bind
+    # fails "Authentication Failed" / "going offline" AFTER the keytab itself is provably
+    # fine (`kinit -kt` gets a TGT and `kvno ldap/<dc>` succeeds), and the only hint is a
+    # 0x0020 line about being unable to touch the file's mtime:
+    #   sss_write_domain_mappings: Unable to change last modification time of krb5.conf.
+    # sssd also WRITES realm/domain mappings into it, so the file has to be writable, not a
+    # read-only mount.
+    cat > /etc/krb5.conf <<EOF
+    [libdefaults]
+      default_realm = ${AD_REALM}
+      # The AD zone resolves in-cluster via the CoreDNS forward (dns-config-job.yaml), but
+      # SRV discovery adds a failure mode for no benefit when there is one reachable DC.
+      dns_lookup_realm = false
+      dns_lookup_kdc = false
+      rdns = false
+      # Kerberos tolerates +-5 min; the lab node measured 2 s skew. Left at the default
+      # rather than widened — a large clock skew should fail loudly, not be papered over.
+    [realms]
+      ${AD_REALM} = {
+        kdc = ${AD_DC_FQDN}
+        admin_server = ${AD_DC_FQDN}
+      }
+    [domain_realm]
+      .${AD_DOMAIN} = ${AD_REALM}
+      ${AD_DOMAIN} = ${AD_REALM}
+    EOF
+    chmod 644 /etc/krb5.conf
+
+    # SSSD against SAMBA AD DIRECTLY (no longer the Authentik LDAP outpost).
+    cat > /etc/sssd/sssd.conf <<EOF
+    [sssd]
+    config_file_version = 2
+    # The ssh responder is what backs sss_ssh_authorizedkeys (sshd's AuthorizedKeysCommand).
+    # Without it the helper exits non-zero, sshd logs nothing useful, and key auth silently
+    # falls back to the password prompt.
+    services = nss, pam, ssh
+    domains = ad
+    # gVisor's netlink has no group-membership subscription, so sssd's
+    # setup_netlink() fails ("Unable to add membership: Operation not supported")
+    # and the daemon EXITS at startup — LDAP logins are then silently unavailable.
+    # sssd only uses netlink to notice network changes; with a fixed in-cluster
+    # ldap_uri there is nothing to react to, so disabling it costs nothing. Set
+    # unconditionally rather than branching on the runtime.
+    disable_netlink = true
+    [nss]
+    filter_users = root,desktop
+    [pam]
+    offline_credentials_expiration = 7
+    # ⚠ ACTIVE DIRECTORY, not the Authentik LDAP outpost. This is what makes the desktop
+    # and the fileserver agree on a uid. See doc/ad-identity-chain.md.
+    [domain/ad]
+    id_provider = ad
+    auth_provider = ad
+    access_provider = simple
+    # ⚠ NOT ANCHORED, and that is a deliberate trade — see the assertion after this heredoc.
+    # updateConfigFromProjectSettings.sh only rewrites a value when the
+    # "automatically updated from project-settings:<key>" comment is on the SAME line. Here
+    # that would put a trailing \`# …\` on a domain name and a Kerberos realm. sssctl
+    # config-check accepts it, but config-check does not validate VALUES at all (verified: it
+    # reports "Issues identified by validators: 0" for a deliberately bogus domain), so it
+    # cannot tell us whether sssd strips the comment or reads
+    # "ad.base.internal # automatically updated from …" as the domain. Guessing wrong here
+    # breaks every login and every Kerberos ticket.
+    #
+    # So these two are hardcoded, and the runtime check below fails loudly if they ever drift
+    # from the AD_DOMAIN/AD_REALM env vars (which ARE anchored, on their own lines in
+    # desktop-gvisor.yaml).
+    ad_domain = ad.base.internal
+    krb5_realm = AD.BASE.INTERNAL
+    # ⚠ THE MOST IMPORTANT LINE HERE. With the default (true) SSSD *hashes the SID* into a
+    # uid range of its own — the same mistake as TrueNAS's RID backend, and it would recreate
+    # the very divergence this change exists to remove, just in a new form. false makes SSSD
+    # read the real uidNumber out of the directory, which is exactly what the fileserver's
+    # idmap_backend: AD reads. The two sides then cannot disagree.
+    ldap_id_mapping = false
+    ldap_schema = rfc2307bis
+    # ⚠ THE KEYTAB IS MANDATORY. SSSD's ad provider authenticates to the DC with GSSAPI and
+    # has NO simple-bind fallback: without this the provider fails at startup with
+    #   Module [ad] constructor failed: No suitable principal found in keytab
+    # and every lookup returns "no such user" while the pod reports 2/2 Running. Minted for
+    # the rdesk-gvisor$ machine account by remote-desktop/keytab-job.yaml.
+    krb5_keytab = /etc/krb5.keytab
+    ldap_sasl_mech = GSSAPI
+    ldap_sasl_authid = ${AD_MACHINE_ACCOUNT}
+    # ⚠ 0 DISABLES SSSD-SIDE MACHINE PASSWORD RENEWAL — and this is a TEMPORARY STOPGAP,
+    # not a settled design. TODO(rotation): re-enable it.
+    #
+    # Why it is off today: samba rotates machine passwords every 7 days (machine password
+    # timeout = 604800), but an EXPORTED keytab is a point-in-time copy that does not follow
+    # a rotation. So with renewal on, sssd would change the account's password, the mounted
+    # keytab would go stale, and EVERY login would break a week later with no deploy having
+    # happened — the worst kind of latent failure. Turning renewal off buys correctness now
+    # at the cost of a long-lived machine credential.
+    #
+    # ⚠ WHAT RE-ENABLING REQUIRES (the work is on the keytab side, not here):
+    #   1. Let sssd renew (drop this line, or set it to e.g. 30).
+    #   2. remote-desktop/keytab-job.yaml must then RE-EXPORT after each renewal and update
+    #      the Secret — a CronJob, not a PostSync hook, since renewals happen between syncs.
+    #      The route-guard/replication-guard CronJobs are the pattern.
+    #   3. The re-export must be keyed on the account's KVNO changing, not on a timer, or it
+    #      will roll the desktop pointlessly; \`samba-tool user show <acct>$\` exposes
+    #      msDS-KeyVersionNumber.
+    #   4. Order matters: sssd renews the password FIRST and only then needs the new keytab,
+    #      so there is a window where the mounted keytab is already invalid. Either accept a
+    #      short re-auth gap or have the Job watch and roll promptly.
+    # Until all four exist, leaving renewal on would be strictly worse than leaving it off.
+    ad_maximum_machine_account_password_age = 0
+    # ⚠ THE DC MUST BE NAMED BY ITS AD NAME, NOT ITS KUBERNETES SERVICE NAME.
+    # Kerberos derives the target SPN from whatever name is used here, so pointing at
+    # ad-cloud.samba-ad.svc.cluster.local makes sssd ask for
+    #   krbtgt/AD-CLOUD-DNS.SAMBA-AD.SVC.CLUSTER.LOCAL@AD.BASE.INTERNAL
+    # which is "not found in Kerberos database" — the DC's SPNs are HOST/ad-cloud-0 and
+    # HOST/ad-cloud-0.ad.base.internal, nothing else. It presents as
+    # "ldap_sasl_interactive_bind_s failed (-2)[Local error]" and then "No available servers
+    # for service 'AD'", neither of which mentions a name.
+    #
+    # ⚠ And this name DOES resolve from a pod (verified: ad-cloud-0.ad.base.internal ->
+    # 10.42.0.242, the cloud DC's pod IP), because dns-config-job.yaml forwards the AD zone
+    # into CoreDNS. That is exactly the opposite of the TrueNAS appliance, which cannot route
+    # to pod addresses and therefore pins /etc/hosts to the LAN IP instead. Same zone, two
+    # different right answers depending on where the client sits.
+    ad_server = ${AD_DC_FQDN}
+    krb5_server = ${AD_DC_FQDN}
+    # Public keys for sss_ssh_authorizedkeys. In AD these live on altSecurityIdentities,
+    # written from the Authentik user's sshPublicKey attribute by
+    # samba-ad/postsync-provision-users.yaml — AD has no sshPublicKey attribute of its own.
+    #
+    # ⚠ THE CACHE NAME MUST NOT BE \`sshPublicKey\`, AND MUST NOT COLLIDE WITH altSecurityIdentities.
+    # In AD mode SSSD already maps altSecurityIdentities internally (as ldap_user_passkey), so
+    # naming either side of this pair after it makes sssm_ad_init fail with
+    #   Attribute sshPublicKey (altSecurityIdentities in LDAP) is already used by SSSD,
+    #   please choose a different cache name
+    # and the whole \`ad\` provider then fails to load — "Unable to load module ad",
+    # "Accessing a corrupted shared library", every user "no such user". Measured
+    # The error is three screens above the symptom in sssd_ad.log, and a bare
+    # dlopen of libsss_ad.so reports a red-herring undefined symbol (fo_server_count, which
+    # sssd_be legitimately provides) that has nothing to do with it.
+    # Public keys for sss_ssh_authorizedkeys, read from AD. The Authentik user's
+    # sshPublicKey attribute is copied into altSecurityIdentities by
+    # samba-ad/postsync-provision-users.yaml — AD has no sshPublicKey attribute of its own.
+    #
+    # ⚠ NAME THE LDAP ATTRIBUTE DIRECTLY. There is NO ldap_user_extra_attrs alias here, and
+    # adding one silently breaks this: with
+    #     ldap_user_extra_attrs   = adSshKey:altSecurityIdentities
+    #     ldap_user_ssh_public_key = adSshKey
+    # \`sss_ssh_authorizedkeys <user>\` returns EMPTY and EXITS 0 — no error in sssd_ad.log, no
+    # error in sssd_ssh.log, nothing cached. It looks like the attribute is missing from AD
+    # when it is plainly there. Proven by elimination: the same empty result
+    # occurred with a non-reserved attribute (comment), so it was never an
+    # altSecurityIdentities-is-special problem; pointing this option straight at the attribute
+    # made the key appear immediately.
+    #
+    # ⚠ And do NOT re-add the alias for the earlier collision reason. That collision
+    # ("Attribute sshPublicKey (altSecurityIdentities in LDAP) is already used by SSSD")
+    # only arose BECAUSE of the alias. With no alias there is nothing to collide.
+    ldap_user_ssh_public_key = altSecurityIdentities
+    # Everyone provisioned into AD is in Domain Users; membership is not otherwise
+    # provisioned (postsync-provision-users.yaml writes no memberOf), so this is the only
+    # meaningful access gate available today.
+    simple_allow_groups = domain users
+    fallback_homedir = /home/%u
+    default_shell = /bin/bash
+    cache_credentials = true
+    enumerate = false
+    EOF
+    chmod 600 /etc/sssd/sssd.conf
+
+    # ⚠ DRIFT GUARD for the two hardcoded identity values above. They cannot carry
+    # project-settings anchors (see the note in the heredoc), so this is what stops them
+    # silently rotting after a realm rename — which HAS happened in this repo:
+    # `--nis-domain=cape` sat stale in samba-ad's provisioning long after the domain became
+    # ad.base. Fail hard rather than start with a wrong realm: sssd would come up, bind
+    # nowhere, and present as "Authentication failure" for correct passwords.
+    for _pair in "ad_domain:${AD_DOMAIN:-}" "krb5_realm:${AD_REALM:-}"; do
+      _key="${_pair%%:*}"; _want="${_pair#*:}"
+      [ -n "$_want" ] || continue
+      _have=$(sed -n "s|^${_key} = ||p" /etc/sssd/sssd.conf | head -1)
+      if [ "$_have" != "$_want" ]; then
+        echo "FATAL: sssd.conf ${_key}='${_have}' but the anchored env says '${_want}'." >&2
+        echo "  startup-configmap.yaml hardcodes it; update it to match project_settings." >&2
+        exit 1
+      fi
+    done
+    echo "sssd: ad_domain/krb5_realm match the anchored values"
+
+    # ⚠ FAIL FAST IF THE KEYTAB IS MISSING. The Secret is mounted `optional: true` so a first
+    # bring-up can schedule before samba-ad's PostSync hook has minted it — which means the
+    # file legitimately may not exist yet. But starting sssd without it produces the WORST
+    # outcome: the ad provider fails, every user becomes "no such user", and the pod still
+    # reports 2/2 Running with xrdp happily accepting connections it can never authenticate.
+    # Better to refuse to start and let the Job's rollout bring us back.
+    #
+    # ⚠ `-f` FIRST, and it is the whole point of this test. `optional: true` is mounted WITH a
+    # subPath, and when the Secret is absent the kubelet creates the subPath target as a
+    # DIRECTORY. `-s` is TRUE for a directory, so a bare `[ ! -s ... ]` waves the missing
+    # keytab straight through: `wc -c` then prints "'standard input': Is a directory", the
+    # line below reports "keytab present (0 bytes)", and the only error left is sssd's
+    # uninformative death — i.e. exactly the outcome this guard exists to prevent. Measured on
+    # eda-pcb-agent (ecc208), which carries the same mount shape.
+    if [ ! -f /etc/krb5.keytab ] || [ ! -s /etc/krb5.keytab ]; then
+      echo "FATAL: /etc/krb5.keytab is missing, empty, or a directory." >&2
+      echo "  sssd's ad provider needs it (GSSAPI only, no simple-bind fallback)." >&2
+      echo "  It is minted by this desktop's own keytab Job into the Secret its" >&2
+      echo "  Deployment mounts at /etc/krb5.keytab; that Job also rolls the Deployment" >&2
+      echo "  once the Secret lands. Which Job depends on the desktop:" >&2
+      echo "    remote-desktop         remote-desktop/keytab-job.yaml (PreSync)" >&2
+      echo "    remote-desktop-bender  its own keytab-job.yaml (PreSync)" >&2
+      echo "  On a PostSync minter this is EXPECTED on a first bring-up; on a PreSync one" >&2
+      echo "  it is NOT, and means the hook did not run." >&2
+      exit 1
+    fi
+    echo "sssd: keytab present ($(wc -c < /etc/krb5.keytab) bytes)"
+    # ⚠ THE override_gid HACK IS GONE, DELIBERATELY — do not restore it.
+    # It existed because the Authentik LDAP outpost set every user's gidNumber EQUAL to their
+    # uidNumber (a per-user primary group) while publishing no group object for it, so
+    # `getent group <uid>` failed and every shell opened with
+    #     groups: cannot find name for group ID 5005
+    # It worked by resolving remote-desktop-users' gid at runtime and injecting
+    # `override_gid` with a `sed` anchored on the literal line `enumerate = false`.
+    #
+    # Against AD none of that applies: postsync-provision-users.yaml gives every user
+    # gidNumber 6000 AND gives Domain Users (their primaryGroupID 513) gidNumber 6000 too, so
+    # the primary group is a real, resolvable object and the ids already agree. An
+    # override_gid here would now FORCE a wrong primary group rather than fix a missing one.
+    #
+    # The `sed` had to go with it: it anchored on `enumerate = false`, which is still the last
+    # line of the heredoc, so leaving it would keep firing against the new config.
+    echo startxfce4 > /etc/skel/.xsession
+    # ⚠ pam_mkhomedir IS DELIBERATELY NOT INSTALLED, and re-adding it would be a regression.
+    # /home is now the TrueNAS NFS export: each AD user's home is created on the appliance by
+    # truenas/configure-job.yaml, owned by their real AD uid with mode 0700, from a list
+    # derived from the Authentik group. pam_mkhomedir would fight that in two ways:
+    #   1. It creates the directory AT LOGIN, racing the NFS mount — and SSH key auth does
+    #      not need a home to exist (keys come from LDAP via sss_ssh_authorizedkeys), so a
+    #      user can authenticate BEFORE the mount lands and get a home made in the wrong
+    #      place, which then shadows the real one.
+    #   2. It runs as root on a maproot=root export, so anything it creates is root-owned
+    #      until something fixes it — the opposite of the 0700/AD-uid model.
+    # A user whose home is missing should FAIL VISIBLY rather than silently get a fresh empty
+    # one that hides a provisioning problem.
+    for f in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
+      if grep -q pam_mkhomedir "$f"; then
+        sed -i '/pam_mkhomedir/d' "$f"
+        echo "removed pam_mkhomedir from $f (homes come from the fileserver)"
+      fi
+    done
+    sssd -D --logger=files || echo "WARNING: sssd failed — LDAP logins unavailable." >&2
+    # ── sshd: SSH/SFTP for the same LDAP users, on 2222 ────────────────────────────────
+    # Same PAM stack as xrdp, so there is no second credential store. Note homes are NOT
+    # created at login any more (see the pam_mkhomedir note above) — they are provisioned on
+    # the fileserver, so an SSH login for a user without a home fails visibly instead of
+    # silently landing in a fresh empty directory.
+    #
+    # Port 2222, not 22: these pods run on mesh nodes and the desktop container does NOT
+    # use hostNetwork, so 22 inside the pod would be fine — but the tailnet ACL grants
+    # humans 22 only against tag:k8s-node (the NODE's own sshd, operator-only in practice).
+    # Keeping the desktop on a distinct port means a human grant for the desktop can never
+    # be confused with node SSH. The Service maps 22 -> 2222 so users still type `ssh -p 22`
+    # implicitly; see vnc-services.yaml.
+    #
+    # Host keys are generated at RUNTIME into the homes volume, not baked into the image:
+    # an image-baked host key is shared by every cluster that pulls the image, and a
+    # regenerated-per-restart key makes every client re-prompt on the known-hosts mismatch.
+    # This keeps one stable identity per deployment across pod restarts.
+    SSHD_KEYDIR=/home/.ssh-hostkeys
+    mkdir -p "$SSHD_KEYDIR" && chmod 700 "$SSHD_KEYDIR"
+    # Generate each key EXPLICITLY rather than with `ssh-keygen -A -f "$SSHD_KEYDIR"`.
+    # `-A` prefixes its output with <dir>/etc/ssh but does NOT create that directory, so it
+    # fails every key with "Could not save your private key ... No such file or directory",
+    # exits 0-ish under `|| true`, and leaves NO host keys — sshd then dies at startup with
+    # "no hostkeys available" and SSH is silently unavailable while RDP looks fine.
+    # Verified by running this block against a real sshd.
+    for _t in ed25519 rsa; do
+      [ -f "$SSHD_KEYDIR/ssh_host_${_t}_key" ] \
+        || ssh-keygen -q -t "$_t" -N '' -f "$SSHD_KEYDIR/ssh_host_${_t}_key" >/dev/null 2>&1 || true
+    done
+    chmod 600 "$SSHD_KEYDIR"/ssh_host_*_key 2>/dev/null || true
+    _HK_DIR="$SSHD_KEYDIR"
+    cat > /etc/ssh/sshd_config <<EOF
+    Port 2222
+    # Root and password-free access are both off: every login is an LDAP user
+    # authenticating through PAM/SSSD, which is also what the RDP path enforces.
+    PermitRootLogin no
+    PasswordAuthentication yes
+    PermitEmptyPasswords no
+    ChallengeResponseAuthentication no
+    UsePAM yes
+    # ── Public-key auth from the directory, NOT from ~/.ssh/authorized_keys ─────────
+    # sss_ssh_authorizedkeys prints the keys held in the user's AD attribute
+    # altSecurityIdentities (see ldap_user_ssh_public_key in the sssd config above).
+    # Carried into AD from Authentik by samba-ad/postsync-provision-users.yaml.
+    #
+    # WHY NOT ~/.ssh/authorized_keys: /home is moving to TrueNAS over NFS, and a
+    # per-user key file on a network filesystem is fragile in two ways at once —
+    # OpenSSH StrictModes refuses any key file whose ownership/mode it cannot trust,
+    # and a user cannot install a key until after a first PASSWORD login, so keys could
+    # never be the primary factor. Reading keys from the directory removes both
+    # problems: nothing about key auth touches the home filesystem, and a key works on
+    # a brand-new account at first contact.
+    #
+    # Keys are still ALSO read from ~/.ssh/authorized_keys (AuthorizedKeysFile is left
+    # at its default) so a user who has already put one there is not locked out; LDAP is
+    # simply tried as well. Do not "tidy" that by setting AuthorizedKeysFile none.
+    AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys
+    # nobody, not root: this helper only needs to talk to the sssd socket, and running a
+    # per-login helper as root is the thing AuthorizedKeysCommandUser exists to avoid.
+    AuthorizedKeysCommandUser nobody
+    # X11 forwarding is the point of SSH-ing into a DESKTOP image: it lets a user run a
+    # single GUI tool over SSH instead of taking a whole Xfce session over RDP.
+    X11Forwarding yes
+    X11UseLocalhost yes
+    Subsystem sftp /usr/lib/openssh/sftp-server
+    HostKey ${_HK_DIR}/ssh_host_ed25519_key
+    HostKey ${_HK_DIR}/ssh_host_rsa_key
+    EOF
+    # /run/sshd must exist for privilege separation or sshd refuses to start.
+    mkdir -p /run/sshd
+    if /usr/sbin/sshd -t 2>/dev/null; then
+      /usr/sbin/sshd && echo "sshd: listening on 2222 (LDAP/PAM auth, X11 forwarding on)"
+    else
+      echo "WARNING: sshd config invalid — SSH unavailable (RDP unaffected)." >&2
+      /usr/sbin/sshd -t 2>&1 | head -5 >&2
+    fi
+    # ── xrdp session backends: leave EXACTLY ONE ────────────────────────────────
+    # Stock xrdp.ini offers a "Session" dropdown on the greeter with four backends.
+    # Only [Xorg] works properly here; the other three are either broken by this
+    # deployment's design or strictly worse, and every one of them is reachable by any
+    # user who opens the dropdown:
+    #   [Xvnc]            starts a VNC server and proxies RDP<->VNC. Functional but
+    #                     doubly transcoded, and it defeats two connection parameters
+    #                     the tile sets: resize-method=display-update (an RDP extension
+    #                     driving X RandR directly — under Xvnc the geometry is fixed at
+    #                     session start) and enable-drive (an RDP channel, so browser
+    #                     drag-and-drop file transfer does not survive the VNC hop).
+    #   [vnc-any]         connects to an EXISTING VNC server at a host/port the user
+    #                     types. Nothing binds 5901/6901 in SESSION_MODE=per-user, so it
+    #                     can never reach this desktop — it is a free-form outbound
+    #                     connection box that turns the pod into a small relay.
+    #   [neutrinordp-any] same shape, proxying to another RDP server. No downstream host.
+    # Editing in place rather than writing a whole xrdp.ini: the stock file carries
+    # crypt/channel/bitmap tuning that is not ours to re-derive.
+    #
+    # Deleting a section means from its header to the line before the next one. The
+    # trailing [Channels]/[EnabledChannels] sections must survive, so the range ends at
+    # the next '[' rather than at EOF.
+    if [ -f /etc/xrdp/xrdp.ini ]; then
+      for _sec in Xvnc vnc-any neutrinordp-any; do
+        sed -i "/^\[${_sec}\]/,/^\[/{ /^\[${_sec}\]/d; /^\[/!d }" /etc/xrdp/xrdp.ini
+      done
+      # With one backend left the dropdown is a control with no choice in it. autorun
+      # picks [Xorg] unattended and hides the Session row entirely, leaving username +
+      # password. The value is a SECTION NAME — if it names a section that no longer
+      # exists, xrdp silently falls back to showing the list again.
+      if grep -q '^\[Xorg\]' /etc/xrdp/xrdp.ini; then
+        if grep -q '^autorun=' /etc/xrdp/xrdp.ini; then
+          sed -i 's/^autorun=.*/autorun=Xorg/' /etc/xrdp/xrdp.ini
+        else
+          sed -i '/^\[Globals\]/a autorun=Xorg' /etc/xrdp/xrdp.ini
+        fi
+      else
+        echo "WARNING: no [Xorg] section in xrdp.ini — leaving the session list alone." >&2
+      fi
+      # The login box is captioned with ls_title, which stocks to the pod's hostname —
+      # i.e. a ReplicaSet hash users have no reason to see.
+      if grep -q '^ls_title=' /etc/xrdp/xrdp.ini; then
+        sed -i 's/^ls_title=.*/ls_title=Remote Desktop/' /etc/xrdp/xrdp.ini
+      fi
+      echo "xrdp: session backends = $(grep -c '^\[Xorg\]' /etc/xrdp/xrdp.ini) (Xorg), autorun on"
+    fi
+    /usr/sbin/xrdp-sesman && /usr/sbin/xrdp || echo "WARNING: xrdp failed." >&2
+    # podman store driver migration. The store is a hostPath, so it OUTLIVES this
+    # pod: a store written by the old vfs driver makes every podman command fail
+    # with `database graph driver "vfs" does not match our graph driver "overlay"`
+    # — container modules would break with no obvious cause. podman cannot convert
+    # in place, so drop the old store and let modules re-pull once (see
+    # doc/nested-container-runtime.md). Keyed off the recorded driver, so this
+    # fires exactly once and is a no-op on every later start.
+    # Each driver names its own subdirs (vfs/, vfs-layers/ … overlay/, overlay-layers/),
+    # so the on-disk layout is the reliable tell — no need to parse podman's db.
+    _st=/var/lib/containers/storage
+    _wants=$(sed -n 's/^ *driver *= *"\(.*\)"/\1/p' /etc/containers/storage.conf | head -1)
+    for _d in vfs overlay; do
+      if [ -d "$_st/$_d" ] && [ -n "$_wants" ] && [ "$_d" != "$_wants" ]; then
+        echo "podman store: found '$_d' store but config wants '$_wants' — resetting $_st" >&2
+        rm -rf "${_st:?}"/* || true
+        break
+      fi
+    done
+    # Drop the fuse-overlayfs mount_program the image bakes in. That line exists for a
+    # VM-based runtime, whose guest rootfs is virtiofs: the kernel refuses to stack
+    # overlay on FUSE and the fallback (vfs) copies every layer per container — 3m23s
+    # startup and a 118 GB store for one 31 GB image.
+    #
+    # Under gVisor it is not merely unnecessary, it BREAKS podman outright:
+    #   using mount program /usr/bin/fuse-overlayfs: unknown argument ignored: lazytime
+    #   fuse: mount failed: Invalid argument
+    #   Error: mounting storage for container ...: exit status 1
+    #
+    # ⚠ Removing it is NECESSARY but has NOT been sufficient on unibi-hclab-pcie-tb-s since
+    # 2026-08-30: a raw `mount -t overlay` inside the pod is refused there too, so podman
+    # has no working storage driver at all and no container module can run. See the
+    # KNOWN BROKEN block in doc/nested-container-runtime.md before "fixing" this line —
+    # putting the mount_program back does not help either, and the earlier claim here that
+    # a clean storage.conf makes an inner `podman run alpine` succeed was tested and is
+    # false on that node.
+    #
+    # storage.conf is baked into the image at build time and cannot differ per pod, so the
+    # correction belongs here.
+    if [ -f /etc/containers/storage.conf ]; then
+      sed -i -E '/^\s*mount_program\s*=/d' /etc/containers/storage.conf
+      echo "gVisor: removed fuse-overlayfs mount_program — using native overlay"
+    fi
+    # AND the marker inside the store. Editing storage.conf alone is NOT enough:
+    # podman drops a `.has-mount-program` file into the overlay dir the first time a
+    # store is used with a mount_program, and thereafter keeps using fuse-overlayfs no
+    # matter what the config says — the same failure persists with an unchanged error,
+    # which reads as "the fix did not work". A store first used under a runtime that
+    # needed the mount_program hits exactly this.
+    #
+    # ⚠ THIS WHOLE BLOCK MUST STAY AHEAD OF module-podmand (started just below). It used
+    # to sit AFTER it, which made the removal useless in the case it exists for: podman
+    # REWRITES this marker on every run from the config it sees, so a pull served by the
+    # daemon before the sed above lands re-stamps it `true` and every later mount is
+    # routed through fuse-overlayfs again. Measured 2026-09-18 on the gVisor desktop: a
+    # store carrying a stale `true` marker failed EVERY module image — petalinux and
+    # xilinx alike — with
+    #   lstat .../overlay/<id>/merged: transport endpoint is not connected
+    # while the layers sat intact on disk and the kernel overlay driver mounted them
+    # correctly by hand. The error names neither podman's config nor the marker.
+    rm -f /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null || true
+    # Container-module pull helper. Every desktop needs it: an unprivileged LDAP user
+    # cannot pull into the shared root podman store themselves — rootless podman has no
+    # /etc/subuid entry for them, no uidmap binaries, and gVisor refuses the mapping.
+    # See the header of module-podman.sh.
+    #
+    # ⚠ SUPERVISED, not fire-and-forget. A bare `… &` means one death disables every
+    # container module for the life of the pod, with no restart, no probe and no error:
+    # the generated wrappers poll for a status file that will never be written, so the
+    # user sees a tool that hangs silently rather than one that fails. Observed for real —
+    # the daemon died at 10:59 and an 86 GB pull request sat unserviced until it was
+    # restarted by hand 14 minutes later, with the desktop container reporting
+    # restartCount=0 and PID 1 healthy the whole time.
+    #
+    # The 1 s floor is what stops a permanently-broken binary (wrong mode, missing
+    # interpreter) from spinning the CPU; the log records every restart, so a crash loop
+    # is visible in module-podmand.log instead of being silent.
+    (
+      while :; do
+        /usr/local/bin/module-podmand
+        echo "[startup $(date -u +%H:%M:%S)] module-podmand exited rc=$? — restarting in 1s" >&2
+        sleep 1
+      done
+    ) >>/var/log/module-podmand.log 2>&1 &
+
+    # SESSION_MODE selects who owns the X displays in this pod. Both Deployments set
+    # "per-user", which is also the default here:
+    #
+    #   "per-user" — no always-on desktop. xrdp-sesman spawns a private X server + xfce
+    #     session per LDAP login, from X11DisplayOffset=10 upward. Every session is owned
+    #     by, and attributable to, one LDAP user.
+    #
+    #   anything else — falls through to the image entrypoint, which starts ONE root VNC
+    #     desktop on :1 (ports 5901/6901) that everyone shares, behind a single shared
+    #     password. Nothing sets this; it is not an access path this app offers.
+    #
+    # These two CANNOT coexist here. With the root desktop running, xrdp's stale-display
+    # probe misdetects :10 as already in use ("Found X server running at
+    # /tmp/.X11-unix/X10" for a display whose socket does not exist and whose abstract
+    # address refuses connections — gVisor's netstack reports Unix socket state
+    # differently than a normal kernel). xrdp then SKIPS starting its own X server and
+    # launches the window manager against a display that was never created; the WM exits 2
+    # in ~1s and sesman tears the session down. Symptom: RDP authenticates
+    # ("login successful for user <x> on display 10") and then immediately disconnects.
+    #
+    # We do NOT call the image entrypoint at all in this mode. Its --skip-startup flag
+    # looks like the right lever but is not: on that path it runs execute_command with an
+    # empty command, and that function has no else-branch — it returns immediately and the
+    # container exits 0 (CrashLoop with reason "Completed"). The `sleep infinity` in that
+    # script lives inside main(), AFTER start_vnc, and is unreachable when startup is
+    # skipped. So block here instead.
+    #
+    # xrdp + xrdp-sesman are already running (started above) and are the only thing this
+    # pod needs to serve; `wait` keeps PID 1 alive without spawning a desktop, so signals
+    # still terminate the container promptly.
+    if [ "${SESSION_MODE:-per-user}" = "per-user" ]; then
+      echo "SESSION_MODE=per-user — skipping the shared root VNC desktop; xrdp owns display allocation"
+      trap 'echo "shutting down"; pkill -TERM xrdp-sesman 2>/dev/null; pkill -TERM xrdp 2>/dev/null; exit 0' TERM INT
+      sleep infinity &
+      wait $!
+      exit 0
+    fi
+    exec /dockerstartup/startup.sh

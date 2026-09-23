@@ -1,0 +1,130 @@
+# ConfigMap: LE staging CA chain, for the tailscale sidecar's control-plane TLS.
+#
+# The sidecar dials --login-server=https://vpn.<tld> (headscale) with Go's crypto/tls,
+# which reads /etc/ssl/certs/ca-certificates.crt. On letsencrypt-staging that cert is
+# signed by the staging root, which is NOT in the image's trust store, so it fails:
+#
+#   Received error: fetch control key: Get "https://vpn.<tld>/key?v=138":
+#     x509: certificate signed by unknown authority
+#   boot: failed to auth tailscale: tailscale up failed: signal: killed
+#
+# The sidecar then crashloops. The DESKTOP still works (RDP via guacamole is in-cluster);
+# what breaks is reaching it over the tailnet.
+#
+# ⚠ Mounted with subPath OVER the single file, which SHADOWS the system roots — so this
+# must stay a COMPLETE chain. That is safe here only because this container talks to
+# exactly one TLS endpoint, headscale. Do NOT copy this mount into a container that also
+# needs public CAs. Same reasoning as argocd-infra/headscale/args-patch.yaml (6fcdc70f).
+#
+# Chain: end-entity -> Ersatz Emmer YR2 -> Yonder Yam Root YR -> Pretend Pear X1
+#
+# Only needed for letsencrypt-staging. On letsencrypt-prod the chain is the standard
+# ISRG Root X1, already trusted — this bundle then SHADOWS it, so if it ever went stale
+# it would break prod too. updateConfigFromProjectSettings.sh does not touch this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: staging-ca-bundle
+  namespace: remote-desktop
+data:
+  ca-bundle.pem: |
+    # (STAGING) Ersatz Emmer YR2 — LE staging intermediate
+    -----BEGIN CERTIFICATE-----
+    MIIFDjCCAvagAwIBAgIQP62QbC8DAdGNbaR7NzBv3jANBgkqhkiG9w0BAQsFADBD
+    MQswCQYDVQQGEwJVUzENMAsGA1UEChMESVNSRzElMCMGA1UEAxMcKFNUQUdJTkcp
+    IFlvbmRlciBZYW0gUm9vdCBZUjAeFw0yNTA5MDMwMDAwMDBaFw0yODA5MDIyMzU5
+    NTlaMEoxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MSMwIQYD
+    VQQDExooU1RBR0lORykgRXJzYXR6IEVtbWVyIFlSMjCCASIwDQYJKoZIhvcNAQEB
+    BQADggEPADCCAQoCggEBALVKXXQ+HfIdsroHx2TzhU3yBaocETY0MRoMHnS8CXUd
+    X3GYyVh/rHVgbiN3Kl8uBUl9PULcgNL5ltGEaPbQpQ6Ydb3SCAUTkJYySlJRFTdd
+    VnreV5Rv+zkcwWiyCVxjT1q10MDHQwIqKzfQqNK0bPn/RTUMgdGREPZsDdHaRjNS
+    t3zTECX/UUkeKSGwRqQLmdpmT0cV1XgUnNdCSeZoChX/WGTy5ntWD7ejHUo/KQG5
+    bhbD+XZ7Lm7us4Q5eBa10wgF9n7Q5JK/ZzwJ3Hx/o889zV+ZOlxWiQJi2K4E0DM9
+    Oj3hPPHW6NEWNjVqvDOWd8WqlgrM06JKWukGgZzzieECAwEAAaOB9jCB8zAOBgNV
+    HQ8BAf8EBAMCAYYwEwYDVR0lBAwwCgYIKwYBBQUHAwEwEgYDVR0TAQH/BAgwBgEB
+    /wIBADAdBgNVHQ4EFgQURf/2+BQuZ/bfqVTyRaVnwNZqg2wwHwYDVR0jBBgwFoAU
+    ULHXmAJQX9syRhtYwWhAciRvSsEwNgYIKwYBBQUHAQEEKjAoMCYGCCsGAQUFBzAC
+    hhpodHRwOi8vc3RnLXlyLmkubGVuY3Iub3JnLzATBgNVHSAEDDAKMAgGBmeBDAEC
+    ATArBgNVHR8EJDAiMCCgHqAchhpodHRwOi8vc3RnLXlyLmMubGVuY3Iub3JnLzAN
+    BgkqhkiG9w0BAQsFAAOCAgEAhUIaqp4M/cqLqKqb5zyG9kJkGYzOWq2YHV558vCK
+    CeLDkc12Jlll7u+AqkfkqwnLmqUHolHPQFNdL6HPW+f9lX68Kv4kaznRT7rxqXbX
+    xWO5ylgpJibwDKmVt581OcyhleZ8fajL2LfcDbY24ivsWOwlKevbLBV2C+HKS+IM
+    yvKxJovnbQsd2NfEiizPfrHXJAqyOv49yYeeE+eorvQHe8HJrNrYVjSs6PI51dbv
+    Lac6+SwfiwbtGZqddS7t8IY+IfOksamRe78s4kiA99nLOEGrQXhxNZIryngqL8p8
+    FKIi4UIC4Jez5wF8aSS/SG5IhCGbixgSYj/NpttpHOuWQFij54/eaFC8JXgDXafz
+    +XXFuuTXpEzQdD0exRnRj5DU0GUR174KagSiYgK2ND0RAPMkwtdOND+2wCN6UC5x
+    9fAjsDETMOe0aDAA1MKITiZ27MAxvxIDuAqTcVKYLu8NA37r2oC0k8ucAipMSUxt
+    OYQ03+hl+7GCx14j9LYYG3PfVt/qD5wsp6ys2GcJX0GPj2FziTs0FoIb1zrKTD1v
+    66xRtYZJIJmFfeSeZf7D0UcD3YA5Mbjmuz/6h43mws2nG/ZHbwPOtZV2N4cbXszu
+    fEciE157FGkWTBabn3GeUd2uyMvuhbPKM6UajJ4TyjFBM8AVZyNPFR0IqRLZX64h
+    DS4=
+    -----END CERTIFICATE-----
+    # (STAGING) Yonder Yam Root YR — LE staging sub-root (trust anchor)
+    -----BEGIN CERTIFICATE-----
+    MIIGKDCCBBCgAwIBAgIRAKYOL1Z3OCaTuowlAS/mVJgwDQYJKoZIhvcNAQELBQAw
+    ZjELMAkGA1UEBhMCVVMxMzAxBgNVBAoTKihTVEFHSU5HKSBJbnRlcm5ldCBTZWN1
+    cml0eSBSZXNlYXJjaCBHcm91cDEiMCAGA1UEAxMZKFNUQUdJTkcpIFByZXRlbmQg
+    UGVhciBYMTAeFw0yNjA1MTMwMDAwMDBaFw0zMjA5MDIyMzU5NTlaMEMxCzAJBgNV
+    BAYTAlVTMQ0wCwYDVQQKEwRJU1JHMSUwIwYDVQQDExwoU1RBR0lORykgWW9uZGVy
+    IFlhbSBSb290IFlSMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtp7v
+    6tBp9gDpiGVLOjMs1eS9DgItpgFU9ReJwb/Sygs6q+6EUCxfi5qDOKkDldiVOtlj
+    uwAFv8621qM4ukY6OmRBIA9hnCuunJlKNEjQfWArqwMOoo5iLZ4pq0UP4htWJluk
+    OoVorSouK/3E1XWTR3ZwImIofC0+p2203TpDbThhgPzT/ZjvMUE24qQTBcQtJ8wI
+    J7nz/k6B/NyM2+GmEMNFF11BtbUamVFJXMRi+KZeRoK/bQTAjePpY/0B1DDcqgQc
+    wCb3sIOj5ysFUK7qJyca8Xk5bF8wFOFxGHKmRRPrMpb7tXdTXHlSymDCtUx98CCf
+    wpr+7+vnHgaqsW5Yfr3AGt9P5SL+3hcmww4j0Xx6B3E4m0E+8g9mtJ1L1k7Caapw
+    geRW0ghidKJmN+5gY3p2G7P8Hq4yWC+fmJy1OWCg6GDwZmCMQu/AMUawRV40AUYZ
+    ZYBAeobZU/uKcmbWKUXuak1baZWp7oqjcsIDKxbMkg6KGjhLbVchHcYUslCoL+Aj
+    ShfAA3n8WJ0cjU3p+BMkWjTKVuAfLYN/DA76CvfRWX02D+riGz3VsFXCw9k5mFE0
+    zm+Vhc8xI3TWNhU6Qm6R1KrgCU2qOpgaJ8RlokUK3QFWrIdOAIQwO0leeyjTd/Me
+    vsw62Bzg0rbQ1kS3h+eWBcBskNCFJKDujztGeCcCAwEAAaOB8zCB8DAOBgNVHQ8B
+    Af8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDwYDVR0TAQH/BAUwAwEB/zAd
+    BgNVHQ4EFgQUULHXmAJQX9syRhtYwWhAciRvSsEwHwYDVR0jBBgwFoAUtfNl8v6w
+    CpIf+zx980SgrGMlwxQwNgYIKwYBBQUHAQEEKjAoMCYGCCsGAQUFBzAChhpodHRw
+    Oi8vc3RnLXgxLmkubGVuY3Iub3JnLzATBgNVHSAEDDAKMAgGBmeBDAECATArBgNV
+    HR8EJDAiMCCgHqAchhpodHRwOi8vc3RnLXgxLmMubGVuY3Iub3JnLzANBgkqhkiG
+    9w0BAQsFAAOCAgEAaqpAP+MTuFW+J0X2ibDAFe2QBUxEVzxUri7lDLII/lcXkL93
+    Vzu/fsfZL/D730It62cTSvVojEpBWP9AqGkVlldOjpKU2xag1D41CoRvkdgfFOd0
+    ezk8afg6mDHv+aBnHr49AL7xb5SC3GUqj+bn5HURBQcGZJJhhTjzET4Wj1lQSZbP
+    DqlS2WOxLiLnf5+EOVGjouJmJwFoodGOhEpAVxBWUY8B/9OGMzGAMBYeLMlEm4WV
+    NO4J7URT4AL2+i+WAK/qhpVrl6Zc+x/NPcRbW3qm9xFwgqdNXxcDgPktWwVyEhlg
+    3L9JrQ7y0s0b/or9Nbzj/Fng82IAputPDTMRHFRcsK2X7rShg2slHpWRrajd/j+u
+    xmHm/x84V0I1MVqMKkPEW5PBkmoJICt5GtSX7UkI4NVGFDo8IFG/eTIFSEkCvBq5
+    XEvE5lebNoFNSNKs7DfA6mhEpFmTJVONehdvRjPssmyTq21lY7w/9/4HTF2bEq8g
+    G6dRn2ZJgqfmUxnBun2JdAADXArYsh1BkRtWQN+JjQIjiMNO3AhmHOXmkkW2gww2
+    w8aH4OfRCndYYtw5Y60X9gNcpMRZOE2JjQG3ECZZb6EY5SEwPG+QxcRDOdQjZ4S6
+    jgKO5JRQNGcnvW8cVYK5AMjgRGZE6V9IxECMeEwNEFA17qGcweG1Tb3IpYs=
+    -----END CERTIFICATE-----
+    # (STAGING) Pretend Pear X1 — LE staging root (self-signed trust anchor)
+    -----BEGIN CERTIFICATE-----
+    MIIFmDCCA4CgAwIBAgIQU9C87nMpOIFKYpfvOHFHFDANBgkqhkiG9w0BAQsFADBm
+    MQswCQYDVQQGEwJVUzEzMDEGA1UEChMqKFNUQUdJTkcpIEludGVybmV0IFNlY3Vy
+    aXR5IFJlc2VhcmNoIEdyb3VwMSIwIAYDVQQDExkoU1RBR0lORykgUHJldGVuZCBQ
+    ZWFyIFgxMB4XDTE1MDYwNDExMDQzOFoXDTM1MDYwNDExMDQzOFowZjELMAkGA1UE
+    BhMCVVMxMzAxBgNVBAoTKihTVEFHSU5HKSBJbnRlcm5ldCBTZWN1cml0eSBSZXNl
+    YXJjaCBHcm91cDEiMCAGA1UEAxMZKFNUQUdJTkcpIFByZXRlbmQgUGVhciBYMTCC
+    AiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALbagEdDTa1QgGBWSYkyMhsc
+    ZXENOBaVRTMX1hceJENgsL0Ma49D3MilI4KS38mtkmdF6cPWnL++fgehT0FbRHZg
+    jOEr8UAN4jH6omjrbTD++VZneTsMVaGamQmDdFl5g1gYaigkkmx8OiCO68a4QXg4
+    wSyn6iDipKP8utsE+x1E28SA75HOYqpdrk4HGxuULvlr03wZGTIf/oRt2/c+dYmD
+    oaJhge+GOrLAEQByO7+8+vzOwpNAPEx6LW+crEEZ7eBXih6VP19sTGy3yfqK5tPt
+    TdXXCOQMKAp+gCj/VByhmIr+0iNDC540gtvV303WpcbwnkkLYC0Ft2cYUyHtkstO
+    fRcRO+K2cZozoSwVPyB8/J9RpcRK3jgnX9lujfwA/pAbP0J2UPQFxmWFRQnFjaq6
+    rkqbNEBgLy+kFL1NEsRbvFbKrRi5bYy2lNms2NJPZvdNQbT/2dBZKmJqxHkxCuOQ
+    FjhJQNeO+Njm1Z1iATS/3rts2yZlqXKsxQUzN6vNbD8KnXRMEeOXUYvbV4lqfCf8
+    mS14WEbSiMy87GB5S9ucSV1XUrlTG5UGcMSZOBcEUpisRPEmQWUOTWIoDQ5FOia/
+    GI+Ki523r2ruEmbmG37EBSBXdxIdndqrjy+QVAmCebyDx9eVEGOIpn26bW5LKeru
+    mJxa/CFBaKi4bRvmdJRLAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMB
+    Af8EBTADAQH/MB0GA1UdDgQWBBS182Xy/rAKkh/7PH3zRKCsYyXDFDANBgkqhkiG
+    9w0BAQsFAAOCAgEAncDZNytDbrrVe68UT6py1lfF2h6Tm2p8ro42i87WWyP2LK8Y
+    nLHC0hvNfWeWmjZQYBQfGC5c7aQRezak+tHLdmrNKHkn5kn+9E9LCjCaEsyIIn2j
+    qdHlAkepu/C3KnNtVx5tW07e5bvIjJScwkCDbP3akWQixPpRFAsnP+ULx7k0aO1x
+    qAeaAhQ2rgo1F58hcflgqKTXnpPM02intVfiVVkX5GXpJjK5EoQtLceyGOrkxlM/
+    sTPq4UrnypmsqSagWV3HcUlYtDinc+nukFk6eR4XkzXBbwKajl0YjztfrCIHOn5Q
+    CJL6TERVDbM/aAPly8kJ1sWGLuvvWYzMYgLzDul//rUF10gEMWaXVZV51KpS9DY/
+    5CunuvCXmEQJHo7kGcViT7sETn6Jz9KOhvYcXkJ7po6d93A/jy4GKPIPnsKKNEmR
+    xUuXY4xRdh45tMJnLTUDdC9FIU0flTeO9/vNpVA8OPU1i14vCz+MU8KX1bV3GXm/
+    fxlB7VBBjX9v5oUep0o/j68R/iDlCOM4VVfRa8gX6T2FU7fNdatvGro7uQzIvWof
+    gN9WUwCbEMBy/YhBSrXycKA8crgGg3x1mIsopn88JKwmMBa68oS7EHM9w7C4y71M
+    7DiA+/9Qdp9RBWJpTS9i/mDnJg1xvo8Xz49mrrgfmcAXTCJqXi24NatI3Oc=
+    -----END CERTIFICATE-----

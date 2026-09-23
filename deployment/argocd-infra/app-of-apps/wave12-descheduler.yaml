@@ -1,0 +1,57 @@
+# ArgoCD Application: descheduler
+#
+# Kubernetes has NO built-in mechanism to relocate a RUNNING pod when its
+# `preferredDuringSchedulingIgnoredDuringExecution` node affinity later becomes
+# satisfiable (the default scheduler decides placement at creation time only; k3s
+# ships just the stock scheduler). The sig-k8s descheduler fills that gap: it EVICTS
+# mis-placed pods (the default scheduler then reschedules them onto a preferred node).
+#
+# Two independent uses, two plugins (see values.yaml for each):
+#
+# 1. RemovePodsViolatingNodeAffinity — the GitLab registry runs 2 replicas that PREFER
+#    lab mesh nodes (soft affinity, deployment/argocd-apps/gitlab/values.yaml
+#    `registry:`). At cluster bootstrap no mesh node is Ready, so both replicas land on
+#    cloud. Once mesh nodes join, this plugin evicts the cloud-bootstrapped replica →
+#    it reschedules onto a lab node → the Thor CI push then reaches a LAN-local
+#    registry instead of crossing WireGuard.
+#
+# 2. LowNodeUtilization — relieves CPU/memory pressure on the cloud node generically,
+#    for any pod that tolerates mesh but has no preference telling it to move there.
+#    Added after the 2026-09-01 Ryax bootstrap: action-builder sat FailedScheduling at
+#    94% cloud-node CPU requests until manually patched onto a lab node; this plugin
+#    would have evicted it (or another over-provisioned pod) automatically once the
+#    node crossed the utilization threshold.
+#
+# Wave 12: after the mesh nodes + gateway (wave 10) and monitoring (wave 11) so mesh
+# nodes exist to migrate toward; it is otherwise cluster-generic and harmless earlier.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: descheduler
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+spec:
+  project: default
+  sources:
+    - repoURL: https://kubernetes-sigs.github.io/descheduler/
+      chart: descheduler
+      targetRevision: "0.36.0"  # https://github.com/kubernetes-sigs/descheduler/releases
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/descheduler/values.yaml
+
+    # ref source so valueFiles ($values) resolve from the git repo
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: descheduler
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,24 @@
+# Wildcard TLS certificate for infra services.
+# cert-manager issues this via Let's Encrypt DNS-01 (Hetzner webhook).
+#
+# The resulting Secret `wildcard-tls` is what the shared Gateway `main` terminates
+# TLS with, on its `https-wildcard` listener (deployment/argocd-infra/gateway/
+# gateway.yaml). A listener can only reference a Secret in its own namespace, which
+# is why both live in argocd-infra.
+#
+# wildcard-tls  → *.<tld>  covers every single-label host: infra (argocd, grafana,
+# prometheus, longhorn, id, vpn) and apps (nextcloud, wiki, meet, zulip, …). Only
+# multi-level hosts need their own cert — see doc/tls-certificates.md.
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard
+  namespace: argocd-infra
+spec:
+  secretName: wildcard-tls
+  issuerRef:
+    name: letsencrypt-prod # automatically updated from project-settings:tls.certIssuerType
+    kind: ClusterIssuer
+  dnsNames:
+    - "*.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}

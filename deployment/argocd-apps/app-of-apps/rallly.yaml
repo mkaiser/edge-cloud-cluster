@@ -1,0 +1,51 @@
+# ArgoCD Application: Rallly (lukevella/rallly).
+# Accessible at https://rallly.<subdomain>.<domain>
+# Group availability polling tool (Doodle replacement).
+# OIDC via Authentik; provider + tile created by authentik-blueprint.yaml.
+# PostgreSQL self-managed (postgres.yaml). Wave 20 (user apps).
+#
+# Plain manifests only (no Helm chart):
+#   deployment.yaml, postgres.yaml, ingress.yaml, authentik-blueprint.yaml,
+#   rallly-secrets-sealed.yaml, oidc-client-secret-sealed.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rallly
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/rallly
+    directory:
+      exclude: "*.sh"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rallly
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

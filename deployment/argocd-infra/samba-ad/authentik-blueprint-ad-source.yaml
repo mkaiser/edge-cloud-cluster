@@ -1,0 +1,180 @@
+# Authentik blueprint: Samba AD source — inbound sync + PASSWORD WRITE-BACK.
+#
+# This is the mechanism that makes one Authentik password work for SMB and Kerberos.
+#
+# HOW WRITE-BACK WORKS (verified by reading the LIVE 2026.5.5 worker image, not docs):
+#   sources/ldap/signals.py:39   @receiver(password_changed) def ldap_sync_password
+#   sources/ldap/signals.py:42   LDAPSource.objects.filter(sync_users_password=True, enabled=True)
+#   sources/ldap/password.py:104 self._connection.extend.microsoft.modify_password(user_dn, password)
+#
+# `extend.microsoft.modify_password` is ldap3's AD-native `unicodePwd` replace. When Samba
+# writes unicodePwd it derives BOTH the NT hash and the Kerberos keys, so one Authentik
+# password change yields working NTLM *and* working Kerberos. That is the whole design.
+#
+# ─── THREE CONSTRAINTS, ALL LOAD-BEARING ────────────────────────────────────────────────
+#
+# 1. ORDERING: a password set BEFORE the first inbound sync is a SILENT NO-OP.
+#    password.py:58-60 gates on `distinguishedName` being present in user.attributes, which
+#    only an inbound sync sets, and the miss is logged at INFO
+#    ("User has no distinguishedName set.") with no UI error. Per user the order MUST be:
+#      create in AD  ->  inbound sync stamps the DN  ->  password write-back works
+#    This is the single most likely thing to make Phase 2 look broken. The provisioning Job
+#    triggers the sync and then ASSERTS the DN landed, rather than assuming it.
+#
+# 2. EXACTLY ONE SOURCE may carry sync_users_password. signals.py takes `sources.first()`
+#    and silently ignores the rest — the upstream docstring says "can only be enabled on a
+#    single LDAP source" but nothing enforces it. If a second AD source is ever added, this
+#    flag must move, not be duplicated.
+#
+# 3. AN UNREACHABLE DC FAILS THE PASSWORD CHANGE OUTRIGHT. signals.py:63 raises
+#    ValidationError("Failed to set password"). That is the SAFE direction — no half-applied
+#    state, no divergence — but it means DC availability gates password changes cluster-wide.
+#    Mitigated by pointing at the CLOUD DC (in-cluster, co-located with Authentik), so a lab
+#    outage never touches password changes. Do NOT repoint this at the lab DC.
+#
+# ─── WHY THE K8S SERVICE NAME, NOT THE AD FQDN ──────────────────────────────────────────
+#
+# `unicodePwd` is refused in the clear, so this must be LDAPS, and ldap3 verifies the chain.
+# The DC's AD FQDN (ad-cloud-0.ad.cape.internal) does NOT resolve in-cluster: the k3s CoreDNS
+# pod mounts exactly ONE ConfigMap named `coredns-custom`, so the separate `coredns-samba-ad`
+# ConfigMap that dns-config-job.yaml writes is never mounted and its forward never loads.
+# The k8s service name resolves today and is covered by the cert's SANs (samba-ad/tls-cert.yaml).
+#
+# peer_certificate pins the DEDICATED CA (not the leaf), so the leaf can rotate without
+# touching Authentik. TLS verification stays ON — this channel carries passwords.
+#
+# ─── IDENTITY AUTHORITY ─────────────────────────────────────────────────────────────────
+#
+# Authentik owns the lifecycle; Samba AD is the password STORE. Account CREATION goes
+# Authentik -> AD via the samba-ad provisioning Job. This source syncs INBOUND only to stamp
+# the DN (and keep attributes fresh) — it must never become the authority for who exists.
+#
+# `password_login_update_internal_password: false` — do NOT copy an AD-side password back
+# into Authentik's own hash on login. Authentik stays the sole write source; anything else
+# re-opens the divergent-write hazard the two-DC partition analysis rules out.
+#
+# `user_matching_mode: username_link` — link to the EXISTING Authentik user by username
+# rather than creating a duplicate. The accounts originate here.
+#
+# ⚠ THIS FILE LIVES IN samba-ad/ BUT THE ConfigMap IS CREATED IN NAMESPACE authentik
+# (metadata.namespace below) — the Authentik worker only reads blueprints from its own
+# namespace. It is shipped by the wave13-samba-ad Application, so it must also be named
+# in that Application's `include:` allowlist or it is silently never applied.
+#
+# Delivery: authentik/values.yaml mounts it via worker.volumes with `optional: true`
+# (projected under /blueprints/apps/samba-ad), NOT via blueprints.configMaps. That list
+# renders without `optional:`, so listing a wave-13 ConfigMap there would leave the
+# wave-6 worker stuck in ContainerCreating. A labelled ConfigMap that is neither mounted
+# nor listed is never applied and the blueprint silently does nothing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-ad-source
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  ad-source.yaml: |
+    version: 1
+    metadata:
+      name: samba-ad-source
+    entries:
+      # Trust anchor for the LDAPS bind below: the dedicated CA from samba-ad/tls-cert.yaml.
+      # Trusting the CA rather than the leaf means a leaf rotation needs no change here.
+      #
+      # ⚠ The CERTIFICATE VALUE IS NOT KEPT HERE, deliberately. cert-manager mints a NEW CA
+      # on every cluster recreate, so any PEM committed to this file is stale the moment the
+      # cluster is rebuilt — and a stale trust anchor fails the LDAPS bind with
+      # CERTIFICATE_VERIFY_FAILED inside Authentik's async worker, where it is invisible:
+      # `distinguishedName` never lands and password write-back silently no-ops.
+      #
+      # Instead: `state: created` makes this entry create the pair ONCE (so the !KeyOf below
+      # resolves on a fresh cluster) and then never touch it again. The LIVE ca.crt is pushed
+      # in by samba-ad/postsync-provision-users.yaml step 0, which mounts the cert-manager
+      # Secret. `created` is what stops a blueprint re-apply from reverting that to the
+      # placeholder.
+      - model: authentik_crypto.certificatekeypair
+        id: samba-ad-ca
+        state: created
+        identifiers:
+          name: samba-ad-ca
+        attrs:
+          name: samba-ad-ca
+          # Placeholder ONLY — overwritten with the live CA by the samba-ad PostSync Job.
+          # A syntactically valid, permanently-expired throwaway cert: the field is
+          # non-nullable, and an obviously dead placeholder fails loudly rather than
+          # appearing to work if the Job never runs.
+          certificate_data: |
+            -----BEGIN CERTIFICATE-----
+            MIIDUTCCAjmgAwIBAgIUHZ60qKNRoeUWCtXiWDB0i3PalfEwDQYJKoZIhvcNAQEL
+            BQAwODE2MDQGA1UEAwwtUExBQ0VIT0xERVItcmVwbGFjZWQtYnktc2FtYmEtYWQt
+            cG9zdHN5bmMtam9iMB4XDTAxMDEwMTAwMDAwMFoXDTAxMDEwMjAwMDAwMFowODE2
+            MDQGA1UEAwwtUExBQ0VIT0xERVItcmVwbGFjZWQtYnktc2FtYmEtYWQtcG9zdHN5
+            bmMtam9iMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA21KfyDmr6u9v
+            XI/IF1gzhgvwDzEWb5WefXAMMZ2c95Yy9QhOjGiO9wJbnezdR0CK1FoWpvoEWjmO
+            Mat8UFBuBwcf81Qm5fF1aAYh7/Rq85wfsOYkoqoJHVh3Fl7gdQTmx1KlJsdvAikG
+            12B6Dgq+33xaADd3w0sZX3MTH8Efy0R9jpHS1Omc5fHRC608XTec9z3tiDCh6WVi
+            ufk9cD6t1ufzXBg12laaCoHvLfpHywz3GtrND8L0DszC+h2HND2eCD4ptGGeSlv3
+            lSzo0HjbRvMYstVxpQETM8AV+Bx9/OIbwuxr4xpXy+YNLF/KgtO0Im8URCy/IKRk
+            uFuFzZVZSwIDAQABo1MwUTAdBgNVHQ4EFgQUbnd1zAXSfHKz8sxUyROfm3yq82kw
+            HwYDVR0jBBgwFoAUbnd1zAXSfHKz8sxUyROfm3yq82kwDwYDVR0TAQH/BAUwAwEB
+            /zANBgkqhkiG9w0BAQsFAAOCAQEAMfsUVFnfAGF4pV01X/zcOOk/1tQ6+tE176Su
+            TxoMGCGRjsfzWoY9IDGQSaSCVNCAdiBEZSx1K+L4XxqFxTDpvKMHP5Y57JqPCCOz
+            324uXZon0Y+tUabwiD47vxEqcCdOSMyH0H6aKIEZhTxiPv/p4eduHKlmMQJ8/W7c
+            CFlpGclzmua5lDQgNgEPjkMTcnWfyifPsFqIh3kC7kKXnnO3BFzd1j9RKf2oo7en
+            b2g70QoIxMn/rBqah/w9jQh6Hux3lEsuRYZY3l2Ep9S6t5NVXleqqEAZ2QujUQs0
+            UkQNPnmF1UFQ8vTM7NETIHZoWV5yiyOodfXu55ugbyLuqkvEgg==
+            -----END CERTIFICATE-----
+
+      - model: authentik_sources_ldap.ldapsource
+        id: samba-ad-source
+        identifiers:
+          slug: samba-ad
+        attrs:
+          name: Samba AD
+          enabled: true
+          # LDAPS to the CLOUD DC by its k8s service name — see the header for why not the
+          # AD FQDN, and why not the lab DC.
+          server_uri: ldaps://ad-cloud-0.ad-cloud.samba-ad.svc.cluster.local:636
+          peer_certificate: !KeyOf samba-ad-ca
+          start_tls: false
+          sni: false
+          # Binds as a DEDICATED AD service account, not Administrator. Two reasons:
+          #   - Administrator's password is the sealed DOMAIN ADMIN password (baked into
+          #     sam.ldb at provision); putting it in a second place means two things to
+          #     rotate and a domain-admin credential living in Authentik's DB.
+          #   - This account needs only "read users" + "reset password" on CN=Users, which
+          #     is a delegation, not domain admin.
+          # The account and its delegation are created by the samba-ad provisioning Job
+          # (postsync-provision-users.yaml), which sets this same password from the bundle.
+          # ⚠ Its DN must match what that Job creates.
+          bind_cn: CN=authentik-sync,CN=Users,dc=ad,dc=base,dc=internal # automatically updated from project-settings:activeDirectory.baseDn
+          bind_password: !Env SAMBA_AD_BIND_PASSWORD
+          base_dn: dc=ad,dc=base,dc=internal # automatically updated from project-settings:activeDirectory.baseDn
+          # Users live under CN=Users; groups are managed in Authentik, not synced back.
+          additional_user_dn: CN=Users
+          # Inbound sync exists to stamp distinguishedName (see constraint 1) and keep
+          # attributes fresh. Groups are NOT synced: Authentik owns group membership, and
+          # syncing them inbound would let AD-side edits become authoritative.
+          sync_users: true
+          sync_groups: false
+          # THE POINT OF THIS FILE.
+          sync_users_password: true
+          # Never overwrite Authentik's own password hash from AD (see header).
+          password_login_update_internal_password: false
+          # Link to the existing Authentik user; never create a duplicate.
+          user_matching_mode: username_link
+          # objectSid is AD's stable identifier — survives renames.
+          object_uniqueness_field: objectSid
+          user_object_filter: (&(objectClass=user)(!(objectClass=computer)))
+          # `managed` identifiers verified against the live instance — these are the exact
+          # strings authentik ships (note the inconsistent casing: ms-samaccountname is
+          # lowercase while ms-givenName/ms-sn are not; a !Find that matches nothing yields
+          # a source with no mappings and an inbound sync that stamps nothing).
+          user_property_mappings:
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/ms-samaccountname"]]
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/ms-userprincipalname"]]
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/ms-givenName"]]
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/ms-sn"]]
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/default-name"]]
+            - !Find [authentik_sources_ldap.ldapsourcepropertymapping, [managed, "goauthentik.io/sources/ldap/default-mail"]]

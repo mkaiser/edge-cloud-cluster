@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k3s-upgrade-plan-save-cordoned-nodes
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/k3s-upgrade-plan-save-cordoned-nodes
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

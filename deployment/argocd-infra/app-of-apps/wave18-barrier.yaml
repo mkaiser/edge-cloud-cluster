@@ -1,0 +1,197 @@
+# Wave 18 Sync barrier: waits until all infrastructure applications are Synced+Healthy
+# before advancing to wave 19 (notify) and wave 20 (general apps).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wave18-barrier
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "18"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wave18-barrier
+  annotations:
+    argocd.argoproj.io/sync-wave: "18"
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wave18-barrier
+  annotations:
+    argocd.argoproj.io/sync-wave: "18"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wave18-barrier
+subjects:
+- kind: ServiceAccount
+  name: wave18-barrier
+  namespace: argocd-infra
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wave18-barrier
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "18"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1200
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: wave18-barrier
+      restartPolicy: Never
+      containers:
+      - name: barrier
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          echo "Wave-18 barrier: discovering applications with sync-wave < 18..."
+
+          # ⚠ EVERY wave below 18, not just the preceding one. The earlier barriers
+          # (wave1/3/5/7/9) each gate only wave N-1, which is correct for them: they are
+          # stepping stones and the next barrier re-checks anyway. THIS barrier is the last
+          # one, and wave 19 hands the cluster to the apps ArgoCD — so "all infra
+          # Synced+Healthy" has to mean all of it.
+          #
+          # It read `wave == '10'` and therefore waited for mesh-gateway and node-guard ONLY,
+          # letting waves 11-17 through ungated: mesh-monitoring, descheduler, samba-ad,
+          # grafana, loki, alloy, truenas and csi-driver-nfs. Measured on the ecc212 bring-up
+          # 2026-09-16 — the barrier passed in 5 SECONDS with 12 infra apps still Progressing,
+          # and argocd-apps started deploying on top of an infrastructure that was not up.
+          # A 5s pass on this barrier is the symptom to look for; it cannot be right.
+          APPS=$(kubectl get applications -n argocd-infra -o json | \
+            python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for item in data['items']:
+              ann = item.get('metadata', {}).get('annotations', {})
+              wave = ann.get('argocd.argoproj.io/sync-wave', '')
+              tracking = ann.get('argocd.argoproj.io/tracking-id', '')
+              parent = tracking.split(':')[0] if tracking else ''
+              if parent != 'argocd-infra-app-of-apps':
+                  continue
+              # An app with no sync-wave annotation defaults to 0, i.e. below 18 — include it
+              # rather than silently skipping it, which is how this class of bug hides.
+              try:
+                  w = int(wave) if wave else 0
+              except ValueError:
+                  w = 0
+              if w < 18:
+                  print(item['metadata']['name'])
+          ")
+
+          echo "Waiting for: $(echo $APPS | tr '\n' ' ')"
+
+          MARKER="wave18-barrier-done"
+          if kubectl get configmap "$MARKER" -n argocd-infra >/dev/null 2>&1; then
+            echo "Barrier already passed (ConfigMap $MARKER exists) — skipping."
+            exit 0
+          fi
+
+          i=0
+          while [ "$i" -lt 120 ]; do
+            PENDING=""
+            for APP in $APPS; do
+              SYNC=$(kubectl get application "$APP" -n argocd-infra \
+                -o jsonpath="{.status.sync.status}" 2>/dev/null || true)
+              HEALTH=$(kubectl get application "$APP" -n argocd-infra \
+                -o jsonpath="{.status.health.status}" 2>/dev/null || true)
+              # ⚠ `.operation`, NOT `.status.operationState.phase`. After a sync finishes,
+              # `phase` can keep reading "Running" for HOURS while the operation itself is
+              # long gone — so a Synced+Healthy app gates the barrier forever. Measured on the
+              # ecc213 bring-up 2026-09-17: samba-ad and truenas both sat
+              # Synced/Healthy/phase=Running, the barrier burned all 120 attempts and FAILED,
+              # and wave 19 never created the apps ArgoCD instance. `.operation` is present
+              # only while a sync is genuinely in flight, which is the question being asked.
+              INFLIGHT=$(kubectl get application "$APP" -n argocd-infra \
+                -o jsonpath="{.operation}" 2>/dev/null || true)
+              # Backstop for an app that reports Degraded while owning no unhealthy
+              # resource. The custom HTTPRoute health check
+              # (argocd-infra-self/values.yaml) already keeps a route waiting on a
+              # later wave out of Degraded, but that ConfigMap only takes effect once
+              # argocd-infra-self has synced — until then ArgoCD's BUILT-IN check
+              # degrades the parent app and would deadlock the bootstrap:
+              # longhorn-config and kube-prometheus-stack (wave 2) carry OIDC routes
+              # backed by authentik-server (wave 6), so they sat Degraded with 0 of
+              # 17 resources unhealthy, this barrier never released, and wave 6 could
+              # never run to create the Service that would have fixed them.
+              #
+              # So Degraded is tolerated ONLY when the app reports no unhealthy
+              # resource of its own. A crashlooping pod or a failed job still sets a
+              # resource-level status and still blocks — the barrier keeps catching
+              # real breakage.
+              TOLERATED=""
+              # NB: Degraded only. Progressing is NOT tolerated — a Progressing app is
+              # genuinely still coming up, and ArgoCD blocks its own sync on Progressing
+              # resources anyway, so tolerating it here would race the sync.
+              if [ "$HEALTH" = "Degraded" ]; then
+                UNHEALTHY=$(kubectl get application "$APP" -n argocd-infra -o json 2>/dev/null | \
+                  python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print('unknown'); sys.exit(0)
+          bad = [r for r in d.get('status', {}).get('resources', [])
+                 if (r.get('health') or {}).get('status') not in (None, 'Healthy')]
+          print(len(bad))
+          " 2>/dev/null || echo unknown)
+                if [ "$UNHEALTHY" = "0" ]; then
+                  TOLERATED="yes"
+                fi
+              fi
+
+              if [ "$SYNC" = "Synced" ] && \
+                 { [ "$HEALTH" = "Healthy" ] || [ -n "$TOLERATED" ]; } && \
+                 [ -z "$INFLIGHT" ]; then
+                if [ -n "$TOLERATED" ]; then
+                  echo "  ${APP}: Degraded but 0 unhealthy resources (unresolved ref to a later wave) — tolerated."
+                fi
+              else
+                PENDING="${PENDING} ${APP}(sync=${SYNC},health=${HEALTH},syncing=${INFLIGHT:+yes})"
+              fi
+            done
+
+            if [ -z "$PENDING" ]; then
+              echo "All wave-(<18) Applications Synced+Healthy."
+              break
+            fi
+
+            echo "Attempt $i/120 — waiting for:${PENDING}"
+            sleep 10
+            i=$((i+1))
+          done
+
+          if [ -n "$PENDING" ]; then
+            echo "ERROR: timed out waiting for:${PENDING}"
+            exit 1
+          fi
+
+          kubectl create configmap "$MARKER" -n argocd-infra \
+            --from-literal=status=done \
+            --from-literal=timestamp="$(date -Iseconds)" \
+            2>/dev/null || true
+          echo "All wave-(<18) Applications Synced+Healthy — releasing wave 19."

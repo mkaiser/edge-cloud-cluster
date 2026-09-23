@@ -1,0 +1,711 @@
+# Lab Samba AD domain controller — joins the domain the cloud DC provisioned.
+#
+# WHY A SECOND DC AT THE LAB SITE:
+# TrueNAS must reach the KDC on 88/389/445/464 and DNS/53 for EVERY SMB and NFS
+# authentication, and TrueNAS is on the lab LAN. A cloud-only DC would put file-server auth
+# behind the least reliable link in the system (the university egress silently drops TCP
+# 80/443 to the cloud IP — see the unibi-hclab-webfilter memory), and a kinit timeout is a
+# failed login.
+#
+# A Samba AD DC is a FULL MULTI-MASTER REPLICA: it holds a complete local copy and serves
+# KDC, LDAP, netlogon and NTLM from it, consulting no peer on the authentication path.
+# a user created on the cloud DC authenticated over SMB3 against the
+# lab DC ALONE. So when the mesh↔cloud link breaks, lab users keep working — TrueNAS, this
+# DC, the desktop pod and the laptops are all on the same LAN.
+#
+# --setup=wait-domain,join — the image's own ordering primitive. `wait-domain` polls
+# _ldap._tcp.<realm> SRV until the cloud DC answers, then `join` runs
+# `samba-tool domain join <realm> DC` (sambacc/addc.py). _prep_join is idempotent
+# ("Already configured. Not joining"), so it is safe under ArgoCD re-sync. This is why
+# there is no hand-rolled join Job.
+#
+# WHY hostNetwork (and not NodePort / ServiceLB):
+# AD clients do not negotiate ports — Kerberos is 88, LDAP is 389, SMB is 445, full stop.
+# NodePort rewrites into 30000-32767 and is therefore unusable for AD; k3s ServiceLB
+# (klipper) masquerades unconditionally, so Samba would see every client as a pod IP.
+# hostNetwork gives the real ports on the node's LAN IP. Precedent: kube-vip/daemonset.yaml,
+# mesh-gateway/daemonset.yaml, node-guard/mesh-antiloop-daemonset.yaml.
+#
+# ⚠ PORT 53 IS CONTESTED ON THE LOOPBACK — three resolvers share it, by design:
+#   127.0.0.1     Samba's internal DNS (this pod). NOT movable: samba binds the loopback for
+#                 its internal DNS regardless of `interfaces`, which is why a conflict shows
+#                 up as "Failed to listen on 127.0.0.1:53" and not on the LAN address.
+#   127.0.0.2     the node-local AD-zone resolver (dnsmasq, ecc-ad-dns.service), installed
+#                 UNCONDITIONALLY on every mesh node by src/provisioning-scripts/30-connect-vpn.sh.
+#   127.0.0.53/54 systemd-resolved's stubs.
+# dnsmasq listening on 127.0.0.1 takes this DC down everywhere it could schedule — both
+# sides independently record .1 as "free", and both are right in isolation. Do not move
+# dnsmasq back. 88/389/445/636 are free on the LAN address.
+# Re-check with `sudo ss -lntupe 'sport = :53'` if the node is rebuilt — the cgroup column
+# names the owning unit, which is what distinguishes dnsmasq from resolved.
+#
+# ⚠ Same snapshot warning as the cloud DC: NEVER snapshot-restore this volume.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ad-onprem
+  namespace: samba-ad
+spec:
+  serviceName: ad-onprem
+  # One DC per node carrying ecc/ad-dc=true. MUST equal the number of such nodes: the
+  # anti-affinity below is `required`, so a surplus replica sits Pending forever and a
+  # shortfall silently leaves a node without a DC.
+  #
+  # ⚠ NOT HAND-EDITED — derived from the count of enabled mesh nodes with `adDc: true` by
+  # scripts/environment/updateConfigFromProjectSettings.sh. Change `adDc` in
+  # project_settings.ts and re-run it.
+  #
+  # ⚠ SCALING DOWN NEEDS A DEMOTE FIRST. Deleting a replica leaves an orphaned DC object in
+  # AD (`samba-tool domain demote`, or `--remove-other-dead-server` from a survivor). There
+  # is deliberately NO preStop demote hook — it would fire on every ordinary eviction.
+  replicas: 2 # automatically updated from project-settings:nodes.mesh[].adDc
+  selector:
+    matchLabels:
+      app: samba-ad
+      dc: onprem
+  template:
+    metadata:
+      labels:
+        app: samba-ad
+        dc: onprem
+    spec:
+      priorityClassName: platform
+      terminationGracePeriodSeconds: 30
+      # Real AD ports on the node's LAN IP — see the header.
+      hostNetwork: true
+      # NO `hostname:` override — see the long note in statefulset-cloud.yaml. The pod
+      # hostname the StatefulSet assigns (ad-onprem-N) IS that DC's AD identity, and the
+      # resolve-node-config initContainer writes it into instance_name, so samba_dnsupdate
+      # keeps the one record that peers resolve pointed at the live address.
+      #
+      # A CAPABILITY LABEL, NOT A HOSTNAME PIN. This used to read
+      # `kubernetes.io/hostname: <a single lab node>`, which put every SMB/NFS login at the
+      # site behind one box: a DC restart was a site-wide auth outage, and it armed the
+      # TrueNAS FAULTED repair path (truenas/configure-job.yaml), which leaves the domain
+      # and DELETES the machine account. That fired unattended on 2026-08-31.
+      #
+      # ecc/ad-dc comes from `adDc: true` in project_settings.ts, applied by the Tier-1
+      # mesh-label reconcile (src/nodes-k3s-mesh.ts) — so enrolling another node needs no
+      # re-provision.
+      nodeSelector:
+        ecc/ad-dc: "true"  # automatically updated from project-settings:applicationPlacements.labels.adDc
+      affinity:
+        # REQUIRED, not preferred. These pods are hostNetwork and every one of them wants
+        # 53/88/389/445/464/636 on the node; two on one box is not a degraded placement, it
+        # is a bind conflict and a crashloop.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: samba-ad
+                  dc: onprem
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # DNS — LOAD-BEARING. See the long note in statefulset-cloud.yaml: a DC on cluster
+      # DNS cannot resolve its own name, and one direction of replication then silently
+      # never converges while everything still looks healthy.
+      #
+      # NOTE this deliberately does NOT use ClusterFirstWithHostNet, the usual companion to
+      # hostNetwork. AD-zone resolution wins over cluster-service resolution here: this pod
+      # talks to its peer DC by AD name, not to cluster Services.
+      #
+      # 127.0.0.1 = its own SAMBA_INTERNAL DNS once joined.
+      #
+      # THE BOOTSTRAP PROBLEM: at first start this DC has no domain and no DNS of its own,
+      # so 127.0.0.1 answers nothing and `wait-domain` could never discover the cloud DC.
+      # It therefore also needs the cloud DC as a resolver. Its address cannot be a literal
+      # here (ClusterIPs change on every cluster recreate) and cannot be a cluster Service
+      # NAME either, because dnsConfig.nameservers takes IP addresses only — resolving a
+      # name would require the very DNS being configured.
+      #
+      # Resolved by dns-config-job.yaml: a Sync-hook Job reads the live cloud-DC address and
+      # patches it into this pod's dnsConfig. `ignoreDifferences` on the Application keeps
+      # ArgoCD selfHeal from reverting it (see wave13-samba-ad.yaml).
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - "127.0.0.1"
+          # The cloud DC, via its dedicated ClusterIP Service (ad-cloud-dns). Needed
+          # to BOOTSTRAP: at first start this DC has no domain and no DNS of its own, so
+          # 127.0.0.1 answers nothing and `wait-domain` would never discover the domain.
+          #
+          # A literal is correct here BECAUSE it is a ClusterIP: allocated once and stable
+          # across pod restarts, unlike a pod IP. Earlier this was patched in at sync time
+          # from the live pod IP; that does not hold — ArgoCD re-applies the git manifest
+          # on every sync and the pod is recreated without the patch, so the lab DC
+          # silently loses its resolver and sits in wait-domain forever.
+          #
+          # ⚠ This IP is cluster-scoped state: on a cluster RECREATE the Service gets a new
+          # ClusterIP and this line must be updated. dns-config-job.yaml checks it and
+          # corrects the StatefulSet if it drifts.
+          - "10.43.48.96" # automatically updated from project-settings:network.adDnsClusterIp
+        searches:
+          - "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+        options:
+          - { name: ndots, value: "2" }
+      securityContext:
+        fsGroup: 0
+      initContainers:
+        # MUST BE FIRST. Resolves every per-node and per-pod token in the sealed config and
+        # writes the result to the `config` emptyDir that SAMBACC_CONFIG points at.
+        # Everything downstream — the join in the samba container as well as the globals
+        # merge in apply-global-options — reads the RESOLVED copy, so a fresh join and a
+        # restart of an already-joined DC both get current values.
+        #
+        # NOTHING NODE- OR POD-SCOPED MAY BE A LITERAL IN THE SEALED SECRET. A sealed blob is
+        # opaque, needs the Pulumi stack to regenerate, and nothing validates it against
+        # reality: when the lab node was re-addressed 10.0.10.8 -> 10.0.10.11 the seal still
+        # said .8, samba could not bind an address the node no longer had, and the DC
+        # CrashLooped 63x on "Failed to listen on 10.0.10.8:53 -
+        # NT_STATUS_ADDRESS_NOT_ASSOCIATED", taking cloud replication to 5/10.
+        #
+        # Four tokens, all resolved here:
+        #   __MESH_IP__            status.podIP — under hostNetwork that IS the node's mesh
+        #                          (tailscale) address.
+        #   __POD_CIDR_NETMASK__   the WHOLE cluster pod range, from the env below.
+        #   __DNS_FORWARDER__      the site gateway, from the env below.
+        #   __POD_NAME__           this pod's name -> instance_name, i.e. THIS DC's netbios
+        #                          name. It must differ per replica, which is exactly what
+        #                          the pod name already is; a literal here would make every
+        #                          replica claim one AD identity.
+        #   __LAB_NIC__            the node's LAN interface, DERIVED from its default route.
+        - name: resolve-node-config
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, sys, json, ipaddress
+              mesh_ip = os.environ.get('MESH_IP', '').strip()
+              if not mesh_ip:
+                  sys.exit('MESH_IP empty — downward API status.podIP not set')
+              # Pod CIDR in Samba's ADDRESS/NETMASK form (Samba's `interfaces` takes a
+              # netmask, not a prefix length). POD_CIDR comes from the env below, which is
+              # anchored to project_settings.network.podCidr — it is NOT read from the node:
+              # spec.podCIDR is a per-node /24 slice, while Samba must be told the WHOLE
+              # cluster pod range, and the downward API cannot expose node spec fields anyway.
+              # Kept out of the sealed secret because a sealed secret is opaque and needs the
+              # Pulumi stack to regenerate — exactly how the old literal 10.0.10.8 survived a
+              # re-addressing and CrashLooped the DC 63 times.
+              pod_cidr = os.environ.get('POD_CIDR', '').strip()
+              if not pod_cidr:
+                  sys.exit('POD_CIDR empty — check the env entry in this StatefulSet')
+              net = ipaddress.ip_network(pod_cidr, strict=False)
+              pod_cidr_netmask = f'{net.network_address}/{net.netmask}'
+
+              # `dns forwarder` — WHY THIS IS DERIVED AND NOT A LITERAL.
+              # Samba's internal DNS is authoritative for the AD zone and, with no
+              # forwarder, answers NXDOMAIN for every name outside it. NXDOMAIN is an
+              # authoritative "does not exist", so a resolver client ACCEPTS it and never
+              # tries its second nameserver — the DC returned
+              # NXDOMAIN for github.com / download.truenas.com while the LAN router
+              # resolved both. Any domain member pointed at this DC (TrueNAS is the first)
+              # therefore loses ALL external name resolution — including its update
+              # servers — while looking correctly configured. A two-nameserver fallback
+              # does NOT rescue it, precisely because NXDOMAIN is not a failure.
+              #
+              # Derived from the node's own default gateway rather than pinned, so a
+              # changed router or lab subnet self-heals on the next pod start. A literal
+              # here is the same class of bug as the old hard-coded 10.0.10.8 mesh IP
+              # that CrashLooped this DC 63 times when the node was re-addressed.
+              # LAB_GATEWAY comes from the env below; empty means "leave unset", which
+              # restores the previous (NXDOMAIN) behaviour rather than breaking startup.
+              forwarder = os.environ.get('LAB_GATEWAY', '').strip()
+
+              # ── this pod's AD identity ────────────────────────────────────────────
+              # instance_name becomes the DC's netbios name, so it MUST differ per replica.
+              # NOT `hostname` — this pod is hostNetwork and shares the host UTS namespace,
+              # so `hostname` returns the NODE name. The downward API is the only honest
+              # source.
+              pod_name = os.environ.get('POD_NAME', '').strip()
+              if not pod_name:
+                  sys.exit('POD_NAME empty — downward API metadata.name not set')
+
+              # ── the node's LAN interface, DERIVED ─────────────────────────────────────
+              # Samba's `interfaces` needs the NIC NAME, and it differs on every box —
+              # measured 2026-09-01 across the four lab nodes: eno2np1, enp129s0, ens3,
+              # enP2p1s0. A literal (or even a list of all four) would be one more piece of
+              # node-scoped state in a sealed blob, and wrong the day a node is replaced.
+              #
+              # This pod is hostNetwork, so /proc/net/route IS the host's table. Take the
+              # DEFAULT ROUTE's interface — never "the first global-scope address", which
+              # docker0 (172.17.0.1/16) wins on any node running docker.
+              #
+              # ⚠ Getting this wrong is loud, not silent: samba falls back to 0.0.0.0:53,
+              # collides with systemd-resolved and the DC crashloops. Verify a change with
+              # samba.interface_ips(), NEVER by reading testparm — testparm echoes back a
+              # name that binds nothing.
+              lab_nic = ''
+              with open('/proc/net/route') as fh:
+                  next(fh)
+                  for line in fh:
+                      f = line.split()
+                      # destination 0.0.0.0 and the RTF_UP|RTF_GATEWAY flags = default route
+                      if len(f) > 3 and f[1] == '00000000' and int(f[3], 16) & 0x2:
+                          lab_nic = f[0]
+                          break
+              if not lab_nic:
+                  sys.exit('no default route on this node — cannot derive the LAN NIC')
+
+              # The address that NIC actually carries, via SIOCGIFADDR — exact, and it
+              # needs no `ip` binary (the samba image has none). Logged, not enforced here:
+              # this pod cannot see its Node's ecc/lan-ip label (the downward API exposes
+              # POD labels only, and a StatefulSet template cannot hold a per-node value),
+              # and granting the DC a cluster-wide node-read binding to compare one string
+              # would be a far larger change than the check is worth.
+              #
+              # ⚠ The declared-vs-actual check lives in replication-job.yaml instead, where
+              # the node labels are already readable — and it is a REACHABILITY probe rather
+              # than a string comparison, which is the property that actually matters.
+              import fcntl, socket, struct
+              _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              try:
+                  lan_ip_actual = socket.inet_ntoa(fcntl.ioctl(
+                      _s.fileno(), 0x8915,  # SIOCGIFADDR
+                      struct.pack('256s', lab_nic[:15].encode()))[20:24])
+              finally:
+                  _s.close()
+
+              raw = open('/etc/samba/container-src/config.json').read()
+              if '__MESH_IP__' not in raw:
+                  sys.exit('__MESH_IP__ token missing — re-run sealSecrets.sh and re-seal')
+              if '__POD_CIDR_NETMASK__' not in raw:
+                  sys.exit('__POD_CIDR_NETMASK__ token missing — re-run sealSecrets.sh and re-seal')
+              # ⚠ NOT a hard failure, deliberately — unlike the two tokens above.
+              # Those two have been in the sealed config since it was first written, so
+              # their absence means a genuinely corrupt seal. `dns forwarder` was ADDED
+              # later, so a sealed config predating it is the NORMAL state
+              # until sealSecrets.sh is re-run, and exiting here would CrashLoop the DC on
+              # the very sync that ships this file — taking down lab Kerberos, SMB and AD
+              # replication to add an optional forwarder. Warn and carry on instead; the
+              # DC keeps working exactly as before, just without external resolution.
+              has_forwarder_token = '__DNS_FORWARDER__' in raw
+              if not has_forwarder_token:
+                  print('WARNING: __DNS_FORWARDER__ token absent from the sealed config — '
+                        'external (non-AD) names will NXDOMAIN for every client using this '
+                        'DC as a resolver. Re-run samba-ad/sealSecrets.sh to enable '
+                        'forwarding.')
+              resolved = raw.replace('__MESH_IP__', mesh_ip)
+              resolved = resolved.replace('__POD_CIDR_NETMASK__', pod_cidr_netmask)
+              # ⚠ Hard-fail on an absent token, like __MESH_IP__ above and unlike
+              # __DNS_FORWARDER__: a seal without these predates the multi-DC layout, and
+              # substituting nothing would leave every replica claiming instance_name
+              # ad-onprem-0 (two DCs, one AD identity) or binding the wrong NIC.
+              for tok in ('__POD_NAME__', '__LAB_NIC__'):
+                  if tok not in raw:
+                      sys.exit('%s token missing — re-run samba-ad/sealSecrets.sh and '
+                               're-seal' % tok)
+              resolved = resolved.replace('__POD_NAME__', pod_name)
+              resolved = resolved.replace('__LAB_NIC__', lab_nic)
+              # No forwarder configured (or no token to substitute): drop the option
+              # entirely rather than writing an empty value, which Samba rejects at load.
+              if has_forwarder_token:
+                  if forwarder:
+                      resolved = resolved.replace('__DNS_FORWARDER__', forwarder)
+                  else:
+                      # Drop the key by PARSING, not by deleting its text line. A line-wise
+                      # strip plus a trailing-comma regex looks equivalent and is not: the
+                      # sealed config is written COMPACT, so the option can share its line
+                      # with the closing braces and `,(\s*})` then leaves invalid JSON
+                      # (caught in test: `Expecting property name` at the brace run). Parsing
+                      # is correct for any formatting and cannot corrupt the rest of the file.
+                      doc = json.loads(resolved)
+                      for g in doc.get('globals', {}).values():
+                          g.get('options', {}).pop('dns forwarder', None)
+                      resolved = json.dumps(doc)
+              json.loads(resolved)  # fail here, not deep inside sambacc
+              with open('/etc/samba/container/config.json', 'w') as f:
+                  f.write(resolved)
+              print('resolved __MESH_IP__ ->', mesh_ip)
+              print('resolved __POD_CIDR_NETMASK__ ->', pod_cidr_netmask)
+              print('resolved __POD_NAME__ ->', pod_name)
+              print('resolved __LAB_NIC__ ->', lab_nic, '(LAN', lan_ip_actual + ')')
+              if has_forwarder_token:
+                  print('resolved __DNS_FORWARDER__ ->',
+                        forwarder or '<unset: external names will NXDOMAIN>')
+          env:
+            - name: MESH_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            - name: POD_CIDR
+              value: "10.42.0.0/16" # automatically updated from project-settings:network.podCidr
+            # Upstream resolver for names OUTSIDE the AD zone (see `dns forwarder` above).
+            # The lab LAN's gateway, which is also its resolver —
+            # `dig @192.168.1.1 github.com` answers from this pod, while the DC itself
+            # NXDOMAINs it. Anchored to the lab subnet so a subnet change updates it here
+            # too; set it EMPTY to disable forwarding (external names then NXDOMAIN).
+            - name: LAB_GATEWAY
+              value: "192.168.1.1" # automatically updated from project-settings:activeDirectory.labDnsForwarder
+            # This pod's name -> instance_name, i.e. THIS DC's netbios name.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          volumeMounts:
+            - { name: config-src, mountPath: /etc/samba/container-src, readOnly: true }
+            - { name: config, mountPath: /etc/samba/container }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+        # Re-apply the sambacc `globals` (lab_bind) to smb.conf on every start.
+        #
+        # WHY THIS IS NEEDED: sambacc merges global options into smb.conf exactly ONCE, on
+        # the join path (addc.py `_prep_join` -> `_merge_config`). `_prep_join` returns early
+        # ("Already configured. Not joining") as soon as the marker exists, so on an
+        # already-joined DC a changed `lab_bind` reaches the mounted Secret and is then
+        # SILENTLY IGNORED — smb.conf keeps whatever it was written with at join time.
+        #
+        # That is not a corner case: `interfaces`, `bind interfaces only`, `dns update
+        # command` and `server services` all live there. Repairing them by hand means a Job
+        # mounting the same PVC, because a crashlooping DC cannot be exec'd into. Without
+        # this container the next person
+        # to edit sealSecrets.sh gets a green sync, a Running pod, and no effect at all.
+        #
+        # Ordered BEFORE fix-private-perms. Idempotent: _merge_config rewrites the [global]
+        # section from the current config each time, so a steady-state restart is a no-op.
+        # A FAILED join leaves smb.conf behind, which permanently wedges the next start.
+        #
+        # sambacc gates the join on ONE path (sambacc/addc.py:44,106):
+        #     _provisioned = "/etc/samba/smb.conf"
+        #     if os.path.exists(_provisioned): "Already configured. Not joining"
+        # but `samba-tool domain join` writes that file EARLY and the join is not atomic. So a
+        # join that dies partway — a transient "Failed to find a writeable DC", a DC restarting
+        # underneath it — leaves smb.conf present and sam.ldb absent. Every subsequent start
+        # then reads "Already configured", skips the join, and boots samba against an empty
+        # database:
+        #     dsdb_schema_from_db() failed: No such Base DN: CN=Schema,...
+        #     exit_daemon: daemon failed to start: Samba failed to prime database, error code 22
+        # That is a PERMANENT crashloop — the join can never retry on its own.
+        #
+        # Measured 2026-09-15 on ad-onprem-0: the first join attempt after a rebuild failed
+        # transiently, and the DC then crashlooped on the leftover marker rather than simply
+        # retrying.
+        #
+        # ⚠ THE TEST IS A PARTITION FILE, NOT sam.ldb. `sam.ldb` is the database SHELL and the
+        # join creates it almost immediately, so it is present even on a join that replicated
+        # nothing — testing it detects nothing. Measured on the ad-onprem-0 rebuild:
+        #     private/sam.ldb        4739072 bytes   <- present
+        #     private/sam.ldb.d/     metadata.tdb ONLY, no partition .ldb at all
+        # and samba still died on "No such Base DN: CN=Schema,...". The real payload is
+        # sam.ldb.d/*.ldb — one file per naming context, written as each NC replicates.
+        #
+        # ⚠ On a healthy DC those files exist and this MUST be a no-op; deleting the marker
+        # there would re-join a working DC on every restart.
+        - name: clear-failed-join
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -f /etc/samba/smb.conf ] \
+                 && ! ls /var/lib/samba/private/sam.ldb.d/*.ldb >/dev/null 2>&1; then
+                echo "smb.conf present but sam.ldb.d/ holds no partition — a previous join"
+                echo "FAILED partway (the database shell exists, no NC was replicated)."
+                echo "removing the marker so --setup=join retries instead of starting samba"
+                echo "against an unusable database (which crashloops permanently)."
+                rm -f /etc/samba/smb.conf /etc/samba/smb.conf.orig
+                # The half-built database must go too, or the retried join trips over it.
+                rm -rf /var/lib/samba/private
+              fi
+          volumeMounts:
+            - { name: samba-config, mountPath: /etc/samba }
+            - { name: samba-data, mountPath: /var/lib/samba }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+        - name: apply-global-options
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, sys
+              # Nothing to merge before the join, and nothing is LOST by skipping it: sambacc
+              # passes the container config's global_options straight into
+              # `samba-tool domain join` as --option= arguments, and its _filter_opts strips
+              # ONLY "netbios name" (external/git_samba-in-kubernetes_sambacc,
+              # sambacc/addc.py:_filter_opts + _join_cmd). So `interfaces` and
+              # `bind interfaces only` are already in force DURING the join — this step exists
+              # to re-assert them into the smb.conf the join writes, not to introduce them.
+              if not os.path.exists('/etc/samba/smb.conf'):
+                  print('not joined yet — sambacc writes smb.conf at join time, with these '
+                        'same global options already applied')
+                  sys.exit(0)
+              # config.json here is the RESOLVED copy written by resolve-node-config, so
+              # __MESH_IP__ is already a real address by this point.
+              from sambacc import config as sconfig
+              from sambacc.commands.addc import _merge_config
+              cfg = sconfig.read_config_files(
+                  ['/etc/samba/container/config.json']).get('lab')
+              opts = list(cfg.global_options())
+              _merge_config('/etc/samba/smb.conf', opts)
+              # Print the values that actually landed, so a wrong one is visible in the pod
+              # log rather than only in a replication failure hours later.
+              import samba
+              from samba.param import LoadParm
+              lp = LoadParm(); lp.load('/etc/samba/smb.conf')
+              print('interfaces   :', lp.get('interfaces'))
+              print('bound IPs    :', samba.interface_ips(lp, False))
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: samba-config, mountPath: /etc/samba }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+        # Samba refuses to start if /var/lib/samba/private is group-accessible:
+        #   invalid permissions on directory '/var/lib/samba/private/msg.sock':
+        #   has 0770 should be 0700
+        #   exit_daemon: daemon failed to start: Samba failed to setup parent messaging
+        # and the pod then crashloops.
+        #
+        # WHY IT HAPPENS HERE AND NOT ON THE CLOUD DC: `fsGroup` makes the kubelet apply
+        # group ownership + g+w to the volume, and `private/` carries the SETGID bit, so
+        # everything created inside inherits it. The cloud DC PROVISIONS its private/ (mode
+        # 2700, mkdir'd by samba-tool after the kubelet is done) while the lab DC JOINS,
+        # which populates private/ in a way that keeps the volume's 2770. Verified on the
+        # live PVCs: cloud private/ = 2700, lab private/ = 2770.
+        #
+        # Fixing only msg.sock is NOT enough — it is recreated on every start and inherits
+        # the parent's mode. The PARENT is what has to be 0700 — fixing only the socket
+        # makes this look "fixed" while it is not.
+        #
+        - name: fix-private-perms
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Modes copied from a WORKING (provisioned) DC. Samba validates each of these
+              # at startup and refuses to run on any one that is group-accessible, so they
+              # must ALL be right — fixing them as each error appears just moves the failure
+              # to the next directory — private/msg.sock, then lock/msg.lock, then
+              # ntp_signd — so fix the whole set at once.
+              #
+              # lost+found and sysvol are deliberately absent: samba does not check them,
+              # and sysvol is 2770 on a healthy DC by design (group-writable for share ACLs).
+              for spec in \
+                "private:700" \
+                "private/msg.sock:700" \
+                "private/sam.ldb.d:700" \
+                "private/ldap_priv:750" \
+                "private/smbd.tmp:755" \
+                "private/tls:755" \
+                "lock:755" \
+                "lock/msg.lock:755" \
+                "ntp_signd:750" \
+                "bind-dns:750" \
+                "winbindd_privileged:750" \
+              ; do
+                d="/var/lib/samba/${spec%:*}"
+                m="${spec#*:}"
+                if [ -e "$d" ]; then
+                  cur=$(stat -c '%a' "$d")
+                  # Skip if already correct (with or without the setgid bit). Written as an
+                  # if, NOT `[ a ] || [ b ] && continue` — that chain's precedence is a trap
+                  # under `set -e`.
+                  if [ "$cur" != "2$m" ] && [ "$cur" != "$m" ]; then
+                    chmod "$m" "$d"
+                    echo "$d: $cur -> $(stat -c '%a' "$d")"
+                  fi
+                fi
+              done
+              # FILES matter too, not just directories. samba rejects a group-readable TLS
+              # key with
+              #   ldapsrv_task_init: ldapsrv failed tstream_tls_params_server
+              #   - NT_STATUS_CANT_ACCESS_DOMAIN_INFO
+              # and the same fsGroup+setgid inheritance leaves key.pem as rw-rw---- on a
+              # joined DC where a provisioned one has rw-------.
+              # `if`, NOT `[ -f x ] && chmod` — under set -e a false test ABORTS the whole
+              # initContainer, so on a first start (no tls/ yet) the sweep silently stopped
+              # here and never ran again. That is what left the CLOUD DC crashlooping on
+              #   invalid permissions on file '.../tls/key.pem': has 0660 should be 0600
+              #   ... This is known as CVE-2013-4476.
+              if [ -f /var/lib/samba/private/tls/key.pem ]; then
+                chmod 600 /var/lib/samba/private/tls/key.pem
+                echo "tls/key.pem -> 600"
+              fi
+              # Sweep private/ RECURSIVELY (-maxdepth 1 missed private/tls/ entirely) for
+              # anything group/other-writable. Done last so the explicit modes above win.
+              find /var/lib/samba/private -type f -perm /g+w,o+w \
+                -exec chmod g-w,o-w {} + 2>/dev/null || true
+              echo "permission sweep done"
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - { name: samba-data, mountPath: /var/lib/samba }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+      containers:
+        # ── perm-guard ────────────────────────────────────────────────────────────
+        # Re-asserts the modes samba validates, FOR AS LONG AS SAMBA RUNS.
+        #
+        # fix-private-perms (initContainer) is not enough and cannot be: samba RE-CREATES
+        # these directories at runtime, after every initContainer has exited, and the
+        # kubelet's `fsGroup: 0` stamps g+w AND the setgid bit onto whatever it creates.
+        # Measured on a cloud DC with 8h uptime: the sweep logged "permission sweep done"
+        # with no chmod line — the modes were right when it ran — and samba then re-created
+        #   /var/lib/samba            2775   (mtime 20:46:17, initContainers ended ~20:44)
+        #   /var/lib/samba/lock       2775
+        #   /var/lib/samba/lock/msg.lock 2775   (re-created continuously)
+        #   /var/lib/samba/private    2770
+        #   /var/lib/samba/private/msg.sock 2770
+        #
+        # What that costs is NOT obvious, which is why it went undiagnosed for 8 hours:
+        #   invalid permissions on directory '/var/lib/samba/lock/msg.lock': has 0775 should be 0755
+        #   Unable to initialize messaging context!
+        # samba does NOT exit. task[ldap] binds TCP 389 and then drops EVERY session —
+        # anonymous, authenticated, LDAPS, and even the ldapi unix socket. Meanwhile
+        # task[cldap] (UDP 389) keeps serving normally, so `samba-tool domain info`,
+        # `nc -z 389` and the tcpSocket probes ALL PASS. The DC reports Ready and healthy
+        # while every real LDAP client fails, and the lab DC's `samba-tool domain join`
+        # CrashLooped 92 times on a bare `NT_STATUS_CONNECTION_RESET` that reads as a
+        # network fault. Fixing the modes on the live pod restored LDAP instantly and the
+        # join completed on the next retry.
+        #
+        # ⚠ `fsGroup: 0` cannot be dropped to fix this at the source — the DC's data PVC
+        # relies on it (see stage-ldaps-cert). So the mode has to be re-applied, not prevented.
+        #
+        # The setgid bit SURVIVES `chmod 0755` (it is inherited from the parent dir, not the
+        # mode argument), so the loop tolerates 2755/2700 exactly as the initContainer's
+        # table does — samba accepts those; it is the GROUP-WRITE bit it rejects.
+        - name: perm-guard
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              # No `set -e`: a transient failure (dir not created yet) must not kill the
+              # sidecar and take the pod's restart count with it.
+              while true; do
+                for spec in \
+                  ":755" \
+                  "lock:755" \
+                  "lock/msg.lock:755" \
+                  "private:700" \
+                  "private/msg.sock:700" \
+                  "private/sam.ldb.d:700" \
+                  "ntp_signd:750" \
+                  "bind-dns:750" \
+                  "winbindd_privileged:750" \
+                ; do
+                  d="/var/lib/samba/${spec%:*}"; m="${spec#*:}"
+                  [ -e "$d" ] || continue
+                  cur=$(stat -c '%a' "$d" 2>/dev/null) || continue
+                  # Accept the mode with or without the setgid bit; fix anything else.
+                  if [ "$cur" != "$m" ] && [ "$cur" != "2$m" ]; then
+                    chmod "$m" "$d" 2>/dev/null \
+                      && echo "perm-guard: $d $cur -> $(stat -c '%a' "$d" 2>/dev/null)"
+                  fi
+                done
+                sleep 15
+              done
+          volumeMounts:
+            - { name: samba-data, mountPath: /var/lib/samba }
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 64Mi }
+        - name: samba
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--setup=wait-domain", "--setup=join"]
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+            # AppArmor Unconfined — REQUIRED for dynamic DNS registration.
+            #
+            # `samba_dnsupdate` shells out to `nsupdate`, which signals its own process group
+            # on shutdown. Under containerd's default profile that signal is denied and
+            # nsupdate dies before sending anything:
+            #   isc_app_ctxshutdown(): fatal error: kill: Permission denied (13)
+            # samba_dnsupdate reports only "Failed nsupdate: -11", which looks like a crash
+            # or a Kerberos problem — the Kerberos step above it SUCCEEDS, so the log is
+            # actively misleading.
+            #
+            # The effect is that this DC registers NOTHING in DNS: all 28 records fail, so it
+            # is invisible to every client and its site-specific SRV records
+            # (_ldap._tcp.unibi-hclab._sites...) never appear. Every client then falls back to
+            # the cloud DC — silently negating the whole point of a lab-site DC.
+            #
+            # WHY ONLY HERE: this is not a hostNetwork effect. The lab node runs Ubuntu 25.10
+            # with AppArmor enabled, so containerd applies cri-containerd.apparmor.d
+            # (enforce); the Debian cloud node has AppArmor off, so the cloud DC is already
+            # `unconfined` and its nsupdate works. Verified by reading
+            # /proc/self/attr/current in both pods — capabilities and seccomp are IDENTICAL.
+            #
+            # This grants no new capability: it matches what the cloud DC already gets, and
+            # SYS_ADMIN above is the far larger grant.
+            appArmorProfile:
+              type: Unconfined
+          env:
+            - name: SAMBACC_CONFIG
+              value: "/etc/samba/container/config.json"
+            - name: SAMBA_CONTAINER_ID
+              value: "lab"
+          resources:
+            requests: { cpu: "200m", memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          # PROBES MUST NOT USE tcpSocket HERE. Under hostNetwork the kubelet dials the
+          # pod's reported IP, which for this node is the TAILSCALE address (10.0.10.8) —
+          # and `bind interfaces only = yes` with `interfaces = lo eno2np1` (the lab_bind
+          # globals in sealSecrets.sh) deliberately makes samba listen ONLY on loopback and
+          # the LAN IP. So a tcpSocket probe gets `connection refused` from a DC that is
+          # perfectly healthy.
+          #
+          # A joined DC serving 53/88/389/445/636 on its LAN address still fails the
+          # readiness probe, and the liveness probe then kills it every ~10 min, restarting
+          # a working DC indefinitely. The logs show a clean
+          # start ("Already configured. Not joining"), so nothing in them points at the
+          # probe; only `netstat` on the node reveals the bind addresses.
+          #
+          # exec + 127.0.0.1 probes what actually matters (can samba answer LDAP?) and is
+          # independent of which node IP the kubelet happens to report.
+          #
+          # ldbsearch, NOT ldapsearch: the image has no ldapsearch (openldap-clients is not
+          # installed). Note ldbsearch defaults to reading the local.ldb FILE, which would
+          # pass even with samba dead — the `-H ldap://` URL is what makes it a real query
+          # over the socket. Verified: rc=0 live, rc=1 against a dead port.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "ldbsearch -H ldap://127.0.0.1 -s base -b '' namingContexts >/dev/null 2>&1"]
+            # wait-domain can block indefinitely if the cloud DC is not up yet, so the
+            # failure budget here is deliberately large: this pod legitimately spends its
+            # first minutes waiting rather than failing.
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 40
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "ldbsearch -H ldap://127.0.0.1 -s base -b '' namingContexts >/dev/null 2>&1"]
+            initialDelaySeconds: 600
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 6
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: samba-data, mountPath: /var/lib/samba }
+            - { name: samba-config, mountPath: /etc/samba }
+      volumes:
+        # The sealed config, with __MESH_IP__ still unresolved. Nothing should read this
+        # directly — read `config-resolved` instead.
+        - name: config-src
+          secret:
+            secretName: samba-ad-config
+        # The same config with __MESH_IP__ substituted from the downward API by the
+        # resolve-node-config initContainer. Mounted at the path SAMBACC_CONFIG points to, so
+        # both the join in the samba container and the later globals merge see real values.
+        - name: config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: samba-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Site-local block storage. NOT a network filesystem: TDB/LDB need POSIX locking
+        # and xattrs.
+        storageClassName: longhorn-unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshStorageClass
+        resources: { requests: { storage: 8Gi } }
+    - metadata:
+        name: samba-config
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn-unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshStorageClass
+        resources: { requests: { storage: 1Gi } }

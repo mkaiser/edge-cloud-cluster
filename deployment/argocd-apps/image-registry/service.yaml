@@ -1,0 +1,52 @@
+# NodePort — reachable from the HOST namespace on every node at 127.0.0.1:<nodePort>, and
+# deliberately NOT exposed through the Gateway.
+#
+# WHY A NODEPORT AT ALL. An imagePullSecret is used by the KUBELET, which resolves through
+# the NODE's resolver — and a node does not resolve *.svc.cluster.local. So a pod whose
+# image names this Service sits in ImagePullBackOff with `dial tcp: lookup
+# image-registry.image-registry.svc.cluster.local: Try again`, and lab workloads had to pull
+# from GitLab's S3-backed registry instead: ~5 MB/s from the lab against ~126 MB/s for this
+# registry on the LAN. Measured alternatives (plans/old/eda-registry-node-reachable.md): a
+# pinned ClusterIP does NOT work from the host — `socketLB.hostNamespaceOnly` does not give
+# generic ClusterIP access, and `nc -z 10.43.0.1 443` is a FALSE POSITIVE because the packet
+# goes to the LAN gateway, which answers. A NodePort does work, on 127.0.0.1 and on the
+# node's LAN address, returning real payload.
+#
+# ⚠ A NodePort binds on ALL interfaces, so this also exposes the registry on the lab LAN.
+# That is acceptable only because of what came before it: the credential is split (the
+# node-side account is the READ-ONLY `eda-pull`), and what the broker runs is pinned by
+# DIGEST. A LAN host therefore gets a read-only endpoint whose contents cannot be swapped
+# under a tag. It would NOT have been acceptable when one shared push credential was the
+# only control.
+#
+# What this registry serves is executed AS ROOT by the remote-desktop broker, so publish
+# rights are effectively root-execution rights. Three layers guard it, all load-bearing
+# (see deployment.yaml): htpasswd auth, a CiliumNetworkPolicy limiting reachability to the
+# [eda] runner's build pods and the broker, and TLS from a PRIVATE in-cluster CA.
+#
+# ⚠ NEVER give this an HTTPRoute. The cert is signed by an in-cluster CA for the name
+# image-registry.image-registry.svc.cluster.local, which no public issuer can sign and no
+# external client could verify — and publishing it would put a root-execution push
+# endpoint on the public wildcard.
+#
+# Consumers use https://image-registry.image-registry.svc.cluster.local:5000 and must trust
+# the image-registry-ca ConfigMap (buildah/skopeo: /etc/containers/certs.d/<host>/ca.crt;
+# curl: --cacert), or they fail with x509 UnknownAuthority.
+apiVersion: v1
+kind: Service
+metadata:
+  name: image-registry
+  namespace: image-registry
+spec:
+  type: NodePort
+  selector:
+    app: image-registry
+  ports:
+    - name: registry
+      port: 5000
+      targetPort: 5000
+      # ⚠ PINNED, not allocated. Every node reaches the registry at 127.0.0.1:30500 — the
+      # SAME url on every node, which is what makes a single `registries.yaml` and a single
+      # image reference work fleet-wide. An allocated port would change on a recreate and
+      # silently invalidate both.
+      nodePort: 30500

@@ -1,0 +1,262 @@
+# GPU metrics exporter — one DaemonSet covering BOTH GPU node classes, scraped by
+# Prometheus and rendered by grafana-dashboard.yaml beside it.
+#
+# WHY NOT DCGM-EXPORTER, the obvious choice: neither GPU node has DCGM, and neither can get
+# it. dcgm-exporter needs a DCGM host engine (nv-hostengine), which is not present on either
+# box (verified 2026-09-20: `which dcgmi nv-hostengine` → none on both) and does not support
+# Tegra at all — DCGM is a datacenter-GPU product, and the Thor is an integrated SoC GPU.
+# So this exporter shells out to `nvidia-smi --query-gpu`, which IS available and correct on
+# both classes, and converts its CSV into Prometheus text.
+#
+# ⚠ IT MUST NOT REQUEST `nvidia.com/gpu`. The Thor has exactly ONE card and vLLM holds it, so
+# a request here would leave the exporter Pending forever on the node it most needs to watch
+# (measured: a probe pod requesting 1 GPU sat `Insufficient nvidia.com/gpu` while vLLM ran).
+# Instead it sets NVIDIA_VISIBLE_DEVICES=all + NVIDIA_DRIVER_CAPABILITIES=utility, which the
+# nvidia runtime honours WITHOUT allocating: it injects the driver's utility stack (nvidia-smi
+# and NVML) but consumes no schedulable device. Verified on both nodes — the Thor reported
+# 73% while vLLM was mid-inference on that same card, and smartmirror1 enumerated BOTH cards.
+#
+# ONE DaemonSet, not two (unlike the device plugins next door, which genuinely need per-class
+# env): the nvidia-smi query path is identical on both classes. The per-class difference is in
+# the DATA, not the config, and is handled by the script skipping fields the node reports as
+# [N/A] — see below. Selected on the ecc/gpu capability label so it covers every GPU node.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-gpu-metrics-exporter
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app: nvidia-gpu-metrics-exporter
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-gpu-metrics-exporter
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nvidia-gpu-metrics-exporter
+    spec:
+      # The nvidia containerd handler is what injects the driver's utility stack in response
+      # to the NVIDIA_* env below. Without it `nvidia-smi` is simply not in the image.
+      runtimeClassName: nvidia
+      # Both GPU nodes are mesh nodes, and are additionally tainted ecc/gpu=true:NoSchedule as
+      # a scarce dedicated resource. Tolerate both, exactly as the device plugins do.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # The ecc/gpu CAPABILITY label (not ecc/gpu-model): this one manifest serves every GPU
+      # class, so it must not pin a model. Zero GPU nodes → desired=0 → ArgoCD Healthy, so it
+      # never stalls wave 2 while GPU mesh nodes join later.
+      nodeSelector:
+        ecc/gpu: "true"  # automatically updated from project-settings:applicationPlacements.labels.gpu
+      containers:
+        - name: exporter
+          # A plain python image, NOT an nvidia/cuda one. The CUDA base looks like the
+          # natural choice and is the wrong one: it ships neither python3 nor nc/socat
+          # (verified in-cluster — the first cut crash-looped on `exec: python3: not found`,
+          # and a rewrite to a bash+nc loop then found no nc either), so an exporter built on
+          # it would have to apt-install at runtime and thus depend on lab-node egress.
+          # Nothing CUDA is needed anyway: the DRIVER, nvidia-smi included, is injected from
+          # the host by the nvidia runtime in response to the NVIDIA_* env below. Multi-arch,
+          # which is required — thor-eval is the fleet's only aarch64 node.
+          image: python:3.13-slim  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # Present the GPUs to this container WITHOUT allocating one — see the header.
+            # `utility` is the smallest capability that includes nvidia-smi/NVML; `compute`
+            # is deliberately NOT requested, as this container never runs a kernel.
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 9401
+          # Serve /metrics from a small stdlib HTTP server. Metrics are collected per
+          # REQUEST, so a scrape always sees the current reading rather than a cached one.
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import http.server, socketserver, subprocess, os
+
+              NODE = os.environ.get("NODE_NAME", "unknown")
+
+              # Queried per card. memory.* comes back as "[N/A]" on Tegra (the iGPU shares
+              # system RAM and NVML has no memory query there) — those samples are DROPPED
+              # rather than zero-filled, because a flat 0 on a dashboard reads as "idle"
+              # when the truth is "not measurable on this hardware".
+              FIELDS = [
+                  "index", "uuid", "name",
+                  "utilization.gpu", "utilization.memory",
+                  "memory.used", "memory.total",
+                  "temperature.gpu", "power.draw",
+              ]
+
+              METRICS = [
+                  ("utilization.gpu",    "gpu_utilization_percent",        "GPU core utilization in percent, as reported by nvidia-smi."),
+                  ("utilization.memory", "gpu_memory_utilization_percent", "Fraction of time the memory bus was in use, in percent."),
+                  ("memory.used",        "gpu_memory_used_bytes",          "GPU memory in use, in bytes. Absent on Tegra (no NVML memory query)."),
+                  ("memory.total",       "gpu_memory_total_bytes",         "Total GPU memory, in bytes. Absent on Tegra (no NVML memory query)."),
+                  ("temperature.gpu",    "gpu_temperature_celsius",        "GPU die temperature in degrees Celsius."),
+                  ("power.draw",         "gpu_power_watts",                "Instantaneous GPU power draw in watts."),
+              ]
+
+              # nvidia-smi reports these in MiB; Prometheus convention is base units.
+              MIB = {"memory.used", "memory.total"}
+
+
+              def collect():
+                  try:
+                      out = subprocess.run(
+                          ["nvidia-smi", "--query-gpu=" + ",".join(FIELDS),
+                           "--format=csv,noheader,nounits"],
+                          capture_output=True, text=True, timeout=20,
+                      )
+                  except Exception:
+                      return "gpu_exporter_up 0\n"
+                  if out.returncode != 0:
+                      return "gpu_exporter_up 0\n"
+
+                  rows = []
+                  for line in out.stdout.strip().splitlines():
+                      parts = [p.strip() for p in line.split(",")]
+                      if len(parts) == len(FIELDS):
+                          rows.append(dict(zip(FIELDS, parts)))
+
+                  lines = [
+                      "# HELP gpu_exporter_up Whether the last nvidia-smi query succeeded.",
+                      "# TYPE gpu_exporter_up gauge",
+                      "gpu_exporter_up 1",
+                  ]
+
+                  for field, metric, helptext in METRICS:
+                      emitted = []
+                      for r in rows:
+                          raw = r.get(field, "")
+                          try:
+                              val = float(raw)
+                          except ValueError:
+                              continue  # "[N/A]" on Tegra — skip, do not zero-fill.
+                          if field in MIB:
+                              val *= 1048576
+                          labels = 'node="%s",gpu="%s",uuid="%s",name="%s"' % (
+                              NODE, r["index"], r["uuid"], r["name"].replace('"', ""))
+                          emitted.append("%s{%s} %g" % (metric, labels, val))
+                      if emitted:
+                          lines.append("# HELP %s %s" % (metric, helptext))
+                          lines.append("# TYPE %s gauge" % metric)
+                          lines.extend(emitted)
+
+                  # A per-node card count, so the dashboard can show "cards seen" without
+                  # depending on any of the optional metrics above existing.
+                  lines.append("# HELP gpu_cards_total Number of GPUs nvidia-smi enumerated on this node.")
+                  lines.append("# TYPE gpu_cards_total gauge")
+                  lines.append('gpu_cards_total{node="%s"} %d' % (NODE, len(rows)))
+                  return "\n".join(lines) + "\n"
+
+
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  protocol_version = "HTTP/1.1"
+
+                  def do_GET(self):
+                      if self.path.split("?")[0] != "/metrics":
+                          self.send_response(404)
+                          self.send_header("Content-Length", "0")
+                          self.end_headers()
+                          return
+                      body = collect().encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/plain; version=0.0.4")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+
+                  # One log line per scrape is pure noise at 30s intervals.
+                  def log_message(self, *a):
+                      pass
+
+
+              class Server(socketserver.ThreadingTCPServer):
+                  allow_reuse_address = True
+                  daemon_threads = True
+
+
+              Server(("", 9401), Handler).serve_forever()
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+---
+# Headless: the ServiceMonitor discovers the per-pod endpoints through it, and nothing ever
+# connects to a single cluster IP (every pod reports a DIFFERENT node's GPUs).
+apiVersion: v1
+kind: Service
+metadata:
+  name: nvidia-gpu-metrics-exporter
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app: nvidia-gpu-metrics-exporter
+spec:
+  clusterIP: None
+  selector:
+    app: nvidia-gpu-metrics-exporter
+  ports:
+    - name: metrics
+      port: 9401
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvidia-gpu-metrics-exporter
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app: nvidia-gpu-metrics-exporter
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-gpu-metrics-exporter
+  endpoints:
+    - port: metrics
+      interval: 30s
+      # The exporter already labels every sample with its own `node`, so the target's
+      # instance label is not load-bearing here; keep the default relabeling.
+      scrapeTimeout: 25s

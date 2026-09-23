@@ -1,0 +1,701 @@
+# PreSync: create the shared `eda-pcb-agent` Authentik user and put it in `employees`.
+#
+# ⚠ PRESYNC, NOT PostSync. The desktop container cannot START without this user: sssd must
+# resolve it, and the whole storage design hangs off the uidNumber that follows from it (see
+# below). As a PostSync hook this deadlocked — the Deployment never went healthy, so the Sync
+# phase failed, so the PostSync phase never ran, so the user was never created, so the
+# Deployment could never go healthy. Measured on ecc208, where this Job had never once run.
+# Same shape, same fix, as keytab-job.yaml. A prerequisite of the workload runs BEFORE it.
+#
+# ⚠ THIS JOB ALONE IS NOT ENOUGH, and that is why presync-ad-account.yaml exists. Creating
+# the Authentik user does not create the AD account — samba-ad's provisioning Job does, and
+# it only runs when SAMBA-AD syncs, which on a recreate is wave 13, i.e. always BEFORE this
+# apps-wave user exists. presync-ad-account.yaml (weight 0) closes that gap; this Job stays
+# the only writer of the Authentik side.
+#
+# ── WHY AN AUTHENTIK USER AT ALL — IT IS THE HOME, NOT THE LOGIN ──────────────
+# An earlier draft used a local `useradd`. That is wrong, and the reason is storage:
+#   Authentik user in `employees`
+#     -> samba-ad/postsync-provision-users.yaml provisions the AD account (uidNumber = 5000+pk)
+#     -> truenas/configure-job.yaml step_homes creates /mnt/datapool/homes/eda-pcb-agent
+# No Authentik user => no AD account => no uidNumber => NO HOME DIRECTORY. And the export
+# pins nfsvers=4.2 precisely so a client cannot negotiate v3 and map everyone to nobody, so
+# a local uid the directory does not know writes files that land unowned or unwritable.
+# (`desktop`/`headless` work only because seed-homes pre-creates their directories.)
+#
+# ── WHY A BLUEPRINT AND NOT A PLAIN API CALL ──────────────────────────────────
+# Impossible twice over:
+#   1. the shared provisioner token has view_user ONLY — no add_user, no change_user
+#      (authentik/blueprint-provisioner.yaml). Widening that role would weaken it for EVERY
+#      app that holds the token; its header says so explicitly.
+#   2. a password can only be written in BLUEPRINT context. POST /core/users/<pk>/set_password/
+#      does not exist (HTTP 405), and the serializer exposes `password` only to the importer.
+#
+# ── WHY INLINE CONTENT AND NOT A MOUNTED ConfigMap ────────────────────────────
+# A mounted blueprint (gitlab/truenas/samba-ad style) works, but can only read its password
+# via !Env — and !Env resolves in the WORKER's environment, which carries only the central
+# authentik-secrets bundle. That would force this app's password into a central file, which
+# is exactly the coupling this app is built to avoid. Because this Job renders the content
+# itself, the password stays in this app's own namespace.
+#
+# Verified against the vendored source (external/git_goauthentik_authentik):
+#   blueprints/models.py:65        content = models.TextField(...), and retrieve() returns
+#                                  self.content when no path is set (models.py:116-122)
+#   blueprints/api.py:113-116      validate() requires EITHER path OR content
+#   blueprints/api.py:96-109       validate_content runs the importer's own validation on
+#                                  write, so a malformed blueprint is rejected at POST time
+#   blueprints/api.py:141,244      ⚠ check_blueprint_perms is attached ONLY to the `import_`
+#                                  action — NOT to create/update of a BlueprintInstance. So
+#                                  this needs add_blueprintinstance, NOT add_user, and the
+#                                  identity-surface restriction on the shared token is
+#                                  untouched.
+#
+# ⚠ WHICH TOKEN, AND WHY IT IS NOT THE SHARED ONE. Blueprint-write is effectively
+# write-EVERYTHING (see check_blueprint_perms above), so it must never be added to the
+# scoped provisioner role that 13 app namespaces hold. This Job uses
+# AUTHENTIK_BOOTSTRAP_TOKEN instead, read LIVE from the authentik namespace — the same
+# thing four existing apps already do (zulip/cronjob-sync-users.yaml,
+# zulip/cronjob-sync-admins.yaml, gitlab/cronjob-sync-admins.yaml,
+# gitlab/cronjob-bootstrap-groups.yaml). None of them seals a copy, and neither does this:
+# a second copy of a superuser credential is one more thing to rotate and leak.
+#
+# ⚠ sync-wave -2: the FIRST thing this app does. Every other PreSync hook in this app sits at
+# wave 0, so they all run together AFTER this one — which is the only ordering that matters
+# here, because presync-ad-account.yaml cannot provision an AD account for a user that does
+# not exist yet. authentik-provider.yaml (PostSync) is unaffected — the OIDC provider gates
+# the dashboard, not the pod's start, so it has no reason to move out of PostSync.
+#
+# ⚠ sync-wave, NOT hook-weight. `argocd.argoproj.io/hook-weight` IS NOT AN ARGOCD ANNOTATION.
+# Ordering within a phase is decided by exactly one function, and for the deployed v3.5.2 it
+# reads (gitops-engine/pkg/sync/syncwaves/waves.go, vendored into argo-cd at that tag):
+#
+#     func Wave(obj) int {
+#         if text, ok := annotations[common.AnnotationSyncWave]; ok { ...return val... }
+#         return helmhook.Weight(obj)          // reads "helm.sh/hook-weight"
+#     }
+#
+# The annotation constants at that tag are sync-options, sync-wave, hook, hook-delete-policy
+# and deletion-approved — there is no hook-weight among them. So a hook carrying only
+# hook-weight falls through to helmhook.Weight(), finds no helm.sh/hook-weight, and gets 0.
+# Measured here on ecc208: this Job and presync-ad-account.yaml started in the SAME SECOND
+# despite "weights" of -2 and 0, and the gate went looking for an AD account belonging to a
+# user this Job had not finished creating.
+#
+# ⚠ external/git_argoproj_argo-cd CANNOT ANSWER THIS. It is a shallow clone of master with no
+# tags, and gitops-engine — where the ordering lives — is a separate path that the clone does
+# not contain. Grepping it returns "no match" for reasons that have nothing to do with the
+# question. Check the deployed tag on GitHub instead.
+#
+# ⚠ THE OTHER hook-weight ANNOTATIONS IN THIS APP ARE LEFT ALONE ON PURPOSE. They are inert,
+# so every hook carrying one is already at wave 0 and they already run concurrently — which is
+# how this app has always behaved and what its Jobs are written for. "Fixing" them to
+# sync-wave would not preserve that, it would IMPOSE an order that has never been tested:
+# presync-build.yaml's build-files ConfigMap carries no annotation at all, so it is wave 0,
+# and moving the Job that MOUNTS it to -1 would schedule it before its own ConfigMap exists.
+# One ordering is needed and one is declared. The rest is a separate question.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-pcb-agent-authentik-user
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+# ⚠ A ClusterRole is unavoidable — the Secret lives in ANOTHER namespace — but it is pinned
+# to that single object and to `get` alone. It cannot enumerate secrets and cannot read any
+# other one.
+#
+# ⚠ NEVER BIND THIS TO THE WORKLOAD POD'S ServiceAccount. The desktop/hermes pod runs
+# automountServiceAccountToken: false and has no API identity at all, so the agent cannot
+# reach this Secret even though a Job in its own namespace can. That separation is the
+# containment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eda-pcb-agent-authentik-user-secrets
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-secrets"]   # ⚠ this one Secret, nothing else
+    verbs: ["get"]                         # ⚠ get only — no list, no watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eda-pcb-agent-authentik-user-secrets
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eda-pcb-agent-authentik-user-secrets
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-authentik-user
+    namespace: eda-pcb-agent
+---
+# The password-usability assertion needs `ak shell`, which means exec'ing into the authentik
+# server — has_usable_password() is not exposed over the API. Scoped to that namespace and to
+# exec alone.
+#
+# ⚠ NEVER bind this to the workload pod's ServiceAccount: the pod runs
+# automountServiceAccountToken: false and has no API identity at all. Only this short-lived
+# Job can exec, and it exits within a minute.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-pcb-agent-authentik-user-exec
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # `kubectl exec deploy/...` resolves the Deployment to a pod first.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-pcb-agent-authentik-user-exec
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-pcb-agent-authentik-user-exec
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-authentik-user
+    namespace: eda-pcb-agent
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-pcb-agent-authentik-user
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # -10 against the provider job's default 0: the user must exist first.
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. hook-delete-policy already cleans up on the
+  # next sync, so a TTL buys nothing and COSTS the post-mortem: it deletes the pod and with
+  # it the only copy of the logs. Alloy's pod discovery is a poll and can miss a short-lived
+  # Job entirely, so Loki does not save you here.
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-pcb-agent-authentik-user
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      # ⚠ THIS JOB IS PreSync AND SO IS ITS CREDENTIAL, which is the only arrangement that
+      # works: ArgoCD runs PreSync to completion before starting Sync, so a Sync-phase
+      # SealedSecret could never reach a PreSync consumer at all (it deadlocked exactly that
+      # way on ecc214 — see eda-pcb-agent-secrets-sealed.yaml). The wait below is still
+      # required, because the hook only APPLIES the SealedSecret; the sealed-secrets
+      # controller decrypts it asynchronously afterwards, and no wave can wait for that.
+      #
+      # Waiting HERE rather than relying on the container's secretKeyRef is what stops the
+      # old deadlock: an unresolvable secretKeyRef leaves the pod in CreateContainerConfigError
+      # with NO logs at all, and the Job burns its full activeDeadlineSeconds before failing —
+      # a 900 s stall diagnosable only by describing a pod that never ran. The initContainer
+      # fails fast and says exactly what it was waiting for.
+      #
+      # `optional: true` on the projection is what lets this container START before the Secret
+      # exists; without it the initContainer inherits the very error it exists to report.
+      initContainers:
+        - name: wait-for-secret
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-euc"]
+          args:
+            - |
+              # 5 min: well past the 113 s decrypt measured on the other sealed secret in
+              # this cluster, and still far inside the Job's 900 s activeDeadlineSeconds so
+              # a real failure is reported by THIS container rather than the deadline.
+              i=0
+              until [ -s /secret/authentik-password ]; do
+                i=$((i + 1))
+                if [ "$i" -gt 60 ]; then
+                  echo "FATAL: secret/eda-pcb-agent-secrets key 'authentik-password' did not appear after 5m." >&2
+                  echo "  The SealedSecret is a PreSync hook (sync-wave -20); check that" >&2
+                  echo "  the sealed-secrets controller decrypted it:" >&2
+                  echo "    kubectl -n eda-pcb-agent get sealedsecret,secret eda-pcb-agent-secrets" >&2
+                  exit 1
+                fi
+                [ $((i % 6)) -eq 1 ] && echo "waiting for eda-pcb-agent-secrets to be decrypted (${i}/60)..."
+                sleep 5
+              done
+              echo "eda-pcb-agent-secrets is present."
+          volumeMounts:
+            - { name: agent-secrets, mountPath: /secret, readOnly: true }
+      volumes:
+        - name: agent-secrets
+          secret:
+            secretName: eda-pcb-agent-secrets
+            optional: true
+      containers:
+        - name: provision-user
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: USERNAME
+              value: "eda-pcb-agent"
+            # ⚠ EVERY group this account must belong to, and each one is load-bearing:
+            #   employees            — THE STORAGE CHAIN. samba-ad provisions an AD account
+            #                          from this group and truenas creates the home from it.
+            #                          Without it there is no uidNumber and no home.
+            #   eda-pcb-agent-users  — its own dashboard tile (access-eda-pcb-agent).
+            #   remote-desktop-users — the Guacamole tile, which is where the shared DESKTOP
+            #                          session actually lives (access-remote-desktop). The
+            #                          agent's own tile points at the Hermes dashboard, not
+            #                          the desktop, so this is the one that matters for
+            #                          "a tile that leads to the desktop".
+            #   mfa-exempt           — see blueprint-mfa.yaml. This is the SUPPORTED way to
+            #                          let an account log in without a second factor; the MFA
+            #                          stage is enforced cluster-wide and must stay that way.
+            # ⚠ NOT named GROUPS: that is a bash BUILTIN (the caller's supplementary gid
+            # list) and it is READ-ONLY, so an env var of that name is silently ignored and
+            # the program sees the gids — or, in a shell that exports it, nothing at all.
+            # Caught while testing: os.environ["GROUPS"] raised KeyError with the value
+            # plainly set in the manifest.
+            - name: TARGET_GROUPS
+              value: "employees,eda-pcb-agent-users,remote-desktop-users,mfa-exempt"
+            - name: DISPLAY_NAME
+              value: "EDA PCB Agent (shared)"
+            # ⚠ onboarding-mailer.yaml emails any active user with a real address that is
+            # not akadmin and not yet marked onboarding_email_sent. This is a shared service
+            # account with no mailbox, so the blueprint pre-sets that attribute (below)
+            # rather than relying on the address being undeliverable.
+            - name: EMAIL
+              # The host here IS the bare TLD, with no service label before the cluster label.
+              # updateConfigFromProjectSettings.sh's subdomain pass has a dedicated rule for
+              # that shape, keyed on the `@` standing in for the missing service label; the
+              # general rule requires at least one label and cannot match this line.
+              value: "eda-pcb-agent@subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: ACCOUNT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: eda-pcb-agent-secrets
+                  key: authentik-password
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+
+              # The BOOTSTRAP token (akadmin), read live — see the header for why this and
+              # not the shared provisioner token.
+              TOKEN=$(kubectl get secret authentik-secrets -n authentik \
+                -o jsonpath='{.data.AUTHENTIK_BOOTSTRAP_TOKEN}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: could not read AUTHENTIK_BOOTSTRAP_TOKEN"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              [ -z "${ACCOUNT_PASSWORD:-}" ] && { echo "ERROR: authentik-password is empty"; exit 1; }
+
+              echo "Waiting for the Authentik API..."
+              i=1
+              until curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1; do
+                [ "$i" -ge 60 ] && { echo "ERROR: Authentik API not reachable after 10m"; exit 1; }
+                echo "  try ${i}/60..."; i=$((i+1)); sleep 10
+              done
+              echo "  API is up."
+
+              # ⚠ The user's attributes are NOT read here any more, and the blueprint no
+              # longer declares them. Reading them at render time and splatting them back
+              # looked like the fix, but froze a SNAPSHOT into the stored blueprint that
+              # every later re-apply replayed — deleting the distinguishedName it was meant
+              # to carry. See the render function for the full account.
+
+              # ── Render the blueprint ────────────────────────────────────────────────
+              # ⚠ The password is a LITERAL here, not !Env: !Env would resolve in the
+              # WORKER's environment, which does not carry this app's secret. Rendering it
+              # here is what keeps the credential in this namespace.
+              #
+              # ⚠ MEMBERSHIP IS EXPRESSED ON THE GROUP, NOT ON THE USER. Written as a
+              # `groups:` list inside the user entry it would need !Find, and !Find returns
+              # None on a miss (verified: blueprints/v1/common.py FindObject.resolve). A None
+              # inside the user entry invalidates the WHOLE entry INCLUDING THE PASSWORD,
+              # leaving an account that resolves and binds over LDAP but fails every PAM
+              # login — a failure that looks like anything but a blueprint problem.
+              # As a separate group entry with `users: [!Find ...]`, a miss can only affect
+              # the membership, and the user (with its password) is already committed.
+              #
+              # ⚠ `type` is left unset so it defaults to `internal`. A service_account is
+              # filtered out by samba-ad's `type=internal` query and would never get an AD
+              # account or a home.
+              #
+              # The password is passed through the ENVIRONMENT into python3, never on a
+              # command line where it would show up in `ps`.
+              # ⚠ A blueprint entry that merely SETS `users` would REPLACE the group
+              # membership, evicting every other employee. Authentik has no additive list
+              # attr, so the entry below is built from the CURRENT membership plus this user.
+              # Read the CURRENT membership of every target group, as a JSON object
+              # {group: [usernames]}. ⚠ A group that does not exist yet maps to [] — the two
+              # tile groups are created by this app's own provider job and by
+              # remote-desktop's, either of which may not have run yet on a fresh cluster.
+              # The blueprint creates a missing group as a side effect of declaring it, which
+              # is harmless: the provider jobs are idempotent and re-assert their attributes.
+              echo "Reading current membership of: $TARGET_GROUPS"
+              CURRENT="{}"
+              for g in $(echo "$TARGET_GROUPS" | tr ',' ' '); do
+                M=$(curl -fsS -H "$AUTH" "$API/core/groups/?name=${g}" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(json.dumps([u['username'] for u in r[0]['users_obj']]) if r else '[]')")
+                CURRENT=$(CUR="$CURRENT" G="$g" M="$M" python3 -c 'import json,os; d=json.loads(os.environ["CUR"]); d[os.environ["G"]]=json.loads(os.environ["M"]); print(json.dumps(d))')
+                echo "  ${g}: ${M}"
+              done
+
+              # ⚠ THE PROGRAM IS WRITTEN TO A FILE VIA AN INDENTATION-STRIPPING HEREDOC, not
+              # passed to `python3 -c`. Two constraints collide here: this block is a YAML literal
+              # scalar, so every line MUST stay indented or the scalar ends and the manifest breaks;
+              # but python treats a leading indent on line 1 as an IndentationError. `sed` strips a
+              # fixed prefix, so the program can be both properly indented HERE and flush-left when
+              # python reads it. (ci-base.yml solves the same collision by collapsing to a
+              # single line; that is not an option for a program this size.)
+              sed 's/^|//' > /tmp/render_bp.py <<'PYEOF'
+              |import json, os, sys, yaml
+              |
+              |u = os.environ["USERNAME"]
+              |# {group: [existing usernames]} — one entry per group, each preserving its
+              |# current members. ⚠ A blueprint entry that merely SETS `users` REPLACES the
+              |# membership, so every other member has to be listed back or they are evicted.
+              |current = json.loads(os.environ["CURRENT"])
+              |groups = [g for g in os.environ["TARGET_GROUPS"].split(",") if g]
+              |
+              |
+              |class Find(object):
+              |    """Emitted as the YAML TAG !Find, never as a mapping.
+              |
+              |    Authentik registers !Find as a yaml CONSTRUCTOR (blueprints/v1/common.py,
+              |    BlueprintLoader.add_constructor), so it resolves only from a real YAML tag. A JSON
+              |    object shaped {"!Find": [...]} parses as an ordinary dict with a funny key: the
+              |    constructor never fires, the membership is stored as literal garbage, and the user
+              |    silently gets no AD account and therefore NO HOME DIRECTORY. Verified both ways
+              |    against the vendored loader before writing this.
+              |    """
+              |
+              |    def __init__(self, username):
+              |        self.username = username
+              |
+              |
+              |def _find_repr(dumper, data):
+              |    return dumper.represent_sequence(
+              |        "!Find", ["authentik_core.user", ["username", data.username]], flow_style=True
+              |    )
+              |
+              |
+              |yaml.SafeDumper.add_representer(Find, _find_repr)
+              |
+              |bp = {
+              |    "version": 1,
+              |    "metadata": {"name": "app-eda-pcb-agent-user"},
+              |    "entries": [
+              |        {
+              |            "model": "authentik_core.user",
+              |            "identifiers": {"username": u},
+              |            "attrs": {
+              |                "name": os.environ["DISPLAY_NAME"],
+              |                "email": os.environ["EMAIL"],
+              |                "password": os.environ["ACCOUNT_PASSWORD"],
+              |                "path": "users",
+              |                "is_active": True,
+              |                # ⚠ `attributes` IS DELIBERATELY ABSENT — DO NOT PUT IT BACK.
+              |                # A blueprint SETS that dict WHOLESALE, so any entry here deletes every
+              |                # attribute another system wrote — in particular `distinguishedName`, which
+              |                # samba-ad's LDAP sync writes and which Authentik's password write-back
+              |                # REQUIRES (sources/ldap/password.py: should_check_user returns False without
+              |                # it, silently). Measured on ecc205: declaring it reduced attributes to
+              |                # {'onboarding_email_sent': True}, and every later password change was accepted
+              |                # by Authentik and never reached the DC.
+              |                #
+              |                # ⚠ Carrying the live dict through — read attributes at render time and splat
+              |                # them back — is NOT enough, and ecc209 proved it. The rendered blueprint is
+              |                # STORED on the BlueprintInstance, so anything re-applying it later replays a
+              |                # SNAPSHOT taken before the LDAP sync stamped distinguishedName. Both the
+              |                # repair loop below and samba-ad's step 4 do exactly that, so the snapshot
+              |                # deleted the very DN it existed to preserve: Authentik held the password, AD
+              |                # never got it, and smbclient answered NT_STATUS_LOGON_FAILURE.
+              |                #
+              |                # Omitting the key is what makes a re-apply SAFE FOREVER: the importer applies
+              |                # existing objects with partial=True, so an ABSENT field is left untouched
+              |                # rather than reset (argocd-infra/authentik/blueprint-initial-users.yaml omits
+              |                # it for the same reason, and its users keep their DN across every re-apply).
+              |                # onboarding_email_sent is set AFTER the apply instead, by a read-modify-write
+              |                # PATCH that cannot clobber what it did not read.
+              |            },
+              |        },
+              |    ]
+              |    + [
+              |        {
+              |            "model": "authentik_core.group",
+              |            "identifiers": {"name": g},
+              |            "attrs": {
+              |                "users": [
+              |                    Find(m)
+              |                    for m in sorted(set(current.get(g, [])) | {u})
+              |                ]
+              |            },
+              |        }
+              |        for g in groups
+              |    ],
+              |}
+              |sys.stdout.write(yaml.safe_dump(bp, default_flow_style=False, sort_keys=False,
+              |                                allow_unicode=True))
+              PYEOF
+
+              BP_CONTENT=$(USERNAME="$USERNAME" DISPLAY_NAME="$DISPLAY_NAME" EMAIL="$EMAIL" \
+                           ACCOUNT_PASSWORD="$ACCOUNT_PASSWORD" CURRENT="$CURRENT" \
+                           TARGET_GROUPS="$TARGET_GROUPS" \
+                           python3 /tmp/render_bp.py)
+              # ── Upsert the BlueprintInstance ────────────────────────────────────────
+              # Idempotent on `name` (filterset_fields includes it): GET by name, PATCH on
+              # hit, POST on miss — the same upsert shape the provider job uses.
+              BP_NAME="app-eda-pcb-agent-user"
+              PAYLOAD=$(BP_NAME="$BP_NAME" BP_CONTENT="$BP_CONTENT" python3 -c '
+              import json, os
+              print(json.dumps({"name": os.environ['"'"'BP_NAME'"'"'],
+                                "content": os.environ['"'"'BP_CONTENT'"'"'],
+                                "enabled": True}))
+              ')
+
+              BP_PK=$(curl -fsS -H "$AUTH" "$API/managed/blueprints/?name=${BP_NAME}" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')")
+
+              if [ -n "$BP_PK" ]; then
+                echo "Updating BlueprintInstance ${BP_NAME} (${BP_PK})..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" "$API/managed/blueprints/${BP_PK}/" >/dev/null
+              else
+                echo "Creating BlueprintInstance ${BP_NAME}..."
+                # ⚠ validate_content runs the importer here, so a malformed blueprint is a
+                # 400 NOW rather than a silent no-op later. Show the body on failure.
+                code=$(curl -sS -o /tmp/bp.out -w '%{http_code}' -X POST -H "$AUTH" \
+                  -H "Content-Type: application/json" -d "$PAYLOAD" "$API/managed/blueprints/")
+                case "$code" in
+                  20*) BP_PK=$(python3 -c "import json; print(json.load(open('/tmp/bp.out'))['pk'])") ;;
+                  *)   echo "ERROR: creating the BlueprintInstance returned HTTP ${code}:"
+                       # The response echoes no secret; the REQUEST would, so never print it.
+                       head -c 500 /tmp/bp.out; echo; exit 1 ;;
+                esac
+              fi
+
+              # ── Apply it, then POLL ─────────────────────────────────────────────────
+              # ⚠ The apply is ASYNCHRONOUS — blueprints/api.py:215 dispatches
+              # apply_blueprint.send_with_options(...), a task. A 200 on this POST means
+              # "queued", NOT "applied", so waiting on the instance status is mandatory.
+              echo "Applying..."
+              curl -fsS -X POST -H "$AUTH" "$API/managed/blueprints/${BP_PK}/apply/" >/dev/null
+
+              # Status values are successful | warning | error | orphaned | unknown
+              # (blueprints/models.py BlueprintInstanceStatus).
+              i=1
+              while [ "$i" -le 60 ]; do
+                ST=$(curl -fsS -H "$AUTH" "$API/managed/blueprints/${BP_PK}/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+                case "$ST" in
+                  successful|warning)
+                    echo "  blueprint applied (status=${ST})."
+                    break ;;
+                  error|orphaned)
+                    echo "ERROR: blueprint reached terminal status '${ST}'."
+                    curl -fsS -H "$AUTH" "$API/managed/blueprints/${BP_PK}/" | head -c 800; echo
+                    exit 1 ;;
+                  *)
+                    echo "  try ${i}/60: status='${ST}' — waiting..."
+                    i=$((i+1)); sleep 5 ;;
+                esac
+              done
+              if [ "$i" -gt 60 ]; then
+                echo "ERROR: blueprint still not applied after 5m."; exit 1
+              fi
+
+              # ── ⚠ APPLY A SECOND TIME — THE PASSWORD NEEDS IT ──────────────────────
+              # MEASURED ON ecc205, and this is the HTTP-405 trap in its real form. On the
+              # FIRST apply the user is CREATED and the account is fully usable for
+              # everything except authentication: has_usable_password() is False. A second
+              # apply, which takes the serializer's UPDATE path against the now-existing
+              # instance, sets it — verified by running Importer.apply() by hand and watching
+              # the flag go False -> True with no other change.
+              #
+              # Why it matters more than it looks: nothing downstream reports this. The user
+              # syncs to AD, gets a uidNumber, gets a home directory, resolves through sssd
+              # and binds over LDAP. ONLY the interactive login fails. samba-ad's own repair
+              # loop cannot rescue it either — that loop re-applies the blueprint named
+              # `test-users` specifically, so a user owned by any other blueprint loops until
+              # the Job times out (observed: three sweeps, then failure).
+              #
+              # Cheap and idempotent: a second apply of an unchanged blueprint is a no-op for
+              # every other field.
+              echo "Applying a second time (the password lands on the UPDATE path)..."
+              curl -fsS -X POST -H "$AUTH" "$API/managed/blueprints/${BP_PK}/apply/" >/dev/null
+              i=1
+              while [ "$i" -le 60 ]; do
+                ST=$(curl -fsS -H "$AUTH" "$API/managed/blueprints/${BP_PK}/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+                case "$ST" in
+                  successful|warning) echo "  second apply done (status=${ST})."; break ;;
+                  error|orphaned)     echo "ERROR: second apply reached '${ST}'."; exit 1 ;;
+                  *)                  i=$((i+1)); sleep 5 ;;
+                esac
+              done
+
+              # ── Verify from the IdP side ────────────────────────────────────────────
+              # A blueprint that applied is not proof the account is USABLE: an
+              # unsubstituted or rejected password yields an account that resolves and binds
+              # but fails every PAM login. Check type, group and password separately.
+              # ── onboarding_email_sent, WITHOUT clobbering anything ──────────────────
+              # The blueprint deliberately does not declare `attributes` (it would replace
+              # the dict wholesale), so this one key is merged here instead: read the LIVE
+              # attributes, add our key, write the union back. Whatever samba-ad's LDAP sync
+              # has written by now — distinguishedName above all — is read and written back
+              # unchanged, and a re-apply of the blueprint can never undo it.
+              # Non-fatal: failing to suppress an onboarding mail is not worth failing a Job
+              # whose real work succeeded.
+              U_PK=$(curl -fsS -H "$AUTH" "$API/core/users/?username=${USERNAME}&type=internal" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')")
+              if [ -n "$U_PK" ]; then
+                MERGED=$(curl -fsS -H "$AUTH" "$API/core/users/${U_PK}/" \
+                  | python3 -c "import json,sys; a=json.load(sys.stdin).get('attributes',{}) or {}; a['onboarding_email_sent']=True; print(json.dumps({'attributes':a}))")
+                curl -fsS -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+                  -d "$MERGED" "$API/core/users/${U_PK}/" >/dev/null \
+                  && echo "  onboarding_email_sent merged (attributes preserved)" \
+                  || echo "  WARNING: could not merge onboarding_email_sent" >&2
+              fi
+
+              echo "Verifying..."
+              INFO=$(curl -fsS -H "$AUTH" "$API/core/users/?username=${USERNAME}&type=internal")
+              OK=$(echo "$INFO" | python3 -c "
+              import json,sys
+              r = json.load(sys.stdin)['results']
+              if not r:
+                  print('MISSING'); raise SystemExit
+              u = r[0]
+              groups = [g['name'] for g in u.get('groups_obj', [])]
+              print('OK' if 'employees' in groups else 'NOTINGROUP')
+              ")
+              case "$OK" in
+                OK)         echo "  ${USERNAME} exists, type=internal, in employees." ;;
+                MISSING)    echo "ERROR: ${USERNAME} does not exist as an internal user."; exit 1 ;;
+                NOTINGROUP) echo "ERROR: ${USERNAME} exists but is NOT in employees — it will"
+                            echo "       get no AD account and therefore no home directory."; exit 1 ;;
+              esac
+
+              # ── The password must be USABLE, and this Job must LEAVE it that way ──
+              # ⚠ has_usable_password() is not exposed over the API, so this needs `ak shell`.
+              # It is the difference between an account that syncs to AD, gets a uidNumber and
+              # a home, resolves through sssd — and fails EVERY interactive login. Nothing
+              # downstream reports it, and samba-ad's provisioning ASSERTS it for every
+              # `employees` member, so a broken password here fails provisioning for EVERYONE.
+              #
+              # ⚠ THERE IS NO set_password() PUSH HERE ANY MORE — DO NOT REINTRODUCE ONE.
+              # This Job used to re-set the password through User.set_password() to "fire the
+              # write-back signal". That is the exact call
+              # argocd-infra/authentik/blueprint-initial-users.yaml warns against BY NAME, and
+              # it is redundant: write-back is driven by User.SAVE (sync_users_password on the
+              # LDAP source -> sources/ldap/signals.py:ldap_sync_password), which a blueprint
+              # apply already performs. It is also actively harmful — during bring-up that
+              # write-back can raise LDAPSocketOpenError, which authentik does NOT catch.
+              # Measured on ecc208: this Job logged "password is usable", then "WARNING: could
+              # not push the password to AD", and left the user at has_usable_password()=False.
+              #
+              # ⚠ REPAIR IS THIS APP'S OWN JOB, not samba-ad's. Its step 4 DETECTS any broken
+              # `employees` member but can only repair the blueprint it owns — that repair is
+              # hardcoded to BlueprintInstance name "test-users" — and this app deliberately
+              # ships its own blueprint, in this folder. Re-applying ours re-asserts the
+              # password (state: present), so the loop below is the local equivalent. It
+              # retries because the underlying LDAPS failure is transient: it clears once the
+              # cluster CA reaches Authentik, which samba-ad's provisioning is what pushes.
+              #
+              # ⚠ BP_NAME/USERNAME are baked into the program TEXT, not passed as env:
+              # `kubectl exec` has no --env flag (verified against kubectl 1.36). That is safe
+              # for these two and ONLY these two — they are fixed identifiers from this
+              # manifest, not secrets and not user input. The password is never interpolated
+              # anywhere; this repair does not handle the password at all, the blueprint does.
+              sed -e "s/^|//" -e "s|__BP_NAME__|${BP_NAME}|" -e "s|__USERNAME__|${USERNAME}|" \
+                > /tmp/pw_repair.py <<'PYEOF'
+              |from authentik.core.models import User
+              |from authentik.blueprints.models import BlueprintInstance
+              |from authentik.blueprints.v1.importer import Importer
+              |
+              |username = "__USERNAME__"
+              |u = User.objects.filter(username=username).first()
+              |if u and u.has_usable_password():
+              |    print("PWSTATE=ok")
+              |else:
+              |    # ⚠ Importer.apply() directly, NOT blueprints.v1.tasks.apply_blueprint —
+              |    # that one is a dramatiq task and raises CurrentTaskNotFound outside a
+              |    # worker context, so from `ak shell` it silently applies nothing.
+              |    # ⚠ from_string(b.content), not a file read: this app's blueprint is INLINE
+              |    # content on the BlueprintInstance, never a mounted ConfigMap. That is what
+              |    # makes this repair work from the server pod and need nothing outside this
+              |    # folder — a mounted blueprint would only exist on the worker.
+              |    b = BlueprintInstance.objects.filter(name="__BP_NAME__").first()
+              |    if not b:
+              |        print("PWSTATE=no-blueprint")
+              |    else:
+              |        b.last_applied_hash = ""
+              |        b.save()
+              |        Importer.from_string(b.content).apply()
+              |        u = User.objects.filter(username=username).first()
+              |        print("PWSTATE=" + ("repaired" if u and u.has_usable_password() else "broken"))
+              PYEOF
+
+              PWSTATE=""
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                # ⚠ stderr is NOT discarded. With 2>/dev/null a python traceback reads as empty
+                # output, PWSTATE stays empty, and a BROKEN account is reported as an unknown
+                # one — which is how the bug this guards hid in the first place.
+                PWSTATE=$(kubectl -n authentik exec -i deploy/authentik-server -- ak shell 2>&1 \
+                            < /tmp/pw_repair.py \
+                          | grep -o 'PWSTATE=[a-z-]*' | tail -1 | cut -d= -f2 || true)
+                case "$PWSTATE" in
+                  ok)       echo "  password is usable in Authentik."; break ;;
+                  repaired) echo "  password was NOT usable — re-applied this app's blueprint, it is now."; break ;;
+                  no-blueprint)
+                            echo "ERROR: BlueprintInstance '${BP_NAME}' does not exist." >&2
+                            echo "  This Job creates it above; if it is gone, that apply failed." >&2
+                            exit 1 ;;
+                  *)        echo "  attempt ${attempt}/12: password not usable yet — retrying in 10s..."
+                            sleep 10 ;;
+                esac
+              done
+
+              case "$PWSTATE" in
+                ok|repaired) ;;
+                *)
+                  echo "ERROR: ${USERNAME} has NO USABLE PASSWORD after 12 attempts." >&2
+                  echo "  The account syncs to AD, gets a uidNumber and a home and resolves" >&2
+                  echo "  through sssd — and every interactive login still fails. It ALSO" >&2
+                  echo "  fails samba-ad's provisioning for every OTHER employee, which" >&2
+                  echo "  asserts a usable password across the whole 'employees' group." >&2
+                  echo "  Usual cause: the LDAPS write-back the password signal does not" >&2
+                  echo "  catch. Look for it:" >&2
+                  echo "    kubectl logs -n authentik -l app.kubernetes.io/component=worker \\" >&2
+                  echo "      | grep CERTIFICATE_VERIFY_FAILED" >&2
+                  echo "  If present, Authentik's samba-ad-ca CertificateKeyPair does not match" >&2
+                  echo "  the live cluster CA; samba-ad's provisioning is what pushes it." >&2
+                  exit 1 ;;
+              esac
+              echo "eda-pcb-agent Authentik user provisioned."

@@ -1,0 +1,74 @@
+---
+# k3s upgrade Plans. The `version` on BOTH plans is derived from
+# project_settings.ts general.k3sVersion (the same constant the nodes install with) and is
+# rewritten by updateConfigFromProjectSettings.sh — do not hand-edit it here.
+#
+# The two MUST NOT drift: rancher/k3s-upgrade refuses to downgrade, so a Plan version BEHIND
+# what a node runs makes the job cordon the node, exit 1, and never uncordon — retrying
+# forever. On a single-node control plane that stops all scheduling.
+# Upgrade k3s server (control-plane) nodes to the latest stable release.
+# cordon only (no drain) — draining a single-node CP evicts all pods with nowhere to go.
+# With multiple CP nodes, concurrency:1 ensures rolling upgrades.
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-server
+  namespace: system-upgrade
+spec:
+  concurrency: 1
+  serviceAccountName: system-upgrade
+  version: "v1.36.4+k3s1" # automatically updated from project-settings:general.k3sVersion
+  upgrade:
+    image: rancher/k3s-upgrade  # renovate: datasource=docker depName=rancher/k3s-upgrade
+  cordon: true
+  nodeSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+---
+# Upgrade k3s agent (worker) nodes after all server nodes are done.
+# prepare: waits for k3s-server plan to complete on server nodes first.
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-agent
+  namespace: system-upgrade
+spec:
+  concurrency: 2
+  serviceAccountName: system-upgrade
+  version: "v1.36.4+k3s1" # automatically updated from project-settings:general.k3sVersion
+  upgrade:
+    image: rancher/k3s-upgrade  # renovate: datasource=docker depName=rancher/k3s-upgrade
+  prepare:
+    image: rancher/k3s-upgrade  # renovate: datasource=docker depName=rancher/k3s-upgrade
+    args: ["prepare", "k3s-server"]
+  cordon: true
+  # Every agent node is a mesh node, and mesh nodes carry ecc/mesh=true:NoSchedule.
+  # Without this the upgrade Job can never schedule onto the nodes it targets.
+  #
+  # ⚠ ecc/gpu IS A SECOND, INDEPENDENT TAINT — tolerating ecc/mesh alone is not enough.
+  # GPU nodes (ecc/gpu=true) carry BOTH ecc/mesh=true:NoSchedule and
+  # ecc/gpu=true:NoSchedule, and a pod must tolerate EVERY taint on a node to land there.
+  # With only the mesh toleration the agent Job cannot schedule on any GPU node and the
+  # scheduler reports the generic
+  #   0/7 nodes are available: 2 node(s) had untolerated taint(s), ...
+  # so the Plan retries forever on a pod that can never be placed. It is easy to miss
+  # because it stays PENDING rather than failing, and because the upgrade is usually a
+  # no-op anyway (all nodes already on the pinned version) — the symptom is a permanently
+  # Pending Job in system-upgrade, not a broken node.
+  #
+  # These are the only two NoSchedule taints this repo ever applies to a node
+  # (40-join-cluster.sh for ecc/mesh, the mesh-label step for ecc/gpu); ecc/gpu-model is a
+  # LABEL, not a taint. Tolerating a taint a node does not carry is free, so listing both
+  # is correct for every agent, GPU or not.
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Exists
+      effect: NoSchedule
+    - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+      operator: Exists
+      effect: NoSchedule
+  nodeSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: DoesNotExist

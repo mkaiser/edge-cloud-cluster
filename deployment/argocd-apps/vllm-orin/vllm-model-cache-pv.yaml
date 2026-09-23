@@ -1,0 +1,81 @@
+# A STATIC `local` PV on the Orin's NVMe, plus the claim the serving pod loads from.
+#
+# ⚠ WHY NOT storageClassName: local-path, WHICH THE THOR USES. k3s's local-path
+# provisioner has ONE path for every node — its local-path-config nodePathMap contains
+# only DEFAULT_PATH_FOR_NON_LISTED_NODES → /var/lib/rancher/k3s/storage. On the Thor that
+# resolves to a 936 GiB NVMe root, so local-path is free. On THIS node the root is a
+# 54 GiB eMMC measured 2026-09-23 at 82% full — 9.3 GiB free — while a separate 458 GiB
+# NVMe sits at 1%. A 5.14 GiB checkpoint plus HuggingFace's download temporaries would
+# fill the root filesystem and take the node down with it.
+#
+# Adding a nodePathMap entry was the obvious alternative and was rejected: local-path-config
+# is a k3s Addon (objectset owner-name local-storage), so k3s rewrites it on restart, and
+# this is an AGENT node — there is no server manifests directory here to own the override.
+# A static PV keeps the fix inside the app, which is also what CLAUDE.md asks for
+# (self-contained applications, no cross-app dependencies).
+#
+# ⚠ THE DIRECTORY MUST EXIST ON THE NODE. `local` volumes do not create their path — the
+# kubelet fails the mount if it is missing. Created 2026-09-23:
+#   mkdir -p /mnt/storage/vllm-cache && chmod 0777 /mnt/storage/vllm-cache
+# It is a SIBLING of Longhorn's replicas/ on the same mount, not inside it. /mnt/storage
+# is Longhorn's disk (extraLonghornDisks in project_settings.ts) and carries a
+# longhorn-disk.cfg; do not place this under replicas/.
+#
+# ⚠ 0777 is deliberate: the vLLM container runs as a non-root uid that is not known here,
+# and a `local` PV has no fsGroup-style ownership fixup for a pre-existing directory.
+# Nothing sensitive lives here — it is a cache of PUBLIC HuggingFace weights.
+#
+# ⚠ nodeAffinity is REQUIRED for a local PV (the API rejects it otherwise) and is what
+# binds the volume to this one box. It matches the Deployment's ecc/gpu-model nodeSelector,
+# so the pod and its data can never be scheduled apart.
+#
+# Retain, not Delete: `local` volumes ignore Delete anyway (nothing reclaims a host
+# directory), and the cache is exactly what we do not want removed on a claim delete.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: vllm-orin-model-cache
+  labels:
+    # The claim selects on this, so it cannot bind to another app's local PV.
+    ecc/volume: vllm-orin-model-cache
+spec:
+  capacity:
+    # Nominal. A `local` PV reserves nothing — the real limit is the 458 GiB filesystem.
+    # Sized well above the 5.14 GiB checkpoint so a model swap (e.g. the 10.65 GiB 9B
+    # fallback) needs no PV edit.
+    storage: 60Gi
+  accessModes:
+    # RWO: a single pod (Recreate strategy) ever mounts it.
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  # ⚠ EMPTY STRING, not omitted. Empty explicitly means "no dynamic provisioning";
+  # omitting it lets the default class (longhorn-cloud) claim it.
+  storageClassName: ""
+  volumeMode: Filesystem
+  local:
+    path: /mnt/storage/vllm-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: ecc/gpu-model  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+              operator: In
+              values:
+                - jetson-orin
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  namespace: vllm-orin
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 60Gi
+  selector:
+    matchLabels:
+      ecc/volume: vllm-orin-model-cache

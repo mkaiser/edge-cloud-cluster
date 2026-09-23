@@ -1,0 +1,60 @@
+#### Vivado Design Suite 2026.1 batch install configuration ####
+# Consumed by xsetup --batch Install --config ... (Dockerfile install stage).
+#
+# Names below are VERBATIM from the 2026.1 installer's own reference config,
+# generated on the build node with:
+#   xsetup --batch ConfigGen --product Vivado --edition "Vivado Design Suite"
+# and dumped from /root/.Xilinx/install_config.txt. Do NOT invent names — 2026.1
+# renamed almost everything vs earlier releases ("Artix-7" -> "Artix-7 FPGAs",
+# "Zynq-7000" -> "Zynq-7000 All Programmable SoC", and the "Versal * Series"
+# family entries were replaced by per-part xcv*/xave*/xc2v* modules). Any unknown
+# key or module makes xsetup abort. If this file is rejected, re-run the ConfigGen
+# command above and realign, then bump IMAGE_TAG in .gitlab-ci.yml.
+#
+# 2026.1 has a SINGLE edition ("Vivado Design Suite") — the ML Standard/Enterprise
+# split is gone; licensing (not the installer) decides the feature tier.
+#
+# Selection: Vivado only, trimmed device set — 7-series (Artix/Kintex/Zynq-7000),
+# Kintex/Virtex UltraScale+ and Zynq UltraScale+ MPSoC. Everything else off,
+# including Vitis Model Composer and DocNav (both default to 1 in the reference
+# config and add GBs). Enable a family by flipping its :0 to :1, then bump
+# IMAGE_TAG in .gitlab-ci.yml — and keep build-files-configmap.yaml in sync.
+# ⚠ DO NOT COPY KEYS FROM THE 2024.1 CONFIG. This file intentionally has NO
+# EnableDiskUsageOptimization and NO CreateShortcutsForAllUsers: the 2026.1 installer's own
+# reference config does not emit them, and an unknown KEY aborts xsetup exactly as an unknown
+# module name does. Diffed against eda-xilinx-2024-1/install_config.txt — those
+# two keys are the only difference in key set, and their absence here is correct.
+#
+# ⚠ Nor are the MODULE NAMES interchangeable: 2026.1 uses the long spellings
+# ("Artix-7 FPGAs", "Zynq-7000 All Programmable SoC") and Edition="Vivado Design Suite",
+# where 2024.1 uses short names and "Vivado ML Standard". Verified identical to the
+# long-standing native 2026.1 config (was remote-desktop/modules/vivado/install_config.txt,
+# deleted with that app; see git history if the original is ever needed).
+#
+# ⚠ DocNav stays :0. On 2024.1 it hung xsetup's FINALISATION step twice (pipelines #46/#51):
+# files reach 100% (Done), then the JVM parks forever on futex_do_wait with 0% CPU because
+# DocNav fetches its online doc catalogue (resources/xhubs.xml, xdocs.xml) from AMD and this
+# lab's egress is filtered. Not a timeout and not cpu throttling — both were tested and
+# disproven. Do not enable it here without a working HTTPS path AND a completed build.
+Edition=Vivado Design Suite
+
+Product=Vivado
+
+# Path where AMD FPGAs & Adaptive SoCs software will be installed.
+Destination=/opt/Xilinx
+
+# Enabled: Artix-7, Kintex-7, Zynq-7000, Kintex UltraScale+, Virtex UltraScale+,
+# Zynq UltraScale+ MPSoCs. All Versal parts, Alveo/Kria, Vitis and DocNav off.
+Modules=Artix-7 FPGAs:1,Kintex-7 FPGAs:1,Zynq-7000 All Programmable SoC:1,Kintex UltraScale+ FPGAs:1,Virtex UltraScale+ FPGAs:1,Zynq UltraScale+ MPSoCs:1,Spartan-7 FPGAs:0,Virtex-7 FPGAs:0,Spartan UltraScale+:0,Artix UltraScale+ FPGAs:0,Kintex UltraScale FPGAs:0,Virtex UltraScale FPGAs:0,Virtex UltraScale+ 58G FPGAs:0,Virtex UltraScale+ HBM FPGAs:0,Zynq UltraScale+ RFSoCs:0,Install Devices for Kria SOMs and Starter Kits:0,Install devices for Alveo and edge acceleration platforms:0,Vitis Embedded Development:0,Vitis Networking P4:0,Vitis Model Composer(A toolbox for Simulink):0,Power Design Manager (PDM):0,DocNav:0
+
+# Post-install scripts. Licensing is provided at RUNTIME via the sealed
+# XILINXD_LICENSE_FILE/LM_LICENSE_FILE (see desktop-gvisor.yaml) — never at build time.
+InstallOptions=Acquire or Manage a License Key:0
+
+## Shortcuts and File associations ##
+# No shortcuts/associations: the desktop image provides its own launcher and
+# .desktop entry (see Dockerfile), and SIP's own menu entries would be redundant.
+CreateProgramGroupShortcuts=0
+ProgramGroupFolder=AMD Adaptive SoC and FPGA Tools
+CreateDesktopShortcuts=0
+CreateFileAssociation=0

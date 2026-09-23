@@ -1,0 +1,78 @@
+# SearXNG settings — MINIMAL overlay, not a full copy of upstream's settings.yml.
+#
+# `use_default_settings: true` merges this on top of the image's built-in defaults, so only
+# the deltas live here. Copying the whole 3400-line upstream file would be a maintenance trap:
+# every image bump would silently keep OUR stale copy of engine definitions.
+#
+# ⚠ THE `json` FORMAT IS THE WHOLE POINT. Upstream ships `formats: [html]` only
+# (external/git_searxng_searxng/searx/settings.yml), and Hermes' provider calls
+# `GET /search?format=json` (plugins/web/searxng/provider.py). Without `json` here that
+# request is REFUSED — the upstream comment is explicit: "remove format to deny access". The
+# agent would then report web search as unavailable with no obvious cause.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-settings
+  namespace: searxng
+data:
+  settings.yml: |
+    # Editing anything below is enough: the Deployment carries
+    # reloader.stakater.com/auto, so Reloader rolls the pod when this content changes.
+    # SearXNG itself reads this file only at startup.
+    use_default_settings: true
+
+    general:
+      instance_name: "ecc search"
+      # No public contact/donation links on an internal instance.
+      contact_url: false
+      donation_url: false
+
+    search:
+      # ⚠ json is REQUIRED — see the header. html is kept so a human can open the UI
+      # through a port-forward to debug what the agent is seeing.
+      formats:
+        - html
+        - json
+      # Safe default; the agent asks for what it wants per query.
+      safe_search: 0
+      autocomplete: ""
+      default_lang: "en"
+
+    server:
+      # Bind all interfaces: the container is the security boundary, and the
+      # NetworkPolicy plus the absence of an Ingress are what actually restrict access.
+      bind_address: "0.0.0.0"
+      port: 8080
+      # limiter needs redis/valkey to coordinate; with ONE known client (the Hermes pod,
+      # enforced by NetworkPolicy) there is nothing to rate-limit and no shared store to do
+      # it with. Turning it on without redis makes SearXNG log warnings and degrade.
+      limiter: false
+      # public_instance enables bot-protection features meant for the open internet. This
+      # instance is not reachable from there; enabling it would only add friction.
+      public_instance: false
+      image_proxy: false
+
+    outgoing:
+      # Agent queries are latency-sensitive (they block a tool-loop step) but must not hang
+      # it either. 6s is generous for a metasearch fan-out.
+      request_timeout: 6.0
+      max_request_timeout: 12.0
+      pool_connections: 10
+      pool_maxsize: 10
+
+    # Engines: keep the set small and text-focused. The default set includes dozens of
+    # image/video/music/social engines an agent never asks for, and each one is another
+    # outbound dependency that can rate-limit or break.
+    engines:
+      - name: wikipedia
+        disabled: false
+      - name: duckduckgo
+        disabled: false
+      - name: brave
+        disabled: false
+      - name: startpage
+        disabled: false
+      - name: github
+        disabled: false
+      - name: stackoverflow
+        disabled: false

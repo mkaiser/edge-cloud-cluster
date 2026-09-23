@@ -1,0 +1,64 @@
+# A SECOND static PV onto the BUILD-OUTPUT export, for the [eda-run] runner's build pods.
+#
+# ⚠ WHY A SECOND PV: a PV binds to exactly ONE PVC, and `nfs-eda-builds` is claimed in the
+# eda-fileserver namespace. A claim here would stay Pending forever. Two PVs onto the same
+# export is the supported shape (verified on ecc204 for the modulefiles export).
+# The volumeHandle therefore differs — the CSI driver treats it as the volume's identity.
+#
+# Mounted READ-WRITE, deliberately: this is where a pipeline PUTS its .xsa, bitstreams,
+# BOOT.BIN, packaged deployment/ set and logs. Unlike the module registry next door, write
+# access here grants no execution authority — it is ordinary build output.
+#
+# ⚠ CI MUST WRITE UNDER <project>/<branch>-<short-sha>/, never a fixed path. The export is
+# shared with every interactive machine, so two concurrent builds writing one path silently
+# interleave and the loser's bitstream is the one you ship.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-eda-builds-ci
+  labels:
+    # The claim below selects on this, so the pairing cannot bind to the wrong volume.
+    ecc/volume: nfs-eda-builds-ci
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size. The real limit is the ZFS quota on
+    # datapool/eda/builds, which is where to enforce one.
+    storage: 2Ti
+  accessModes:
+    # Genuinely multi-writer: the CI build pod and every interactive machine mount it rw.
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as the other EDA claims; see gitlab-runner-eda/nfs-installers-pv.yaml for why
+    # each is pinned.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # Must be unique cluster-wide.
+    volumeHandle: fs-1-datapool-eda-builds-ci
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/eda/builds # automatically updated from project-settings:storage.fileserver.datasets.eda.builds
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-eda-builds-ci
+  namespace: gitlab-runner
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 2Ti
+  selector:
+    matchLabels:
+      ecc/volume: nfs-eda-builds-ci

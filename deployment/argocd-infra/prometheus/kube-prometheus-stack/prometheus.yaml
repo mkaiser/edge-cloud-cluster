@@ -1,0 +1,913 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd-infra
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: "91.4.1" # renovate: datasource=helm depName=kube-prometheus-stack registryUrl=https://prometheus-community.github.io/helm-charts
+    helm:
+      values: |
+        prometheusOperator:
+          # ⚠ WATCH EVERY NAMESPACE. This was an allow-list of the release namespace alone,
+          # and it is the reason a ServiceMonitor placed beside its app was ignored no matter
+          # what the Prometheus CR's selectors said: the OPERATOR never saw the object, so no
+          # scrape job was ever generated and no selector got a chance to match. Measured
+          # 2026-09-03 — alloy, both GitLab monitors, all seven CNPG PodMonitors and
+          # nextcloud's own monitor produced no job_name at all, while authentik-server
+          # worked purely because its monitor is placed in ns prometheus.
+          # `namespaces: {}` means unrestricted (the chart omits --namespaces), which is what
+          # an empty object does here — unlike the CR selectors, where empty means own
+          # namespace only.
+          namespaces: {}
+          # The allow-list existed to avoid fighting Ryax's own bundled prometheus-operator
+          # over CRs in ryaxns. Ryax is disabled (ryax.yaml.disable), but the concern is real
+          # if it ever returns, and a deny-list keeps it addressed without scoping the
+          # operator down to a single namespace. Mutually exclusive with `namespaces` above,
+          # which is why that one must stay empty.
+          denyNamespaces:
+            - ryaxns
+          admissionWebhooks:
+            # Admission webhook Jobs use Helm hooks that ArgoCD cannot track reliably —
+            # the Job completes and is GC'd before ArgoCD polls it, causing a permanent
+            # stuck sync. cert-manager handles TLS for webhooks instead.
+            enabled: false
+            patch:
+              enabled: false
+          tls:
+            enabled: false
+        grafana:
+          # Grafana is its own app now — deployment/argocd-infra/prometheus/grafana/ (chart
+          # from grafana.github.io/helm-charts). It serves Prometheus AND Loki, so
+          # it should not be owned by the metrics stack.
+          #
+          # These two flags are the whole trick: with grafana.enabled=false the
+          # chart would ALSO stop rendering its 29 built-in dashboard ConfigMaps
+          # and the Prometheus+Alertmanager datasource ConfigMap (both are guarded
+          # by `if .Values.grafana.enabled`), and the standalone Grafana would come
+          # up empty. forceDeploy* keeps producing them; the split-out Grafana
+          # discovers them with its sidecars (same namespace, `prometheus`).
+          enabled: false
+          forceDeployDashboards: true
+          forceDeployDatasources: true
+        # ── Control-plane components this cluster does not expose ───────────────────
+        # All four ship enabled by default, and on k3s all four produce a ServiceMonitor
+        # whose Service has NO endpoints — so they sit at 0 targets while their stock
+        # *Down alerts fire forever. KubeProxyDown and KubeSchedulerDown were both firing
+        # CRITICAL on a perfectly healthy cluster (verified 2026-09-03), which is how
+        # people learn to ignore critical alerts.
+        #   kubeProxy              — genuinely absent: cilium runs kubeProxyReplacement.
+        #   kubeScheduler          — in-process in the k3s server, metrics bound to
+        #   kubeControllerManager    localhost; no bind-address override is set
+        #                            (src/nodes-k3s-base.ts passes only the
+        #                            node-monitor-* args).
+        #   kubeEtcd               — embedded etcd, and k3s does not serve its metrics
+        #                            without --etcd-expose-metrics.
+        # Turning them off removes four dead monitors, two permanently-firing criticals and
+        # four empty dashboards. To get the metrics back rather than hide them, expose them
+        # at the source first (k3s --etcd-expose-metrics, and bind-address args for the
+        # other two), then re-enable the matching component here.
+        kubeProxy:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeControllerManager:
+          enabled: false
+        kubeEtcd:
+          enabled: false
+        # ServiceMonitors for components deployed by Pulumi (or wave-1 apps).
+        # These live here (not in Pulumi/wave-1) because the CRD doesn't exist until
+        # the kube-prometheus-stack Helm chart is deployed.
+        prometheus:
+          prometheusSpec:
+            # Source of the `generatorURL` in every alert Prometheus fires — the
+            # "View in Prometheus"/source link that ends up in Alertmanager
+            # notifications. Same failure mode as the alertmanager externalUrl
+            # above if left unset. prometheus.subdomain is already routed through
+            # the Authentik outpost (prometheus-oidc-ingress.yaml).
+            externalUrl: https://prometheus.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+            # ⚠ SELECT EVERY MONITOR, not only the ones carrying this chart's release label.
+            # By default kube-prometheus-stack sets each selector to
+            # {matchLabels: {release: kube-prometheus-stack}}, and a ServiceMonitor that does
+            # not happen to carry that label is then IGNORED — silently. The object exists,
+            # ArgoCD reports the app Synced and Healthy, `kubectl get servicemonitor` lists
+            # it, and nothing is ever scraped. Measured 2026-09-03: alloy, authentik-server
+            # and the ak-outpost-truenas monitor were all in exactly that state, and the
+            # outpost one cannot be fixed at the source at all — Authentik creates it itself.
+            # Enabling an app's chart-provided monitor is the ordinary way to add a target
+            # here, so the selector must not depend on an unrelated chart's release name.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+            scrapeConfigSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            # ⚠ AND THE NAMESPACE SCOPE, which is a SEPARATE selector from the label one
+            # above and fails just as silently. An empty/absent namespace selector means
+            # "only this Prometheus object's own namespace", so a monitor living beside its
+            # app — the normal place for one — is never even compiled into a scrape job.
+            # Measured 2026-09-03, after the label selectors were opened up: authentik-server
+            # was scraped (its monitor is placed in ns prometheus) while alloy, both GitLab
+            # monitors, all seven CNPG PodMonitors and nextcloud's own monitor produced NO
+            # job_name at all. `{}` does not fix it: Helm omits an empty map, leaving the
+            # field nil, which is precisely the own-namespace case. Matching on
+            # kubernetes.io/metadata.name — a label the apiserver puts on every namespace —
+            # is non-empty, so it renders, and selects all of them.
+            serviceMonitorNamespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: Exists
+            podMonitorNamespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: Exists
+            probeNamespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: Exists
+            scrapeConfigNamespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: Exists
+            ruleNamespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: Exists
+          additionalServiceMonitors:
+            # ── Cilium ──────────────────────────────────────────────────────────────────
+            # The CNI's monitors live HERE rather than in the cilium chart because that
+            # chart is wave 0 and these CRDs arrive with this chart at wave 2 — cilium's own
+            # serviceMonitor.enabled would try to create a ServiceMonitor before the CRD
+            # exists and fail the app the whole cluster waits on. cilium sets
+            # prometheus.metricsService / operator.prometheus.metricsService instead, which
+            # publishes the Services with no ServiceMonitor; these adopt them.
+            # Port NAMES, not numbers, and they differ per component: the agent and operator
+            # Services both name theirs `metrics` (9962 / 9963), cilium-envoy names its
+            # `envoy-metrics` (9964) and hubble names its `hubble-metrics` (9965).
+            - name: cilium-agent
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  k8s-app: cilium
+              namespaceSelector:
+                matchNames:
+                  - kube-system
+              endpoints:
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            - name: cilium-operator
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  io.cilium/app: operator
+              namespaceSelector:
+                matchNames:
+                  - kube-system
+              endpoints:
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            - name: cilium-envoy
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  k8s-app: cilium-envoy
+              namespaceSelector:
+                matchNames:
+                  - kube-system
+              endpoints:
+                - port: envoy-metrics
+                  path: /metrics
+                  interval: 30s
+            # Hubble flow metrics — the source of the policy-drop series. Its Service exists
+            # whenever hubble.metrics.enabled is non-empty, independent of any monitor flag.
+            - name: hubble
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  k8s-app: hubble
+              namespaceSelector:
+                matchNames:
+                  - kube-system
+              endpoints:
+                - port: hubble-metrics
+                  path: /metrics
+                  interval: 30s
+            # ── CoreDNS ─────────────────────────────────────────────────────────────────
+            # Here for the same reason as cilium's above: coredns is a wave-0 app and these
+            # CRDs arrive at wave 2, so the chart's own prometheus.monitor.enabled would fail
+            # the app the wave-1 barrier waits on. It sets prometheus.service.enabled instead
+            # (src/coredns.ts + app-of-apps/wave0-coredns.yaml, kept in sync), which publishes
+            # coredns-metrics with no ServiceMonitor; this adopts it.
+            # ⚠ Select on app.kubernetes.io/component: metrics — the DNS Service and the
+            # metrics Service BOTH carry k8s-app: kube-dns, and only the latter serves 9153.
+            - name: coredns
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  k8s-app: kube-dns
+                  app.kubernetes.io/component: metrics
+              namespaceSelector:
+                matchNames:
+                  - kube-system
+              endpoints:
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            - name: external-dns
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: external-dns
+              namespaceSelector:
+                matchNames:
+                  - external-dns
+              endpoints:
+                - port: http
+                  interval: 30s
+            - name: cert-manager
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: cert-manager
+                  app.kubernetes.io/component: controller
+              namespaceSelector:
+                matchNames:
+                  - cert-manager
+              endpoints:
+                - port: http-metrics
+                  path: /metrics
+                  interval: 60s
+            - name: headscale
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app.kubernetes.io/instance: headscale
+                  app.kubernetes.io/name: headscale
+              namespaceSelector:
+                matchNames:
+                  - headscale
+              endpoints:
+                # `metrics` (9090), NOT `http` (8080). Headscale serves /metrics on its own
+                # listener; the app port answers 404 there, which Prometheus reports as a DOWN
+                # target rather than a misconfigured one — it fired TargetDown continuously.
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            - name: longhorn
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app: longhorn-manager
+              namespaceSelector:
+                matchNames:
+                  - longhorn-system
+              endpoints:
+                - port: manager
+                  path: /metrics
+                  interval: 60s
+            # Admin WireGuard VPN exporter (prometheus-wireguard-exporter sidecar,
+            # src/wireguard.ts). The wireguard-metrics Service (app: wireguard,
+            # port 9586 named "metrics") existed but had no ServiceMonitor — the
+            # comment in wireguard.ts:245 claimed one lived here but it never did.
+            - name: wireguard
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app: wireguard
+              namespaceSelector:
+                matchNames:
+                  - wireguard-infra
+              endpoints:
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            # Mesh link metrics exporter sidecar in the mesh-gateway DaemonSet.
+            # Selects the mesh-gateway-metrics Service (headscale ns); emits
+            # mesh_peer_* connection-state series from the CP tailscaled socket.
+            - name: mesh-gateway
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app: mesh-gateway-metrics
+              namespaceSelector:
+                matchNames:
+                  - headscale
+              endpoints:
+                - port: metrics
+                  path: /metrics
+                  interval: 30s
+            # Prometheus Pushgateway (pushgateway.yaml) — sink for the mesh
+            # active-probe CronJobs (mesh_peer_ping_*, mesh_peer_iperf_*).
+            - name: pushgateway
+              namespace: prometheus
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: prometheus-pushgateway
+              namespaceSelector:
+                matchNames:
+                  - prometheus
+              endpoints:
+                - port: http
+                  path: /metrics
+                  interval: 30s
+                  honorLabels: true
+          # The chart's own ingress is disabled: prometheus has no native auth, so
+          # access is fronted by Authentik instead. See prometheus-oidc-ingress.yaml
+          # (routes prometheus.subdomain → Authentik embedded outpost → this server).
+          ingress:
+            enabled: false
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+
+        alertmanager:
+          # The full alertmanager config (incl. SMTP creds + recipient) is supplied
+          # as the sealed secret 'alertmanager-config' (key alertmanager.yaml),
+          # rendered from the Pulumi stack by this directory's sealSecrets.sh.
+          # No SMTP server, credentials, or recipient are committed in this manifest.
+          # Routing rules are kept readable in alertmanager-config.yaml.template.
+          # configSecret must sit under alertmanagerSpec — at the top level the chart
+          # silently ignores it and Alertmanager falls back to its default (null) config.
+          alertmanagerSpec:
+            configSecret: alertmanager-config
+            # Every link Alertmanager emits (the "View in AlertManager" button in
+            # notification emails, silence URLs) is built from this. Unset, the
+            # operator defaults it to the in-cluster Service DNS
+            # (http://kube-prometheus-stack-alertmanager.prometheus:9093), which
+            # resolves nowhere from a mail client. Routed by
+            # alertmanager-oidc-ingress.yaml via the Authentik outpost.
+            externalUrl: https://alertmanager.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+
+        prometheus-node-exporter:
+          # Overwrite the node-exporter `instance` label (default: <node-ip>:9100)
+          # with the k3s node NAME, so every node_* series — and thus every panel
+          # in the built-in Kubernetes/Networking dashboards, our mesh dashboard,
+          # and node-based alerts — legends by hostname instead of ip:port.
+          # __meta_kubernetes_pod_node_name is the node-exporter DaemonSet pod's
+          # host node = the k8s node name. Node names are unique, so the 12
+          # node_*+instance recording/alert rules that group by `instance` keep
+          # working (they treat it as an opaque per-node key). One-time series
+          # discontinuity when this lands: old ip:port series simply stop.
+          prometheus:
+            monitor:
+              relabelings:
+                - sourceLabels: [__meta_kubernetes_pod_node_name]
+                  targetLabel: instance
+
+        # ⚠ KubeNodePressure IS RAISED FROM info TO warning ON PURPOSE.
+        #
+        # Upstream ships it at `severity: info`, and this cluster's Alertmanager routes
+        # every `info` alert to the null receiver deliberately (see
+        # alertmanager-config.yaml.template — "info is diagnostic padding"). The two
+        # together mean the alert fires perfectly and NOBODY IS TOLD.
+        #
+        # Measured 2026-09-20: unibi-hclab-bender hit DiskPressure at 13:10 UTC, the rule
+        # went firing at 13:20 and stayed firing until 16:00 — nearly three hours — with no
+        # email. In that window the kubelet evicted the bender desktop (down ~3h, its
+        # replacement stuck Pending), gitlab-registry, gitlab-s3-proxy, image-registry,
+        # ryax-datastore and ryax-grafana.
+        #
+        # `info` is simply the wrong class here: the rule does not report a diagnostic, it
+        # reports that the kubelet is ACTIVELY EVICTING PODS.
+        #
+        # ⚠ USE `customRules`, NOT `defaultRules.disabled` + a re-declared copy. The chart
+        # exposes exactly this knob ("Custom rules to override 'for' and 'severity' in
+        # defaultRules"), so the expr and annotations stay upstream's and keep tracking the
+        # chart on every bump. Re-declaring the rule would fork it silently.
+        customRules:
+          KubeNodePressure:
+            severity: warning
+
+        additionalPrometheusRulesMap:
+          argocd:
+            groups:
+              - name: argocd
+                rules:
+                  # App stuck out of sync (OutOfSync / Unknown) for a while.
+                  # Metric exported by argocd-application-controller (ServiceMonitor
+                  # enabled in argocd-infra-self/values.yaml).
+                  - alert: ArgoCDAppNotSynced
+                    expr: |
+                      argocd_app_info{sync_status!="Synced"} == 1
+                    for: 15m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "ArgoCD app {{ $labels.name }} not synced"
+                      description: "Application {{ $labels.name }} (project {{ $labels.project }}) sync_status={{ $labels.sync_status }} for >15m."
+                  # App unhealthy: failed sync, degraded workload, missing resources.
+                  - alert: ArgoCDAppUnhealthy
+                    expr: |
+                      argocd_app_info{health_status=~"Degraded|Missing|Unknown"} == 1
+                    for: 15m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "ArgoCD app {{ $labels.name }} unhealthy"
+                      description: "Application {{ $labels.name }} health_status={{ $labels.health_status }} for >15m."
+          gitlab-s3-artifacts:
+            groups:
+              - name: gitlab.s3.artifacts
+                rules:
+                  # Fed by gitlab-s3-proxy-probe, a CLOUD-pinned CronJob that GETs the S3
+                  # endpoint unauthenticated and requires 403. A lab-pinned probe would stay
+                  # green through the exact outage this is for.
+                  - alert: GitLabArtifactsEndpointUnreachable
+                    expr: |
+                      time() - max(kube_cronjob_status_last_successful_time{namespace="gitlab-s3-proxy",cronjob="gitlab-s3-proxy-probe"}) > 1800
+                    for: 5m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "GitLab's on-prem artifact endpoint is not answering from the cloud"
+                      description: "No successful probe for >30m (10-minute schedule). Every CI job's artifact step fails while this is true, late and after the build has already succeeded. Check the mesh link, gitlab-s3-proxy, and the seaweedfs app on fs-1."
+                  # Same absent() reasoning as the mirror: if the CronJob is gone, the
+                  # expression above has no series and can never fire.
+                  - alert: GitLabArtifactsProbeMissing
+                    expr: |
+                      absent(kube_cronjob_status_last_successful_time{namespace="gitlab-s3-proxy",cronjob="gitlab-s3-proxy-probe"})
+                    for: 1h
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "The artifact-endpoint probe reports no successful run"
+                      description: "kube_cronjob_status_last_successful_time is absent for gitlab-s3-proxy-probe: the CronJob is missing, or has never succeeded since creation."
+          gitlab-mirror:
+            groups:
+              - name: gitlab.mirror
+                rules:
+                  # ⚠ THE ALERT IS THE POINT OF THE MIRROR, NOT AN EXTRA. A mirror that
+                  # silently stopped is WORSE than no mirror: it still looks like a backup.
+                  # The most likely cause is token expiry — GitLab PATs cap at 365 days and
+                  # cannot be non-expiring — and that failure is completely silent from the
+                  # outside.
+                  - alert: GitLabMirrorStale
+                    expr: |
+                      time() - max(kube_cronjob_status_last_successful_time{namespace="gitlab-mirror",cronjob="gitlab-mirror"}) > 10800
+                    for: 15m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "GitLab repository mirror is stale"
+                      description: "No successful gitlab-mirror run for >3h (hourly schedule). Most likely the API token expired; check the CronJob's last Job logs."
+                  # absent() is a SEPARATE alert on purpose: if the CronJob is deleted or
+                  # never created, the expression above has no series and can never fire —
+                  # the stale-mirror alert would itself go silent exactly when the mirror
+                  # disappears entirely.
+                  - alert: GitLabMirrorMissing
+                    expr: |
+                      absent(kube_cronjob_status_last_successful_time{namespace="gitlab-mirror",cronjob="gitlab-mirror"})
+                    for: 1h
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "GitLab repository mirror CronJob reports no successful run"
+                      description: "kube_cronjob_status_last_successful_time is absent for gitlab-mirror: the CronJob is missing, or it has never succeeded since it was created."
+          longhorn-backup:
+            groups:
+              - name: longhorn.backup
+                rules:
+                  # Covers EVERY backup RecurringJob, not just backup-daily: the families
+                  # are backup-{6hourly,daily,weekly,monthly,yearly}, cnpg-backup-daily and
+                  # mesh-backup-daily. All match ".*backup-.*"; snapshot-only jobs
+                  # (snapshot-hourly, mesh-snapshot-6hourly) deliberately do NOT — a missed
+                  # local snapshot is not a durability event, a missed S3 backup is.
+                  # Keep this regex in sync with longhorn/recurring-jobs.yaml.
+                  #
+                  # The age bound matters as much as the match: kube_job_status_failed stays
+                  # 1 for as long as the failed Job object exists, and failedJobsHistoryLimit
+                  # keeps 14 of them, so without it one bad night pages daily for two weeks
+                  # while backups succeed. The window must exceed the job's own period or the
+                  # alert self-clears before the next attempt, so the sub-daily/daily families
+                  # (26h) are split from the long-cadence ones (9d covers weekly). monthly and
+                  # yearly get no job-level rule — no sane age bound exists for a yearly job —
+                  # and are covered by LonghornVolumeBackupTooOld below, which watches the
+                  # outcome per volume rather than the job.
+                  - alert: LonghornBackupJobFailed
+                    expr: |
+                      (
+                        kube_job_status_failed{
+                          namespace="longhorn-system",
+                          job_name=~"(backup-(6hourly|daily)|cnpg-backup-daily|mesh-backup-daily)-.*"
+                        } > 0
+                        unless kube_job_status_active{
+                          namespace="longhorn-system",
+                          job_name=~"(backup-(6hourly|daily)|cnpg-backup-daily|mesh-backup-daily)-.*"
+                        } > 0
+                      )
+                      and on(namespace, job_name) (
+                        time() - kube_job_status_start_time{
+                          namespace="longhorn-system",
+                          job_name=~"(backup-(6hourly|daily)|cnpg-backup-daily|mesh-backup-daily)-.*"
+                        } < 26 * 3600
+                      )
+                    for: 2m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Longhorn backup job {{ $labels.job_name }} failed"
+                      description: "Job {{ $labels.job_name }} in longhorn-system has failed pods."
+                  - alert: LonghornBackupJobFailedLongCadence
+                    expr: |
+                      (
+                        kube_job_status_failed{
+                          namespace="longhorn-system",
+                          job_name=~"backup-weekly-.*"
+                        } > 0
+                        unless kube_job_status_active{
+                          namespace="longhorn-system",
+                          job_name=~"backup-weekly-.*"
+                        } > 0
+                      )
+                      and on(namespace, job_name) (
+                        time() - kube_job_status_start_time{
+                          namespace="longhorn-system",
+                          job_name=~"backup-weekly-.*"
+                        } < 9 * 24 * 3600
+                      )
+                    for: 2m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Longhorn weekly backup {{ $labels.job_name }} failed"
+                      description: "Job {{ $labels.job_name }} in longhorn-system has failed pods."
+                  # The failure mode that pages for NOTHING otherwise: a RecurringJob whose
+                  # `groups` names a group no StorageClass assigns runs, matches zero volumes,
+                  # and reports Succeeded — so no *JobFailed alert can ever fire while volumes
+                  # silently go unprotected (this is exactly how a mis-typed mesh scope name
+                  # once hid 7 unbacked volumes). Alert on the OUTCOME instead of the job: a volume
+                  # that exists but has no backup recorded in the last 48h.
+                  # longhorn_volume_last_backup_at is a unix timestamp and is 0 for a volume
+                  # that has NEVER been backed up, so the never/stale cases are split (0 would
+                  # otherwise read as an ~56-year-old backup).
+                  #
+                  # Both are gated on state="attached". Longhorn cannot back up a detached
+                  # volume, so idle/scratch PVCs sit at 0 forever and would be permanent false
+                  # positives — on this cluster that is 8 of the 16 zeros. Gating on attachment
+                  # (rather than an unmaintainable name blocklist) keeps the rule to volumes
+                  # actually in service. Trade-off: a volume that is detached for >48h is out
+                  # of scope, which is intended — it is not taking writes.
+                  #
+                  # `and on(volume)` is required: the two metrics carry different label sets,
+                  # so an unqualified `and` would match nothing.
+                  #
+                  # The 30h PVC-age gate stops this firing for every NEWLY created volume: a
+                  # volume has no backup until its group's job next runs, and the daily groups
+                  # (cnpg-backup-daily 04:45, mesh-backup-daily 03:00) mean that wait is up to
+                  # 24h — a new PVC created just after the run would otherwise page for a whole
+                  # day. `for: 2h` cannot express this; it only requires the condition to hold
+                  # 2h, which a fresh volume trivially does. 30h = 24h cycle + 6h slack.
+                  # kube-state-metrics labels PVCs namespace/persistentvolumeclaim while
+                  # Longhorn uses pvc_namespace/pvc, hence the label_replace bridge.
+                  #
+                  # Some volumes are excluded because they are DELIBERATELY not backed up.
+                  # Keep each in sync with its policy file: if one is deactivated and the
+                  # volume put back in a backup group, drop its exclusion here or the volume
+                  # goes unmonitored.
+                  #
+                  # windows/windows-vm-storage: ~28GiB raw block over the mesh link at
+                  # ~3.5 MB/s never completes in one job run, so it would page forever. It
+                  # keeps local snapshots. Policy:
+                  # deployment/argocd-apps/windows/backup-policy.yaml
+                  #
+                  # ryaxns/* and ryaxns-tools/* — the WHOLE CAPE demonstrator stack: everything
+                  # it stores is re-importable (build cache, action images, execution
+                  # artifacts, observability retention, demo databases regenerated by
+                  # re-running a workflow), so neither snapshots nor backups preserve anything
+                  # authored here. Every volume in both namespaces is in NO recurring job at
+                  # all. The nix build cache alone had reached 97GiB of snapshot history over
+                  # a 39GiB working set on the cluster's tightest disk. Policy:
+                  # deployment/argocd-apps/cape-demo/ryax/snapshot-policy.yaml
+                  - alert: LonghornVolumeNeverBackedUp
+                    expr: |
+                      (
+                        max by (volume, pvc, pvc_namespace) (
+                          longhorn_volume_last_backup_at
+                          unless (
+                            longhorn_volume_last_backup_at{pvc_namespace="windows"}
+                            and longhorn_volume_last_backup_at{pvc="windows-vm-storage"}
+                          )
+                          unless (
+                            longhorn_volume_last_backup_at{pvc_namespace=~"ryaxns|ryaxns-tools"}
+                          )
+                        ) == 0
+                      )
+                      and on(volume) (
+                        max by (volume) (longhorn_volume_state{state="attached"}) == 1
+                      )
+                      and on(pvc, pvc_namespace) (
+                        label_replace(
+                          label_replace(
+                            max by (namespace, persistentvolumeclaim) (
+                              time() - kube_persistentvolumeclaim_created
+                            ) > 30 * 3600,
+                            "pvc", "$1", "persistentvolumeclaim", "(.*)"
+                          ),
+                          "pvc_namespace", "$1", "namespace", "(.*)"
+                        )
+                      )
+                    for: 2h
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} has NEVER been backed up"
+                      description: "No backup has ever completed for attached volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} ({{ $labels.volume }}). Check its recurring-job-group.longhorn.io/* label resolves to a group named in longhorn/recurring-jobs.yaml — a group matching no StorageClass silently skips the volume."
+                  - alert: LonghornVolumeBackupTooOld
+                    expr: |
+                      (
+                        time() - max by (volume, pvc, pvc_namespace) (longhorn_volume_last_backup_at != 0)
+                        > 48 * 3600
+                      )
+                      and on(volume) (
+                        max by (volume) (longhorn_volume_state{state="attached"}) == 1
+                      )
+                    for: 30m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} has no recent backup"
+                      description: "No completed backup for {{ $labels.pvc_namespace }}/{{ $labels.pvc }} ({{ $labels.volume }}) in >48h — check RecurringJob group membership (recurring-job-group.longhorn.io/* labels) against longhorn/recurring-jobs.yaml."
+          mesh:
+            groups:
+              - name: mesh.link
+                rules:
+                  # Mesh peer dropped off the VPN. mesh_peer_online comes from the
+                  # mesh-gateway exporter sidecar (CP tailscaled socket).
+                  - alert: MeshPeerOffline
+                    expr: |
+                      mesh_peer_online == 0
+                    for: 10m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Mesh peer {{ $labels.peer }} offline"
+                      description: "Peer {{ $labels.peer }} (site {{ $labels.site }}) has been offline for >10m."
+                  # WireGuard handshake gone stale — peer likely unreachable even
+                  # if headscale still lists it. Tailscale rekeys well under 5 min.
+                  - alert: MeshPeerHandshakeStale
+                    expr: |
+                      mesh_peer_last_handshake_seconds > 300
+                    for: 5m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Mesh peer {{ $labels.peer }} handshake stale"
+                      description: "Peer {{ $labels.peer }} (site {{ $labels.site }}) last WireGuard handshake >5m ago (value {{ $value | humanizeDuration }})."
+                  # The node looks fine to Kubernetes but headscale has lost it. This
+                  # divergence is the ONLY unambiguous signal for a class of failure
+                  # that otherwise hides for days: a mesh node black-holing its own
+                  # egress to the cloud public IP (Service externalIPs
+                  # programs a NAT rule on every node — see
+                  # doc/cloud-mesh-architecture.md). Neither MeshPeerOffline nor
+                  # MeshPeerHandshakeStale fires there, because WireGuard stays
+                  # perfectly healthy (`tailscale ping` 22 ms) while the CONTROL
+                  # connection is dead — which is exactly what made it hard to spot.
+                  # Consequence if unnoticed: kubectl logs/exec 502 on that node, its
+                  # longhorn-manager goes ready=false, and its volumes never attach.
+                  # `mesh_peer_online` carries a `node` label matching the k8s node
+                  # name, so the join is direct (verified: matches all 4 mesh nodes).
+                  - alert: MeshNodeReadyButPeerOffline
+                    expr: |
+                      kube_node_status_condition{condition="Ready",status="true"} == 1
+                      and on(node) mesh_peer_online == 0
+                    for: 15m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Mesh node {{ $labels.node }} is Ready but headscale says offline"
+                      description: "Node {{ $labels.node }} reports Ready to Kubernetes while headscale has not seen it for >15m. The WireGuard data path may still work — check the k3s agent tunnel with `kubectl logs` against a pod on that node (a 502 dialing :10250 confirms it), then `nft list ruleset | grep <cloud-public-ip>` on the node for a KUBE-EXT hijack rule."
+          cilium:
+            groups:
+              - name: cilium.cni
+                rules:
+                  # Series and baselines verified on the live cluster 2026-09-03, right after
+                  # the agents rolled: 6 cilium-agent, 6 cilium-envoy, 1 cilium-operator and
+                  # 6 hubble-metrics targets up, cilium_unreachable_nodes back to 0 on every
+                  # agent once the roll settled.
+                  #
+                  # No agent on a node means no NEW pod there gets networking, and existing
+                  # pods lose policy and service updates. The datapath keeps forwarding, which
+                  # is exactly why this is easy to miss.
+                  - alert: CiliumAgentDown
+                    expr: |
+                      up{job="cilium-agent"} == 0
+                    for: 10m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Cilium agent not scrapeable on {{ $labels.pod }}"
+                      description: "The cilium agent on {{ $labels.pod }} has not answered for >10m. No new pod on that node can get an IP or policy. The datapath may still be forwarding, so nothing else will look wrong."
+                  # The operator is off the datapath but owns IPAM: while it is down no new
+                  # pod anywhere gets an address.
+                  - alert: CiliumOperatorDown
+                    expr: |
+                      up{job="cilium-operator"} == 0
+                    for: 10m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Cilium operator not scrapeable"
+                      description: "The cilium operator has not answered for >10m. It owns IPAM, so no new pod in the cluster can get an IP while it is gone — running pods are unaffected, which delays discovery."
+                  # An agent's own health probe cannot reach another node. This is the
+                  # datapath view of the failure doc/cloud-mesh-architecture.md describes as
+                  # one-way black-holing (tx>0, rx=0), where headscale still reports the peer
+                  # online and Kubernetes still reports the node Ready — the case the mesh
+                  # alerts cannot see. `for` is long because a rolling agent restart briefly
+                  # reports 1-2 unreachable nodes before health probing re-converges.
+                  # Hubble losing events from anything OTHER than its recent-flow ring.
+                  # The distinction is the whole rule: hubble_ring_buffer is a bounded cache
+                  # of recent flows, so it evicts unread ones at every capacity and climbs
+                  # forever in normal operation (~0.6/s measured at ~500 flows/s) — alerting
+                  # on it would fire on arrival and teach people to ignore hubble alerts.
+                  # observer_events_queue and perf_event_ring_buffer are different: loss
+                  # there means the agent could not keep up INGESTING from the datapath, so
+                  # flows never reached the metrics or the ring at all. Both sit at exactly 0
+                  # in steady state, which is what makes them alertable.
+                  - alert: HubbleDroppingEventsAtIngest
+                    expr: |
+                      sum by (pod, source) (rate(hubble_lost_events_total{source!="hubble_ring_buffer"}[10m])) > 0
+                    for: 15m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Hubble on {{ $labels.pod }} is losing events at ingest ({{ $labels.source }})"
+                      description: "The agent cannot keep up reading flows from the datapath, so they never reach the flow metrics or the recent-flow ring — every hubble series and any drop investigation is now incomplete. Raising hubble.eventBufferCapacity does NOT help this; it is an ingest-side backlog."
+                  - alert: CiliumUnreachableNodes
+                    expr: |
+                      cilium_unreachable_nodes > 0
+                    for: 20m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Cilium on {{ $labels.pod }} cannot reach {{ $value }} node(s)"
+                      description: "The agent's health probe has failed to reach {{ $value }} other node(s) for >20m while Kubernetes still considers them Ready. Compare with mesh_peer_online and `cilium-health status` inside the agent."
+          cnpg:
+            groups:
+              - name: cnpg.databases
+                rules:
+                  # Every one of these series comes from the exporter CNPG runs inside each
+                  # instance pod on :9187, scraped via the PodMonitor that
+                  # spec.monitoring.enablePodMonitor creates. Names and labels were read off
+                  # the live endpoint on 2026-09-03 rather than from documentation:
+                  # cnpg_collector_up carries `cluster`, and Prometheus adds namespace/pod.
+                  #
+                  # The exporter cannot reach its own PostgreSQL. Distinct from the pod being
+                  # down, which kube-state-metrics already covers: this fires while the pod
+                  # runs, which is the case nothing else notices.
+                  - alert: CNPGClusterDown
+                    expr: |
+                      cnpg_collector_up == 0
+                    for: 5m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "CNPG cluster {{ $labels.namespace }}/{{ $labels.cluster }} unreachable"
+                      description: "The CNPG exporter in {{ $labels.pod }} cannot reach its PostgreSQL for >5m. Every app using this database is failing now. Check `kubectl cnpg status {{ $labels.cluster }} -n {{ $labels.namespace }}`."
+                  # WAL segments queued for archiving to S3. A non-zero `ready` count that
+                  # does not drain means barman is not shipping: PITR silently stops being
+                  # possible for everything after the last archived segment, AND pg_wal grows
+                  # without bound until the data volume fills and PostgreSQL stops.
+                  - alert: CNPGWALArchiveBacklog
+                    expr: |
+                      cnpg_collector_pg_wal_archive_status{value="ready"} > 0
+                    for: 15m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "CNPG {{ $labels.namespace }}/{{ $labels.cluster }} is not archiving WAL"
+                      description: "{{ $value }} WAL segment(s) waiting to be archived for >15m. PITR is broken from the last archived segment onward and pg_wal will keep growing until the volume is full. Check the barman object-store credentials and endpoint in the Cluster spec."
+                  # No base backup exists at all. WAL archiving cannot restore anything on its
+                  # own — PITR replays WAL on top of a base backup — so a cluster in this
+                  # state has NO recoverable copy. `immediate: true` on each ScheduledBackup
+                  # closes the window after a recreate; this catches it staying open.
+                  - alert: CNPGNoBaseBackup
+                    expr: |
+                      cnpg_collector_last_available_backup_timestamp == 0
+                    for: 1h
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "CNPG {{ $labels.namespace }}/{{ $labels.cluster }} has no base backup"
+                      description: "No base backup has ever completed for this cluster, so nothing can be restored — WAL archiving alone is not a backup. Check the ScheduledBackup and `kubectl get backups -n {{ $labels.namespace }}`."
+                  # A backup attempt failed more recently than any succeeded.
+                  - alert: CNPGBackupFailing
+                    expr: |
+                      cnpg_collector_last_failed_backup_timestamp
+                        > cnpg_collector_last_available_backup_timestamp
+                    for: 30m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "CNPG {{ $labels.namespace }}/{{ $labels.cluster }} backup failing"
+                      description: "The most recent backup attempt failed and is newer than the last successful one. The existing base backup is ageing out while WAL keeps accumulating against it."
+                  # The exporter itself is erroring — its metrics may be stale or partial, so
+                  # the alerts above can go quiet for the wrong reason.
+                  - alert: CNPGCollectorErrors
+                    expr: |
+                      cnpg_collector_last_collection_error != 0
+                    for: 30m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "CNPG exporter erroring in {{ $labels.namespace }}/{{ $labels.cluster }}"
+                      description: "The CNPG metrics collector reports a collection error, so the other cnpg alerts may be evaluating stale or partial data."
+          node-image-stores:
+            groups:
+              - name: node.image.stores
+                rules:
+                  # HEADROOM on the filesystem that carries the node-local image and scratch
+                  # stores. Three hostPath trees share it and nothing ever prunes them:
+                  #   /var/lib/eda-module-podman            SHARED module podman graphroot
+                  #                                          (desktop + [eda-run], one per node)
+                  #   /var/lib/xilinx-build                  [eda] runner buildah + media
+                  #   /var/lib/desktop-scratch               desktop scratch, 1777, no cleanup
+                  # They are all on / — there is no separate mount (verified 2026-09-03 on
+                  # both pcie-tb nodes), so filling them fills the node's ROOT filesystem and
+                  # takes kubelet and containerd down with the builds.
+                  #
+                  # WHY THE STOCK RULES ARE NOT ENOUGH. kube-prometheus-stack already ships
+                  # NodeFilesystemAlmostOutOfSpace (< 5% / < 3% free) and
+                  # NodeFilesystemSpaceFillingUp. On a 1.9 TiB root, 5% is ~95 GB — BELOW the
+                  # 200 GB the EDA CI's own `df` guard demands before it will start a build,
+                  # and below a single decompressed Vivado image (86.8 GB). So the generic
+                  # rules fire only after the interesting failures have already happened.
+                  # SpaceFillingUp does not close the gap either: it needs predict_linear over
+                  # 6 h to reach zero, and these stores grow in one-shot 87 GB steps that a
+                  # linear fit over a mostly-idle window does not extrapolate.
+                  #
+                  # SCOPED BY FILESYSTEM SIZE, not by node name or label. kube_node_labels is
+                  # empty in this cluster (kube-state-metrics ships node labels only behind
+                  # --metric-labels-allowlist), so a join on ecc/nested-runtime-gvisor is not
+                  # available; a node-name regex would go stale on the next lab box. Size is
+                  # the honest discriminator anyway: a >1.5 TB root is what makes a machine a
+                  # module host in the first place. Today that is exactly the two pcie-tb
+                  # nodes (1966 GB); the 1 TB thor node is deliberately outside it, as it
+                  # builds only its own arm64 images.
+                  # ⚠ The consequence is that a SMALLER future EDA box gets no alert here. If
+                  # that happens, enable the kube-state-metrics node-label allowlist and join
+                  # on the label instead of widening the size bound.
+                  - alert: NodeImageStoreLowHeadroom
+                    expr: |
+                      node_filesystem_avail_bytes{mountpoint="/",fstype!=""} < 300e9
+                      and on(instance) node_filesystem_size_bytes{mountpoint="/",fstype!=""} > 1.5e12
+                    for: 15m
+                    labels:
+                      severity: warning
+                    annotations:
+                      summary: "Node {{ $labels.instance }} image/scratch store below 300 GB free"
+                      description: "Only {{ $value | humanize1024 }}B free on / — the EDA CI `df` guard refuses to start a build under 200 GB, and one Vivado image is ~87 GB. Nothing prunes these stores: check which consumer grew with `du -sh /var/lib/{desktop-scratch,xilinx-build,eda-module-podman}` on the node, then prune podman images for module versions no longer registered. eda-module-podman is SHARED by the desktop and CI, so pruning an image there costs BOTH a fresh ~23 min pull."
+                  # Below one image plus margin: the next `module load` or image build will
+                  # fail mid-pull, and a pull that dies part-way leaves its staging data in
+                  # /var/tmp, making the situation worse rather than self-correcting.
+                  - alert: NodeImageStoreCriticallyFull
+                    expr: |
+                      node_filesystem_avail_bytes{mountpoint="/",fstype!=""} < 120e9
+                      and on(instance) node_filesystem_size_bytes{mountpoint="/",fstype!=""} > 1.5e12
+                    for: 5m
+                    labels:
+                      severity: critical
+                    annotations:
+                      summary: "Node {{ $labels.instance }} image/scratch store critically full"
+                      description: "Only {{ $value | humanize1024 }}B free on / — less than one decompressed Vivado image (~87 GB). The next module load or build fails mid-pull and leaves staging data behind. Prune now; kubelet DiskPressure eviction on this node is the next thing to happen."
+
+  # Prometheus CRD (>= kube-prometheus-stack 60.x / prometheus-operator 0.73+) has
+  # spec.hostNetwork which ArgoCD's schema cache may not know about, causing the
+  # structured-merge-diff calculation to fail with "field not declared in schema".
+  # Workaround: skip SMD for monitoring.coreos.com CRs by ignoring their spec fields.
+  ignoreDifferences:
+    - group: monitoring.coreos.com
+      kind: Prometheus
+      jqPathExpressions:
+        - .spec.hostNetwork
+    - group: monitoring.coreos.com
+      kind: Alertmanager
+      jqPathExpressions:
+        - .spec.hostNetwork
+    # The ServiceMonitor CRD defaults relabelings[].action to "replace" (the
+    # operator/CRD writes it into the live object). The node-exporter subchart
+    # renders our instance-relabeling WITHOUT an action field, so ArgoCD sees a
+    # permanent phantom diff (target: no action, live: action=replace). Ignore
+    # the defaulted action on every ServiceMonitor relabeling/metricRelabeling.
+    - group: monitoring.coreos.com
+      kind: ServiceMonitor
+      jqPathExpressions:
+        - '.spec.endpoints[]?.relabelings[]?.action'
+        - '.spec.endpoints[]?.metricRelabelings[]?.action'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prometheus
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true

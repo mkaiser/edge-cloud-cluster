@@ -1,0 +1,51 @@
+# The mirror's home on the appliance. Static + Retain, like every other NFS claim here: the
+# whole point is to outlive the cluster, and a dynamic StorageClass would mint a fresh
+# directory per PVC and silently lose the mirror on a recreate.
+#
+# The dataset and its NFS export are created by deployment/argocd-infra/truenas/configure-job.yaml
+# (DS_GITLAB_MIRROR). ⚠ Exactly one controller may manage an export path — nfs_export
+# converges by path and takes rows[0] — so do not add this export anywhere else.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-gitlab-mirror
+  labels:
+    ecc/volume: nfs-gitlab-mirror
+spec:
+  capacity:
+    # Nominal — an NFS "volume" is a directory; the real limit is the pool.
+    storage: 200Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: fs-1-datapool-gitlab-mirror
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/gitlab/mirror
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-gitlab-mirror
+  namespace: gitlab-mirror
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 200Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-gitlab-mirror

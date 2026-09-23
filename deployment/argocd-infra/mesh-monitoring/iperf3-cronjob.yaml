@@ -1,0 +1,140 @@
+# Mesh throughput probe — CronJob (hourly) on the control plane.
+# Runs `iperf3 -c <peer-mesh-ip>` against each mesh node's iperf3-server
+# DaemonSet listener (iperf3-server.yaml), one measurement per peer per run,
+# staggered so links aren't saturated in parallel. Pushes the measured
+# throughput to the Pushgateway. Hourly (not every 5 min) because iperf3 sends
+# real traffic — deliberately kept low-frequency and short (-t 3) to bound the
+# bandwidth cost on the (sometimes low-power) on-premise boxes.
+#
+# Enumerates peers from the CP's tailscaled socket (hostPath), same as the ping
+# probe. Uses Alpine + `apk add iperf3` for arm64 support (thor).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-iperf3-probe
+  namespace: headscale
+data:
+  iperf.sh: |
+    #!/bin/sh
+    set -eu
+    # iperf3 = probe; python3 = k8s API query + JSON parse. Runs on the CP (full
+    # egress) so apk works here — unlike the edge nodes.
+    apk add --no-cache iperf3 python3 >/dev/null
+
+    PUSHGATEWAY="${PUSHGATEWAY:-http://prometheus-pushgateway.prometheus.svc:9091}"
+    IPERF_PORT=5201
+    DURATION=3
+
+    # List "<node> <mesh-ipv4> <site>" for CURRENT mesh nodes from the k8s API
+    # (mesh-worker label). Avoids the non-unique, stale-registration-laden
+    # tailscale HostName. Node InternalIP == mesh IP for mesh nodes.
+    NODES=$(python3 -c '
+    import json, ssl, urllib.request
+    tok=open("/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+    ca="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    ctx=ssl.create_default_context(cafile=ca)
+    req=urllib.request.Request("https://kubernetes.default.svc/api/v1/nodes",
+        headers={"Authorization":"Bearer "+tok})
+    d=json.loads(urllib.request.urlopen(req,timeout=10,context=ctx).read())
+    for n in d.get("items",[]):
+        L=n["metadata"].get("labels") or {}
+        if L.get("node.kubernetes.io/mesh-worker")!="true": continue
+        name=n["metadata"]["name"]; site=L.get("ecc/site","")  # automatically updated from project-settings:applicationPlacements.labels.site
+        ip=next((a["address"] for a in n["status"].get("addresses",[]) if a.get("type")=="InternalIP"), None)
+        if ip: print(name, ip, site)
+    ')
+
+    rm -f /tmp/push_failures
+    echo "$NODES" | while read -r NAME IP SITE; do
+      [ -z "$NAME" ] && continue
+      # -J JSON output; parse the receiver bits/sec → Mbps. Connect timeout keeps
+      # a node with no listener (or offline) from hanging the whole run.
+      if OUT=$(iperf3 -c "$IP" -p "$IPERF_PORT" -t "$DURATION" -J \
+                 --connect-timeout 8000 2>/dev/null); then
+        MBPS=$(echo "$OUT" | python3 -c '
+    import json,sys
+    d=json.load(sys.stdin)
+    bps=d["end"]["sum_received"]["bits_per_second"]
+    print(round(bps/1e6, 2))
+    ' 2>/dev/null || echo "")
+        UP=1
+      else
+        MBPS=""
+        UP=0
+      fi
+
+      # Build the exposition body and PUT it via python3 (busybox wget can't do
+      # PUT/body-data). Env-passed so no shell-quoting of the metric text.
+      if SITE="$SITE" UP="$UP" MBPS="$MBPS" NAME="$NAME" PUSHGATEWAY="$PUSHGATEWAY" \
+         python3 -c '
+    import os, urllib.request
+    site=os.environ["SITE"]; up=os.environ["UP"]; mbps=os.environ["MBPS"]
+    name=os.environ["NAME"]; pg=os.environ["PUSHGATEWAY"]
+    lines=["# TYPE mesh_peer_iperf_up gauge", f"mesh_peer_iperf_up{{site=\"{site}\"}} {up}"]
+    if mbps:
+        lines+=["# TYPE mesh_peer_iperf_throughput_mbps gauge",
+                f"mesh_peer_iperf_throughput_mbps{{site=\"{site}\"}} {mbps}"]
+    body=("\n".join(lines)+"\n").encode()
+    url=f"{pg}/metrics/job/mesh_iperf/instance/{name}"
+    req=urllib.request.Request(url, data=body, method="PUT")
+    urllib.request.urlopen(req, timeout=15).read()
+    '; then
+        :
+      else
+        echo "push failed for $NAME" >&2
+        echo "$NAME" >> /tmp/push_failures
+      fi
+      echo "$NAME ($IP): up=$UP mbps=${MBPS:-n/a}"
+      # stagger: brief gap so we don't overlap the next link's probe
+      sleep 5
+    done
+    # the while loop runs in a pipeline subshell; surface failures via the file
+    [ -s /tmp/push_failures ] && exit 1
+    exit 0
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mesh-iperf3-probe
+  namespace: headscale
+spec:
+  schedule: "17 * * * *"  # hourly, offset from :00 to avoid other job pileups
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Same reasoning as the ping probe: the default 6 retries leave six Error pods
+      # per bad run. Hourly schedule, so the next run is the better signal.
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: mesh-probe
+          restartPolicy: Never
+          # hostNetwork so the probe reaches mesh peers over tailscale0 on the CP.
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - operator: Exists
+          volumes:
+            - name: script
+              configMap:
+                name: mesh-iperf3-probe
+          containers:
+            - name: iperf3
+              image: docker.io/library/alpine:3.24  # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "/script/iperf.sh"]
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "32Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "128Mi"

@@ -1,0 +1,175 @@
+# remote-desktop base image — a GENERIC Ubuntu/Xfce VNC desktop where EDA
+# applications are loaded AT RUNTIME (HPC `module load` style, via Lmod + per-module OCI
+# images run by the desktop's own podman) instead of being baked in. Built on
+# unibi-hclab-pcie-tb-s via GitLab CI (ci-base.yml, tags:[eda]).
+#
+# NO application is baked in. This image provides only:
+#   - the desktop (Xfce + TigerVNC + noVNC + xrdp + SSSD/Authentik-LDAP logins)
+#   - the module broker's tools (skopeo) — the broker sidecar runs from THIS same image
+#   - podman, to run module images inside the sandboxed desktop container
+#   - Lmod, so `module load <app>/<ver>` works in login shells
+#
+# The apt set is the UNION of the xilinx and hyperlynx runtime library sets, so a
+# module for either tool finds its system deps here — modules cannot apt-install at
+# load time. This is where "generic desktop" leaks: it is generic only over apps
+# whose system deps are anticipated here. Adding a tool with new deps = a base bump.
+
+# renovate: tracked by "Container image tags" regex (docker datasource)
+FROM docker.io/accetto/ubuntu-vnc-xfce-opengl-g3:latest
+USER 0
+
+# Native (on-PATH) modules: a loaded module's binary runs as a NATIVE
+# process in THIS container and links against the system libs installed here — so
+# each tool's system-lib deps must be present in the base. This is the one place
+# "generic desktop" leaks: it is generic only over tools whose deps are anticipated
+# here (a new tool with new deps = a base bump). Container-runtime modules avoid this:
+# their libs live in the module image, not here.
+#
+# CURRENT SCOPE: Vivado only. HyperLynx's Motif/GTK2 libs are deliberately NOT here
+# yet — add them (libxm4 libgtk2.0-0t64 libgl1 libglu1-mesa) when hyperlynx becomes
+# a module.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    # --- desktop/runtime base (xrdp per-user sessions + SSSD/Authentik-LDAP) ---
+    locales file xz-utils x11-utils ca-certificates curl \
+    libtinfo6 libncurses6 libxext6 libxrender1 libxtst6 libxi6 \
+    libatomic1 libgomp1 libnss3 libasound2t64 \
+    libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+    libxcb-render-util0 libxcb-shape0 \
+    xrdp xorgxrdp dbus-x11 \
+    sssd-ldap libnss-sss libpam-sss ldap-utils \
+    #   sssd-ad sssd-krb5 adcli krb5-user — SSSD's ACTIVE DIRECTORY provider, so the
+    #                    desktop resolves identity from Samba AD directly instead of from
+    #                    the Authentik LDAP outpost. That closes the last structural gap in
+    #                    the identity chain: the outpost COMPUTES uid = 5000 + Authentik pk,
+    #                    while AD (and therefore the fileserver) STORES uidNumber — two
+    #                    sources that diverge the moment a pk changes — the desktop and the
+    #                    fileserver then report different uids for one user, who cannot read
+    #                    their own home. See doc/ad-identity-chain.md.
+    #                    ⚠ WITHOUT sssd-ad there is no libsss_ad.so, and because the
+    #                    startup script runs `sssd -D … || echo WARNING` the pod comes up
+    #                    LOOKING HEALTHY with no identity at all.
+    sssd-ad sssd-krb5 adcli krb5-user \
+    #   openssh-server — SSH/SFTP into the desktop for the same LDAP users that log in
+    #                    over RDP. Authenticates through the SAME PAM/SSSD stack (see
+    #                    the sshd block in startup-configmap.yaml), so there is no
+    #                    second credential store and no host keys baked into the image.
+    #   sssd-tools     — provides sss_ssh_authorizedkeys, which sshd's
+    #                    AuthorizedKeysCommand calls to fetch a user's public keys from
+    #                    the `sshPublicKey` LDAP attribute. This is what makes key auth
+    #                    work WITHOUT ~/.ssh/authorized_keys — load-bearing once /home
+    #                    moves to a network filesystem, because OpenSSH StrictModes
+    #                    refuses a key file whose mode/owner it cannot trust and a
+    #                    network mount presents uniform mode bits for every user.
+    #                    If this package name ever disappears, the build MUST fail here
+    #                    rather than silently produce an image where key auth degrades
+    #                    to a password prompt.
+    openssh-server sssd-tools \
+    # --- Vivado (Qt/GTK3) — the only module tool in scope now ---
+    libgtk-3-0t64 libglib2.0-0t64 \
+    # --- module tooling: Lmod + the broker's registry stack ---
+    #   lmod              — activation (module load)
+    #   skopeo            — read module manifests from the registry (no daemon)
+    #   python3-yaml      — parse module.yaml (broker + GUI launcher)
+    #   inotify-tools     — broker request-dir watch (falls back to poll)
+    #   util-linux        — flock (per-module serialization)
+    #   fuse3             — fusermount3, needed by fuse-overlayfs.
+    #                       Must be fuse3, not the legacy `fuse`: fuse-overlayfs pulls in
+    #                       fuse3, and `fuse3 Breaks: fuse`, so listing both fails the
+    #                       build with "held broken packages".
+    #   podman            — run container-runtime module images inside the desktop
+    #                       container (the sandbox runtime isolates it; see module-cli.sh)
+    #   fuse-overlayfs    — copy-on-write for podman on the FUSE rootfs. WITHOUT it podman
+    #                       falls back to vfs, which copies every layer per container:
+    #                       3m23s to start a 31 GB image vs 1.5s. See storage.conf below.
+    #   python3-pip       — the base ships a Python interpreter with NO pip and NO
+    #   python3-venv        ensurepip: both report "No module named ...", and
+    #                       `python3 -m venv` fails at "Failing command: .../bin/python3"
+    #                       trying to seed pip. An interpreter that cannot install anything
+    #                       is effectively broken for users.
+    #                       ⚠ python3-pip pulls a full build toolchain (binutils, gcc,
+    #                       libc6-dev) via python3-dev. apt --dry-run first: 76 new
+    #                       packages, 5 upgraded, 0 REMOVALS.
+    #                       ⚠ DELIBERATELY NOT uv: Hermes downloads and manages its OWN
+    #                       uv at $HERMES_HOME/bin/uv (hermes_cli/managed_uv.py) and
+    #                       `hermes update` resolves that
+    #                       managed path, never a system binary — so a distro uv would sit
+    #                       unused while drifting. It is also not in the Ubuntu 24.04
+    #                       repos, so baking it in would mean curl|sh or a third-party PPA.
+    #                       Per-user tooling belongs on /shared/tools, not in this image.
+    lmod skopeo umoci python3-yaml inotify-tools util-linux fuse3 \
+    python3-pip python3-venv \
+    podman fuse-overlayfs \
+    && locale-gen en_US.UTF-8 de_DE de_DE.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+ENV LANG=en_US.UTF-8
+
+# podman storage: the desktop's rootfs is FUSE-backed (a sandbox runtime's gofer/virtiofs),
+# and the kernel refuses to stack a NATIVE overlay mount on FUSE — `mount -t overlay` fails
+# with "wrong fs type". That rules out the plain overlay driver.
+#
+# But vfs has NO copy-on-write: it materialises every layer as a full physical copy for
+# EVERY container. On the 31 GB hyperlynx image that made `podman run … /bin/true` take
+# 3m23s (only 36s of it CPU — the rest is pure copying) and grew the store to 118 GB for
+# a single image. Users saw a ~4 min "startup" that was ~3m25s podman + ~40s application.
+#
+# fuse-overlayfs gives real copy-on-write on a FUSE rootfs, and the pod has /dev/fuse, so
+# it works here. NOTE: in podman 4.x "fuse-overlayfs" is NOT a driver name — passing it as
+# one fails with "driver not supported". It is the `overlay` driver plus a mount_program.
+# Measured in-pod on the same image: 3m23s -> 1.5s, store 118 GB -> 30 GB.
+RUN mkdir -p /etc/containers && printf '%s\n' \
+    '[storage]' \
+    'driver = "overlay"' \
+    'runroot = "/run/containers/storage"' \
+    'graphroot = "/var/lib/containers/storage"' \
+    '[storage.options.overlay]' \
+    'mount_program = "/usr/bin/fuse-overlayfs"' \
+    'mountopt = "nodev"' \
+    > /etc/containers/storage.conf
+
+# Lmod: `module` available in every login shell. z10-module.sh WRAPS Lmod so
+# `module load <name>/<ver>` asks the broker to fetch+prepare the module and then writes
+# the podman-run launchers; a BARE name still delegates to real Lmod.
+COPY module-cli.sh /etc/profile.d/z10-module.sh
+COPY broker.sh /usr/local/bin/broker
+# Root helper that pulls container-module images into the SHARED ROOT podman store for
+# unprivileged LDAP users. Rootless podman cannot work for them (no /etc/subuid entry —
+# LDAP users do not exist at build time — no uidmap package, and gVisor refuses the
+# mapping), and sudo is not usable either since setuid is ineffective under gVisor.
+COPY module-podman.sh /usr/local/bin/module-podmand
+RUN chmod 0644 /etc/profile.d/z10-module.sh \
+    && chmod 0755 /usr/local/bin/broker \
+                  /usr/local/bin/module-podmand \
+    # /etc/profile.d is sourced by LOGIN shells only. The xfce terminal opens a
+    # NON-login interactive shell (xfce4-terminal defaults to CommandLoginShell=FALSE),
+    # which reads only the bashrc files — so on the desktop `module` was
+    # "command not found" while `su - user` had it. Source it for interactive
+    # non-login shells too.
+    #
+    # Guards, both load-bearing:
+    #   case $- in *i*)  — interactive ONLY. /etc/bash.bashrc is also read by any
+    #     non-interactive bash that has BASH_ENV set, and z10-module.sh itself
+    #     `unset BASH_ENV`s to stop Lmod's init clobbering the wrapper; sourcing it
+    #     from a non-interactive shell would re-enter that path.
+    #   ! declare -F _module_fetch — skip only when OUR WRAPPER is already installed.
+    #     Testing MODULEPATH here does NOT work: /etc/xrdp/startwm.sh runs under dash,
+    #     sources /etc/profile, and lmod.sh sets MODULEPATH + exports BASH_ENV while
+    #     z10-module.sh (bash-guarded) correctly bails. The whole xfce session then
+    #     INHERITS a non-empty MODULEPATH that contains only the system paths, so a
+    #     MODULEPATH test made every desktop terminal skip the wrapper and `module`
+    #     stayed command-not-found. _module_fetch is defined only by z10-module.sh.
+    # lmod.sh FIRST, exactly as the login path does it (profile.d runs alphabetically,
+    # so lmod.sh precedes z10-module.sh there). It sets the system MODULEPATH entries;
+    # z10-module.sh then appends the broker's tree and installs the wrapper. Sourcing
+    # only z10-module.sh here would silently drop the system paths.
+    && printf '%s\n' \
+         'case $- in *i*)' \
+         '  if ! declare -F _module_fetch >/dev/null 2>&1; then' \
+         '    [ -r /etc/profile.d/lmod.sh ] && . /etc/profile.d/lmod.sh' \
+         '    [ -r /etc/profile.d/z10-module.sh ] && . /etc/profile.d/z10-module.sh' \
+         '  fi' \
+         ';; esac' \
+       >> /etc/bash.bashrc
+
+# Keep the accetto startup contract. The remote-desktop Deployment (desktop-gvisor.yaml)
+# overrides the command per-container: the DESKTOP container wires SSSD + xrdp with
+# pod-time secrets (like xilinx/hyperlynx); the BROKER sidecar runs `broker`.

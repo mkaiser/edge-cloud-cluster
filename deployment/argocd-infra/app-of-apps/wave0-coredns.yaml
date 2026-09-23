@@ -1,0 +1,223 @@
+# ArgoCD Application: CoreDNS — the cluster's DNS, ours rather than k3s's.
+#
+# WHY NOT k3s's: k3s ships CoreDNS as a PLAIN MANIFEST (manifests/coredns.yaml), not a Helm
+# chart, so there is no HelmChartConfig to override and k3s re-applies the file over any
+# `kubectl edit`. Its fixed manifest has tolerations for CriticalAddonsOnly and
+# node-role.kubernetes.io/control-plane ONLY — no `ecc/mesh` — while every mesh node is
+# tainted ecc/mesh=true:NoSchedule. The single replica can therefore only ever run on the one
+# untainted cloud node, which made cluster DNS a single point of failure for all four sites
+# and put a WireGuard round trip (14 ms measured) in front of every mesh pod's queries.
+#
+# ⚠ Raising `replicas` on k3s's manifest would NOT have fixed it: its topologySpreadConstraints
+# use whenUnsatisfiable: DoNotSchedule over kubernetes.io/hostname, and only one node tolerates
+# the pod, so extra replicas sit Pending. The toleration is the blocker, and k3s owns the file.
+#
+# Turned off with `disable: coredns` in src/nodes-k3s-common.ts (k3sDisableFlags) — the same
+# mechanism already used for traefik and servicelb.
+#
+# ⚠ THIS APP DOES NOT BOOTSTRAP CoreDNS — it ADOPTS the release Pulumi already installed
+# (src/coredns.ts), exactly as wave0-cilium.yaml does for the CNI. ArgoCD cannot be the
+# installer: with no cluster DNS the repo-server cannot resolve `argocd-repo-server`, the
+# chart cannot be fetched from coredns.github.io, and app-of-apps sits ComparisonError while
+# every consumer downstream fails to resolve a Service. Keeping it at wave 0 is still right —
+# it is the first thing adopted — but the no-DNS window is closed by Pulumi, not by the wave.
+#
+# ⚠ The values below must be kept in sync with src/coredns.ts; each carries a comment pointing
+# at the other. They are IDENTICAL — a values drift shows up as an app that re-syncs forever.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: coredns
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://coredns.github.io/helm
+    chart: coredns
+    targetRevision: "1.47.1" # renovate: datasource=helm depName=coredns registryUrl=https://coredns.github.io/helm
+    helm:
+      values: |
+        # ⚠ The Service name and label MUST stay kube-dns. kubelet writes
+        # /etc/resolv.conf from --cluster-dns and every consumer selects on
+        # k8s-app=kube-dns: the node-local cache's kube-dns-upstream Service, the
+        # CiliumLocalRedirectPolicy that steers DNS to it, and this cluster's Prometheus
+        # scrape config. The chart would otherwise name everything `coredns`.
+        fullnameOverride: coredns
+        k8sAppLabelOverride: kube-dns
+        service:
+          name: kube-dns
+          # ⚠ PINNED, not allocated. k3s derives kubelet's --cluster-dns from serviceCidr
+          # (the .10 address) and writes it into every pod's resolv.conf, so this Service
+          # must claim exactly that IP or the whole cluster resolves against nothing.
+          clusterIP: 10.43.0.10 # automatically updated from project-settings:network.clusterDnsIp
+          clusterIPs: []
+
+        # ── Placement: one replica per site, not one pod on the cloud node ──────────────
+        # The autoscaler owns the replica COUNT (see below); these decide WHERE they land.
+        # Tolerating ecc/mesh is the entire point of self-managing this chart.
+        tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+          - key: ecc/mesh # automatically updated from project-settings:applicationPlacements.labels.mesh
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+        # Spread across SITES first, then hosts. ScheduleAnyway on both: DoNotSchedule is what
+        # left k3s's extra replicas Pending, and a DNS pod that does not run is worse than one
+        # sharing a site.
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: ecc/site # automatically updated from project-settings:applicationPlacements.labels.site
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                k8s-app: kube-dns
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                k8s-app: kube-dns
+
+        # ── Replica count follows the fleet ────────────────────────────────────────────
+        # cluster-proportional-autoscaler is the upstream-standard way to size CoreDNS, and
+        # it is what makes this future-proof: adding a site or a node moves the count without
+        # anyone remembering to. nodesPerReplica 2 with min 2 gives every site local DNS at
+        # today's 7 nodes / 4 sites. preventSinglePointFailure keeps >= 2 whenever there is
+        # more than one node, which is the property that was missing entirely before.
+        autoscaler:
+          enabled: true
+          coresPerReplica: 256
+          nodesPerReplica: 2
+          min: 2
+          max: 6
+          preventSinglePointFailure: true
+
+        podDisruptionBudget:
+          maxUnavailable: 1
+
+        priorityClassName: system-cluster-critical
+
+        rbac:
+          create: true
+
+        # ⚠ `service`, not `monitor` — the same trap wave0-cilium.yaml documents. A
+        # ServiceMonitor is a monitoring.coreos.com/v1 resource and those CRDs arrive with
+        # kube-prometheus-stack at WAVE 2, so rendering one here fails this wave-0 app with
+        # "failed to discover server resources for group version monitoring.coreos.com/v1" —
+        # and the wave-1 barrier waits on every wave-0 app, so the whole cluster stops behind
+        # it. Measured on the ecc211 bring-up 2026-09-16: headscale never deployed and the
+        # mesh VPN never came up. `service` publishes the coredns-metrics Service with no
+        # ServiceMonitor; prometheus.yaml adopts it as an additionalServiceMonitor.
+        prometheus:
+          service:
+            enabled: true
+
+        # ── The `coredns-custom` ConfigMap ─────────────────────────────────────────────
+        # ⚠ LOAD-BEARING, and easy to drop when porting k3s's Corefile: several apps publish
+        # extra DNS config by writing keys into the `coredns-custom` ConfigMap (samba-ad,
+        # gitlab, remote-desktop, truenas). Without the mount AND both imports below, those
+        # keys are silently ignored — the ConfigMap exists, looks right, and does nothing,
+        # while fs-1.ad.base.internal NXDOMAINs from every pod. Measured on ecc211 2026-09-16.
+        #
+        # `optional: true` matches k3s: the ConfigMap is created by whichever app needs it
+        # first, so CoreDNS must start fine before it exists.
+        extraVolumes:
+          - name: custom-config-volume
+            configMap:
+              name: coredns-custom
+              optional: true
+        extraVolumeMounts:
+          - name: custom-config-volume
+            mountPath: /etc/coredns/custom
+            readOnly: true
+        # `*.server` holds WHOLE server blocks (`ad.base.internal:53 { … }`), so it must sit
+        # OUTSIDE the `.:53` block — which is where the chart puts extraConfig. The in-block
+        # `*.override` counterpart is an `import` plugin in servers[].plugins below. Both
+        # halves are needed; k3s ships both.
+        extraConfig:
+          import:
+            parameters: /etc/coredns/custom/*.server
+
+        # ── Corefile ───────────────────────────────────────────────────────────────────
+        # Carried across from k3s's Corefile, with ONE deliberate omission: the
+        # `hosts /etc/coredns/NodeHosts` block. k3s populated that key from its own node
+        # controller (pkg/server/server.go passes !Skips["coredns"] to node.Register), so
+        # disabling k3s's CoreDNS stops it being maintained — a stale hosts file is worse
+        # than none. Nothing in deployment/ resolves bare node hostnames, and node addresses
+        # are anchored in project_settings.ts. The `import custom/*` lines go too: they are a
+        # k3s convenience for dropping Corefile snippets into a ConfigMap, and the chart's
+        # own `servers`/`extraConfig` values are the supported way to extend this.
+        servers:
+          - zones:
+              # ⚠ `use_tcp` is what makes the chart publish the TCP service port. Without it
+              # kube-dns has ONLY udp-53, so DNS-over-TCP has no path at all (any response
+              # >512 bytes) AND the CiliumLocalRedirectPolicy cannot map its frontend,
+              # leaving the node-local cache inert. Measured on ecc211 2026-09-16.
+              - zone: .
+                use_tcp: true
+            port: 53
+            plugins:
+              - name: errors
+              - name: health
+                configBlock: |-
+                  lameduck 10s
+              - name: ready
+              - name: kubernetes
+                parameters: cluster.local in-addr.arpa ip6.arpa
+                configBlock: |-
+                  pods insecure
+                  fallthrough in-addr.arpa ip6.arpa
+                  ttl 30
+              # Serves the container's own /etc/hosts — the only answer for `localhost` in
+              # the cluster. k3s's Corefile passes /etc/coredns/NodeHosts here; that FILE is
+              # deliberately not carried over (k3s no longer maintains it), but the PLUGIN
+              # must stay: without it localhost NXDOMAINs cluster-wide and every hostNetwork
+              # + ClusterFirstWithHostNet pod that binds a localhost address fails —
+              # csi-driver-nfs never registers its driver, so NFS PVs cannot mount.
+              # Measured on ecc211 and ecc212. Keep in sync with src/coredns.ts.
+              # ⚠ The two entries are EXPLICIT on purpose: CoreDNS runs from a distroless
+              # image whose own /etc/hosts carries no localhost line, so relying on the
+              # plugin's implicit file still NXDOMAINs (verified on ecc212).
+              - name: hosts
+                configBlock: |-
+                  127.0.0.1 localhost
+                  ::1 localhost
+                  ttl 60
+                  reload 15s
+                  fallthrough
+              - name: prometheus
+                parameters: 0.0.0.0:9153
+              - name: forward
+                parameters: . /etc/resolv.conf
+              - name: cache
+                parameters: 30
+              - name: loop
+              - name: reload
+              - name: loadbalance
+              # In-block half of the coredns-custom wiring (see extraConfig above for the
+              # `*.server` half). `*.override` holds plugin lines that extend THIS server
+              # block, so it belongs inside it.
+              - name: import
+                parameters: /etc/coredns/custom/*.override
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m

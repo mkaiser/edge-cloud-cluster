@@ -1,0 +1,175 @@
+# Authentik Helm values — identity provider (OIDC) for the cluster.
+# Applied by the wave6-authentik Application via $values valueFiles.
+#
+# Secrets (NOT in git) come from the sealed secret `authentik-secrets`:
+#   AUTHENTIK_SECRET_KEY              — Authentik session/signing key
+#   AUTHENTIK_POSTGRESQL__PASSWORD   — DB password (authentik app side; double underscore → postgresql.password)
+#   AUTHENTIK_BOOTSTRAP_TOKEN         — API token for akadmin (used by PostSync job)
+#   AUTHENTIK_BOOTSTRAP_PASSWORD      — initial akadmin password
+#   password / AUTHENTIK_PG_ADMIN_PASSWORD      — consumed by the bundled postgresql subchart
+#   <client>_OIDC_CLIENT_SECRET       — OIDC client secrets, referenced by blueprints via !Env
+
+authentik:
+  error_reporting:
+    enabled: false
+  postgresql:
+    host: authentik-pg-rw
+    name: authentik
+    user: authentik
+    # password supplied via AUTHENTIK_POSTGRESQL__PASSWORD env (envFrom below)
+  redis:
+    host: authentik-redis
+  # Outgoing SMTP (enrollment email-verification + notifications) is NOT set here.
+  # The ENTIRE email config — host, port, username, from, use_tls, use_ssl,
+  # timeout AND password — is injected at runtime from the authentik-smtp sealed
+  # secret as AUTHENTIK_EMAIL__* env vars (global.envFrom below), so nothing about
+  # the mail relay appears in git. Seal/rotate via sealSecrets.sh (sources the
+  # values from Pulumi config). updateConfigFromProjectSettings.sh does not touch these.
+
+# Inject all secret env vars (secret key, DB password, bootstrap token, OIDC client secrets).
+# Recent authentik charts moved env injection under `global` — top-level env/envFrom
+# is deprecated and errors out during `helm template`.
+global:
+  # NB: there is NO AUTHENTIK_HOST setting for email link hostnames. Authentik builds
+  # outgoing recovery/invitation links from the incoming HTTP request Host header
+  # (Django build_absolute_uri; ALLOWED_HOSTS=["*"]). The onboarding-mailer CronJob
+  # overrides Host + X-Forwarded-Proto on its API call so links resolve to
+  # https://id.<tld>/… — see onboarding-mailer.yaml. The admin-UI "Email recovery
+  # link" button already carries the browser host, so it was never affected.
+  envFrom:
+    - secretRef:
+        name: authentik-secrets
+    # Full SMTP relay config → AUTHENTIK_EMAIL__{HOST,PORT,USERNAME,PASSWORD,
+    # FROM,USE_TLS,USE_SSL,TIMEOUT} (enrollment email verification + notifications).
+    - secretRef:
+        name: authentik-smtp
+  # Custom branding: mount CAPE logo into Authentik's media storage.
+  # The FileBackend serves files from /data/media/public/{name} at /files/media/public/{name}?token=...
+  # Kubernetes creates the mount-point directory, so no initContainer is needed.
+  volumes:
+    - name: cape-branding
+      configMap:
+        name: authentik-branding
+  volumeMounts:
+    - name: cape-branding
+      mountPath: /data/media/public/branding
+      readOnly: true
+    # Email templates: server pod renders templates synchronously before handing
+    # off to worker for delivery, so /templates must be mounted on the server too.
+    - name: cape-branding
+      mountPath: /templates/email/email-password-reset.html
+      subPath: email-password-reset.html
+      readOnly: true
+    - name: cape-branding
+      mountPath: /templates/email/email-account-confirmation.html
+      subPath: email-account-confirmation.html
+      readOnly: true
+
+server:
+  replicas: 1
+  # Chart has no Gateway API support — routing is an HTTPRoute in httproute.yaml
+  # beside this file, which carries the 300s timeout.
+  ingress:
+    enabled: false
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      # `labels`, not `additionalLabels` — this chart reads
+      # server.metrics.serviceMonitor.labels (server/servicemonitor.yaml). Under the wrong
+      # key the value was accepted by Helm and dropped, so the rendered monitor carried no
+      # release label and the Prometheus CR's default selector ignored it: the monitor
+      # existed, the app was Synced and Healthy, and authentik was never scraped.
+      labels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+
+worker:
+  replicas: 1
+  # Per-app blueprint mount for the apps still using the blueprint+!Env model.
+  # Most OIDC apps (nextcloud, xwiki, zulip, rallly, headscale, windows) migrated to
+  # the Part-B live-API model — they register their provider/tile via the Authentik
+  # API with the scoped provisioner token and ship NO blueprint, so their mounts
+  # were removed. GitLab keeps the blueprint model (its OIDC secret comes from its
+  # own dynamic presync flow), mounted OPTIONALLY (optional=true lets the worker
+  # boot at wave 6 before gitlab deploys; empty mount → no tile until it syncs).
+  volumes:
+    # ArgoCD (apps) — wave 19, thirteen waves after this worker boots. Optional for the same
+    # reason as the rest: an absent ConfigMap must not stop the worker, and the tile must not
+    # appear before the instance it points at exists.
+    - name: bp-argocd-apps
+      configMap: { name: authentik-blueprint-argocd-apps, optional: true }
+    - name: bp-gitlab
+      configMap: { name: authentik-blueprint-gitlab, optional: true }
+    # TrueNAS keeps the blueprint model because a PROXY provider needs a dedicated,
+    # NON-EMBEDDED outpost declared alongside it (the appliance is on the lab LAN, which
+    # cloud pods cannot route to) — and an outpost object is not something the live-API
+    # provisioner model covers. Same optional mount as gitlab: the worker boots at wave 6,
+    # long before the truenas app exists, and an absent ConfigMap must not stop it.
+    - name: bp-truenas
+      configMap: { name: authentik-blueprint-truenas, optional: true }
+    # Samba AD (wave 13) — the LDAP source + its scoped provisioner service account.
+    # These ship from deployment/argocd-infra/samba-ad/ so the AD integration lives with
+    # the app that owns it, and MUST be optional: authentik boots at wave 6, seven waves
+    # before samba-ad exists. They cannot go in blueprints.configMaps below — the chart
+    # renders that list without `optional:`, so a not-yet-created ConfigMap would leave
+    # the worker stuck in ContainerCreating.
+    #
+    # Both land in ONE directory on purpose. ad-source binds as an AD account that
+    # ad-provisioner's token lets the samba-ad Job create, so ad-provisioner must be
+    # discovered first; blueprint discovery walks a directory in sorted order, and
+    # "…-ad-provisioner.yaml" sorts before "…-ad-source.yaml".
+    - name: bp-samba-ad
+      projected:
+        defaultMode: 0444
+        sources:
+          - configMap: { name: authentik-blueprint-ad-provisioner, optional: true }
+          - configMap: { name: authentik-blueprint-ad-source, optional: true }
+  volumeMounts:
+    - name: bp-argocd-apps
+      mountPath: /blueprints/apps/argocd-apps
+      readOnly: true
+    - name: bp-gitlab
+      mountPath: /blueprints/apps/gitlab
+      readOnly: true
+    - name: bp-truenas
+      mountPath: /blueprints/apps/truenas
+      readOnly: true
+    - name: bp-samba-ad
+      mountPath: /blueprints/apps/samba-ad
+      readOnly: true
+
+# Blueprints mounted at worker startup via the chart (config-as-code).
+# These ConfigMaps ship WITH authentik (wave 6) so they always exist at boot:
+#   groups       — the IdP's own role model (authentik-admins, employees, …)
+#   apps         — shared scope + access policies, always-on infra (argocd,
+#                  grafana), the proxy providers + embedded-outpost assignment
+#   test-users   — the two seed accounts, incl. their PASSWORDS (a blueprint is
+#                  the only supported way to set one — see that file's header)
+# ⚠ Everything listed under blueprints.configMaps below is a HARD dependency: the
+# chart renders each as a plain configMap volume with NO `optional:` field, so a
+# ConfigMap that does not exist leaves the worker in ContainerCreating. Anything
+# shipped by a LATER wave must therefore go in worker.volumes above with
+# `optional: true` instead — never here.
+# App-owned blueprints (gitlab, truenas, samba-ad) are mounted that way.
+blueprints:
+  configMaps:
+    - authentik-blueprint-groups
+    - authentik-blueprint-apps
+    - authentik-blueprint-provisioner
+    - authentik-blueprint-initial-users
+    - authentik-blueprint-enrollment
+    - authentik-blueprint-mfa
+    - authentik-blueprint-recovery
+    # After enrollment + recovery: binds via !Find to their prompt stages.
+    - authentik-blueprint-password-policy
+    - authentik-blueprint-branding
+
+# PostgreSQL + Redis are self-managed (postgres.yaml, redis.yaml in this folder),
+# using official upstream images — NOT the chart's bundled bitnami postgresql
+# subchart (Chart.yaml depends on oci://registry-1.docker.io/bitnamicharts, whose
+# images moved to the unmaintained bitnamilegacy catalog). The authentik app is
+# pointed at them via authentik.postgresql.host / authentik.redis.host above;
+# the DB password comes from authentik-secrets (AUTHENTIK_POSTGRESQL__PASSWORD).
+postgresql:
+  enabled: false

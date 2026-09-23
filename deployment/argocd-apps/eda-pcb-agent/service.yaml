@@ -1,0 +1,25 @@
+# Two listeners on one pod, one ClusterIP:
+#
+#   3389  rdp       — the shared X session. Consumed ONLY in-cluster, by remote-desktop's
+#                     Guacamole (see connection-seed.yaml, which points its tile at
+#                     eda-pcb-agent.eda-pcb-agent.svc.cluster.local:3389). Deliberately not
+#                     routed publicly: RDP is not a Gateway API protocol and Guacamole is
+#                     already the SSO-gated front door.
+#   9119  dashboard — the Hermes admin dashboard (config, Kanban, logs), published at
+#                     pcb-agent.<tld> by httproute.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: eda-pcb-agent
+  namespace: eda-pcb-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: eda-pcb-agent
+  ports:
+    - name: rdp
+      port: 3389
+      targetPort: rdp
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard

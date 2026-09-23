@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zulip-redis-auth
+  namespace: zulip
+spec:
+  encryptedData:
+    redis-password: AgCBUZUtImtVXd6arN3rmytHpMBMN5izbwJigCHS8Y9dXi1cQUZSZVielhzx7VgOVbNsR6VbV7kjbZW6g9+YznQeR2ORVHylXkFgyPsqXgtQej3LapS05ogHnnFuW+PIqgSwsXoVyDBvAT7PZtYL61Z3M7VkO7lQ/xo5dsesBJFDaTW9Sf71Z3unTiuqxseHpgyR43fznxevjxVjYk7VKBqGO+zNdeGieXHA/V0a+v4KwQ1zbtpgKDYrBEgrgnxkKiWvWAvUgrOpSJelWv/S2xGeIABUChijc6biwgnZ9GZhj3kDti8N0niGcLYmNe4Ds6OVUWAlXjIQPrk6DoDTZmUgpFO61sCyJ30joV4mgBnTkaE6YnUWXXUCTlObQ9HrpQJy4eaTI00i0FPfzNTFfFnenA58vOxIHb+DZdCNHGc/EveAN3XGanRvMHDEEIuXxXGQD2OS2kDTTlqy1yw6mVGpI1nvpenqmj7ZZftiErbnHmlCuFoDahSKryx+b8khvptemwHeMpUaHCH/QUxv3tc2irKKFPRs0RJ9ddbL3utvkyTcxMQgDdkDjeIOrMuM5UpLHuMvKZwENKWpix3m0ncpvsVDtNXaQMLN0Z6WWQR0wLvjTQdYsjQ1kEyx2u52s6iKM5BoEX7jQpG+1RNiYhOi9kjSIPUjQiv4YGLjM0SBreicvfh6Sf+qHjJi63SB8rEFCxjTqSl9dRGGfhyY3EcazA0hUB4czaRpaBz7tDb9gXx5HPOvV6IOCXjJxaQI8Jk=
+  template:
+    metadata:
+      name: zulip-redis-auth
+      namespace: zulip

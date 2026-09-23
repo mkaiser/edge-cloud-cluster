@@ -1,0 +1,169 @@
+# CoreDNS override: resolve the GitLab public hostname to the IN-CLUSTER Envoy
+# Gateway proxy, so in-cluster clients reach GitLab over the LAN/pod network
+# instead of looping out to the public IP over the (flaky) WireGuard mesh path.
+#
+# WHY: gitlab.<tld> normally resolves (via CoreDNS → upstream) to the cloud node's
+# PUBLIC IP. A pod on a MESH node (e.g. the Thor vLLM build) reaching that public IP
+# goes out over WireGuard and back — slow and drop-prone. The registry image PUSH
+# already targets the internal registry Service (LAN-local via trafficDistribution
+# PreferClose), but buildah's JWT auth call hits https://gitlab.<tld>/jwt/auth, which
+# escaped to the public path and died on a transient "Temporary failure in name
+# resolution", killing an otherwise-complete 18-min push. This rewrite keeps that auth
+# call (and the image PULL, webhooks, runner registration, …) inside the cluster.
+#
+# HOW: k3s CoreDNS imports `/etc/coredns/custom/*.override` (see the managed Corefile),
+# mounted from the `coredns-custom` ConfigMap (kube-system). The `rewrite` plugin
+# aliases the query name to the Envoy proxy Service DNS name — NOT a hardcoded
+# ClusterIP (which drifts every cluster recreate). CoreDNS resolves that Service name
+# internally and returns its ClusterIP under the original name. Envoy terminates TLS
+# for gitlab.<tld> from the Gateway's wildcard listener, so HTTPS still validates.
+#
+# NB: the Service name is pinned to `envoy-gateway-proxy` by envoyService.name in
+# src/ingress.ts. Envoy Gateway otherwise autogenerates a hash-suffixed name that
+# this rewrite could not target.
+#
+# `answer auto` rewrites the response name back to the queried name so clients (and TLS
+# SNI/cert matching) see gitlab.<tld>, not the internal service name.
+#
+# ── WHY A PATCH JOB AND NOT A ConfigMap MANIFEST ──────────────────────────────────────────
+# k3s mounts exactly ONE ConfigMap for CoreDNS customisation — `coredns-custom` in
+# kube-system, by hardcoded name (k3s manifests/coredns.yaml, volume `custom-config-volume`).
+# So every app's snippet has to land in that one object; a volume cannot merge several
+# ConfigMaps, and editing the CoreDNS Deployment to add one is reverted by the k3s addon
+# controller within ~15s.
+#
+# That object therefore has three contributors: samba-ad (`ad.server`), remote-desktop
+# (`license-alias.override`) and this file. They MUST NOT be shipped as ConfigMap manifests,
+# because ALL ArgoCD Applications on one instance apply under the SAME server-side-apply
+# field manager, `argocd-controller`. When app A applies the object with only its own key in
+# `data`, SSA reads that as "argocd-controller no longer owns app B's key" and DELETES it.
+# That is correct SSA semantics, not a conflict, so nothing errors and nothing retries: the
+# losing app just sits OutOfSync while reporting a successful sync.
+#
+# This actually happened: when this file was a plain ConfigMap manifest, its sync stripped
+# remote-desktop's `license-alias.override` and `licence.internal` went NXDOMAIN cluster-wide
+# with no error anywhere.
+#
+# So every contributor needs a DISTINCT field manager, which only a `kubectl patch` gives —
+# ArgoCD cannot be made to vary its manager per app. Each contributor owns its own key and
+# never the object: this app, remote-desktop, and
+# `argocd-infra/samba-ad/dns-config-job.yaml`.
+#
+# Because no app owns `coredns-custom` in its tracking-id, retiring any one of the three
+# cannot prune the shared object out from under the other two.
+#
+# ⚠ THE KEY MUST END IN `.override`. The Corefile imports `custom/*.override` INSIDE the
+# `.:53` block and `custom/*.server` at top level. A `rewrite` belongs inside the existing
+# block, so `.override` is correct here — whereas samba-ad's zone `forward` opens its own
+# server block and must be `.server`. Getting this wrong does not fail loudly: CoreDNS keeps
+# serving the OLD config and logs a parse error.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-dns-internal
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+---
+# Cluster-scoped because the target object lives in kube-system, not in this app's namespace.
+# Narrowed to the single ConfigMap by name: this SA must never be able to touch another one.
+# No `delete` — this Job only ever patches its own key, and removing the object would take
+# the other two contributors' keys with it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-dns-internal
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["coredns-custom"]
+    verbs: ["get", "patch"]
+  # `create` cannot be restricted by resourceName (the name does not exist yet at admission
+  # time), so it is granted separately and used only for the create-if-absent bootstrap.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-dns-internal
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-dns-internal
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-dns-internal
+    namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-dns-internal
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: gitlab-dns-internal
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: dns-internal
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # Only the <cluster>.<basedomain> segment is rewritten by the marker, so the
+            # "gitlab." prefix survives a subdomain bump.
+            - name: GITLAB_HOST
+              value: "gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              ENVOY_SVC="envoy-gateway-proxy.envoy-gateway-system.svc.cluster.local"
+
+              read -r -d '' REWRITE_BLOCK <<EOF || true
+              rewrite stop {
+                name exact ${GITLAB_HOST} ${ENVOY_SVC}
+                answer auto
+              }
+              EOF
+
+              # Create the object if absent. k3s mounts it `optional: true`, so an empty
+              # ConfigMap is harmless — and without this the patch below fails with
+              # `configmaps "coredns-custom" not found` on a fresh cluster where no
+              # contributor has run yet.
+              #
+              # A SEPARATE field manager from the patch: this only ever asserts the object's
+              # existence, never its `data`, so it can never own — and therefore never drop —
+              # another contributor's key.
+              kubectl create configmap coredns-custom -n kube-system \
+                --dry-run=client -o yaml | kubectl apply --server-side \
+                --field-manager=gitlab-dns-internal-bootstrap -f - 2>/dev/null || true
+
+              # The actual write. `patch --type merge` touches ONLY this key, and the
+              # dedicated --field-manager is what keeps it out of argocd-controller's
+              # ownership set — see the header for why that is the whole point.
+              kubectl patch configmap coredns-custom -n kube-system \
+                --field-manager=gitlab-dns-internal --type merge \
+                -p "$(jq -n --arg v "$REWRITE_BLOCK" '{data:{"gitlab-internal.override":$v}}')"
+
+              echo "CoreDNS rewrite ${GITLAB_HOST} -> ${ENVOY_SVC} applied to coredns-custom"

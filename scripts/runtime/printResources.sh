@@ -12,7 +12,7 @@ fi
 
 while true; do
     TS="$(TZ=Europe/Berlin date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo -n "$TS: "
+    echo "$TS"
 
     # Gather requested memory per node (sum of all pod container requests) in Ki
     declare -A NODE_REQ_MEM
@@ -40,6 +40,13 @@ while true; do
 
     # Print one line per node with converted units
     kubectl top node --no-headers 2>/dev/null | while read -r name cpu_abs cpu_pct mem_abs mem_pct rest; do
+        # A node whose metrics-server has no sample yet reports "<unknown>" in
+        # every column -- print it as such rather than feeding it to printf %f.
+        if [[ "$cpu_abs" == "<unknown>" || "$mem_abs" == "<unknown>" ]]; then
+            printf "%s metrics unavailable\n" "$name"
+            continue
+        fi
+
         alloc_ki=$(kubectl get node "$name" -o jsonpath='{.status.allocatable.memory}' 2>/dev/null | sed 's/Ki$//')
         req_ki=${NODE_REQ_MEM["$name"]:-0}
 
@@ -66,17 +73,15 @@ while true; do
         cpu_pct_num="${cpu_pct%%%}"
         mem_pct_num="${mem_pct%%%}"
 
-        if [[ "$alloc_ki" -gt 0 ]]; then
+        if [[ "${alloc_ki:-0}" -gt 0 ]]; then
             req_pct=$(( req_ki * 100 / alloc_ki ))
-            printf "%s cpu=%05.2f cores (%02d%%) mem=%06.2fGi (%02d%%) req=%06.2fGi (%02d%%)" \
+            printf "%s cpu=%05.2f cores (%02d%%) mem=%06.2fGi (%02d%%) req=%06.2fGi (%02d%%)\n" \
                 "$name" "$cpu_cores" "$cpu_pct_num" "$mem_gi" "$mem_pct_num" "$req_gi" "$req_pct"
         else
-            printf "%s cpu=%05.2f cores (%02d%%) mem=%06.2fGi (%02d%%) req=unknown" \
+            printf "%s cpu=%05.2f cores (%02d%%) mem=%06.2fGi (%02d%%) req=unknown\n" \
                 "$name" "$cpu_cores" "$cpu_pct_num" "$mem_gi" "$mem_pct_num"
         fi
     done
-
-    echo ""
 
     unset NODE_REQ_MEM
     sleep "$INTERVAL_SECONDS"

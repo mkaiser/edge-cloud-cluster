@@ -1,0 +1,111 @@
+# Services for the two domain controllers.
+#
+# ad-cloud is a normal headless Service: it backs the StatefulSet's stable pod DNS
+# name and gives in-cluster clients (Authentik's LDAPSource in Phase 2, the CoreDNS forward)
+# something stable to reach.
+#
+# ad-onprem is headless too, but note the pod runs hostNetwork: its endpoints resolve to
+# the NODE's IP, not a pod IP. That is intended — the whole point of the lab DC is that
+# TrueNAS and laptops reach it at the node's LAN address on real AD ports.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ad-cloud
+  namespace: samba-ad
+  labels:
+    app: samba-ad
+    dc: cloud
+spec:
+  # Headless: the StatefulSet's serviceName. Gives ad-cloud-0.ad-cloud.samba-ad.svc
+  # a stable A record for replication and for Authentik's LDAPS bind.
+  #
+  # The per-pod name is <pod>.<serviceName>.<ns>.svc, so it tracks the StatefulSet's pod
+  # hostname — which is also this DC's AD identity (see statefulset-cloud.yaml). Do not
+  # reintroduce a `hostname:` override to make this read more nicely; that is exactly what
+  # split the DC's identity in two.
+  clusterIP: None
+  selector:
+    app: samba-ad
+    dc: cloud
+  ports:
+    - { name: dns-tcp, port: 53, protocol: TCP }
+    - { name: dns-udp, port: 53, protocol: UDP }
+    - { name: kerberos-tcp, port: 88, protocol: TCP }
+    - { name: kerberos-udp, port: 88, protocol: UDP }
+    - { name: ldap, port: 389, protocol: TCP }
+    - { name: cldap, port: 389, protocol: UDP }
+    - { name: smb, port: 445, protocol: TCP }
+    - { name: kpasswd-tcp, port: 464, protocol: TCP }
+    - { name: kpasswd-udp, port: 464, protocol: UDP }
+    - { name: ldaps, port: 636, protocol: TCP }
+    - { name: gc, port: 3268, protocol: TCP }
+    - { name: gc-ssl, port: 3269, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ad-onprem
+  namespace: samba-ad
+  labels:
+    app: samba-ad
+    dc: onprem
+spec:
+  clusterIP: None
+  selector:
+    app: samba-ad
+    dc: onprem
+  ports:
+    - { name: dns-tcp, port: 53, protocol: TCP }
+    - { name: dns-udp, port: 53, protocol: UDP }
+    - { name: kerberos-tcp, port: 88, protocol: TCP }
+    - { name: kerberos-udp, port: 88, protocol: UDP }
+    - { name: ldap, port: 389, protocol: TCP }
+    - { name: cldap, port: 389, protocol: UDP }
+    - { name: smb, port: 445, protocol: TCP }
+    - { name: kpasswd-tcp, port: 464, protocol: TCP }
+    - { name: kpasswd-udp, port: 464, protocol: UDP }
+    - { name: ldaps, port: 636, protocol: TCP }
+---
+# A SECOND, non-headless Service for the cloud DC, existing only to give it a STABLE IP.
+#
+# WHY: the lab DC bootstraps by asking the cloud DC for the domain's SRV records, and
+# `dnsConfig.nameservers` accepts IP ADDRESSES ONLY — no Service names, because resolving
+# one would need the very DNS being configured. The headless Service above has no
+# ClusterIP, and a pod IP changes on every restart.
+#
+# Patching the pod IP in at sync time was tried first and does not hold: ArgoCD re-applies
+# the git manifest on each sync and the pod is recreated without the patch, so the lab DC
+# silently loses its resolver and sits in wait-domain forever. A ClusterIP is allocated
+# once and survives pod restarts, so it can simply be
+# written into the manifest — no runtime patching, nothing to revert.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ad-cloud-dns
+  namespace: samba-ad
+  labels:
+    app: samba-ad
+    dc: cloud
+spec:
+  # PINNED, not dynamically allocated. statefulset-onprem.yaml hardcodes this exact address
+  # in dnsConfig.nameservers, and a Service only keeps its ClusterIP for as long as the
+  # Service object survives. Renaming this Service deletes and recreates it, which hands
+  # out a DIFFERENT address and
+  # silently break the on-prem DC's bootstrap — the failure looks like "stuck in
+  # wait-domain forever", with nothing pointing at DNS.
+  #
+  # Pinning also fixes the recreate fragility the comment above describes: the address is
+  # now declared rather than observed, so it is identical on every cluster.
+  #
+  # Must lie inside the service CIDR and not collide with an existing allocation. On
+  # "provided IP is already allocated", change it in project_settings.network.adDnsClusterIp
+  # and re-run scripts/environment/updateConfigFromProjectSettings.sh — this line and the
+  # forwarder in statefulset-onprem.yaml are both anchored to that key, so they cannot drift.
+  clusterIP: 10.43.48.96 # automatically updated from project-settings:network.adDnsClusterIp
+  selector:
+    app: samba-ad
+    dc: cloud
+  ports:
+    - { name: dns-tcp, port: 53, protocol: TCP }
+    - { name: dns-udp, port: 53, protocol: UDP }

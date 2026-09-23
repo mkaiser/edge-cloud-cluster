@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-cred-node
+  namespace: hermes
+spec:
+  encryptedData:
+    .dockerconfigjson: ""
+  template:
+    metadata:
+      name: image-registry-cred-node
+      namespace: hermes
+    type: kubernetes.io/dockerconfigjson

@@ -1,0 +1,275 @@
+# eda-pcb-agent image build — recover-or-rebuild.
+#
+# SOURCE OF TRUTH: this file lives in the infra repo
+# (deployment/argocd-apps/eda-pcb-agent/.gitlab-ci.yml). The build-trigger
+# (presync-build.yaml) MIRRORS it (+ Dockerfile) into the in-cluster GitLab project
+# deployments/infrastructure/eda/eda-pcb-agent via a git push (as .gitlab-ci.yml +
+# Dockerfile), then triggers this pipeline. Do NOT hand-edit it in GitLab — it is
+# overwritten on the next mirror.
+#
+# Only the ConfigMap reaches GitLab — the source files in the infra repo do not — so the
+# embedded/source drift check cannot run in this pipeline. Run
+# `deployment/argocd-apps/remote-desktop/sync-build-files.sh deployment/argocd-apps/eda-pcb-agent`
+# before committing (precommit does this); a stale ConfigMap silently builds the wrong file.
+#
+# Runs on the shared [eda] runner (tags:[eda] → unibi-hclab-pcie-tb-s, privileged buildah,
+# /build-scratch hostPath). No /installer bind mount — everything comes from apt.
+stages: [build]
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+build-eda-pcb-agent:
+  stage: build
+  tags: [eda]
+  # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+  # for the registry gate below, which quay's image has never shipped. Built by
+  # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+  # ⚠ The tag must equal that app's IMAGE_TAG; remote-desktop/check-image-invariants.sh
+  # fails the commit if they drift.
+  # ⚠ THE LAB-LOCAL REGISTRY, NOT $CI_REGISTRY. This job runs on a lab node, and under
+  # `targetState: production` the lab cannot reach the PUBLIC registry host at all. The pull
+  # is done by the KUBELET, so it fails in prepare_script before any script line runs.
+  # An IP rather than the Service DNS name is correct HERE: the kubelet resolves an image
+  # reference with the HOST's resolver, which knows nothing about cluster DNS, and matches
+  # containerd's certs.d config by the EXACT host string. In-POD clients use the FQDN.
+  image: 127.0.0.1:30500/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+  # Serialize on the single node: every ArgoCD (re)sync fires the PreSync trigger.
+  resource_group: eda-pcb-agent-build
+  interruptible: true
+  # ⚠ 2h, matching remote-desktop, and the reason is the ARCHIVE not the build.
+  # The image itself builds and pushes to GitLab's registry in ~4 min. The
+  # recreate-surviving copy goes to image-registry, which is backed by an NFS export on the
+  # TrueNAS appliance, and that write competes with every other image restore after a
+  # recreate. Measured on ecc205: the cluster-registry push took 90s while the archive PATCH
+  # moved 189 MB and then stalled 58m50s, killing the job at a 1h timeout — with an unrelated
+  # 3.8 GB ollama blob GET taking 6h27m in the same window. The build was fine; only the
+  # backup copy ran out of clock.
+  timeout: 2h
+  variables:
+    IMAGE_TAG: r6                       # ⚠ THE TAG IS THE CACHE KEY for the gate below.
+                                        # Bump ONLY when the Dockerfile's CONTENT changes —
+                                        # NEVER on a subdomain change/recreate, which is
+                                        # precisely when the archived image must still match.
+                                        # A bump takes this workstation DOWN for the whole
+                                        # build (strategy: Recreate), so land one on its own.
+                                        # ⚠ image-registry has NO GC: every bump orphans a
+                                        # few GB permanently.
+    IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES the
+    # tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository literally
+    # named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is fail-open, so
+    # that 404 reads as "not in the registry" and rebuilds every single time, silently.
+    IMAGE_REPO: $CI_PROJECT_PATH
+    # Registry TLS: prod cert is publicly trusted -> verify; staging CA is untrusted in the
+    # build pod -> false. Toggled by certIssuerType via the update script.
+    REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+    # overlay on the ext4 hostPath scratch (privileged pod) — vfs would copy the tree once
+    # per layer.
+    STORAGE_DRIVER: overlay
+    BUILDAH_ROOT: /build-scratch/buildah-storage
+    BUILDAH_RUNROOT: /build-scratch/buildah-run
+    # Push to the in-cluster registry Service directly, bypassing the public ingress.
+    # PreferClose lands the push on the LAN-local (unibi-hclab) replica — NOT across WireGuard.
+    INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+    # ⚠ THE ONE COPY THAT SURVIVES A CLUSTER RECREATE. $IMAGE above is GitLab's registry,
+    # which is IN-CLUSTER and destroyed with the cluster — so after a recreate this pod would
+    # sit in ImagePullBackOff until a full rebuild. image-registry is backed by the TrueNAS
+    # export datapool/images (Retain), which does not go away.
+    IMAGE_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+    # ⚠ image-archives/, NOT deployments/... — this registry also holds the EDA module images
+    # under deployments/, and those are pulled BY THE BROKER AND RUN AS ROOT, authorised by
+    # <repo>:<tag> in broker.sh allowed(). A separate repository namespace means this image
+    # can never be confused for a module in either direction.
+    SURVIVING_IMAGE: $IMAGE_REGISTRY/image-archives/eda-pcb-agent:$IMAGE_TAG
+    SURVIVING_IMAGE_REPO: image-archives/eda-pcb-agent
+  script:
+    # Trust the image-registry CA before anything talks to it. It serves TLS from a PRIVATE
+    # in-cluster CA, so the build pod cannot verify it from the system trust store.
+    # containers/image reads /etc/containers/certs.d/<host>/ca.crt, so skopeo and buildah both
+    # pick this up. Writing the CA (rather than --tls-verify=false) means a wrong or missing
+    # CA fails loudly at the handshake instead of silently downgrading.
+    - |
+      if [ -n "$IMAGE_REGISTRY_CA" ]; then
+        mkdir -p "/etc/containers/certs.d/${IMAGE_REGISTRY}"
+        printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${IMAGE_REGISTRY}/ca.crt"
+        # ⚠ THE PYTHON PROGRAM MUST NOT BE INDENTED. This block is a YAML `- |` literal
+        # scalar, so every line must stay indented or the scalar ends — but python treats
+        # leading whitespace as an indent error on line 1. Hence a SINGLE-LINE program: there
+        # is no second line to indent. (Validated with python3 because this image has no
+        # openssl.)
+        printf '%s' "$IMAGE_REGISTRY_CA" | python3 -c 'import base64,re,sys; raw=sys.stdin.read(); m=re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S); sys.exit("no PEM CERTIFICATE block") if not m else None; der=base64.b64decode("".join(m.group(1).split())); sys.exit("certificate body implausibly short") if len(der)<100 else None; print("image-registry CA OK (%d bytes DER)" % len(der))' \
+          || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+      else
+        echo "WARN: IMAGE_REGISTRY_CA is empty — the recreate-surviving copy is unavailable."
+        echo "      The build still works; it just cannot restore or archive."
+      fi
+    - |
+      # ── Recover-or-rebuild ────────────────────────────────────────────────────────
+      # Three outcomes, cheapest first:
+      #   1. already in GitLab's registry        -> nothing to do          (instant)
+      #   2. in the recreate-surviving registry  -> copy it back           (seconds)
+      #   3. neither                             -> buildah bud            (minutes)
+      # `skopeo inspect --raw` — NOT curl. GitLab's registry answers /v2/ with
+      # `401 + WWW-Authenticate: Bearer`, so a BASIC-auth curl returns 401 even for a tag
+      # that EXISTS; the gate is fail-open, so that 401 would read as "absent" and this
+      # pipeline would never once skip a build it could have skipped. skopeo performs the
+      # bearer token exchange itself.
+      #
+      # FORCE_REBUILD=1 overrides the gate for a one-shot rebuild of the same tag.
+      if [ "${FORCE_REBUILD:-0}" = "1" ]; then
+        echo "FORCE_REBUILD=1 — skipping the registry gate and rebuilding $IMAGE."
+      else
+      set +e
+      _gate_out=$(skopeo inspect --raw --tls-verify=false \
+               --creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" "docker://$IMAGE" 2>&1)
+      _gate_rc=$?
+      set -e
+      if [ "$_gate_rc" -eq 0 ]; then
+        echo "$IMAGE already exists — skipping build."
+        # ── Archive-on-skip ────────────────────────────────────────────────────────
+        # ⚠ "in GitLab's registry" does NOT imply "archived": a tag built while the archive
+        # credential was broken publishes fine and is never archived — and this gate then
+        # exits 0 on every later run, so nothing notices until a recreate rebuilds it from
+        # scratch. Repair it here instead of waiting for the next tag bump.
+        # ⚠ NEVER FATAL — the image is published and the app already works.
+        if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+          set +e
+          skopeo inspect --raw --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+            "docker://$SURVIVING_IMAGE" >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "  the recreate-surviving copy is MISSING — archiving it now..."
+            skopeo copy --retry-times 10 \
+              --src-tls-verify=false --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+              --dest-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+              "docker://$IMAGE" "docker://$SURVIVING_IMAGE"
+            if [ $? -eq 0 ]; then
+              echo "  archived $SURVIVING_IMAGE — this tag now survives a recreate."
+            else
+              echo "  WARN: could not archive — the next recreate will rebuild this tag."
+            fi
+          else
+            echo "  recreate-surviving copy is present."
+          fi
+          set -e
+        else
+          echo "  WARN: no image-registry credential — cannot confirm the surviving copy."
+        fi
+        exit 0
+      fi
+      case "$_gate_out" in
+        *"manifest unknown"*|*"name unknown"*|*"was not found"*) : ;;
+        *) echo "registry gate: $IMAGE not readable (fail-open, continuing):"
+           echo "  skopeo: $_gate_out" ;;
+      esac
+      echo "$IMAGE not found in the cluster registry."
+
+      # ── 2. Restore from the surviving registry ───────────────────────────────────
+      # ⚠ NEVER FATAL. If anything here fails we fall through to the rebuild, which is slow
+      # but always correct. A backup path must not redden a pipeline that would otherwise
+      # have produced a working image.
+      # ONE `skopeo copy`, REGISTRY TO REGISTRY: nothing is staged locally, and ONE command
+      # carries BOTH credentials (--src-creds / --dest-creds), so the "credential missing on
+      # the second half" failure cannot recur.
+      if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+        echo "Checking the recreate-surviving registry for $SURVIVING_IMAGE ..."
+        set +e
+        _arc_out=$(skopeo inspect --raw \
+                 --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                 "docker://$SURVIVING_IMAGE" 2>&1)
+        _arc_rc=$?
+        set -e
+        if [ "$_arc_rc" -eq 0 ]; then
+          echo "[$(date -u +%F' '%T)] found it — copying it back instead of rebuilding..."
+          set +e
+          skopeo copy --retry-times 10 \
+            --src-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+            --dest-tls-verify=false \
+            --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+            "docker://$SURVIVING_IMAGE" "docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+          _restore_rc=$?
+          set -e
+          if [ "$_restore_rc" -eq 0 ]; then
+            echo "[$(date -u +%F' '%T)] restored $IMAGE from the surviving registry."
+            exit 0
+          fi
+          echo "WARN: restore failed (rc=$_restore_rc) — falling through to a full rebuild."
+        else
+          case "$_arc_out" in
+            *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+              echo "  not there either — this tag has never been archived." ;;
+            *)
+              echo "  archive not readable — rebuilding (fail-open):"
+              echo "  skopeo: $_arc_out" ;;
+          esac
+        fi
+      fi
+      fi
+
+      echo "$IMAGE building on $(uname -m) at $(date -u +%F' '%T)..."
+    # CI_REGISTRY_* are injected by GitLab CI — no push secret needed. Log in to BOTH
+    # endpoints: the login credential (JWT) is scoped per registry host.
+    - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+    # image-registry has its OWN credential (htpasswd) — the GitLab JWT above is scoped to
+    # the GitLab host and is rejected here. Non-fatal: without it we simply do not write the
+    # surviving copy.
+    - |
+      if [ -n "$IMAGE_REGISTRY_USER" ]; then
+        buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$IMAGE_REGISTRY" \
+          || echo "WARN: image-registry login failed — the surviving copy will be skipped."
+      fi
+    - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+    # ⚠ QUOTED, and the `: ` inside the message is why. An unquoted YAML scalar containing
+    # ": " is parsed as a MAPPING, so this entry became a dict and GitLab rejected the whole
+    # pipeline at config time with "script config should be a string or a nested array of
+    # strings" — before any job ran, so there is no build log to read. Measured on ecc205.
+    - 'echo "[$(date -u +%F" "%T)] buildah bud (apt - xfce + KiCad + sssd)..."'
+    # NOTE: the build-trigger mirrors Dockerfile into the GitLab project under the canonical
+    # name `Dockerfile`, so no -f is needed here.
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+      bud --isolation chroot --format docker
+      -t "$IMAGE" .
+    - |
+      # ONE push implementation, one retry policy, two destinations. Defined as a function so
+      # the mandatory push and the best-effort archive push cannot drift apart.
+      #   $1 = destination ref (no docker:// prefix)   $2 = label for the log
+      push_image() {
+        _dest="$1"; _what="$2"
+        _n=0
+        set +e
+        until [ "$_n" -ge 6 ]; do
+          echo "=== ${_what} push attempt $((_n+1)) START $(date -u +%H:%M:%S) ==="
+          timeout 3600 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+            push --tls-verify=false --retry 20 --retry-delay 10s \
+            "$IMAGE" "docker://${_dest}"
+          _rc=$?
+          echo "=== ${_what} push attempt $((_n+1)) END $(date -u +%H:%M:%S) rc=$_rc ==="
+          [ "$_rc" -eq 0 ] && break
+          _n=$((_n+1)); echo "${_what} push attempt $_n failed (rc=$_rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+        done
+        set -e
+        [ "$_n" -lt 6 ]
+      }
+
+      # Push under the SAME repository path as $IMAGE so the stored image == the canonical
+      # $IMAGE (pods pull via the ingress name).
+      push_image "${INTERNAL_REGISTRY}/${IMAGE#*/}" "cluster-registry" \
+        || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+    - |
+      # ── Archive to the recreate-surviving registry ───────────────────────────────
+      # ⚠ NEVER FATAL. The image is already pushed and the app already works; a failure here
+      # costs a rebuild after the NEXT recreate, which is the status quo before this existed.
+      if [ -n "$IMAGE_REGISTRY_USER" ] && [ -n "$IMAGE_REGISTRY_CA" ]; then
+        if push_image "$SURVIVING_IMAGE" "surviving-registry"; then
+          echo "Archived $SURVIVING_IMAGE — this tag now survives a cluster recreate."
+        else
+          echo "WARN: could not archive to the surviving registry. The build is still"
+          echo "      GOOD; the next recreate will just have to rebuild this tag."
+        fi
+      else
+        echo "WARN: no image-registry credential — skipping the recreate-surviving copy."
+      fi
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+    - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"

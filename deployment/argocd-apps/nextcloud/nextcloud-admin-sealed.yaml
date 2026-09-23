@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: nextcloud-admin
+  namespace: nextcloud
+spec:
+  encryptedData:
+    password: ""
+    username: AgBo7K9B/vBOAGzFZnRQb85GupwSHVC8V4nfxKQ7oJN60m8mwLd4swXS+6VCYUCQMWCtigsvklQrxaLt28huB6CyriIn8BeXxMQYN2eF9Bh50zPG6AeKykRx/ncHXNi2SgGbu9pJvT83YczKchPfOZyScIut9/0HTjAfK+El8NyNzJ4u2W1n8lR2WCfjCVE6fFqXBuGN6zYMTl3TIL4KFyxrHc5XIORtoD0oawjmiP3EAZwAEJ05QzXvl7dZGKd6Ap8IHRvH6Za4hYH+b8qY3vhMB5ML3ly/fHRO/OVZ1lGOb8KRrFv+n4eYK0DEUeSvHR7/faZWAB2Rv0aYb9/BiBju6JKWDrGDF9A35m2OJ0EMeF6g7qY+df244lftU23tWGUVMVPL8nR6jVa5VvJ/GVyEvAunHrCTRS3OainczGLFlgajoNcFoxhRUF8BnI+3ZkcbeixXxW6obNguTC7EMC9RboGUxf/o6E3saTMAGZYwckhJCMpL7Z3n27XnGQG0wJZO2J8ieNf9qDaigI5MjjRPBzRa773mKwqcW65tBSLXiglU0PF9COTIy+ckms9Wh6s/wg2tefygidbfelf4ij7fCnF1hKrXhhhOkJ3dFgcq3D2QSSLsj6+wKOrhGAwSEp7twfc/DF3drR5kRlIoM/2W1Lg3WD/1vq/pQdPknX9CKelumDfYPNb6E8YXF0tk4P8J64sbcg==
+  template:
+    metadata:
+      name: nextcloud-admin
+      namespace: nextcloud

@@ -1,0 +1,86 @@
+# ArgoCD Application: the MESH GitLab runner (tags: mesh).
+#
+# Split out of app-of-apps/gitlab-runner.yaml so it can be enabled, disabled
+# or re-pointed without touching the default/cloud runner that shared that file. Same
+# rationale as gitlab-runner-thor.yaml and gitlab-runner-eda.yaml — one runner profile per
+# file. Its token is still minted by the gitlab app's bootstrap job into
+# gitlab-runner-token-mesh; only the Application moved.
+# ── MESH runner (mesh nodes; GPU nodes excluded by their taint) ─────────────────
+# General mesh CI must never compete with GPU work. That is now enforced by the
+# ecc/gpu=true:NoSchedule taint on GPU nodes, which this runner simply does not
+# tolerate — no explicit exclusion needed. Only tags:[thor] jobs (gitlab-runner-thor.yaml,
+# which DOES tolerate it) land on the GPU.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+    name: gitlab-runner-mesh
+    namespace: argocd-apps
+    annotations:
+        placement.ecc/tier: mesh
+spec:
+    project: default
+    source:
+        repoURL: https://charts.gitlab.io
+        chart: gitlab-runner
+        targetRevision: "0.92.2"
+        helm:
+            valuesObject:
+                gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+                runners:
+                    secret: gitlab-runner-token-mesh
+                    # affinity: mesh node (node.kubernetes.io/mesh-worker=true, set by
+                    # generateProvisioningScripts.sh). GPU nodes need no exclusion here —
+                    # their ecc/gpu taint is untolerated below.
+                    config: |
+                        [[runners]]
+                          # Internal clone URL — external https://gitlab.<tld> is untrusted
+                          # in build pods under letsencrypt-staging (see cloud runner note).
+                          # PORT 8181 = workhorse: git-over-HTTP needs the workhorse JWT;
+                          # 8080 hits puma directly -> "Nil JSON web token" 403.
+                          clone_url = "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+                          [runners.kubernetes]
+                            namespace = "gitlab-runner"
+                            image = "alpine:latest"
+                            privileged = false
+                            cpu_request = "250m"
+                            memory_request = "256Mi"
+                            cpu_limit = "2"
+                            memory_limit = "2Gi"
+                            [runners.kubernetes.node_tolerations]
+                              "ecc/mesh=true" = "NoSchedule"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+                            [runners.kubernetes.affinity.node_affinity]
+                              [runners.kubernetes.affinity.node_affinity.required_during_scheduling_ignored_during_execution]
+                                [[runners.kubernetes.affinity.node_affinity.required_during_scheduling_ignored_during_execution.node_selector_terms]]
+                                  [[runners.kubernetes.affinity.node_affinity.required_during_scheduling_ignored_during_execution.node_selector_terms.match_expressions]]
+                                    key = "node.kubernetes.io/mesh-worker"
+                                    operator = "In"
+                                    values = ["true"]
+                rbac:
+                    create: true
+                resources:
+                    requests:
+                        cpu: 100m
+                        memory: 128Mi
+                    limits:
+                        memory: 512Mi
+    destination:
+        server: https://kubernetes.default.svc
+        namespace: gitlab-runner
+    syncPolicy:
+        automated:
+            prune: true
+            selfHeal: true
+        syncOptions:
+            - CreateNamespace=true
+        # ⚠ RETRY FOREVER — kept in step with its three sibling runner apps (gitlab-runner,
+        # -eda, -thor/-mesh) so a recreate cannot strand one of them on ArgoCD's default budget of
+        # 5 retries, the way gitlab-runner-eda was stranded on ecc187. This app carries NO hooks
+        # (chart-only, and its gitlab-runner-token-mesh secret is minted by the gitlab app's
+        # bootstrap job), so here it covers transient sync failures only — a runner pod waiting on
+        # a not-yet-minted token shows as Degraded, which no retry budget addresses.
+        retry:
+          limit: -1
+          backoff:
+            duration: 1m
+            factor: 2
+            maxDuration: 10m

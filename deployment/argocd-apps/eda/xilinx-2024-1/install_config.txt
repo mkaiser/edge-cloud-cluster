@@ -1,0 +1,96 @@
+#### Vivado 2024.1 batch install configuration ####
+# Consumed by xsetup --batch Install --config ... (Dockerfile install stage).
+#
+# Module names below are VERBATIM from the 2024.1 installer's OWN reference config, dumped
+# by the Dockerfile's ConfigGen fallback and pasted in. Do NOT
+# invent or "tidy" them — any unknown key or module aborts xsetup with
+# "The value specified in the configuration file for Modules (...) is not valid."
+# To regenerate the reference list, let a build fail and read the
+# ---- /root/.Xilinx/install_config.txt ---- block in the job log.
+#
+# 2024.1 vs 2026.1 differences that actually bit (the first attempt was rejected for these):
+#   1. 2024.1 HAS the ML Standard/Enterprise split that 2026.1 dropped. "Vivado ML Standard"
+#      is correct and is the free tier; ML Enterprise needs a license to install.
+#   2. Older, shorter device spellings: "Artix-7" not "Artix-7 FPGAs", "Zynq-7000" not
+#      "Zynq-7000 All Programmable SoC", "Zynq UltraScale+ MPSoC" (singular, no "s").
+#   3. Several families simply DO NOT EXIST in the 2024.1 ML Standard installer and must be
+#      omitted entirely rather than set to :0 — naming them is itself the error. Notably:
+#      Versal (any series), Virtex-7, Virtex UltraScale (non-plus), Zynq UltraScale+ RFSoC,
+#      and the Alveo/edge-acceleration module.
+#   4. Vitis Model Composer's name embeds a parenthesised description CONTAINING COMMAS.
+#      It must be reproduced exactly, commas and all — the parser handles it.
+#
+# Selection intent: EVERYTHING the 2024.1 ML Standard installer offers
+# is enabled — every device family plus Vitis Embedded Development, Vitis Networking P4,
+# Vitis Model Composer, PDM, Kria and DocNav. The module is named `xilinx` rather than
+# `vivado` precisely because it is no longer Vivado-only.
+#
+# ⚠ Vitis Embedded Development:1 is what makes /opt/Xilinx/Vitis/2024.1 (and `xsct`) exist.
+# Note the path: the installer puts every product at /opt/Xilinx/<Product>/2024.1 and the
+# Dockerfile normalises ONLY Vivado to /opt/Xilinx/2024.1/Vivado, so Vitis stays where the
+# installer left it.
+# module.yaml's cli_entries must gain xsct once a BUILT image confirms the path — verify
+# against the image, never infer it from this file.
+#
+# ⚠ EnableDiskUsageOptimization is now 0: it exists to shrink the installed tree, which
+# directly contradicts a full install. Expect the image to grow substantially (~30 GB with
+# the trimmed set); the /build-scratch guards in .gitlab-ci.yml were sized for that and may
+# need raising — check the actual free space before a rebuild rather than assuming.
+#
+# To turn something OFF again, flip its :1 to :0 — and regenerate
+# build-files-configmap.yaml (sync-build-files.sh) in BOTH app dirs.
+Edition=Vivado ML Standard
+
+Product=Vivado
+
+# Path where AMD FPGAs & Adaptive SoCs software will be installed.
+# NOTE the installer's own reference says /tools/Xilinx; we deliberately use /opt/Xilinx,
+# which the Dockerfile's layout normalisation and the module.yaml paths both assume.
+Destination=/opt/Xilinx
+
+# ⚠ DocNav is the ONE exception at :0, and it is not a size decision (it is only 608 MB).
+# It hangs xsetup's FINALISATION step — after every file is written. MEASURED twice
+# against a successful build for contrast:
+#
+#   #29 (DocNav off): "It took 5 minutes to install files"  16:03:21
+#                     "INFO - Installation completed successfully"  16:03:27   <- 6 SECONDS
+#   #51 (DocNav on) : "It took 9 minutes to install files"  21:04:06
+#                     ...no further output ever. Hung 2 h+, then cancelled.
+#
+# So the file copy REACHES 100% (Done) and every component lands — Vivado 45.5 GB, Vitis
+# 24.1 GB, Vitis_HLS 9.9 GB, PDM 2.7 GB, DocNav 0.6 GB. The JVM then parks in the
+# post-install phase: state=S, 35-40 threads on futex_do_wait, 0 bytes and ~0% CPU over 75 s.
+# DocNav's last-written files are resources/xhubs.xml + xdocs.xml, its ONLINE DOC CATALOGUE,
+# timestamped 21:04:05 — one second before the final progress line. That catalogue is
+# fetched from AMD's servers; this lab's egress is filtered and the fetch has no visible
+# timeout.
+#
+# ⚠ TWO HYPOTHESES WERE WRONG, recorded so they are not retried:
+#   - NOT a timeout: 130 min elapsed of a 360 min limit, 230 min unused.
+#   - NOT cpu throttling: #51 ran with -XX:ActiveProcessorCount=16 and cpu_limit raised
+#     8 -> 16 and stalled at the IDENTICAL point with ~90.27 GB written.
+# Leave DocNav OFF unless someone gives the build a working HTTPS path to AMD AND verifies
+# "Installation completed successfully" actually appears.
+#
+# Every OTHER module the 2024.1 ML Standard installer offers is :1. The families NOT listed
+# here (Versal, Virtex-7, Virtex UltraScale non-plus, Zynq UltraScale+ RFSoC, Alveo) do not
+# exist in this installer and must stay ABSENT — naming them at all aborts xsetup.
+Modules=Artix-7:1,Kintex-7:1,Zynq-7000:1,Kintex UltraScale+:1,Virtex UltraScale+:1,Zynq UltraScale+ MPSoC:1,Spartan-7:1,Artix UltraScale+:1,Kintex UltraScale:1,Virtex UltraScale+ 58G:1,Virtex UltraScale+ HBM:1,Install Devices for Kria SOMs and Starter Kits:1,Vitis Embedded Development:1,Vitis Networking P4:1,Vitis Model Composer(Toolbox for MATLAB and Simulink. Includes the functionality of System Generator for DSP):1,Power Design Manager (PDM):1,DocNav:0
+
+# Post-install scripts. Licensing is provided at RUNTIME via the sealed
+# XILINXD_LICENSE_FILE/LM_LICENSE_FILE (see desktop-gvisor.yaml) — never at build time.
+# The 2024.1 reference emits an EMPTY InstallOptions=; the 2026.1-era
+# "Acquire or Manage a License Key:0" spelling is not a valid 2024.1 option.
+InstallOptions=
+
+## Shortcuts and File associations ##
+# No shortcuts/associations: the desktop image provides its own launcher and .desktop entry
+# (generated from module.yaml's desktop_entries), so the installer's are redundant.
+CreateProgramGroupShortcuts=0
+ProgramGroupFolder=Xilinx Design Tools
+CreateShortcutsForAllUsers=0
+CreateDesktopShortcuts=0
+CreateFileAssociation=0
+
+# Shrink the installed tree (this payload is squashfs'd/pushed over the mesh, so size matters).
+EnableDiskUsageOptimization=0

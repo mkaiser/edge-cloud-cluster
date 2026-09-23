@@ -1,0 +1,323 @@
+# LiteLLM gateway — the identity/accounting layer in front of the Ollama nodes.
+# Users log into the LiteLLM UI at https://llm.<tld> via Authentik OIDC (GENERIC_*
+# SSO env below) and mint their own virtual keys (per-key budget, RPM, model
+# allowlist, expiry, revocation) — the PAT model. Agents (Cline/Aider) present a
+# virtual key; browser users of Open WebUI reach the models through this gateway too.
+#
+# placement.ecc/tier: flex — schedulable cloud OR mesh; pure proxy, no GPU.
+# State in CNPG Postgres litellm-pg (postgres.yaml). Config in litellm-config
+# ConfigMap (config.yaml). Secrets in litellm-secrets (SealedSecret).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: litellm
+  annotations:
+    # LiteLLM reads config.yaml ONCE at startup. ArgoCD updates the ConfigMap correctly and
+    # reports Synced/Healthy while the running process keeps serving the old routes and
+    # general_settings — measured twice (a new model route absent; per-user attribution off,
+    # both with the correct file already mounted). Reloader (argocd-infra/reloader) watches
+    # every ConfigMap and Secret this pod references and rolls the Deployment when their
+    # content changes, so an edit to config.yaml or a re-seal of litellm-secrets reaches the
+    # process. Nothing to keep in sync by hand.
+    reloader.stakater.com/auto: "true"
+spec:
+  # ⚠ MUST STAY 1, and it is not a capacity oversight. LiteLLM caches its wildcard
+  # enumeration PER POD at startup (see config.yaml — the listing does not refresh on its
+  # own). Two pods would therefore advertise DIFFERENT model sets depending on when each
+  # started, and model-sync-cronjob.yaml polls the SERVICE — it would see whichever pod
+  # answered and restart the Deployment on phantom drift, every 5 minutes, forever.
+  # Scaling out needs the enumeration to be shared (or the cronjob to poll every pod)
+  # first. The rolling strategy below is what keeps a restart from being an outage.
+  #
+  # Deliberately NO PodDisruptionBudget: at replicas 1 a minAvailable-1 PDB can never be
+  # satisfied by an eviction, so it blocks a drain forever instead of protecting anything.
+  # This cluster's k3s upgrades cordon without draining anyway
+  # (argocd-infra/system-upgrade/plans.yaml), so there is no drain for it to guard.
+  replicas: 1
+  strategy:
+    # Startup re-enumerates BOTH Ollama backends, so real readiness is well past
+    # readinessProbe.initialDelaySeconds. maxUnavailable 0 keeps the old pod serving until
+    # the new one is Ready — without it a model-sync restart is a gap for every user, and
+    # Open WebUI is the sole browser path.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      priorityClassName: standard
+      # Flex placement: schedulable on cloud OR mesh. Tolerate the mesh taint so it
+      # CAN run on mesh nodes, and softly PREFER unibi-hclab so it actually lands there
+      # once available, next to its Postgres (litellm-pg, on unibi-hclab mesh storage) —
+      # avoiding an otherwise-permanent cross-tier WireGuard hop for every DB query.
+      # Soft, not hard: at cluster bootstrap no mesh node exists yet, so the pod must
+      # still schedule on cloud. Nothing MOVES a running pod when the preference later
+      # becomes satisfiable (preferredDuringScheduling is IgnoredDuringExecution) — the
+      # descheduler's LowNodeUtilization/RemovePodsViolatingNodeAffinity plugins
+      # (deployment/argocd-infra/descheduler/) are what evict the cloud-bootstrapped
+      # pod so it reschedules onto mesh.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # ⚠ GPU nodes are eligible on purpose. LiteLLM is a stateless HTTP proxy — it wants a
+        # CPU and a Postgres connection, not a GPU — but excluding the GPU boxes removes the
+        # two lab nodes most likely to still be up, which is exactly backwards for an app
+        # every agent in the cluster depends on. Without this, `unibi-recslab-smartmirror1`
+        # is unschedulable for LiteLLM even when it is the only healthy lab node left.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # ⚠ EVICT FAST — the default is 300s and that is the outage, not the node loss.
+        # The pcie-tb lab boxes go away for hours at a time. With the k8s default the pod
+        # keeps its claim on a dead node for five minutes before eviction even begins, and
+        # every consumer sees `APIConnectionError` for that whole window (measured twice on
+        # 2026-09-14: both times it read as a model fault, not a node fault, because the
+        # pod still shows `1/1 Running` while the Service has zero endpoints).
+        #
+        # 30s is well clear of a transient kubelet hiccup — a node that misses heartbeats
+        # for 30 consecutive seconds is not coming back inside the eviction window anyway —
+        # and it costs nothing when nodes are healthy, since the taint is only applied once
+        # the node controller has already declared the node unreachable.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      affinity:
+        nodeAffinity:
+          # ⚠ REQUIRED, NOT PREFERRED: this image's glibc needs x86-64-v2 and DIES without it.
+          #     Fatal glibc error: CPU does not support x86-64-v2
+          # It is a fatal startup abort, not a degradation — CrashLoopBackOff with no LiteLLM
+          # log line of its own, and every consumer sees only `APIConnectionError: Connection
+          # error.` Measured 2026-09-14: the pod landed on unibi-hclab-fs-vm and crash-looped
+          # 11 times over 35 min, which silently took down the eda-pcb-agent Kanban worker
+          # (the agent has no model without LiteLLM) and everything else behind the gateway.
+          #
+          # unibi-hclab-fs-vm is a VM on the TrueNAS appliance and TrueNAS's VM `CPU Mode`
+          # DEFAULTS TO "Custom", which emulates a generic `QEMU Virtual CPU version 2.5+`
+          # advertising only X86_64_V1. Every other x86 node here reports V2/V3 (pcie-tb-s
+          # even V4), so this node alone is the hazard — and because the site preference
+          # below points at unibi-hclab, which CONTAINS fs-vm, a plain reschedule is a
+          # coin-flip that eventually lands here. It ran fine for 13 h before it did.
+          #
+          # The label comes from node-feature-discovery (argocd-infra/node-feature-discovery),
+          # which publishes cpu-cpuid.X86_64_V{1..4} per node. Requiring the FEATURE rather
+          # than excluding the node by name is what keeps this correct across recreates and
+          # when new nodes appear. ⚠ arm64 nodes (thor-eval) publish NO X86_64_* label at all,
+          # so this expression also keeps an amd64-only image off them.
+          #
+          # Fixing the VM instead (CPU Mode -> Host Model/Host Passthrough) is the real cure
+          # and would help every workload, but it needs a VM restart and that box runs an
+          # on-prem AD DC (ad-onprem-1) and the image-registry — i.e. planned maintenance,
+          # not a quick toggle. This guard is correct to keep either way.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2
+                    operator: In
+                    values:
+                      - "true"
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: ecc/site  # automatically updated from project-settings:applicationPlacements.labels.site
+                    operator: In
+                    values:
+                      - unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-stable  # renovate: tracked by "Container image tags" regex (docker datasource)
+          args:
+            - "--config"
+            - "/etc/litellm/config.yaml"
+            - "--port"
+            - "4000"
+          env:
+            # Postgres DSN (CNPG read-write service). Password from the sealed
+            # bootstrap user; must equal litellm-pg-user:password.
+            - name: LITELLM_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              value: "postgresql://litellm:$(LITELLM_DB_PASSWORD)@litellm-pg-rw:5432/litellm"
+            # Gateway master key (admin). Seeds the first admin; users self-mint
+            # their own virtual keys via OIDC login instead of sharing this.
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: master-key
+            # Encrypts secrets LiteLLM stores in the DB — must be stable.
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: salt-key
+            # Dedicated local admin for the /ui login. A username+password match on
+            # /ui promotes the session to PROXY_ADMIN (full model/key management)
+            # WITHOUT the master key and WITHOUT SSO — this is the automated "first
+            # admin". Values live in the litellm-secrets SealedSecret (admin-username
+            # = litellm-admin, admin-password generated); rotate via sealSecrets.sh
+            # --regenerate. SSO login (Authentik) still works in parallel.
+            - name: UI_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: admin-username
+            - name: UI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: admin-password
+            # Fallback base for the ollama provider's enumeration path, which
+            # get_valid_models() may reach without any deployment context. Without it that
+            # path falls back to http://localhost:11434, finds nothing, and /v1/models
+            # silently empties — an empty picker with no error anywhere.
+            #
+            # It names ONE node while config.yaml carries TWO wildcards, and that is fine:
+            # the per-deployment api_base wins on the enumeration path too. Verified
+            # 2026-09-08 — model-sync reported `thor` advertising exactly Thor's 3 models
+            # and `turing` exactly Turing's 4, "In sync — no restart". So this is a
+            # belt-and-braces default, not the source of the advertised set.
+            - name: OLLAMA_API_BASE
+              value: http://ollama-turing.ollama-turing.svc:11434
+            # Upstream credential for the THOR vLLM (the thor/qwen3.6-35b-a3b-nvfp4 route
+            # in config.yaml). Same random token both sides share — vllm/vllm-upstream:api-key
+            # is the server end, this is the client end.
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: vllm-api-key
+            # Upstream credential for the ORIN vLLM (the orin/qwen3.5-4b-w4a16 route).
+            # ⚠ A SEPARATE key from the Thor's, deliberately: each backend owns its own
+            # credential so rotating or compromising one cannot reach the other. Server end
+            # is vllm-orin/vllm-orin-upstream:api-key, sealed by that app's sealSecrets.sh
+            # and recovered into litellm-secrets by litellm/sealSecrets.sh.
+            - name: VLLM_ORIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: vllm-orin-api-key
+            # SSO redirect base — LiteLLM builds the OIDC callback from this.
+            - name: PROXY_BASE_URL
+              value: "https://llm.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # Skip the /ui credential page and redirect straight to Authentik SSO on
+            # load. Without this LiteLLM shows the local login form (with an SSO
+            # button) and prints the "SSO is enabled ... set AUTO_REDIRECT..." note.
+            # The local litellm-admin user/pass path (UI_USERNAME/UI_PASSWORD) is no
+            # longer surfaced in the browser; it still works via the master key /
+            # direct API for break-glass admin.
+            - name: AUTO_REDIRECT_UI_LOGIN_TO_SSO
+              value: "true"
+            # --- Authentik OIDC (generic SSO) for the LiteLLM UI login ---
+            - name: GENERIC_CLIENT_ID
+              value: "litellm"
+            - name: GENERIC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-oidc-client-secret
+                  key: client-secret
+            - name: GENERIC_AUTHORIZATION_ENDPOINT
+              value: "https://id.subdomain1.your-domain.tld/application/o/authorize/" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: GENERIC_TOKEN_ENDPOINT
+              value: "https://id.subdomain1.your-domain.tld/application/o/token/" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: GENERIC_USERINFO_ENDPOINT
+              value: "https://id.subdomain1.your-domain.tld/application/o/userinfo/" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # Request the groups claim so role_mappings below can read it. Without
+            # `groups` here (and the matching scope mapping on the Authentik
+            # provider) no group array reaches LiteLLM and every SSO user falls back
+            # to the hardcoded INTERNAL_USER_VIEW_ONLY (read-only — can't add models
+            # or mint keys).
+            - name: GENERIC_SCOPE
+              value: "openid profile email groups"
+            # Map Authentik groups → LiteLLM roles on SSO login. LiteLLM reads these
+            # from ENV (GENERIC_ROLE_MAPPINGS_*), NOT from config.yaml general_settings.
+            #   - authentik-admins  → proxy_admin  (full model/key/budget management)
+            #   - everyone else allowed in (access-ai) → internal_user (self-service:
+            #     mint own keys, use models; cannot manage models/other users)
+            # ROLES is a Python-dict literal (parsed via ast.literal_eval): role → [groups].
+            - name: GENERIC_ROLE_MAPPINGS_GROUP_CLAIM
+              value: "groups"
+            - name: GENERIC_ROLE_MAPPINGS_DEFAULT_ROLE
+              value: "internal_user"
+            - name: GENERIC_ROLE_MAPPINGS_ROLES
+              value: "{'proxy_admin': ['authentik-admins']}"
+            # CA trust for LiteLLM's server-side TLS (Python): the Authentik OIDC
+            # token exchange to id.<tld> AND the model-cost-map fetch from GitHub.
+            # SSL_CERT_FILE *replaces* Python's trust store (not additive), so on
+            # letsencrypt-prod it MUST point at the system bundle (which has ISRG
+            # Root X1) — pointing it at the staging-only chain breaks OIDC login and
+            # the cost-map fetch with CERTIFICATE_VERIFY_FAILED. On staging, the
+            # toggle below swaps it to the mounted staging-ca bundle.
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}
+          ports:
+            - containerPort: 4000
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm
+              readOnly: true
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              # 1Gi, not 512Mi: the limit below records that 1Gi is not even enough to CAP
+              # this pod, so requesting half of that made the scheduler reserve ~4x less
+              # than startup actually uses — inviting the very OOM the limit documents when
+              # the node is packed. Request what it needs, burst to the limit.
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              # LiteLLM loads the model-cost map + proxy machinery on startup;
+              # 1Gi OOM-kills it (exit 137). 2Gi headroom.
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: litellm
+spec:
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000

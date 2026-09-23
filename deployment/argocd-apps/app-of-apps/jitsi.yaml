@@ -1,0 +1,83 @@
+# ArgoCD Application: Jitsi Meet (jitsi-contrib/jitsi-helm chart).
+# Accessible at https://meet.<subdomain>.<domain>
+# OIDC via Authentik using the jitsi-oidc-adapter (separate Deployment) + JWT
+# token auth in prosody. Provider/tile created & removed via the Authentik API
+# (PostSync/PreDelete hooks) — all config lives in deployment/argocd-apps/jitsi.
+#
+# Same sync wave as GitLab (14).
+#
+# Multi-source:
+#   1. jitsi-meet Helm chart
+#   2. ref source for $values
+#   3. Git directory for adapter, authentik provider jobs, sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jitsi
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://jitsi-contrib.github.io/jitsi-helm/
+      chart: jitsi-meet
+      targetRevision: "3.7.0" # renovate: datasource=helm depName=jitsi-meet registryUrl=https://jitsi-contrib.github.io/jitsi-helm/
+      helm:
+        releaseName: jitsi-meet
+        valueFiles:
+          - $values/deployment/argocd-apps/jitsi/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/jitsi
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: jitsi
+  # jibri uses a PVC; k8s mutates immutable volumeClaimTemplates with defaults
+  # ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    # jibri's recordings PVC. Chart 2.22.2 requested accessModes [ReadWriteOnce,
+    # ReadWriteMany]; 3.6.0 requests [ReadWriteMany] alone. accessModes is
+    # IMMUTABLE on a bound PVC, so the existing claim can never be patched to
+    # match and the app would sit OutOfSync forever (measured on the 3.6.0
+    # upgrade). The underlying Longhorn PV already carries both modes, so RWX —
+    # the only mode the chart now asks for — is genuinely satisfied; the
+    # disagreement is in the immutable spec, not in what the volume can do.
+    # Recreating the PVC to "fix" the field would destroy the recordings for no
+    # functional gain. Drop this entry if the claim is ever recreated.
+    - kind: PersistentVolumeClaim
+      name: jitsi-meet-jibri
+      namespace: jitsi
+      jsonPointers:
+        - /spec/accessModes
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

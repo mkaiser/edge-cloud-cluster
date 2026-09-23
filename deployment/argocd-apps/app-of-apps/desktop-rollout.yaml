@@ -1,0 +1,44 @@
+# ArgoCD Application: the thing that syncs remote-desktop when nobody can be hurt by it.
+#
+# remote-desktop has no automated sync on purpose — applying a change restarts a
+# single-replica Recreate Deployment and every session on it dies. That leaves one gap: when
+# the desktop is NOT RUNNING (first boot after a recreate, or a crash-loop), waiting for a
+# human buys nothing. This app carries a CronJob that closes exactly that gap and nothing
+# more: OutOfSync AND zero ready replicas ⇒ sync; one ready replica ⇒ hands off.
+#
+# ⚠ SEPARATE FROM remote-desktop BY NECESSITY, not taste. Anything inside that app is only
+# applied by the manual sync this CronJob exists to trigger, so on a fresh cluster it would
+# never run. It therefore needs its own Application, and this one IS automated.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: desktop-rollout
+  namespace: argocd-apps
+  annotations:
+    # Same tier as the app it serves: on a cloud-only restore remote-desktop is skipped, and
+    # a watcher for an app that is not there would only produce noise.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/desktop-rollout
+  destination:
+    server: https://kubernetes.default.svc
+    # The CronJob lives in argocd-apps, NOT in remote-desktop: on a fresh cluster the
+    # remote-desktop namespace does not exist until that app is synced, which is the very
+    # thing this job has to be able to trigger.
+    namespace: argocd-apps
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

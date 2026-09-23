@@ -1,0 +1,354 @@
+# HyperLynx 2604 module image build — recover-or-rebuild.
+#
+# SOURCE OF TRUTH: this file lives in the infra repo
+# (deployment/argocd-apps/eda/hyperlynx-2604/.gitlab-ci.yml). The build-trigger
+# (postsync-build-image.yaml) MIRRORS it (+ Dockerfile + module.yaml) into the in-cluster
+# GitLab project deployments/infrastructure/eda/modules/hyperlynx; ArgoCD then TRIGGERS
+# this pipeline. Do NOT hand-edit it in GitLab — overwritten on the next mirror. Bump
+# IMAGE_TAG to force a rebuild.
+#
+# Runs on a unibi-hclab [eda] node via tags:[eda]. The Siemens media lives on the TrueNAS
+# artifacts export, beside the archive it is built into, and is mounted rw at /artifacts by
+# the [eda] runner (static PV, gitlab-runner-eda/nfs-installers-pv.yaml). No S3, no
+# node staging, no credentials in CI. buildah bind-mounts the extracted tree BUILD-TIME
+# only (never committed to a layer).
+stages: [build]
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+build-hyperlynx-module:
+  stage: build
+  tags: [eda]                     # -> pcie-tb-s [eda] runner (gitlab-runner-token-eda)
+  # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+  # for the registry gate below, which quay's image has never shipped. Built by
+  # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+  # ⚠ The tag must equal that app's IMAGE_TAG; remote-desktop/check-image-invariants.sh
+  # fails the commit if they drift. A consumer pinned to a tag that was never built simply
+  # never starts its build pod.
+  image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+  resource_group: hyperlynx-module-build   # serialize rebuilds; distinct from xilinx/vivado
+  interruptible: true
+  # ── MEASURED COSTS ───────────────────────────────────────────────────────────────────
+  # Phase timings from a full build:
+  #     extract 9.7 GB from the SMB share   04:36 -> 04:54   ~18 min  (~9 MB/s, the share)
+  #     Xvfb batch install (SIP replay)     04:56 -> 04:59   ~2m45s   <-- see below
+  #     buildah bud total                   04:54 -> 05:14   ~20 min
+  #     push to registry                    05:14 -> 05:30   ~16 min  (11.1 GB compressed)
+  #     archive to NFS                      05:30 -> 05:36   ~6 min   (31.1 GB tar)
+  #     TOTAL                                                ~60 min
+  #
+  # ⚠ THE XVFB INSTALL IS ~2m45s, NOT ~45 min. Three places in this repo (and a memory)
+  # claimed ~45 min and the Dockerfile said ~10-20; all were wrong by an order of magnitude.
+  # The install genuinely succeeded — the following step's SDD_HOME check passes, which it
+  # cannot if the tree is absent. The build is dominated by the SMB media READ and the
+  # registry PUSH, not by the installer.
+  #
+  # DISK on /build-scratch: the extracted tree is ~9.7 GB and the buildah storage for a
+  # ~31 GB image is far below the Vivado figures (that build peaks around 275-450 GB), so
+  # this app has never been the disk constraint. It shares the disk with Vivado though, and
+  # the runner is concurrent=1, so a queued Vivado build is what delays it.
+  #
+  # SIZES for capacity planning:
+  #     registry tag (compressed)     11.1 GB   <- what a desktop pull costs
+  #     uncompressed image            31.1 GB   <- what it expands to on disk
+  #     ⚠ Do not conflate the two: "31 GB push" is wrong, only 11.1 GB crosses the wire.
+  #
+  # 4h is generous against a measured 60 min; kept as headroom for a slow share day.
+  timeout: 4h
+  variables:
+    FORCE_REBUILD: "0"                 # set to "1" for a ONE-SHOT rebuild of the same tag after a
+                                       # Dockerfile fix (IMAGE_TAG is the user-facing module version
+                                       # and must not be bumped); reset to 0 once the image publishes
+    IMAGE_TAG: "2604"                  # the MODULE version (module load hyperlynx/2604); bump on Dockerfile changes
+    IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+    # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+    # literally named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is
+    # fail-open, so that 404 reads as "not in the registry" and rebuilds from installer
+    # media every single time, silently. Measured on ecc188: the buggy form returned 404
+    # and this form returned 200 against the same tag.
+    # A `docker://` push destination is the opposite case — it MUST keep the tag, so those
+    # still use ${IMAGE#*/}.
+    IMAGE_REPO: $CI_PROJECT_PATH
+    # ── recreate-survival archive on the NFS export ───────────────────────────────────
+    # MOVED OFF THE SMB SHARE. Two reasons, both measured rather than assumed:
+    #   - restoring 30 GB at the share's ~11.5 MB/s read took ~45 min. ⚠ MEASURED: the
+    #     Xvfb batch install this is meant to save is only ~2m45s, not the ~45 min quoted
+    #     for the Xilinx modules. So for HYPERLYNX the archive does
+    #     NOT save a long rebuild — the whole build is ~20 min end to end. It still earns
+    #     its place for the second reason below, and because a rebuild needs the installer
+    #     media to be present at all;
+    #   - a single long write to that share ABORTS partway
+    #     ("cp: error writing '/smb/modules/hyperlynx/2604.tar.tmp': Software caused
+    #     connection abort"), so the archive could fail to appear at all.
+    # The TrueNAS export measured 126 MB/s read / 92 MB/s write and did not abort.
+    #
+    # ⚠ The first segment is the MODULE name here, while the two xilinx apps use a VENDOR
+    # name (`xilinx/2024.1`). That is a real inconsistency and it is deliberate — the segment
+    # is an arbitrary string. Do not "fix" either side for symmetry.
+    #
+    # MEDIA ONLY: container images are not archived here (the registry blob store is the
+    # only copy), so what remains is purely the vendor installer media the build reads.
+    MODULE_DIR: /artifacts/hyperlynx/$IMAGE_TAG
+    # Installer media. Layout under it: batchInstall.sh flat, compat/*.rpm|deb,
+    # hyperlynx2604/<payload>.tar — the Dockerfile reads those exact relative paths.
+    MEDIA_DIR: $MODULE_DIR/installer
+    # Module identity for the build trigger's recreate gate. ABSENT until now, which is why
+    # this app had no share-archive skip at all: the trigger parses these out of this file
+    # and asks `broker digest`. Without them it only ever checked the registry, so a recreate
+    # rebuilt from installer media even with a byte-identical archive on the share.
+    MODULE_NAME: "hyperlynx"
+    MODULE_VERSION: "2604"
+    REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+    STORAGE_DRIVER: overlay
+    BUILDAH_ROOT: /build-scratch/buildah-storage
+    BUILDAH_RUNROOT: /build-scratch/buildah-run
+    # ⚠ THE LAB-LOCAL REGISTRY, not GitLab's. EDA module images are published here and
+    # ONLY here; GitLab's registry stays the home for everything else (remote-desktop
+    # base, vLLM, …). See deployment/argocd-apps/image-registry/README.md.
+    #
+    # WHY: registry-preferclose only kept the CLIENT HOP on the LAN — the registry behind
+    # it still wrote through to Hetzner S3 in Nuremberg, which is the ~5.3 MB/s that made
+    # a 31 GB push take 16 min. image-registry stores to the TrueNAS export on the lab LAN
+    # (~92 MB/s write / ~126 MB/s read), so S3 leaves the path entirely.
+    #
+    # ⚠ AUTHENTICATED (htpasswd) and TLS from a PRIVATE in-cluster CA. Both are
+    # required, not hardening: what this registry serves is executed AS ROOT by the
+    # remote-desktop broker, whose allowed() gate authorises by <repo>:<tag> and never
+    # checks the CONTENT at that tag. The credential arrives as masked CI variables and
+    # the CA as IMAGE_REGISTRY_CA, both published by this app's build-trigger.
+    # Still ClusterIP-only — the CA is private, so an external client could not verify
+    # it; never give this an ingress.
+    INTERNAL_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+  script:
+    # Trust the image-registry CA. containers/image reads
+    # /etc/containers/certs.d/<host>:<port>/*.crt automatically, so writing it here
+    # means every later buildah call verifies TLS with NO per-call flag — and a missing
+    # CA fails loudly at handshake instead of silently downgrading.
+    - |
+      mkdir -p "/etc/containers/certs.d/${INTERNAL_REGISTRY}"
+      printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt"
+      # ⚠ NOT openssl — quay.io/buildah/stable is Fedora-based and does NOT ship it
+      # (verified by probing the image). python3 IS present, and a stdlib-only parse keeps
+      # the fail-loud intent with no package install and no network at build time.
+      python3 - "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt" <<'CACHECK' \
+        || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+      import base64, re, sys
+      raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+      m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S)
+      if not m:
+          sys.exit("no PEM CERTIFICATE block")
+      try:
+          der = base64.b64decode("".join(m.group(1).split()), validate=True)
+      except Exception as exc:
+          sys.exit(f"base64 decode failed: {exc}")
+      # 0x30 = ASN.1 SEQUENCE, the first byte of every X.509 certificate.
+      if len(der) < 64 or der[0] != 0x30:
+          sys.exit("does not parse as a DER certificate")
+      print(f"image-registry CA OK ({len(der)} bytes DER)")
+      CACHECK
+    - |
+      # Recover-or-rebuild: skip if the tag already exists in the registry.
+      #
+      # IMAGE_TAG is the USER-FACING module version (`module load hyperlynx/2604`), so it
+      # cannot be bumped just to force a rebuild after a Dockerfile fix — that would rename
+      # the module. Set FORCE_REBUILD=1 (pipeline variable, or here) to rebuild the same tag
+      # in place; the push overwrites it.
+      if [ "${FORCE_REBUILD:-0}" = "1" ]; then
+        echo "FORCE_REBUILD=1 — rebuilding $IMAGE even though it may already exist."
+      # ⚠ ASK THE REGISTRY WE ACTUALLY PUSH TO — not GitLab's API.
+      #
+      # Do NOT query $CI_API_V4_URL/.../registry/repositories: EDA module images are
+      # published to the lab-local $INTERNAL_REGISTRY, not GitLab's registry, so GitLab's
+      # API reports the tag ABSENT forever — the gate would never short-circuit and EVERY
+      # pipeline would rebuild from installer media (hours of Xvfb) instead of skipping.
+      #
+      # `skopeo inspect --raw` is how to ask. One command performs the registry's auth
+      # dance, sends the Accept header for every manifest media type, and verifies TLS
+      # against /etc/containers/certs.d/<host>/ca.crt — the file the step above writes,
+      # which is why THAT STEP MUST STAY FIRST (enforced by
+      # remote-desktop/check-image-invariants.sh). skopeo is present because this pipeline
+      # now runs on the CI build image (deployment/argocd-apps/ci-build-image). It is NOT in
+      # quay.io/buildah/stable — do not point this job back at that image.
+      #
+      # Nor buildah: `inspect` errors with 'unsupported transport "docker" for looking up
+      # local images' (it only reads LOCAL storage), `manifest inspect` likewise, and `pull`
+      # would download tens of GB merely to test presence. All measured, not assumed.
+      #
+      # ${IMAGE#*/} strips the registry host from $IMAGE, leaving repository AND tag — the
+      # same derivation the push below uses, so the two can never disagree about WHICH tag
+      # was checked. (A /v2/ URL is the opposite case and must NOT carry the tag.)
+      #
+      # Still FAIL-OPEN: anything but a clean success means "treat as absent and build",
+      # which costs a rebuild, never a wrong image.
+      else
+        # ⚠ PRINT WHAT WENT WRONG. This gate is fail-open by design, so every failure mode
+        # otherwise looks identical to "not in the registry" and costs a multi-hour rebuild
+        # with no error anywhere. A discarded stderr hid three separate defects: a `skopeo`
+        # that was not in the image, a CA file written after this check, and empty
+        # credentials from an unprotected variable on a protected ref. skopeo's own message
+        # distinguishes them (authentication required = credential, manifest unknown =
+        # genuinely absent, x509 = CA, dial tcp = DNS/connect).
+        #
+        # Credentials empty is NOT a soft failure — it means the CI variables did not reach
+        # this pipeline (see the protected=true note in this app's build trigger), so every
+        # run would rebuild forever. Fail loudly instead of silently burning hours.
+        if [ -z "${IMAGE_REGISTRY_USER:-}" ] || [ -z "${IMAGE_REGISTRY_PASSWORD:-}" ]; then
+          echo "ERROR: IMAGE_REGISTRY_USER/PASSWORD are empty in this pipeline."
+          echo "       The registry gate cannot run, so this build would restore nothing and"
+          echo "       rebuild from installer media (hours) on EVERY run."
+          echo "       Cause: the CI variables are published unprotected while this ref is"
+          echo "       protected (CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-unset})."
+          echo "       Fix: publish them with protected=true in this app's build trigger."
+          exit 1
+        fi
+        # ⚠ REPORT THE REF THAT WAS ACTUALLY CHECKED. $IMAGE names the GitLab registry,
+        # but module images live ONLY in $INTERNAL_REGISTRY (image-registry) — printing
+        # $IMAGE here claimed the tag was in a registry this gate never asked, which is
+        # exactly the wrong hint to leave in a recreate post-mortem.
+        _gate_ref="${INTERNAL_REGISTRY}/${IMAGE#*/}"
+        set +e
+        _gate_out=$(skopeo inspect --raw \
+                 --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                 "docker://${_gate_ref}" 2>&1)
+        _gate_rc=$?
+        set -e
+        if [ "$_gate_rc" -eq 0 ]; then
+          echo "$_gate_ref already exists — skipping build."
+          exit 0
+        fi
+        case "$_gate_out" in
+          *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+            echo "registry gate: tag not present in $INTERNAL_REGISTRY — building." ;;
+          *"authentication required"*|*"unauthorized"*)
+            echo "registry gate: AUTH REJECTED by $INTERNAL_REGISTRY. The credential is wrong,"
+            echo "  not the tag. Building anyway (fail-open), but the recreate-survival path is"
+            echo "  NOT working — fix the credential."
+            echo "  skopeo: $_gate_out" ;;
+          *x509*|*certificate*)
+            echo "registry gate: TLS verification failed against $INTERNAL_REGISTRY. Is"
+            echo "  IMAGE_REGISTRY_CA the CA of the CURRENT cluster? A recreate mints a new one."
+            echo "  skopeo: $_gate_out" ;;
+          *)
+            echo "registry gate: unexpected failure — treating as absent, building."
+            echo "  skopeo: $_gate_out" ;;
+        esac
+      fi
+      echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+    - |
+      # Media comes from the NFS export at /artifacts, and the tar is extracted onto
+      # node-local /build-scratch rather than back onto the export — buildah binds the
+      # extracted tree, and a build should not write ~10 GB onto the fileserver every run.
+      # Idempotent: a previous run's extraction is reused.
+      set -e
+      MEDIA=$MEDIA_DIR
+      [ -f "$MEDIA/batchInstall.sh" ] || {
+        echo "ERROR: $MEDIA/batchInstall.sh not found — is the NFS artifacts export mounted?"
+        echo "       expected layout: $MEDIA/{batchInstall.sh,compat/,hyperlynx2604/}"
+        echo "       expected on the TrueNAS artifacts export at $MEDIA"
+        ls -la /artifacts 2>&1 | head; exit 1; }
+      TAR="$MEDIA/hyperlynx2604/HyperLynx2604_linux64.tar"
+      [ -f "$TAR" ] || { echo "ERROR: media tar not found at $TAR"; exit 1; }
+
+      avail_gb=$(df -BG --output=avail /build-scratch | tail -1 | tr -dc '0-9')
+      [ "$avail_gb" -ge 80 ] || echo "WARN: only ${avail_gb}G free on /build-scratch."
+
+      # Extract to a marker-guarded dir so a partial/aborted extraction is redone.
+      SRC=/build-scratch/hyperlynx-media/HyperLynx2604_linux64
+      if [ ! -f "$SRC/.extracted" ]; then
+        echo "[$(date -u +%F' '%T)] extracting $(du -h "$TAR" | cut -f1) from the NFS export..."
+        rm -rf "$SRC"; mkdir -p "$SRC"
+        tar -xf "$TAR" -C "$SRC"
+        [ -f "$SRC/install.aol" ] && chmod +x "$SRC/install.aol"
+        touch "$SRC/.extracted"
+        echo "[$(date -u +%F' '%T)] extraction done."
+      else
+        echo "media already extracted at $SRC — skipping."
+      fi
+
+      # Stage the small side files FLAT next to the extracted tree — the Dockerfile
+      # expects /installer/batchInstall.sh and /installer/libicu-*.rpm,
+      # /installer/libunistring2_*.deb (not a compat/ subdir). Copies are node-local and
+      # writable, so the Dockerfile's chmod +x works.
+      cp -f "$MEDIA/batchInstall.sh" /build-scratch/hyperlynx-media/
+      cp -f "$MEDIA/compat/"*.rpm "$MEDIA/compat/"*.deb /build-scratch/hyperlynx-media/ 2>/dev/null || true
+      chmod +x /build-scratch/hyperlynx-media/batchInstall.sh
+      ls -la /build-scratch/hyperlynx-media/ | head
+    # BOTH registries: $CI_REGISTRY for the Dockerfile's base-image pull, and
+    # $INTERNAL_REGISTRY (image-registry) for the push — separate hosts, separate creds.
+    - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+    - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+    - echo "[$(date -u +%F' '%T)] buildah bud starting (Xvfb batch install inside)..."
+    # -v bind-mounts the EXTRACTED media (node-local) BUILD-TIME only — never committed
+    # to a layer. The Dockerfile sees the same /installer layout as before.
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+      bud --isolation chroot --format docker
+      -v /build-scratch/hyperlynx-media:/installer:ro
+      -t "$IMAGE" .
+    - |
+      # Push under the SAME repository path as $IMAGE. The push is LAN-local to the
+      # appliance (image-registry runs on a unibi-hclab node), so the long per-blob retries are
+      # now belt-and-braces rather than load-bearing.
+      #
+      # ⚠ COMPRESSED, deliberately. Do NOT pass --disable-compression to dodge CPU stalls:
+      # on the vLLM image that trade was MEASURED AS WRONG — uncompressed tripled the
+      # transfer and turned a 6h push into 17h (see the warning in vllm/.gitlab-ci.yml).
+      # Here it is doubly wrong: there is no WireGuard hop, and
+      # image-registry has NO GARBAGE COLLECTION, so every uncompressed byte is a permanent
+      # byte on the ZFS pool. The two xilinx apps have always pushed compressed.
+      DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+      set +e; n=0
+      until [ "$n" -ge 6 ]; do
+        echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+        timeout 7200 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+          push --retry 20 --retry-delay 10s \
+          "$IMAGE" "$DEST"
+        rc=$?; echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+        [ "$rc" -eq 0 ] && break
+        n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s..."; sleep 30
+      done
+      set -e
+      [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+    - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+  # ── ALWAYS-RUN SCRATCH RECLAIM ───────────────────────────────────────────────────────
+  # Runs on SUCCESS AND FAILURE, which is the whole point: the `rmi --prune` at the end of
+  # `script:` is unreachable when the build dies, and a failed `buildah bud` is exactly the
+  # case that leaves the most behind (measured 224-340 GB of layer storage for the full
+  # module set). /build-scratch is the node-local hostPath /var/lib/xilinx-build; nothing
+  # else ever wipes it, so before this existed every failed pipeline leaked its whole layer
+  # store until someone noticed the disk was full.
+  #
+  # WHAT IS DELETED: buildah's containers, images and layer cache, and only via buildah's
+  # own subcommands — never `rm -rf $BUILDAH_ROOT`, which can leave overlay mounts behind
+  # and break the next run. Order matters: `rm -a` first (a working container holds a
+  # reference that makes `rmi` fail), then `rmi -a -f` (the `rmi --prune` in `script:` drops
+  # only DANGLING images, so the tagged build stayed forever), then `prune -a -f` for the
+  # intermediate/mount cache neither of those reaches.
+  #
+  # Dropping the tagged image is safe: it has already been pushed to image-registry, which is
+  # its only permanent home. On the failure path there is nothing worth keeping anyway.
+  #
+  # WHAT IS KEPT: $EXTRACT, the extracted installer tree, guarded by .extract-done and
+  # deliberately SHARED with the twin app. Deleting it would cost every subsequent build a
+  # re-read of the whole tarball off NFS and defeat the flock/marker design. Reclaim it by
+  # hand when the disk is genuinely tight:
+  #   rm -rf /var/lib/xilinx-build/*-extracted /var/lib/xilinx-build/hyperlynx-media
+  #
+  # ⚠ NO `set -e` and every command `|| true`: after_script must not turn a green build red,
+  # and on the failure path it must not mask the real error with a cleanup error. GitLab
+  # gives after_script its own 5-min default timeout, so keep it cheap.
+  after_script:
+    - |
+      echo "[$(date -u +%F' '%T)] scratch reclaim (job status: ${CI_JOB_STATUS:-unknown})"
+      df -h /build-scratch || true
+      BA="buildah --root $BUILDAH_ROOT --runroot $BUILDAH_RUNROOT --storage-driver $STORAGE_DRIVER"
+      $BA rm -a || true
+      $BA rmi -a -f || true
+      $BA prune -a -f || true
+      echo "[$(date -u +%F' '%T)] after reclaim:"
+      df -h /build-scratch || true
+      du -sh /build-scratch/* 2>/dev/null | sort -h || true

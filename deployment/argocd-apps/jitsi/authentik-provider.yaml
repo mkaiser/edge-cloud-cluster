@@ -1,0 +1,279 @@
+# Authentik OAuth2 provider + application tile for Jitsi — managed entirely from
+# this folder via the Authentik API, so nothing jitsi-specific has to be added to
+# the authentik folder.
+#
+#   PostSync  job → create/update the "jitsi" OAuth2 provider and "Jitsi Meet"
+#                   application (dashboard tile, group "Communication").
+#   PreDelete job → delete the application + provider when the jitsi ArgoCD app
+#                   is removed (de-provisioning / tile cleanup).
+#
+# Part B (self-contained OIDC): these jobs authenticate with the SCOPED
+# provisioner token (key `token` in the authentik-provisioner-token sealed secret,
+# this namespace) — NOT the superuser bootstrap token. The token can only
+# add/change/delete oauth2providers + applications + policybindings, so a
+# compromised job cannot touch users/flows/secrets. No cross-namespace secret read
+# is needed → a plain ServiceAccount in this namespace suffices (no ClusterRole).
+# The OIDC client secret comes from the jitsi-oidc-client-secret sealed secret.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jitsi-authentik
+  namespace: jitsi
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jitsi-authentik-token-read
+  namespace: jitsi
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jitsi-authentik-token-read
+  namespace: jitsi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jitsi-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: jitsi-authentik
+    namespace: jitsi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jitsi-authentik-provider
+  namespace: jitsi
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: jitsi-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PUBLIC_URL
+              value: "https://meet.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jitsi-oidc-client-secret
+                  key: OIDC_CLIENT_SECRET
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n jitsi \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              # First result pk for an arbitrary list endpoint+query, else "".
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # Resolve the default scope property-mapping PKs we want to expose.
+              MAP_PKS="[]"
+              for s in openid profile email; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" PUBLIC_URL="$PUBLIC_URL" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'jitsi',
+                'client_type': 'confidential',
+                'client_id': 'jitsi',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [
+                    {'matching_mode': 'strict',
+                     'url': os.environ['PUBLIC_URL'] + '/oidc/tokenize'},
+                    # invite-minter's own OIDC login (see invite-minter.yaml) reuses
+                    # this same "jitsi" client; its callback must be an allowed
+                    # redirect URI or Authentik rejects the code flow.
+                    {'matching_mode': 'strict',
+                     'url': os.environ['PUBLIC_URL'] + '/invite/callback'},
+                ],
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=jitsi")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'jitsi'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'jitsi' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Jitsi Meet',
+                'slug': 'jitsi',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'Communication',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/jitsi-meet.png',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app jitsi "Jitsi Meet" "$APP_PAYLOAD"
+
+              # ---- the dedicated "jitsi" access group (idempotent) ----
+              # Owned HERE, not in argocd-infra/authentik/blueprint-groups.yaml, so that
+              # disabling this app creates no jitsi group at all. bind_group() below
+              # SKIPS a group it cannot find and still exits 0, so without this create
+              # the binding would silently vanish on a fresh cluster — green sync, no
+              # access for external hosts.
+              #
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              JITSI_GRP_PK=$(first_pk "core/groups/?name=jitsi")
+              if [ -z "$JITSI_GRP_PK" ]; then
+                echo "Creating group 'jitsi'..."
+                JITSI_GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"jitsi","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "jitsi group pk=$JITSI_GRP_PK"
+
+              # ---- access control: restrict the app to allowed groups ----
+              # (employees / employees-extended / admins + the dedicated "jitsi"
+              # group for non-employee hosts). Once ≥1 binding exists, Authentik
+              # denies everyone not matched, so other users can't enter.
+              # NB the first three are CENTRAL role groups (blueprint-groups.yaml) and
+              # stay there; only "jitsi" is app-owned and created just above.
+              APP_PK=$(first_pk "core/applications/?slug=jitsi")
+              # Fetch all existing bindings for THIS app once to avoid the
+              # ?target=&group= cross-target false-positive bug (the filter
+              # matches group bindings on ANY app, not just this target).
+              BOUND_GROUPS=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                | python3 -c "import json,sys; print(','.join(b['group'] for b in json.load(sys.stdin)['results'] if b.get('group')))")
+              bind_group() {
+                gpk=$(first_pk "core/groups/?name=$1")
+                if [ -z "$gpk" ]; then echo "  group '$1' not found yet — skip"; return; fi
+                exists=$(echo "$BOUND_GROUPS" | tr ',' '\n' | grep -qx "$gpk" && echo yes || true)
+                if [ -z "$exists" ]; then
+                  echo "  binding group '$1' to Jitsi (order $2)"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"group\":\"${gpk}\",\"order\":$2,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              }
+              ord=0
+              for g in employees employees-extended authentik-admins jitsi; do
+                bind_group "$g" "$ord"; ord=$((ord+1))
+              done
+
+              echo "Jitsi Authentik provider + tile + access bindings configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jitsi-authentik-provider-cleanup
+  namespace: jitsi
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: jitsi-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n jitsi \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'jitsi'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/jitsi/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=jitsi" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'jitsi' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "Jitsi Authentik cleanup done."

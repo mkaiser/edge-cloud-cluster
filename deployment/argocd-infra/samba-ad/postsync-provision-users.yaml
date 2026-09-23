@@ -1,0 +1,1231 @@
+# Provision Authentik users into Samba AD, then make write-back possible.
+#
+# ── SHAPE: A SUSPENDED CRONJOB PLUS A LAUNCHER, NOT A HOOK JOB ────────────────
+# The work lives in a suspended CronJob (an ordinary resource that always exists and never
+# fires), and TWO things start runs from it with `kubectl create job --from=cronjob/...`:
+#   • samba-ad-provision-users-run — this app's PostSync hook, at the bottom of this file;
+#   • argocd-apps/eda-pcb-agent/presync-ad-account.yaml — an apps-wave app that has just
+#     added an `employees` member and needs it in AD before its own pod can start.
+# The second is the reason for the shape. See the CronJob's own header for why a plain hook
+# Job could not serve it, and why no sequence of ArgoCD syncs could repair that.
+#
+# This is the Authentik -> AD half of Phase 2. The AD -> Authentik half (stamping
+# `distinguishedName`, then password write-back) is authentik-blueprint-ad-source.yaml.
+#
+# ─── WHAT IT DOES, AND WHY IN THIS ORDER ────────────────────────────────────────────────
+#
+#   1. create/refresh the `authentik-sync` AD account the LDAPSource binds as, and delegate
+#      it the rights it needs (read users + reset passwords on CN=Users). NOT domain admin —
+#      see authentik-blueprint-ad-source.yaml for why binding as Administrator was rejected.
+#   2. create one AD account per Authentik user in the selector group, with
+#      uidNumber = 5000 + user.pk and gidNumber = 6000.
+#   3. trigger the LDAPSource inbound sync, then ASSERT that `distinguishedName` landed on
+#      each user.
+#
+# Step 3 is not ceremony. Authentik's write-back
+# (sources/ldap/password.py: `should_check_user`) silently returns False for any user
+# lacking that attribute and logs at INFO — so a password set before the first sync is a
+# SILENT no-op with no UI error. Asserting turns "passwords mysteriously don't reach AD"
+# into a red hook.
+#
+# ─── uid/gid ────────────────────────────────────────────────────────────────────────────
+#
+# uidNumber = 5000 + user.pk, written into AD. AD is the single source: TrueNAS resolves
+# file ownership via winbind/idmap `ad` reading these attributes, and the desktops read the
+# same attribute over sssd id_provider=ad. Nothing derives a uid independently any more —
+# the Authentik LDAP outpost, which computed its own from the pk, was retired — so the two
+# views cannot diverge the way they could when a file written over SMB and the same user
+# seen over NFS came from different formulas.
+#
+# ⚠ FILTER BY user.type. A naive "all users" pass would assign uidNumbers to AnonymousUser,
+# both ak-outpost-* accounts and oidc-provisioner. Only `type=internal` humans are
+# provisioned.
+#
+# ─── SELECTOR ───────────────────────────────────────────────────────────────────────────
+#
+# Members of `employees` (argocd-infra/authentik/blueprint-groups.yaml). The Job FAILS
+# LOUDLY if that group is empty rather than reporting success on zero users — an empty
+# group would make every downstream Phase 2 gate pass vacuously.
+#
+# ⚠ THE SELECTOR MUST BE AN INFRA-OWNED GROUP. An apps-wave group such as
+# `remote-desktop-users` (created by argocd-apps/remote-desktop/authentik-provider.yaml)
+# would make this infra-wave Job depend on an apps-wave one: on a recreate the group does
+# not exist yet, this Job exhausts its backoffLimit and STAYS failed (nothing re-runs a
+# PostSync hook once the sync is done), so zero users reach AD, nothing resolves via NSS on
+# the fileserver, and
+# truenas-configure step_homes skipped every home. Do not point this at an app-owned group
+# again — a disabled or slow app must not be able to remove every user's identity.
+#
+# `employees` is declared in the Authentik blueprint, so it exists before this wave runs
+# and does not depend on which apps are enabled. It is also the accurate name for what
+# membership confers: an AD account, uidNumber/gidNumber, a home directory and fileserver
+# access — every employee gets a home.
+#
+# Uses the DEDICATED ad-provisioner token (authentik-blueprint-ad-provisioner.yaml): read-only on the
+# identity surface, and not the shared OIDC token every app job holds.
+#
+# ⚠ THE RBAC BELOW IS DELIBERATELY NOT HOOKS. It used to carry
+# `hook: PostSync` / `hook-delete-policy: BeforeHookCreation`, which was correct while the
+# work was a hook Job and is wrong now: a run can be started at ANY time, by an app in the
+# other ArgoCD instance, with no sync of this app in progress. The ServiceAccount it runs
+# under therefore has to be an ordinary resource that simply exists. Hook RBAC would still be
+# PRESENT (BeforeHookCreation only deletes at the next sync), so this would have looked fine
+# for a long time and then failed at the worst moment.
+#
+# ⚠ A Job's `spec.template` is IMMUTABLE — which is why nothing here reuses a run's name, and
+# why the launcher timestamps each one. A fixed name would make every later change silently
+# un-deployable: the API server rejects the update, the old pod spec keeps running at the new
+# revision, and the logs keep showing the old error.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-provision-users
+  namespace: samba-ad
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-provision-users
+  namespace: samba-ad
+rules:
+  # exec into the DC to run samba-tool. `get` on pods is needed to find it;
+  # pods/exec `create` is what actually runs the command.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+  # Publish the provisioned user list for the fileserver Job to consume (step 2c).
+  # `patch` is what `kubectl apply` needs on an existing object; without it the
+  # republish fails only on the SECOND run, which is the worst kind of gap — the
+  # first cluster looks fine and a later user addition silently does not propagate.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-provision-users
+  namespace: samba-ad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-provision-users
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-provision-users
+    namespace: samba-ad
+---
+# Exec into the AUTHENTIK server pod, to dispatch the LDAP sync task. Needed because
+# authentik exposes no REST endpoint for it (the viewset's only extra actions are debug,
+# sync/status and used_by — all GET), so a POST.../sync/ just 405s.
+#
+# Scoped deliberately: pods get/list + pods/exec create in the authentik namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-provision-users
+  namespace: authentik
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-provision-users
+  namespace: authentik
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-provision-users
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-provision-users
+    namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: samba-ad-provision-users
+  namespace: samba-ad
+spec:
+  # ⚠ THIS CRONJOB NEVER FIRES. It is a TEMPLATE, not a schedule — `suspend: true` plus a
+  # date that does not exist (31 February). Everything that runs this work does so by
+  # `kubectl create job --from=cronjob/samba-ad-provision-users`, never by the clock.
+  #
+  # WHY A SUSPENDED CRONJOB AND NOT A Job. A Job is the obvious shape and it does not work:
+  # this provisioning has to be re-runnable by things that are not this app's sync, and a
+  # plain hook Job is not there to re-run. Two independent facts make that so, both measured
+  # and both recorded elsewhere in this repo:
+  #   1. A HOOK JOB CAN VANISH. With `hook-delete-policy: HookSucceeded` it deletes itself on
+  #      success, leaving nothing to copy. That flag was removed from this file for exactly
+  #      that reason — and removing it could not bring back the object it had already deleted.
+  #   2. AN ARGOCD SYNC CANNOT BRING IT BACK EITHER. "a no-op sync runs no hooks at all"
+  #      (app-of-apps/wave13-samba-ad.yaml, replication-guard.yaml). A hook-only manifest
+  #      change produces no drift, so there are no tasks, so no hooks run: a sync requested
+  #      on ecc208 at 14:59 returned `successfully synced (no more tasks)` and recreated
+  #      nothing. There is no sequence of syncs that resurrects a self-deleted hook Job.
+  # A CronJob is an ORDINARY resource. It is reconciled like any other manifest, it cannot
+  # delete itself, and `--from` is a first-class kubectl operation — no spec surgery, no
+  # stripping of controller-injected fields, nothing to keep in step with the Job schema.
+  #
+  # ⚠ THE SCHEDULE IS NOT A FALLBACK. Do not un-suspend it or give it a real cron expression.
+  # Step 1 resets the `authentik-sync` account's password and the run authenticates to the
+  # appliance chain; on a timer that becomes a load source against the KDC and a standing
+  # risk, for a job whose input only changes when a human adds a user.
+  schedule: "0 0 31 2 *"
+  suspend: true
+  # Belt and braces: even if something un-suspends it, two runs must never overlap.
+  concurrencyPolicy: Forbid
+  # ⚠ THESE LIMITS APPLY TO MANUALLY-STARTED RUNS TOO, and that is not obvious.
+  # `kubectl create job --from=cronjob/...` stamps a CONTROLLER ownerReference pointing at
+  # this CronJob (verified: `--from` emits ownerReferences with controller: true plus the
+  # annotation cronjob.kubernetes.io/instantiate: manual). So the CronJob controller counts
+  # and prunes those runs exactly as if it had scheduled them — and it does so even while
+  # SUSPENDED, because cleanup runs before the suspend check. At 1/1 a second run would
+  # delete the first run's pod and with it the only copy of its logs, which is precisely what
+  # the `NO ttlSecondsAfterFinished` note in the template argues against.
+  # 3/3 keeps a post-mortem for the last few runs of each outcome while still bounding growth.
+  # ⚠ And deleting this CronJob CASCADES to every run it owns. Do not delete it to "clean up".
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+      # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+      # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+      # pod, and with it the only copy of the logs.
+      #
+      # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+      # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+      # lines for it. A failed hook Job is exactly what you most need logs for after a
+      # recreate.
+      # Retries cover the DC still finishing its startup, or Authentik's API not being up yet.
+      backoffLimit: 5
+      template:
+        spec:
+          serviceAccountName: samba-ad-provision-users
+          restartPolicy: Never
+          # The LIVE cluster CA (public certificate only — no key material), so step 0 can sync it
+          # into Authentik. Mounted from the cert-manager Secret rather than pasted into a
+          # manifest: a cluster recreate issues a BRAND NEW CA, and a stale copy breaks the LDAPS
+          # bind in a way that is invisible where you would look. See step 0.
+          volumes:
+            - name: samba-ad-ca
+              secret:
+                secretName: samba-ad-ca-tls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
+          initContainers:
+            # Authentik must be ANSWERING before the work starts, not merely scheduled.
+            # Measured 2026-09-15: four runs of this Job died at step 2 with
+            #   ERROR: cannot read users from Authentik API (HTTP 000)
+            #   curl: (7) Failed to connect to authentik-server...:80
+            # because Authentik was mid-restart. Steps 0-1 had already run, so each failure
+            # re-did that work for nothing before dying.
+            #
+            # ⚠ GATE HERE, NOT VIA backoffLimit. Same rule as truenas-configure's
+            # read-onprem-dcs initContainer: wait BEFORE the credentialed work begins. Raising
+            # backoffLimit would retry the whole body — re-running the password-policy and
+            # bind-account steps on every attempt — instead of just waiting.
+            - name: wait-authentik
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              env:
+                - name: AUTHENTIK_URL
+                  value: "http://authentik-server.authentik.svc.cluster.local"
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  # Unauthenticated liveness endpoint — this gate asserts REACHABILITY only,
+                  # so it needs no token. A 2xx/3xx here means the API is serving.
+                  i=0
+                  until code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                                 "${AUTHENTIK_URL}/-/health/live/" 2>/dev/null) \
+                        && [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; do
+                    i=$((i + 1))
+                    if [ "$i" -ge 60 ]; then
+                      echo "Authentik still not answering after 5m (last HTTP ${code:-000})" >&2
+                      exit 1
+                    fi
+                    echo "waiting for Authentik (HTTP ${code:-000}) [$i/60]"
+                    sleep 5
+                  done
+                  echo "Authentik answering (HTTP $code)"
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { memory: 64Mi }
+          containers:
+            - name: provision
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              volumeMounts:
+                - name: samba-ad-ca
+                  mountPath: /ad-ca
+                  readOnly: true
+              env:
+                - name: AD_PROVISIONER_TOKEN
+                  valueFrom:
+                    secretKeyRef: { name: samba-ad-authentik, key: AD_PROVISIONER_TOKEN }
+                - name: SAMBA_AD_BIND_PASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: samba-ad-authentik, key: SAMBA_AD_BIND_PASSWORD }
+                - name: AUTHENTIK_URL
+                  value: "http://authentik-server.authentik.svc.cluster.local"
+                - name: DC_POD
+                  value: "ad-cloud-0"
+                # ⚠ INFRA-OWNED ON PURPOSE. `employees` is declared in
+                # argocd-infra/authentik/blueprint-groups.yaml, so it exists as soon as the
+                # Authentik blueprint applies — BEFORE this wave, and regardless of which apps
+                # are enabled. The previous selector (`remote-desktop-users`) is created by an
+                # apps-wave PostSync job (argocd-apps/remote-desktop/authentik-provider.yaml),
+                # which made this infra Job depend on an apps one: on a recreate the group is
+                # still absent, this Job exhausts its backoffLimit and STAYS failed (nothing
+                # re-runs a PostSync hook), so no user reaches AD, nothing resolves via NSS on
+                # the fileserver, and truenas step_homes skips every home.
+                #
+                # `employees` is also the honest name for what membership grants: an AD
+                # account, uidNumber/gidNumber, a home directory and fileserver access. None of
+                # those are remote-desktop concerns — an eda-developer member needs the AD
+                # account for the share ACL whether or not they ever open a desktop.
+                #
+                # remote-desktop-users KEEPS its own job: Guacamole group membership and the
+                # access-remote-desktop policy. It is no longer what confers a POSIX identity.
+                - name: SELECTOR_GROUP
+                  value: "employees"
+                # Mirrored into AD by step 2a and referenced by the eda SMB share's ACL.
+                # ⚠ Its members must ALSO be in SELECTOR_GROUP — that is what gives them an AD
+                # account in the first place.
+                - name: EDA_ACCESS_GROUP
+                  value: "eda-developer"
+                - name: UID_START
+                  value: "5000" # base for uidNumber = 5000 + Authentik pk (see header)
+                - name: GID_NUMBER
+                  value: "6000"
+                # gidNumber for the EDA access group. MUST be set and MUST be distinct from
+                # GID_NUMBER: fs-1 joins with idmap backend `ad` + RFC2307, which READS ids from
+                # the directory instead of allocating them, so a group with no gidNumber cannot
+                # be mapped to a unix id at all. Both inside the appliance's idmap range
+                # (5000-105000) or it is out of scope for the AD idmap domain and fails the same
+                # way. See step 2a.
+                - name: EDA_GROUP_GID
+                  value: "6001"
+                # The NIS domain stamped into the RFC2307 attributes. Follows the AD NetBIOS
+                # domain; it was hardcoded `cape` and went stale at the ad.base rename.
+                - name: NIS_DOMAIN
+                  value: "ad"
+                - name: BASE_DN
+                  value: "dc=ad,dc=base,dc=internal" # automatically updated from project-settings:activeDirectory.baseDn
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  AUTH="Authorization: Bearer ${AD_PROVISIONER_TOKEN}"
+                  dc() { kubectl exec -n samba-ad "$DC_POD" -c samba -- "$@"; }
+                  AK_POD=$(kubectl get pods -n authentik \
+                      -l app.kubernetes.io/component=server -o jsonpath='{.items[0].metadata.name}')
+
+                  echo "== 0. sync the LIVE cluster CA into Authentik =="
+                  # WHY THIS STEP EXISTS — it fixes a silent, recreate-triggered failure.
+                  #
+                  # Authentik's LDAPSource validates the DC's LDAPS certificate against a
+                  # CertificateKeyPair stored in Authentik's own DB. ⚠ Do NOT paste that PEM into
+                  # authentik-blueprint-ad-source.yaml: a cluster recreate makes cert-manager mint a
+                  # NEW CA, so a pasted copy no longer signs the live DC cert. The bind then fails
+                  # CERTIFICATE_VERIFY_FAILED *inside the async worker task* — step 3's dispatch
+                  # still reports success, `distinguishedName` never lands, and password
+                  # write-back silently no-ops for every user
+                  # (sources/ldap/password.py: should_check_user -> False, logged at INFO only).
+                  # Reading the mounted cert-manager Secret makes the trust anchor follow the
+                  # cluster instead of a value committed to git.
+                  #
+                  # Uses `ak shell`, NOT the REST API: AD_PROVISIONER_TOKEN is deliberately
+                  # read-only on the identity surface and gets 403 on
+                  # /api/v3/crypto/certificatekeypairs/. Step 3 already execs `ak shell` under the
+                  # same RBAC, so this needs no extra permission.
+                  if [ ! -s /ad-ca/ca.crt ]; then
+                    echo "ERROR: /ad-ca/ca.crt missing or empty — is Secret samba-ad-ca-tls present?" >&2
+                    exit 1
+                  fi
+                  # The PEM travels as ONE base64 line embedded in the -c string. Deliberate:
+                  # `kubectl cp` needs tar in the target image and a writable path, and a
+                  # multi-line PEM inside nested shell+python quoting is the other way this
+                  # breaks. base64 has neither problem.
+                  CA_B64=$(base64 -w0 < /ad-ca/ca.crt)
+                  CA_RESULT=$(kubectl exec -n authentik "$AK_POD" -- ak shell -c "
+                  import base64
+                  from authentik.crypto.models import CertificateKeyPair
+                  pem = base64.b64decode('${CA_B64}').decode().strip()
+                  kp, created = CertificateKeyPair.objects.get_or_create(
+                      name='samba-ad-ca', defaults={'certificate_data': pem})
+                  if created:
+                      print('RESULT=created')
+                  elif (kp.certificate_data or '').strip() != pem:
+                      # Public trust anchor ONLY — never write key_data: Authentik must not hold
+                      # the CA private key.
+                      kp.certificate_data = pem
+                      kp.save()
+                      print('RESULT=updated')
+                  else:
+                      print('RESULT=current')
+                  " 2>/dev/null | grep -oE 'RESULT=[a-z]+' | head -1) || true
+                  case "${CA_RESULT:-}" in
+                    RESULT=created) echo "  CA imported into Authentik" ;;
+                    RESULT=updated) echo "  CA UPDATED to the live cluster CA (the stale one breaks write-back)" ;;
+                    RESULT=current) echo "  CA already current — no change" ;;
+                    *) echo "ERROR: could not sync the CA into Authentik (got '${CA_RESULT:-<empty>}')" >&2
+                       exit 1 ;;
+                  esac
+
+                  echo "== 0b. domain password policy =="
+                  # WHY THIS IS HERE AND NOT A ONE-OFF: domain password policy lives in sam.ldb,
+                  # i.e. LIVE CLUSTER STATE that a recreate reverts to the provision default.
+                  # That is exactly how complexity came to be OFF for a while: it was set by hand,
+                  # then a rebuild silently dropped it and nothing in git said otherwise.
+                  #
+                  # ⚠ MUST RUN BEFORE STEP 1. Step 1 creates authentik-sync from the sealed
+                  # password; tightening policy afterwards can retroactively reject a value that
+                  # was accepted at create time (surfacing as a 0000052D failure).
+                  #
+                  # No -U credential: `dc` execs as root inside the DC pod, so this cannot
+                  # contribute to a lockout the way a password bind could.
+                  #
+                  # Lockout numbers are load-bearing, not taste — see doc/ad-identity-chain.md:
+                  # authentik-sync binds from a dramatiq worker whose LDAP actors set no
+                  # max_retries, so dramatiq's default of 20 applies. Backoff is exponential from
+                  # 15s, so only ~6 retries fall inside a 15-minute window and the counter resets
+                  # before the 10th. At duration/reset 30 that margin shrinks. Do NOT raise the
+                  # windows or lower the threshold without redoing that arithmetic.
+                  WANT_COMPLEXITY="on"; WANT_MINLEN=12
+                  WANT_THRESHOLD=10; WANT_DURATION=15; WANT_RESET=15
+
+                  pwset=$(dc samba-tool domain passwordsettings show)
+                  cur() { echo "$pwset" | sed -n "s/^$1: *//p" | head -1; }
+                  CUR_COMPLEXITY=$(cur "Password complexity")
+                  CUR_MINLEN=$(cur "Minimum password length")
+                  CUR_THRESHOLD=$(cur "Account lockout threshold (attempts)")
+                  CUR_DURATION=$(cur "Account lockout duration (mins)")
+                  CUR_RESET=$(cur "Reset account lockout after (mins)")
+
+                  # Read-compare-set so a no-drift run logs "current" instead of rewriting the
+                  # domain object, matching step 0's created/updated/current style.
+                  POLICY_ARGS=""
+                  [ "$CUR_COMPLEXITY" = "$WANT_COMPLEXITY" ] || POLICY_ARGS="$POLICY_ARGS --complexity=$WANT_COMPLEXITY"
+                  [ "$CUR_MINLEN" = "$WANT_MINLEN" ] || POLICY_ARGS="$POLICY_ARGS --min-pwd-length=$WANT_MINLEN"
+                  [ "$CUR_THRESHOLD" = "$WANT_THRESHOLD" ] || POLICY_ARGS="$POLICY_ARGS --account-lockout-threshold=$WANT_THRESHOLD"
+                  [ "$CUR_DURATION" = "$WANT_DURATION" ] || POLICY_ARGS="$POLICY_ARGS --account-lockout-duration=$WANT_DURATION"
+                  [ "$CUR_RESET" = "$WANT_RESET" ] || POLICY_ARGS="$POLICY_ARGS --reset-account-lockout-after=$WANT_RESET"
+
+                  if [ -n "$POLICY_ARGS" ]; then
+                    # shellcheck disable=SC2086
+                    dc samba-tool domain passwordsettings set $POLICY_ARGS >/dev/null
+                    echo "password policy updated:$POLICY_ARGS"
+                  else
+                    echo "password policy current (complexity=$CUR_COMPLEXITY minlen=$CUR_MINLEN lockout=$CUR_THRESHOLD/$CUR_DURATION/$CUR_RESET)"
+                  fi
+
+                  # Administrator is consumed ONLY from the sealed secret (replication-guard binds
+                  # as it ~14x per 5-minute run with errors suppressed). maxPwdAge is 42d, so
+                  # without this the password expires on a clock nothing tracks and replication
+                  # breaks silently. Same reasoning as authentik-sync in step 1.
+                  dc samba-tool user setexpiry Administrator --noexpiry >/dev/null
+                  echo "Administrator: password set to never expire"
+
+                  echo "== 1. bind account for the LDAPSource =="
+                  # ⚠ AD enforces 3-of-4 character classes. The sealed value MUST already
+                  # satisfy that — it is used verbatim here and, unchanged, by
+                  # authentik-blueprint-ad-source.yaml's bind. authentik/sealSecrets.sh generates it with
+                  # a complexity-safe alphabet for exactly this reason; a value that fails gives
+                  #   0000052D: check_password_restrictions:... does not meet the complexity criteria
+                  # on create, or a silent 49/52e invalidCredentials on bind if the two sides
+                  # ever disagree. Do NOT "fix" a bad value by mangling it here — that would
+                  # desynchronise this Job from the LDAPSource.
+                  # Idempotent: create, or just reset the password if it already exists so the
+                  # account always matches the sealed value.
+                  if dc samba-tool user show authentik-sync >/dev/null 2>&1; then
+                    dc samba-tool user setpassword authentik-sync \
+                      --newpassword="$SAMBA_AD_BIND_PASSWORD" >/dev/null
+                    echo "authentik-sync exists — password re-synced to the sealed value"
+                  else
+                    dc samba-tool user create authentik-sync "$SAMBA_AD_BIND_PASSWORD" \
+                      --description="Authentik LDAPSource bind account (password write-back)" >/dev/null
+                    echo "authentik-sync created"
+                  fi
+                  # Never expire: an expired bind password breaks password changes cluster-wide
+                  # (an unreachable/unusable DC makes Authentik raise ValidationError).
+                  dc samba-tool user setexpiry authentik-sync --noexpiry >/dev/null
+
+                  # Grant "Reset Password" on CN=Users so write-back can set unicodePwd without
+                  # the account being domain admin. WITHOUT THIS the bind succeeds and the
+                  # password change then fails with
+                  #   LDAPInsufficientAccessRightsResult - 50 - error in module acl:
+                  #   insufficient access rights during LDB_MODIFY
+                  # which surfaces in Authentik only as ValidationError("Failed to set
+                  # password") — the underlying cause is invisible from the UI.
+                  #
+                  # ⚠ `samba-tool delegation add-service` is NOT this: that is Kerberos
+                  # constrained delegation, unrelated to directory ACLs.
+                  #
+                  # SDDL notes, both learned the hard way:
+                  #   - the ACE is passed BARE, with no "D:" prefix (a D:-prefixed string is
+                  #     rejected with "unknown error")
+                  #   - the access right is CR (control/extended right), not CA — "CA" fails
+                  #     with "could not parse access string"
+                  #   - 00299570-246d-11d0-a768-00aa006e0529 is the standard Reset Password
+                  #     extended-right GUID; CI makes it inherit to the user objects inside.
+                  # Idempotent: re-applying an identical ACE is a no-op.
+                  SYNC_SID=$(dc samba-tool user show authentik-sync --attributes=objectSid \
+                              2>/dev/null | awk '/^objectSid/{print $2}')
+                  if [ -n "$SYNC_SID" ]; then
+                    dc samba-tool dsacl set --objectdn="CN=Users,${BASE_DN}" \
+                      --sddl="(OA;CI;CR;00299570-246d-11d0-a768-00aa006e0529;;${SYNC_SID})" \
+                      >/dev/null 2>&1 && echo "reset-password right granted to authentik-sync" \
+                      || echo "  (dsacl set returned non-zero; ACE may already be present)"
+                  else
+                    echo "WARNING: could not read authentik-sync SID — write-back will fail 50" >&2
+                  fi
+                  echo "== 2. provision users from group '$SELECTOR_GROUP' =="
+                  # ⚠ Query the USERS endpoint filtered by group, not groups/.users_obj. The
+                  # group serializer's users_obj is a REDUCED representation — it carries
+                  # pk/username/name/email/attributes but NOT `type`, so a
+                  # `select(.type=="internal")` against it silently matches nothing and the Job
+                  # reports an empty group even when the group is populated. The users endpoint
+                  # returns the full object.
+                  # ⚠ CAPTURE THE BODY, NOT JUST THE EXIT CODE. `groups_by_name` is validated
+                  # as a CHOICE against existing groups, so a group that does not exist is a
+                  # 400 with a precise reason — not an empty result set. With `curl -sf` that
+                  # body is discarded and the failure reads as a generic "cannot read users",
+                  # which sends debugging at the token and the network instead of at the
+                  # missing group:
+                  #   {"groups_by_name":["Select a valid choice. remote-desktop-users is not
+                  #    one of the available choices."]}
+                  # $SELECTOR_GROUP is infra-declared (authentik/blueprint-groups.yaml), so
+                  # absence means the Authentik blueprint has not applied yet — print the
+                  # reason rather than letting it read as a token or network fault.
+                  HTTP_BODY=$(curl -sS -w '\n%{http_code}' -H "$AUTH" \
+                    "${AUTHENTIK_URL}/api/v3/core/users/?groups_by_name=${SELECTOR_GROUP}&type=internal" 2>&1) || true
+                  HTTP_CODE=$(printf '%s' "$HTTP_BODY" | tail -n1)
+                  GROUP_JSON=$(printf '%s' "$HTTP_BODY" | sed '$d')
+                  if [ "$HTTP_CODE" != "200" ]; then
+                    echo "ERROR: cannot read users from Authentik API (HTTP $HTTP_CODE)" >&2
+                    echo "  response: $GROUP_JSON" >&2
+                    case "$GROUP_JSON" in
+                      *"not one of the available choices"*)
+                        echo "  => the group '$SELECTOR_GROUP' does not exist in Authentik yet." >&2
+                        echo "     It is declared in argocd-infra/authentik/blueprint-groups.yaml," >&2
+                        echo "     applied by the Authentik blueprint ahead of this wave. Check" >&2
+                        echo "     that the authentik app is Healthy and its blueprint applied." >&2
+                        ;;
+                    esac
+                    exit 1
+                  fi
+                  MEMBERS=$(echo "$GROUP_JSON" | jq -r \
+                    '.results // [] | .[] | select(.type=="internal") | "\(.pk)\t\(.username)\t\(.name // "")\t\(.email // "")\t\((.attributes.sshPublicKey // "") | gsub("[\t\n]"; " "))"')
+
+                  if [ -z "$MEMBERS" ]; then
+                    echo "ERROR: group '$SELECTOR_GROUP' has no internal-type members." >&2
+                    echo "  Provisioning zero users would make every Phase 2 gate pass vacuously," >&2
+                    echo "  so this is a hard failure rather than a no-op success." >&2
+                    exit 1
+                  fi
+
+                  COUNT=0
+                  while IFS=$'\t' read -r pk username fullname email sshkey; do
+                    [ -z "$username" ] && continue
+                    UIDN=$((UID_START + pk))
+                    if dc samba-tool user show "$username" >/dev/null 2>&1; then
+                      # ⚠ uidNumber IS WRITE-ONCE. AD is authoritative once a uid is assigned:
+                      # it is filled in when ABSENT and never overwritten afterwards.
+                      #
+                      # WHY, because the obvious alternative is what we tried first and it is
+                      # wrong. uid was derived as uidStartNumber + Authentik pk, and a pk is NOT
+                      # stable — deleting and recreating a user in Authentik assigns a fresh one.
+                      # testuser's pk moved 8 -> 24, so the LDAP outpost
+                      # handed the desktop uid 5024 while AD (and the fileserver) said 5008. Same
+                      # user, two uids.
+                      #
+                      # Reconciling AD to the new pk "fixes" the disagreement and creates a worse
+                      # problem: a user's uid changes underneath files they already own, so their
+                      # own home becomes unreadable, and the appliance then serves a STALE mapping
+                      # that survives cache_refresh AND a cifs restart — and the one API that
+                      # clears it leaves winbind resolving NOTHING
+                      # ([[truenas-clear-idmap-cache-wedges-winbind]]). A uid that can move is a
+                      # hazard whatever the caches do.
+                      #
+                      # So: a uid, once given out, is permanent. The pk only ever SEEDS it.
+                      CUR_UID=$(dc samba-tool user show "$username" 2>/dev/null \
+                                | sed -nE 's/^uidNumber:[[:space:]]*([0-9]+).*/\1/p' | head -n1)
+                      if [ -z "$CUR_UID" ]; then
+                        # Pre-existing account with no POSIX attributes yet (or one created
+                        # before this Job existed). Seed it now; it becomes permanent.
+                        echo "  $username exists but has NO uidNumber — seeding $UIDN"
+                        DN=$(dc samba-tool user show "$username" 2>/dev/null \
+                             | sed -nE 's/^dn:[[:space:]]*(.*)/\1/p' | head -n1)
+                        if [ -n "$DN" ] && dc sh -c "printf 'dn: %s\nchangetype: modify\nadd: uidNumber\nuidNumber: %s\n' '$DN' '$UIDN' > /tmp/uid.ldif && ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/uid.ldif" >/dev/null 2>&1; then
+                          echo "    uidNumber set to $UIDN"
+                        else
+                          echo "  ERROR: could not seed uidNumber for $username — the fileserver" >&2
+                          echo "    cannot map this user until it is set (idmap_backend AD reads" >&2
+                          echo "    uidNumber; it does not compute one)." >&2
+                        fi
+                      elif [ "$CUR_UID" = "$UIDN" ]; then
+                        echo "  $username exists (uid $UIDN) — leaving password alone"
+                      else
+                        # NOT an error and NOT repaired: AD wins WHILE THE ACCOUNT EXISTS, and
+                        # every consumer reads the uidNumber attribute from AD, so this
+                        # mismatch is cosmetic — it only means the pk no longer implies the uid
+                        # this account was first given. Overwriting it would move a uid under
+                        # files the user already owns, mid-cluster-life, which is the hazard the
+                        # write-once rule exists to prevent.
+                        #
+                        # ⚠ THIS DOES NOT SURVIVE A RECREATE, and that is deliberate. A recreate
+                        # destroys sam.ldb, so there is no CUR_UID to keep and the account is
+                        # recreated at uidStartNumber + the CURRENT pk. The appliance then
+                        # re-owns the surviving home to match, matched by username
+                        # (truenas/configure-job.yaml step_homes, recursive chown). Authentik is
+                        # the allocator across that boundary; AD is authoritative only within
+                        # the lifetime of one cluster.
+                        echo "  $username keeps uidNumber $CUR_UID (AD is authoritative;"
+                        echo "    Authentik pk $pk would imply $UIDN — NOT overwritten)"
+                      fi
+                    else
+                      # No password is set here ON PURPOSE. Authentik owns passwords; the user's
+                      # real password arrives via write-back on their next password change.
+                      # A random one keeps the account unusable until then.
+                      RANDPW="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 24)Aa1!"
+                      dc samba-tool user create "$username" "$RANDPW" \
+                        --given-name="${fullname%% *}" \
+                        --mail-address="${email:-}" \
+                        --nis-domain="$NIS_DOMAIN" --uid-number="$UIDN" --gid-number="$GID_NUMBER" \
+                        --login-shell=/bin/bash --unix-home="/home/$username" >/dev/null
+                      echo "  $username created (uid $UIDN)"
+                    fi
+                    dc samba-tool user setexpiry "$username" --noexpiry >/dev/null
+
+                    # --- SSH public key -> AD ------------------------------------------------
+                    # ⚠ WHY THIS EXISTS. sshd authenticates desktop users by key via
+                    # `AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys`, and SSSD reads the
+                    # key from the directory rather than ~/.ssh (deliberate: on a network /home,
+                    # OpenSSH StrictModes REFUSES a key file whose mode/owner it cannot trust, and
+                    # a key in $HOME could not be installed before a first PASSWORD login). Today
+                    # that attribute comes from Authentik via the LDAP outpost. Once the desktop
+                    # switches to id_provider = ad it reads AD instead — and AD has no
+                    # sshPublicKey unless something puts it there. Without this step key auth
+                    # silently degrades to a password prompt at the cutover.
+                    #
+                    # Verified end-to-end before writing this: setting
+                    # attributes.sshPublicKey in Authentik makes the outpost serve it and
+                    # `sss_ssh_authorizedkeys testuser` return the key in the desktop pod. ⚠ The
+                    # outpost caches (search_mode: cached), so a NEW key is not visible until its
+                    # cache turns over — a restart forces it. Expect the same lag class here.
+                    #
+                    # ⚠ altSecurityIdentities, chosen against the LIVE schema: it already exists
+                    # and is isSingleValued FALSE, so it holds SEVERAL keys per user. `info` and
+                    # `comment` exist too but are single-valued (one key only). Extending the AD
+                    # schema was rejected — a schema change is irreversible and replicates
+                    # forest-wide.
+                    DN=$(dc samba-tool user show "$username" 2>/dev/null \
+                         | sed -nE 's/^dn:[[:space:]]*(.*)/\1/p' | head -n1)
+                    if [ -z "$DN" ]; then
+                      echo "  WARNING: no DN for $username — skipping ssh key sync" >&2
+                    elif [ -n "${sshkey:-}" ]; then
+                      # REPLACE, never add: an append would leave a rotated key valid forever.
+                      # That is a security property, not tidiness.
+                      if dc sh -c "printf 'dn: %s\nchangetype: modify\nreplace: altSecurityIdentities\naltSecurityIdentities: %s\n' '$DN' '$sshkey' > /tmp/sshkey.ldif && ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/sshkey.ldif" >/dev/null 2>&1; then
+                        echo "  $username: ssh key synced to AD"
+                      else
+                        echo "  WARNING: could not sync $username's ssh key to AD" >&2
+                      fi
+                    else
+                      # Absent in Authentik ⇒ absent in AD, so REVOKING a key actually revokes it.
+                      # `delete` on an attribute that is already absent is an error, so it is
+                      # tolerated rather than reported.
+                      dc sh -c "printf 'dn: %s\nchangetype: modify\ndelete: altSecurityIdentities\n' '$DN' > /tmp/sshkey.ldif && ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/sshkey.ldif" >/dev/null 2>&1 || true
+                    fi
+                    COUNT=$((COUNT + 1))
+                  done <<< "$MEMBERS"
+                  echo "provisioned/verified $COUNT user(s)"
+
+                  # Publish the provisioned user list so the fileserver can create their homes.
+                  # ⚠ WHY A CONFIGMAP HANDOVER instead of creating the homes right here: this
+                  # Job holds the Authentik token and the domain admin password but NOT the
+                  # TrueNAS credential, runs an image with no websocket client, and is not
+                  # pinned to a lab node — cloud nodes cannot reach 192.168.1.0/24 at all. The
+                  # fileserver Job (truenas/configure-job.yaml) has all three and is pinned
+                  # correctly. So the authoritative list is produced here, where it is known,
+                  # and consumed there, where it can be acted on.
+                  #
+                  # ⚠ WHY NOT let the fileserver enumerate AD itself: it cannot. A domain-joined
+                  # TrueNAS resolves a user BY NAME through NSS, but `user.query` over the
+                  # directory cache returns ZERO domain users even
+                  # after directoryservices.cache_refresh. Name resolution and enumeration are
+                  # different capabilities; only the first works.
+                  #
+                  # This makes new users automatic: add someone to the Authentik group, this
+                  # Job provisions them into AD and republishes the list, and the fileserver
+                  # Job creates their home on its next sync. No hardcoded roster.
+                  HOME_USERS=$(printf '%s\n' "$MEMBERS" | cut -f2 | sed '/^$/d' | paste -sd, -)
+                  echo "publishing home-user list: $HOME_USERS"
+                  kubectl create configmap truenas-home-users \
+                    --namespace samba-ad \
+                    --from-literal=users="$HOME_USERS" \
+                    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+                    && echo "  configmap truenas-home-users updated" \
+                    || echo "  WARNING: could not publish the home-user list; the fileserver" >&2
+
+                  echo
+                  echo "== 2a. mirror the EDA-artifacts access group into AD =="
+                  # WHY THIS EXISTS: the eda SMB share (installer media, on the artifacts
+                  # dataset) is AD-authenticated, and without a group to bind an ACL to, the
+                  # share is writable by EVERY domain user. This mirrors ONE Authentik group
+                  # into AD so the share ACL has something narrower to reference.
+                  #
+                  # ⚠ MEMBERSHIP IS ONE-WAY: Authentik -> AD. Nothing reads it back. Removing a
+                  # user in Authentik removes them here on the next run; editing the AD group by
+                  # hand is silently reverted.
+                  #
+                  # ⚠ A MEMBER MUST ALSO BE IN $SELECTOR_GROUP. Only that group's members get an
+                  # AD ACCOUNT at all (step 2 above), so someone in eda-developer but not in
+                  # $SELECTOR_GROUP has nothing to add — reported, not fatal, because it is
+                  # a membership mistake in Authentik rather than a broken deployment.
+                  EDA_GROUP="${EDA_ACCESS_GROUP:-eda-developer}"
+                  if ! dc samba-tool group show "$EDA_GROUP" >/dev/null 2>&1; then
+                    echo "  creating AD group '$EDA_GROUP'"
+                    dc samba-tool group add "$EDA_GROUP" \
+                      --description="EDA installer-media share (mirrored from Authentik)" \
+                      --gid-number="$EDA_GROUP_GID" --nis-domain="$NIS_DOMAIN" \
+                      >/dev/null 2>&1 || echo "  WARNING: could not create '$EDA_GROUP'" >&2
+                  else
+                    echo "  AD group '$EDA_GROUP' already present"
+                  fi
+
+                  # ⚠ A GROUP WITHOUT gidNumber CANNOT BE USED IN THE SHARE ACL. Same root cause
+                  # as 2b below, different object: idmap_ad + RFC2307 reads ids from the
+                  # directory rather than allocating them, so an unmapped group makes the
+                  # appliance fail SID->unix-id conversion outright. The symptom is NOT "group
+                  # not found": sharing.smb.setacl dies with
+                  #   WBC_ERR_DOMAIN_NOT_FOUND: wbcSidsToUnixIds failed
+                  # or, through the TrueNAS API wrapper, the even less helpful
+                  #   TypeError: 'NoneType' object is not subscriptable
+                  # and the share stays wide open — with the group present on both DCs,
+                  # replicating fine, and `directoryservices.status` HEALTHY the whole time.
+                  #
+                  # Separate from the create above on purpose — a group created by an EARLIER
+                  # revision of this job (or by hand) has no gidNumber and would never get one.
+                  EDA_GID=$(dc samba-tool group show "$EDA_GROUP" 2>/dev/null \
+                            | sed -nE 's/^gidNumber:[[:space:]]*([0-9]+).*/\1/p' | head -n1)
+                  if [ -n "$EDA_GID" ]; then
+                    echo "  AD group '$EDA_GROUP' already has gidNumber $EDA_GID"
+                  else
+                    # ldbmodify for the same reason as 2b: `samba-tool group edit` needs an
+                    # interactive $EDITOR and there is no set-gidnumber subcommand.
+                    EDA_DN=$(dc samba-tool group show "$EDA_GROUP" 2>/dev/null \
+                             | sed -nE 's/^dn:[[:space:]]*(.*)/\1/p' | head -n1)
+                    if [ -z "$EDA_DN" ]; then
+                      echo "  WARNING: could not read the '$EDA_GROUP' DN — skipping." >&2
+                    elif dc sh -c "printf 'dn: %s\nchangetype: modify\nadd: gidNumber\ngidNumber: %s\n' '$EDA_DN' '$EDA_GROUP_GID' > /tmp/eda.ldif && ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/eda.ldif" >/dev/null 2>&1; then
+                      echo "  AD group '$EDA_GROUP': set gidNumber $EDA_GROUP_GID"
+                    else
+                      echo "  WARNING: could not set gidNumber on '$EDA_GROUP' — the SMB share" >&2
+                      echo "    ACL cannot reference it and the share stays open." >&2
+                    fi
+                  fi
+
+                  # Authentik members of the SAME-NAMED group. A missing/empty group is NOT an
+                  # error: the share simply has no members yet, which is the initial state.
+                  EDA_JSON=$(curl -sf -H "$AUTH" \
+                    "${AUTHENTIK_URL}/api/v3/core/users/?groups_by_name=${EDA_GROUP}&type=internal" || echo '{}')
+                  EDA_MEMBERS=$(echo "$EDA_JSON" | jq -r '.results // [] | .[] | .username')
+                  if [ -z "$EDA_MEMBERS" ]; then
+                    echo "  Authentik group '$EDA_GROUP' has no members — nothing to mirror"
+                  else
+                    # Current AD membership, so this converges instead of blindly re-adding.
+                    CUR=$(dc samba-tool group listmembers "$EDA_GROUP" 2>/dev/null | tr -d '\r' || true)
+                    for m in $EDA_MEMBERS; do
+                      if ! dc samba-tool user show "$m" >/dev/null 2>&1; then
+                        echo "  SKIP $m — in '$EDA_GROUP' but has no AD account (add them to" >&2
+                        echo "       '$SELECTOR_GROUP' too, which is what creates the account)" >&2
+                        continue
+                      fi
+                      if echo "$CUR" | grep -qx "$m"; then
+                        echo "  $m: already a member"
+                      else
+                        dc samba-tool group addmembers "$EDA_GROUP" "$m" >/dev/null 2>&1 \
+                          && echo "  $m: added" \
+                          || echo "  WARNING: could not add $m to $EDA_GROUP" >&2
+                      fi
+                    done
+                    # Remove anyone AD has but Authentik no longer lists — Authentik is the
+                    # source of truth for this group.
+                    for c in $CUR; do
+                      [ -z "$c" ] && continue
+                      if ! echo "$EDA_MEMBERS" | grep -qx "$c"; then
+                        dc samba-tool group removemembers "$EDA_GROUP" "$c" >/dev/null 2>&1 \
+                          && echo "  $c: removed (no longer in the Authentik group)" \
+                          || echo "  WARNING: could not remove $c from $EDA_GROUP" >&2
+                      fi
+                    done
+                  fi
+
+                  echo
+                  echo "== 2b. give Domain Users a gidNumber (idmap_ad cannot map users without it) =="
+                  # ⚠ WITHOUT THIS, NO DOMAIN USER RESOLVES ON A MEMBER SERVER AT ALL — and the
+                  # symptom points nowhere near the cause.
+                  #
+                  # TrueNAS joins with idmap backend `ad` + RFC2307 (deliberately, so uids match
+                  # what this Job writes rather than RID-hashed values). That backend reads ids
+                  # from the directory instead of computing them, and it requires the user's
+                  # PRIMARY GROUP to be mapped too — not just the user. Every user created here
+                  # gets primaryGroupID 513 (Domain Users), and `samba-tool domain provision`
+                  # does NOT give Domain Users a gidNumber.
+                  #
+                  # fs-1 joined, directoryservices.status
+                  # HEALTHY, and yet ZERO domain users and groups were visible — `getent` style
+                  # lookups failed for testuser AND for Administrator. testuser had uidNumber
+                  # 5008 and gidNumber 6000 set correctly; only Domain Users' missing gidNumber
+                  # stopped it resolving. Nothing in the join, the status or the logs mentions
+                  # a group.
+                  #
+                  # Idempotent: read the attribute, set it only when absent. Uses the same
+                  # GID_NUMBER as the users' own gidNumber so a user's primary group and their
+                  # gidNumber agree, which is what avoids the "cannot find name for group ID"
+                  # class of warning in the desktop pods.
+                  DU_GID=$(dc samba-tool group show "Domain Users" 2>/dev/null \
+                           | sed -nE 's/^gidNumber:[[:space:]]*([0-9]+).*/\1/p' | head -n1)
+                  if [ -n "$DU_GID" ]; then
+                    echo "  Domain Users already has gidNumber $DU_GID"
+                  else
+                    # ⚠ ldbmodify, NOT `samba-tool group edit`. That subcommand shells out to
+                    # an $EDITOR and cannot be driven non-interactively — passing --editor with
+                    # a sed one-liner dies in subprocess._execute_child (tried; it fails).
+                    # There is no `samba-tool group set-gidnumber`, so an LDIF modify against
+                    # sam.ldb is the supported non-interactive path. Run on the CLOUD DC and let
+                    # it replicate, since this is a one-off directory edit rather than the
+                    # per-DC-local repair the A-record prune has to be.
+                    DU_DN=$(dc samba-tool group show "Domain Users" 2>/dev/null \
+                            | sed -nE 's/^dn:[[:space:]]*(.*)/\1/p' | head -n1)
+                    if [ -z "$DU_DN" ]; then
+                      echo "  WARNING: could not read the Domain Users DN — skipping." >&2
+                    elif dc sh -c "printf 'dn: %s\nchangetype: modify\nadd: gidNumber\ngidNumber: %s\n' '$DU_DN' '$GID_NUMBER' > /tmp/du.ldif && ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/du.ldif" >/dev/null 2>&1; then
+                      echo "  Domain Users: set gidNumber $GID_NUMBER"
+                    else
+                      echo "  WARNING: could not set gidNumber on Domain Users — member servers" >&2
+                      echo "    using idmap_ad will not resolve ANY domain user until it is set." >&2
+                    fi
+                  fi
+
+                  echo "== 3. trigger the inbound sync and ASSERT distinguishedName landed =="
+                  SRC=$(curl -sf -H "$AUTH" "${AUTHENTIK_URL}/api/v3/sources/ldap/?slug=samba-ad" \
+                        | jq -r '.results[0].slug // empty')
+                  if [ -z "$SRC" ]; then
+                    echo "ERROR: LDAPSource 'samba-ad' not found — is authentik-blueprint-ad-source applied?" >&2
+                    exit 1
+                  fi
+                  # ⚠ There is NO REST endpoint to trigger an LDAP sync. The viewset's only
+                  # extra actions are debug, sync/status and used_by — all GET — so a
+                  # POST.../sync/ returns 405 and silently does nothing (that is exactly what
+                  # this Job did on its first green run). Dispatch the task instead.
+                  #
+                  # The sync is what stamps `distinguishedName`; without it the assertion below
+                  # simply times out and the real cause is invisible.
+                  kubectl exec -n authentik "$(kubectl get pods -n authentik \
+                      -l app.kubernetes.io/component=server -o jsonpath='{.items[0].metadata.name}')" \
+                    -- ak shell -c "
+                  from authentik.sources.ldap.models import LDAPSource
+                  from authentik.sources.ldap.tasks import ldap_sync
+                  s = LDAPSource.objects.get(slug='samba-ad')
+                  ldap_sync.send(str(s.pk))
+                  " >/dev/null 2>&1 && echo "  inbound sync dispatched" \
+                    || echo "  (could not dispatch sync; the periodic sync will still run)"
+
+                  # Poll rather than sleep-and-hope: the sync is asynchronous.
+                  MISSING=""
+                  for attempt in $(seq 1 30); do
+                    MISSING=""
+                    while IFS=$'\t' read -r pk username _ _; do
+                      [ -z "$username" ] && continue
+                      DN=$(curl -sf -H "$AUTH" \
+                        "${AUTHENTIK_URL}/api/v3/core/users/?username=${username}" \
+                        | jq -r '.results[0].attributes.distinguishedName // empty')
+                      [ -z "$DN" ] && MISSING="$MISSING $username"
+                    done <<< "$MEMBERS"
+                    [ -z "$MISSING" ] && break
+                    sleep 10
+                  done
+
+                  if [ -n "$MISSING" ]; then
+                    echo "ERROR: distinguishedName never appeared for:$MISSING" >&2
+                    echo "  Password write-back silently no-ops for these users" >&2
+                    echo "  (sources/ldap/password.py: should_check_user -> False, logged at INFO)." >&2
+                    exit 1
+                  fi
+                  echo "distinguishedName present for every provisioned user — write-back is armed"
+
+                  echo
+                  echo "== 4. ASSERT the blueprint users actually HAVE a usable password =="
+                  # ⚠ WHY THIS IS SEPARATE FROM STEP 3, AND WHY IT IS NOT OPTIONAL.
+                  #
+                  # Step 3 proves write-back is ARMED (distinguishedName landed). It does NOT
+                  # prove a password was ever stored — and on a fresh cluster it routinely was
+                  # not. both blueprint users finished bring-up
+                  # with has_usable_password() == False while the blueprint reported
+                  # `successful`, every manifest was correct, and ArgoCD was green. Zero
+                  # password_set events in the whole worker log.
+                  #
+                  # THE MECHANISM, reproduced deliberately rather than guessed:
+                  #   1. authentik-blueprint-ad-source.yaml sets sync_users_password=True, so User.save()
+                  #      fires sources/ldap/signals.py:ldap_sync_password.
+                  #   2. Once distinguishedName exists, should_check_user() returns True and the
+                  #      signal opens an LDAPS connection to push the password to the DC.
+                  #   3. During bring-up that bind can fail CERTIFICATE_VERIFY_FAILED: the
+                  #      cluster CA is minted fresh on every recreate, and there is a window
+                  #      before step 2 of this Job pushes it into Authentik.
+                  #   4. ⚠ THE BUG: that handler catches only LDAPOperationResult, but a TLS
+                  #      failure raises LDAPSocketOpenError, which is NOT a subclass of it
+                  #      (LDAPSocketOpenError -> LDAPCommunicationError -> LDAPExceptionError).
+                  #      So it is uncaught, no CONFIGURATION_ERROR event is recorded, and the
+                  #      exception propagates out of set_password(), ABORTING the write.
+                  # Net effect: a user that exists and syncs but has NO password, presenting as
+                  # "Authentication failure" for the right password, or NT_STATUS_LOGON_FAILURE
+                  # from smbclient. Nothing anywhere in the failure says "password".
+                  #
+                  # The blueprint does NOT self-heal: its applied hash is unchanged, so every
+                  # later sync skips it. Clearing that hash and re-applying does work, which is
+                  # what the loop below does once the CA (step 2) is in place.
+                  PROVISIONED=$(printf '%s\n' "$MEMBERS" | cut -f2 | sed '/^$/d' | paste -sd, -)
+
+                  # ── 4a. PUSH THE PASSWORD TO AD, DETERMINISTICALLY ──────────────────
+                  # ⚠ THIS RE-APPLY IS UNCONDITIONAL, AND THAT IS THE WHOLE POINT.
+                  # Write-back fires on the password being WRITTEN, not on its value, and it
+                  # only reaches the DC once step 3 has stamped distinguishedName. A password
+                  # written BEFORE that — which is every app's own user-provisioning job, and
+                  # this Job's own earlier steps — is accepted by Authentik and never leaves
+                  # it. Re-applying here, after the DN is armed, is what actually puts it in
+                  # AD.
+                  #
+                  # ⚠ It used to happen only as a SIDE EFFECT of the repair below: step 3's
+                  # inbound sync clears the Django password, the loop noticed, re-applied, and
+                  # the write-back rode along. That worked but was incidental — measured on
+                  # ecc209, where a user whose password was ALREADY usable at step 4 was
+                  # skipped by the loop and ended with Authentik holding a password AD had
+                  # never heard of (smbclient: NT_STATUS_LOGON_FAILURE) while every UI looked
+                  # correct. Nothing in the assertion below can see that split: it checks
+                  # Authentik, not the DC. Doing the write here makes it a guarantee rather
+                  # than a consequence of a bug in another component.
+                  #
+                  # Idempotent: the same password is written again. Cost is one apply per
+                  # blueprint per provisioning run, and provisioning runs are rare.
+                  echo "== 4a. re-assert passwords with write-back armed =="
+                  AK_WORKER=$(kubectl get pods -n authentik \
+                    -l app.kubernetes.io/component=worker \
+                    -o jsonpath='{.items[0].metadata.name}')
+                  kubectl exec -i -n authentik "$AK_WORKER" \
+                    -- env PW_USERS="$PROVISIONED" ak shell 2>&1 <<'PYEOF' | sed -n 's/^REAPPLY://p'
+                  import os
+                  import yaml
+                  from authentik.blueprints.models import BlueprintInstance
+                  from authentik.blueprints.v1.importer import Importer
+
+                  # ⚠ MATCH A DECLARATION, NOT A MENTION. A substring test on the source
+                  # matched any blueprint that merely NAMES the user — measured here:
+                  # re-applying `enforce-mfa` and `app-gitlab` because a group-membership
+                  # !Find referenced testuser. Idempotent, but a far wider blast radius than
+                  # this Job has any business asserting. Only a blueprint carrying an
+                  # authentik_core.user ENTRY for the username owns that user's password.
+                  #
+                  # ⚠ A tag-tolerant loader is required: blueprints carry !Find/!Env/!KeyOf,
+                  # which yaml.safe_load rejects outright. Returning None for every custom
+                  # tag is fine — nothing below looks inside them.
+                  class _L(yaml.SafeLoader):
+                      pass
+                  _L.add_multi_constructor("!", lambda loader, suffix, node: None)
+
+                  def _source_of(b):
+                      if b.path:
+                          try:
+                              return open("/blueprints/" + b.path).read()
+                          except OSError:
+                              return ""
+                      return b.content or ""
+
+                  def _declares(src, users):
+                      try:
+                          doc = yaml.load(src, Loader=_L)
+                      except Exception:
+                          return False
+                      for e in (doc or {}).get("entries", []) or []:
+                          if not isinstance(e, dict):
+                              continue
+                          if str(e.get("model", "")).lower() != "authentik_core.user":
+                              continue
+                          name = (e.get("identifiers") or {}).get("username")
+                          if name in users:
+                              return True
+                          # ⚠ AN UNRESOLVABLE USERNAME COUNTS AS A MATCH, deliberately.
+                          # argocd-infra/authentik/blueprint-initial-users.yaml declares its
+                          # two seed users as `username: !Env CLUSTER_ADMIN_USERNAME`, so the
+                          # tag-tolerant loader yields None and a strict comparison misses
+                          # them. That silently dropped `test-users` from both the re-assert
+                          # and the repair — i.e. it broke the seed accounts this Job has
+                          # always fixed. Erring towards an extra idempotent re-apply of a
+                          # blueprint that DOES declare users is the safe direction; a
+                          # blueprint declaring none (enforce-mfa, app-gitlab) still never
+                          # matches, which is the over-reach this test exists to stop.
+                          if not isinstance(name, str):
+                              return True
+                      return False
+
+                  users = [u for u in os.environ.get("PW_USERS", "").split(",") if u]
+
+                  for b in BlueprintInstance.objects.all():
+                      src = _source_of(b)
+                      if not _declares(src, users):
+                          continue
+                      b.last_applied_hash = ""
+                      b.save()
+                      Importer.from_string(src).apply()
+                      print("REAPPLY:  re-applied %s" % b.name)
+                  PYEOF
+
+                  echo "  checking: $PROVISIONED"
+                  PW_FIXED=""
+                  PW_BROKEN=""
+                  for attempt in $(seq 1 12); do
+                    # ⚠ The python goes in on STDIN, not via `ak shell -c "..."`. Inline python
+                    # in this YAML block scalar inherits the manifest indentation and dies with
+                    # IndentationError; dedenting it to column 0 ends the block scalar and
+                    # breaks the YAML. A stdin heredoc avoids both.
+                    # ⚠ stderr is NOT discarded. With 2>/dev/null an IndentationError looks
+                    # like success with empty output: PW_BROKEN reads empty, the loop concludes
+                    # every password is fine, and the assertion silently checks nothing. That
+                    # happened while writing this step, which is how the bug it guards hid too.
+                    PW_BROKEN=$(kubectl exec -i -n authentik "$AK_POD" -- ak shell 2>&1 <<PYEOF | sed -n 's/^BROKEN://p' | tail -1
+                  from authentik.core.models import User
+                  want = [n for n in "$PROVISIONED".split(",") if n]
+                  bad = [u.username for u in User.objects.filter(username__in=want)
+                         if not u.has_usable_password()]
+                  print("BROKEN:" + ",".join(bad))
+                  PYEOF
+                  )
+                    [ -z "$PW_BROKEN" ] && break
+                    echo "  no usable password for: $PW_BROKEN — re-applying the blueprint"
+                    # ⚠ Two things here are not interchangeable with the obvious version.
+                    #
+                    # 1. Use Importer directly, NOT blueprints.v1.tasks.apply_blueprint. The
+                    #    latter is a dramatiq task and raises CurrentTaskNotFound when called
+                    #    outside a worker task context, so from `ak shell` it fails without
+                    #    applying anything. Importer.apply() is the underlying call and works.
+                    # 2. Run it on the WORKER pod, not $AK_POD (which is the SERVER). The
+                    #    blueprint ConfigMaps are mounted at /blueprints/mounted ONLY on the
+                    #    worker — on the server that path does not exist, so reading the file
+                    #    raises FileNotFoundError and the repair silently does nothing while
+                    #    the detection loop keeps reporting the same broken users.
+                    #
+                    # last_applied_hash is still cleared so the scheduled apply does not later
+                    # skip the file as unchanged.
+                    AK_WORKER=$(kubectl get pods -n authentik \
+                      -l app.kubernetes.io/component=worker \
+                      -o jsonpath='{.items[0].metadata.name}')
+                    PW_BROKEN_LIST="$PW_BROKEN" kubectl exec -i -n authentik "$AK_WORKER" \
+                      -- env PW_BROKEN_LIST="$PW_BROKEN" ak shell >/dev/null 2>&1 <<PYEOF || true
+                  import os
+                  import yaml
+                  from authentik.blueprints.models import BlueprintInstance
+                  from authentik.blueprints.v1.importer import Importer
+
+                  # ⚠ REPAIR WHICHEVER BLUEPRINT DECLARES THE BROKEN USER — never a fixed
+                  # name. This used to be filter(name="test-users"), which could only ever
+                  # repair the two seed accounts this folder owns. Step 4 above ASSERTS a
+                  # usable password for EVERY member of `employees`, so the moment any app
+                  # adds an employee from its own blueprint, that assertion became
+                  # unsatisfiable: the loop re-applied test-users twelve times, which does
+                  # not contain the user, and the whole provisioning run failed. Measured on
+                  # the ecc209 recreate with argocd-apps/eda-pcb-agent, whose user comes from
+                  # the BlueprintInstance `app-eda-pcb-agent-user`.
+                  #
+                  # ⚠ TWO SOURCES, both real. A blueprint is EITHER a mounted file (`path`,
+                  # this folder's own, present only on the WORKER — which is why this runs
+                  # there) OR inline `content` on the instance (how an app ships one without
+                  # a ConfigMap in this namespace). Read whichever it has.
+                  # Same declaration test as step 4a — a blueprint that merely MENTIONS the
+                  # user (a group-membership !Find) does not own its password.
+                  class _L(yaml.SafeLoader):
+                      pass
+                  _L.add_multi_constructor("!", lambda loader, suffix, node: None)
+
+                  def _source_of(b):
+                      if b.path:
+                          try:
+                              return open("/blueprints/" + b.path).read()
+                          except OSError:
+                              return ""
+                      return b.content or ""
+
+                  def _declares(src, users):
+                      try:
+                          doc = yaml.load(src, Loader=_L)
+                      except Exception:
+                          return False
+                      for e in (doc or {}).get("entries", []) or []:
+                          if not isinstance(e, dict):
+                              continue
+                          if str(e.get("model", "")).lower() != "authentik_core.user":
+                              continue
+                          name = (e.get("identifiers") or {}).get("username")
+                          if name in users:
+                              return True
+                          # ⚠ AN UNRESOLVABLE USERNAME COUNTS AS A MATCH, deliberately.
+                          # argocd-infra/authentik/blueprint-initial-users.yaml declares its
+                          # two seed users as `username: !Env CLUSTER_ADMIN_USERNAME`, so the
+                          # tag-tolerant loader yields None and a strict comparison misses
+                          # them. That silently dropped `test-users` from both the re-assert
+                          # and the repair — i.e. it broke the seed accounts this Job has
+                          # always fixed. Erring towards an extra idempotent re-apply of a
+                          # blueprint that DOES declare users is the safe direction; a
+                          # blueprint declaring none (enforce-mfa, app-gitlab) still never
+                          # matches, which is the over-reach this test exists to stop.
+                          if not isinstance(name, str):
+                              return True
+                      return False
+
+                  broken = [u for u in os.environ.get("PW_BROKEN_LIST", "").split(",") if u]
+
+                  for b in BlueprintInstance.objects.all():
+                      src = _source_of(b)
+                      if not _declares(src, broken):
+                          continue
+                      print("repairing via blueprint: %s" % b.name)
+                      b.last_applied_hash = ""
+                      b.save()
+                      Importer.from_string(src).apply()
+                  PYEOF
+                    PW_FIXED="y"
+                    sleep 10
+                  done
+
+                  if [ -n "$PW_BROKEN" ]; then
+                    echo "ERROR: these users still have NO usable password: $PW_BROKEN" >&2
+                    echo "  They exist and sync, but every login fails — including SMB/NFS to" >&2
+                    echo "  the fileserver, since AD holds no password for them either." >&2
+                    echo "  Look for the LDAPS failure the password signal does not catch:" >&2
+                    echo "    kubectl logs -n authentik -l app.kubernetes.io/component=worker \\" >&2
+                    echo "      | grep CERTIFICATE_VERIFY_FAILED" >&2
+                    echo "  If present, Authentik's samba-ad-ca CertificateKeyPair does not" >&2
+                    echo "  match the live cluster CA — step 2 of this Job is what pushes it." >&2
+                    exit 1
+                  fi
+                  if [ -n "$PW_FIXED" ]; then
+                    echo "passwords were missing and were repaired by re-applying the blueprint"
+                  else
+                    echo "every provisioned user has a usable password"
+                  fi
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 256Mi }
+---
+# ── THE LAUNCHER ──────────────────────────────────────────────────────────────
+# The CronJob above is inert; something has to run it at bring-up, and that is this PostSync
+# hook. It is deliberately tiny: `kubectl create job --from=cronjob/...` plus a wait. All the
+# provisioning logic, RBAC and volumes live in the template, so there is exactly ONE copy of
+# the 34 KB script and this hook cannot drift from it.
+#
+# ⚠ THE RUN IT CREATES IS NOT A HOOK, and that is the point: ArgoCD does not own it, cannot
+# prune it and cannot delete it on success, so the pod and its logs outlive this hook — which
+# is what the `NO ttlSecondsAfterFinished` note in the template is about. They are not
+# immortal, though: the run carries a controller ownerReference to the CronJob, so the
+# CronJob's history limits eventually collect it. See those limits for the detail.
+#
+# ⚠ THE HOOK MUST FAIL IF THE RUN FAILS. `kubectl create job` returns as soon as the object
+# exists, which would report success for a run that then fails — the failure mode that makes
+# a broken directory look green. The `kubectl wait` is what makes this hook honest.
+#
+# ⚠ WHY THE RUN NAME CARRIES A TIMESTAMP. Job names are immutable and a completed Job of the
+# same name would make the next create fail; nothing here deletes old runs, deliberately (see
+# above). `--from` is happy to create as many differently-named runs as it is asked for.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-provision-users-run
+  namespace: samba-ad
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-provision-users-run
+  namespace: samba-ad
+rules:
+  # Read the template.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get"]
+  # Create a run from it and wait for it.
+  # ⚠ `watch` is not optional: `kubectl wait --for=condition=complete` opens a WATCH, and
+  # without it the wait fails outright instead of falling back to polling. The same trap is
+  # documented at length in dns-config-job.yaml, where a missing `watch` hung a Sync hook
+  # forever and blocked every job behind it.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-provision-users-run
+  namespace: samba-ad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-provision-users-run
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-provision-users-run
+    namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: samba-ad-provision-users-run
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # ⚠ BeforeHookCreation ALONE — never HookSucceeded. This launcher is small enough to be
+    # disposable, but the rule that removed HookSucceeded from the old provisioning Job is
+    # worth keeping here too: a Job that deletes itself takes its logs with it, and these are
+    # the logs that say WHICH run was started.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: samba-ad-provision-users-run
+      containers:
+        - name: run
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              RUN="samba-ad-provision-users-$(date +%s)"
+              echo "starting $RUN from cronjob/samba-ad-provision-users"
+              kubectl -n samba-ad create job "$RUN" --from=cronjob/samba-ad-provision-users
+              echo "waiting for $RUN (up to 900s)..."
+              if kubectl -n samba-ad wait --for=condition=complete "job/$RUN" --timeout=900s; then
+                echo "$RUN completed"
+                exit 0
+              fi
+              echo "ERROR: $RUN did not complete." >&2
+              echo "  Its logs: kubectl -n samba-ad logs job/$RUN" >&2
+              echo "  They are NOT deleted with this hook — the run is an ordinary Job." >&2
+              exit 1
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }

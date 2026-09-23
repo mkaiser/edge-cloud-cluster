@@ -1,0 +1,1742 @@
+# ArgoCD Sync hook: converge the TrueNAS appliance into the state this repo declares.
+#
+# ⚠ THE FILE LIVES HERE (truenas/) BUT THE JOB RUNS IN THE samba-ad NAMESPACE.
+# That split is deliberate, and the reason is credentials. The Job needs TWO at once: the
+# TrueNAS admin password (to drive the appliance API) and the DOMAIN ADMINISTRATOR password
+# (to perform the AD join). The latter lives in samba-ad/samba-ad-config — the sealed
+# sambacc config the DCs themselves use — and a Secret cannot be mounted across
+# namespaces. One of the two therefore has to be duplicated, and the choice is not
+# symmetric: duplicating the domain admin password would put the credential that owns the
+# ENTIRE DIRECTORY in a second place, while duplicating the appliance's own password puts a
+# single-appliance credential next to the DC that already trusts it. So the Job is
+# namespaced to samba-ad and truenas/sealSecrets.sh also seals
+# truenas-secrets-samba-ad-sealed.yaml (same credential, samba-ad scope).
+#
+# It is filed under truenas/ because it configures the FILESERVER — that is what a reader
+# looking for "how is the appliance set up" will search for — and it is deployed by
+# wave16-truenas. Only the namespace follows the credential.
+#
+# Appliance provisioning, as read-compare-converge:
+#   1. hostname + NetBIOS name  -> fs-1        (must precede the join; baked into FS-1$)
+#   2. resolver + search domain -> the on-prem DC's literal LAN IP
+#   3. datasets                 -> datapool/homes + datapool/shared/{data,tmp}, acltype NFSV4
+#                                  (datapool/shared itself is a grouping parent, NOT exported)
+#   4. AD join                  -> CREATE-ONCE, behind an explicit status gate
+#   5. NFSv4 exports + SMB share -> nfs-homes/nfs-shared-data/nfs-shared-tmp + SMB userhomes
+#
+# ⚠ THE EDA STORAGE IS NOT HERE. datapool/eda/{artifacts,registry,modulefiles} — their
+# datasets, exports and per-module subdirectories — moved to
+# deployment/argocd-apps/eda/fileserver, so that disabling the EDA stack
+# stops re-asserting them. This job keeps what is genuinely infra: homes, the SMB userhomes
+# share, identity, network and the AD join.
+# Do NOT re-add the EDA datasets: nfs_export() converges by path and takes rows[0], so two
+# controllers managing one export path flap.
+#
+# ⚠ AND IT IS IN THE OTHER ARGOCD INSTANCE — argocd-APPS, not argocd-infra. So TWO ArgoCD
+# instances write to this ONE appliance. That is deliberate (the rule is: a dataset lives
+# with the app that MOUNTS it, and EDA storage is mounted by EDA workloads), and it is safe
+# only because the two are DISJOINT: this job owns datapool/{homes,shared/*,gitlab/mirror},
+# eda/fileserver owns datapool/{eda/*,images}. Every datapool/eda reference in this file is
+# a comment, and vice versa — keep it that way.
+#
+# ⚠ The consequence for the rate limit below: the 20-per-60s budget is PER APPLIANCE, not
+# per instance, so the two instances share it. eda/fileserver consolidates the whole EDA
+# stack into ONE provisioning job for exactly this reason (its Application header explains
+# why per-module jobs would be a path to taking the fileserver down). Anything new that
+# talks to fs-1 has to fit inside the same budget, wherever it is deployed.
+#   6. per-user home directories -> owned by the AD uid, mode 0700
+#
+# ⚠ ONE PROCESS, ONE WEBSOCKET, ONE AUTH. TrueNAS rate-limits at 20 auth attempts and/or
+# unauthenticated requests per 60s and then LOCKS OUT FOR TEN MINUTES. A job that shelled
+# `midclt` per setting would trip that around the 20th call, mid-configuration, and the
+# retry would trip it again. Everything below reuses a single authenticated connection.
+# This is also why backoffLimit is 1, not 5: a failed run has already spent auth attempts.
+#
+# Two startup races are therefore guarded BEFORE the websocket is opened, because the
+# Job cannot retry its way out of either: the AD zone not resolving yet (wait_for_host
+# in configure.py) and the on-prem DCs not yet serving LDAP (the Ready gate in the
+# read-onprem-dcs initContainer). Neither costs an auth attempt. Do NOT "fix" a startup
+# race by raising backoffLimit.
+#
+# ⚠ NODE PLACEMENT IS MANDATORY, NOT A PREFERENCE. Cloud pods cannot reach
+# 192.168.1.0/24. The route IS advertised by pcie-tb-s and IS approved+serving in headscale
+# — that half works. What is missing is the cloud CP INSTALLING it, which needs
+# `--accept-routes` (RouteAll), deliberately off: the flag is all-or-nothing and would also
+# install 10.0.0.0/23, collapsing etcd quorum once the CP set grows. So `ip route get
+# 192.168.1.237` on the cloud CP goes out the PUBLIC gateway — a wrong route, not a drop.
+# ecc/fileserver-lan=true selects pcie-tb-s / pcie-tb-d, both measured REACHABLE to
+# 192.168.1.237:443. thor-eval is excluded for free by its ecc/gpu taint, which the
+# toleration below deliberately does not match. Without the ecc/mesh toleration the pod
+# stays Pending FOREVER rather than failing — the worst diagnostic outcome.
+#
+# ⚠ Sync hook at wave 1, NOT a negative wave: a negative-wave hook deadlocks against the
+# SealedSecret it needs (documented at length in csi-driver-smb/storageclass-job.yaml).
+# Replace=true because a Job's spec.template is immutable under ServerSideApply.
+#
+# The appliance is NOT a k8s resource, so ArgoCD reports Synced regardless of its actual
+# state. verify-job.yaml is what converts appliance drift into a visible failure.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truenas-configure-src
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  tnclient.py: |
+    """Minimal TrueNAS 25.10 JSON-RPC-over-websocket client.
+
+    Deliberately dependency-free rather than `pip install truenas_api_client`: the
+    install would need egress from a lab-pinned pod on every run, and the wire protocol
+    here is a few dozen lines. Written against `core.get_methods` from the live appliance
+    (25.10.4), not against docs — 25.10 folded activedirectory/ldap/idmap into one
+    `directoryservices` namespace and REST v2.0 is removed in 26, so any older recipe
+    names methods that no longer exist.
+    """
+    import base64, json, os, socket, ssl, struct
+
+    class TrueNAS:
+        def __init__(self, host, user, password, timeout=30, api_key=None):
+            self.host, self.user, self.password, self.timeout = host, user, password, timeout
+            # An API key authenticates as API_KEY_PLAIN and takes precedence over the
+            # username/password pair. It exists so a consumer that needs only a NARROW slice
+            # of the appliance (e.g. the EDA provisioner: datasets + exports, no AD, no
+            # identity) can hold a SCOPED credential instead of a copy of the full
+            # appliance-admin password. `user` may be empty when a key is supplied.
+            self.api_key = api_key
+            self._id = 0
+            self._pending = bytearray()
+            self.changes = []          # human-readable log of what was actually mutated
+
+        # -- connection ---------------------------------------------------------
+        def __enter__(self):
+            ctx = ssl.create_default_context()
+            # The appliance serves its own self-signed cert. Verification is off, which is
+            # acceptable ONLY because this runs on the same LAN as the appliance (no
+            # routed path, ~0.09ms).
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            raw = socket.create_connection((self.host, 443), timeout=self.timeout)
+            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.send((
+                "GET /api/current HTTP/1.1\r\n"
+                f"Host: {self.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("appliance closed the connection during handshake")
+                buf += chunk
+            status = buf.split(b"\r\n")[0].decode(errors="replace")
+            if "101" not in status:
+                raise RuntimeError(f"websocket upgrade refused: {status}")
+            self._pending = bytearray(buf.partition(b"\r\n\r\n")[2])
+            # ONE auth for the whole run — see the rate-limit note in the manifest header.
+            if self.api_key:
+                payload = {"mechanism": "API_KEY_PLAIN",
+                           "username": self.user, "api_key": self.api_key}
+            else:
+                payload = {"mechanism": "PASSWORD_PLAIN",
+                           "username": self.user, "password": self.password}
+            r = self.call("auth.login_ex", [payload])
+            rt = (r.get("result") or {}).get("response_type")
+            if rt != "SUCCESS":
+                mech = payload["mechanism"]
+                raise RuntimeError(f"login failed ({mech}): {rt or r.get('error')}")
+            return self
+
+        def __exit__(self, *exc):
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+        # -- framing ------------------------------------------------------------
+        def _send(self, obj):
+            d = json.dumps(obj).encode()
+            mask = os.urandom(4)
+            n = len(d)
+            h = bytearray([0x81])
+            if n < 126:
+                h.append(0x80 | n)
+            elif n < 65536:
+                h.append(0x80 | 126); h += struct.pack(">H", n)
+            else:
+                h.append(0x80 | 127); h += struct.pack(">Q", n)
+            h += mask
+            h += bytes(b ^ mask[i % 4] for i, b in enumerate(d))
+            self.sock.send(bytes(h))
+
+        def _read(self, n):
+            while len(self._pending) < n:
+                chunk = self.sock.recv(1 << 20)
+                if not chunk:
+                    raise RuntimeError("appliance closed the connection")
+                self._pending.extend(chunk)
+            out = bytes(self._pending[:n])
+            del self._pending[:n]
+            return out
+
+        def _recv(self):
+            while True:
+                b0, b1 = self._read(2)
+                op, n = b0 & 0x0F, b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                payload = self._read(n)
+                if op == 1:
+                    return json.loads(payload)
+                if op == 9:                     # ping -> pong, or the box hangs up
+                    self._send_frame_pong(payload)
+                if op == 8:
+                    raise RuntimeError("appliance closed the websocket")
+
+        def _send_frame_pong(self, payload):
+            mask = os.urandom(4)
+            h = bytearray([0x8A, 0x80 | len(payload)]) + mask
+            h += bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            self.sock.send(bytes(h))
+
+        # -- rpc ----------------------------------------------------------------
+        def call(self, method, params=None):
+            self._id += 1
+            mid = self._id
+            self._send({"jsonrpc": "2.0", "id": mid, "method": method,
+                        "params": params or []})
+            while True:
+                msg = self._recv()
+                if msg.get("id") == mid:
+                    return msg
+
+        def rpc(self, method, params=None):
+            """call() + raise on error, so a typo'd method is loud rather than ignored."""
+            r = self.call(method, params)
+            if "error" in r and r["error"] is not None:
+                err = r["error"]
+                # ⚠ `data` is PRESENT-BUT-NULL on some errors, so `err.get("data", {})`
+                # returns None and the chained .get() raises
+                # "'NoneType' object is not subscriptable" — masking the REAL API error
+                # with a TypeError. That is not hypothetical: it hid a sharing.smb.setacl
+                # failure behind a wrong "the AD group does not exist" diagnosis while the
+                # eda share stayed world-writable. Default has to be applied AFTER the
+                # lookup, not inside it.
+                data = err.get("data") or {}
+                detail = data.get("reason") or err.get("message") or err
+                raise RuntimeError(f"{method} failed: {detail}")
+            return r.get("result")
+
+        def job(self, method, params=None, timeout=1800):
+            """Run a long operation and WAIT. Without this a job id is mistaken for
+            success — pool/dataset/join calls all return immediately otherwise."""
+            jid = self.rpc(method, params)
+            if not isinstance(jid, int):
+                return jid                       # not a job-returning method after all
+            import time
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                rows = self.rpc("core.get_jobs", [[["id", "=", jid]]])
+                if rows:
+                    st = rows[0].get("state")
+                    if st in ("SUCCESS", "FAILED", "ABORTED"):
+                        if st != "SUCCESS":
+                            raise RuntimeError(
+                                f"{method} job {jid} {st}: {rows[0].get('error')}")
+                        return rows[0].get("result")
+                time.sleep(3)
+            raise RuntimeError(f"{method} job {jid} did not finish within {timeout}s")
+
+        # -- convergence helper -------------------------------------------------
+        def converge(self, label, current, desired, apply_fn):
+            """Three outcomes, three branches — the rule that separates 'usually
+            idempotent' from actually so. A two-branch version re-creates on drift."""
+            drift = {k: (current.get(k), v) for k, v in desired.items()
+                     if current.get(k) != v}
+            if not drift:
+                print(f"  {label}: already correct")
+                return False
+            for k, (was, now) in drift.items():
+                print(f"  {label}: {k}: {was!r} -> {now!r}")
+            apply_fn(desired)
+            self.changes.append(label)
+            return True
+  configure.py: |
+    """Converge the appliance. Read before write, every time.
+
+    NEVER "create and ignore the error" — that hides genuine failures. Each step reports
+    one of three outcomes (absent / drifted / correct) so a second run is provably a
+    no-op, which is the idempotency proof the plan asks for.
+    """
+    import os, sys, time
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    HOST      = os.environ["TN_HOST"]
+    USER      = os.environ["TN_USER"]
+    PASSWORD  = os.environ["TN_PASS"]
+    HOSTNAME  = os.environ["FS_HOSTNAME"]        # fs-1
+    AD_DOMAIN = os.environ["AD_DOMAIN"]          # ad.base.internal
+    AD_REALM  = os.environ["AD_REALM"]           # AD.BASE.INTERNAL
+    NETBIOS   = os.environ["AD_NETBIOS"]         # ad   (the DOMAIN, not this host)
+    # The on-prem DCs, discovered by the read-onprem-dcs initContainer: LAN addresses in
+    # DC_IPS, and "<pod> <lanIp>" pairs in DC_HOSTS. There is deliberately no single DC_IP —
+    # see that container's comment. Ordered as the API returned them, which is pod order.
+    def _read_dcs():
+        ips, hosts = [], []
+        try:
+            with open("/shared/dc-ips") as fh:
+                ips = [l.strip() for l in fh if l.strip()]
+            with open("/shared/dc-names") as fh:
+                for l in fh:
+                    f = l.split()
+                    if len(f) == 2:
+                        hosts.append((f[0], f[1]))
+        except OSError:
+            pass
+        if not ips:
+            raise SystemExit(
+                "no on-prem DC addresses in /shared — the initContainer should have failed "
+                "first. Refusing to configure the appliance's resolver against an empty list.")
+        return ips, hosts
+    DC_IPS, DC_HOSTS = _read_dcs()
+    LAB_CIDR  = os.environ["LAB_CIDR"]           # 192.168.1.0/24
+    HOMES     = os.environ["DS_HOMES"]           # datapool/homes
+    SHARED_PARENT = os.environ["DS_SHARED_PARENT"]  # datapool/shared  (grouping, NOT exported)
+    SHARED    = os.environ["DS_SHARED"]          # datapool/shared/data (curated, root-owned)
+    SHARED_TMP = os.environ["DS_SHARED_TMP"]     # datapool/shared/tmp  (world-writable 1777)
+    SHARED_TMP_QUOTA = os.environ["DS_SHARED_TMP_QUOTA"]
+    # Git mirror target. A PARENT + child pair like shared/: `datapool/gitlab` groups and is
+    # never exported, `datapool/gitlab/mirror` is the export. Managed HERE, and only here —
+    # nfs_export converges by path and takes rows[0], so two controllers on one export flap.
+    GITLAB_PARENT = os.environ["DS_GITLAB_PARENT"]   # datapool/gitlab   (grouping)
+    GITLAB_MIRROR = os.environ["DS_GITLAB_MIRROR"]   # datapool/gitlab/mirror
+
+    def _parse_size(v):
+        """'1T' -> bytes. The TrueNAS API wants an integer for `quota`; a suffixed
+        string is rejected, so the human-friendly project-settings value is converted
+        here rather than duplicating a byte count in the settings file."""
+        v = str(v).strip().upper()
+        units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
+        if v and v[-1] in units:
+            return int(float(v[:-1]) * units[v[-1]])
+        return int(v)
+    # ⚠ THIS JOB PROVISIONS `homes` AND NOTHING ELSE STORAGE-WISE.
+    # The EDA datasets (datapool/eda/{artifacts,registry,modulefiles}) live with the app
+    # that mounts them, in deployment/argocd-apps/eda/fileserver, so that disabling the EDA
+    # stack stops re-asserting them.
+    # ⚠ Do NOT re-add the EDA datasets here: nfs_export() converges by path and takes
+    # rows[0], so two controllers managing one export path flap.
+    UID_BASE  = int(os.environ["UID_START"])     # 5000
+    GID_BASE  = int(os.environ["GID_START"])     # 6000
+    JOIN      = os.environ.get("ALLOW_AD_JOIN", "false").lower() == "true"
+    REPAIR    = os.environ.get("ALLOW_AD_REPAIR", "false").lower() == "true"
+    # How hard _identity_works() has to try before it declares the member broken. It gates
+    # a leave+rejoin that DELETES FS-1$, so it must not fire on one unlucky sample — see
+    # that function's docstring. Costs nothing on a healthy member (first sweep succeeds)
+    # and ~1 extra minute on a genuine repair.
+    REPAIR_PROBE_ATTEMPTS = int(os.environ.get("REPAIR_PROBE_ATTEMPTS", "3"))
+    REPAIR_PROBE_INTERVAL = int(os.environ.get("REPAIR_PROBE_INTERVAL", "20"))
+
+    def _identity_works(tn):
+        """Can the appliance resolve a domain USER? A joined-and-HEALTHY member that answers
+        'does not exist' for every user is broken, and nothing in its own status says so —
+        this is the only honest probe.
+
+        ⚠ IT MUST BE A USER, AND IT MUST BE A USER WE KNOW HAS A uidNumber. Two traps:
+
+        1. A GROUP PROBE IS NOT A SUBSTITUTE, even though it looks like the more robust
+           choice. A wedged member can resolve `AD\\Domain Users` to its gid while EVERY
+           user — including names never queried before — returns "does not exist":
+           winbind's group path stays fine while its user path is dead. A group fallback here reported "identity works", so step_ad took the
+           already-bound branch and skipped the repair, and step_homes then skipped every
+           home. The probe hid exactly the failure it exists to catch.
+
+        2. Administrator/krbtgt are USELESS as probes under idmap_backend AD: neither has a
+           uidNumber, so both correctly fail on a perfectly healthy member. Probing them
+           and treating failure as "broken" would force a needless leave+rejoin on every
+           run.
+
+        So probe the users this repo actually provisions — the ones guaranteed to carry a
+        uidNumber (HOME_USERS_FILE, published by samba-ad's provisioning job). If that list
+        is not available yet, return True: on a first bring-up there is genuinely nothing to
+        probe, and guessing "broken" would trigger a destructive repair on a healthy join.
+
+        ⚠ IT MUST FAIL REPEATEDLY BEFORE IT REPORTS BROKEN, because what it gates is
+        DESTRUCTIVE. A single failing sample cannot distinguish a wedged member from the
+        lab DC being restarted, winbind mid-restart, or a blip on the LAN path to the DC —
+        and the appliance is joined to exactly ONE reachable DC (configure-job pins all
+        three DC names to the LAN address), so there is no second DC to mask a momentary
+        outage. Meanwhile the app is `automated` + `selfHeal` with this Job as a Sync hook,
+        so the check runs unattended on EVERY sync: a single-sample false positive would
+        leave the domain and DELETE FS-1$ with nobody watching.
+
+        REPAIR_PROBE_ATTEMPTS consecutive sweeps must ALL fail, REPAIR_PROBE_INTERVAL
+        seconds apart. A wedged member fails every sweep — the state survives
+        cache_refresh, a cifs/nfs restart and a full reboot — so the retry costs one extra
+        minute on a genuine repair and rejects the transient case.
+
+        ⚠ The retry reuses `tn`, so it spends NO auth attempts against the 20-per-60s
+        limit that trips a ten-minute lockout. Do NOT reconnect per attempt.
+        """
+        probes = [u for u in os.environ.get("HOME_USERS", "").replace(",", " ").split() if u]
+        if not probes:
+            listed = os.environ.get("HOME_USERS_FILE", "")
+            if listed and os.path.exists(listed):
+                with open(listed) as fh:
+                    probes = [u for u in fh.read().replace(",", " ").split() if u]
+        if not probes:
+            return True
+
+        def _sweep():
+            """True as soon as ANY provisioned user resolves."""
+            for probe in probes:
+                try:
+                    tn.rpc("user.get_user_obj",
+                           [{"username": f"{NETBIOS.upper()}\\{probe}"}])
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        for attempt in range(1, REPAIR_PROBE_ATTEMPTS + 1):
+            if _sweep():
+                # Any success clears the whole streak: the member resolves, so whatever
+                # the earlier sweeps saw was transient and NOT grounds for a rejoin.
+                if attempt > 1:
+                    print(f"  identity probe recovered on attempt {attempt} — not repairing")
+                return True
+            if attempt < REPAIR_PROBE_ATTEMPTS:
+                print(f"  identity probe failed ({attempt}/{REPAIR_PROBE_ATTEMPTS}), "
+                      f"retrying in {REPAIR_PROBE_INTERVAL}s — a transient DC outage looks "
+                      f"identical to a wedged member, so do not repair on one sample")
+                time.sleep(REPAIR_PROBE_INTERVAL)
+        print(f"  identity probe failed {REPAIR_PROBE_ATTEMPTS}/{REPAIR_PROBE_ATTEMPTS} "
+              f"consecutive attempts")
+        return False
+
+    def _ad_password():
+        """Domain Administrator password, read out of the sealed sambacc config the DCs
+        themselves use — same Secret, same json path as sites-job.yaml. Deliberately NOT a
+        second copy of this credential: it owns the whole directory."""
+        path = os.environ.get("AD_ADMIN_PASSWORD_FILE", "")
+        if not path or not os.path.exists(path):
+            return ""
+        import json as _json
+        with open(path) as fh:
+            return _json.load(fh)["domain_settings"]["primary"]["admin_password"]
+
+    AD_PASS = _ad_password()
+
+    def wait_for_host(host, timeout=300, interval=10):
+        """Block until HOST resolves. NOT a nicety — a startup RACE the job cannot retry
+        out of.
+
+        TN_HOST is an AD-internal name (fs-1.<realm>), so resolving it depends on the
+        CoreDNS forward for the AD zone AND on the DC that forward points at being up.
+        samba-ad's dns-config job applies that forward and then DELETES ad-onprem-0 to
+        re-patch its resolver, so for a window of tens of seconds the zone is forwarded to
+        a DC that is restarting and every lookup returns:
+          socket.gaierror: [Errno -2] Name or service not known
+
+        On a recreate this lands squarely in the window where dns-config-job is restarting
+        the DCs: both truenas-configure attempts die on gaierror seconds apart, and the same
+        lookup from the same mesh node succeeds once the DC is back.
+        Nothing is misconfigured in that state: TN_HOST, the CoreDNS forward and the fs-1 A record
+        (192.168.1.237) were all correct the whole time.
+
+        ⚠ backoffLimit IS 1 AND MUST STAY 1 (the appliance locks out for ten minutes after
+        20 auth attempts per 60s), so the Job gets exactly two shots and burned both in a
+        30-second window. Retrying the JOB is the wrong lever; waiting for DNS *before*
+        spending an auth attempt is the right one. This loop costs no auth attempts at all
+        — it never opens the websocket.
+        """
+        import socket, time
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                addr = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0][4][0]
+                if attempt > 1:
+                    print(f"  {host} -> {addr} (resolved after {attempt} attempts)")
+                return
+            except socket.gaierror as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"{host} did not resolve within {timeout}s ({exc}). The AD zone is "
+                        "forwarded to the cloud DC — check that coredns-custom's ad.server "
+                        "block points at a RUNNING ad-cloud-0, and that the fs-1 A record "
+                        "exists in the zone.")
+                if attempt == 1:
+                    print(f"  {host} does not resolve yet — waiting up to {timeout}s "
+                          "(AD DNS may still be settling after a recreate) ...")
+                time.sleep(interval)
+
+    def main():
+        print(f"resolving {HOST} ...")
+        wait_for_host(HOST)
+        with TrueNAS(HOST, USER, PASSWORD) as tn:
+            info = tn.rpc("system.info")
+            print(f"appliance {info.get('hostname')} running {info.get('version')}")
+
+            step_identity(tn)
+            step_network(tn)
+            step_datasets(tn)
+            step_ad(tn)
+            step_shares(tn)
+            step_homes(tn)
+
+            print()
+            if tn.changes:
+                print("CHANGED: " + ", ".join(tn.changes))
+            else:
+                print("NO CHANGES — appliance already converged (idempotent re-run)")
+
+    # -- 1. identity ------------------------------------------------------------
+    def step_identity(tn):
+        print("\n[1/6] identity")
+        # ⚠ TWO SEPARATE NAMES, and the GUI does not sync them. TrueNAS requires the
+        # Network hostname and the SMB NetBIOS name to be THE SAME STRING, because SMB
+        # clients strictly validate Kerberos SPNs. A mismatch does NOT fail at join — it
+        # fails later at mount time as a Kerberos error that reads like a permissions
+        # problem — e.g. a hostname of fs-1 with smb netbiosname still at the default
+        # "truenas".
+        cfg = tn.rpc("network.configuration.config")
+        tn.converge("hostname", {"hostname": cfg.get("hostname")},
+                    {"hostname": HOSTNAME},
+                    lambda d: tn.rpc("network.configuration.update", [d]))
+
+        smb = tn.rpc("smb.config")
+        # workgroup must equal the AD NetBIOS domain; samba uppercases it.
+        tn.converge("smb identity",
+                    {"netbiosname": smb.get("netbiosname"),
+                     "workgroup": (smb.get("workgroup") or "").upper()},
+                    {"netbiosname": HOSTNAME, "workgroup": NETBIOS.upper()},
+                    lambda d: tn.rpc("smb.update", [d]))
+
+    # -- 2. resolver ------------------------------------------------------------
+    def step_network(tn):
+        print("\n[2/6] resolver")
+        # ── do the DC addresses actually ANSWER? ──────────────────────────────
+        # These become the appliance's nameservers, its /etc/hosts overrides and its KDC
+        # list, so an address that serves nothing is not a degradation — it is a resolver
+        # the appliance will sit on. ecc/lan-ip is a DECLARATION (the real address is a
+        # DHCP reservation on the box), so declared and actual can drift.
+        #
+        # ⚠ THIS JOB IS THE ONLY PLACE THIS CHECK WORKS. It is pinned to
+        # ecc/fileserver-lan (see the pod spec), so it sits on the appliance LAN. The same probe
+        # in samba-ad/replication-job.yaml was REMOVED: that Job has no nodeSelector and
+        # lands on the cloud control-plane, which has no route to the lab LAN at all, so it
+        # reported all three addresses dead while every DC was healthy.
+        #
+        # ⚠ WARN, do not fail. A DC restarting during a sync is normal, and the rest of the
+        # convergence is still correct and still worth doing. A PERSISTENT warning here is
+        # the real signal — it means the appliance cannot reach that DC, which otherwise
+        # presents as a DNS misconfiguration with DNS provably fine.
+        import socket as _sock
+        _reachable = []
+        for _ip in DC_IPS:
+            try:
+                with _sock.create_connection((_ip, 389), timeout=5):
+                    _reachable.append(_ip)
+            except OSError as _e:
+                print(f"  ⚠ WARNING: nothing answers tcp/389 at {_ip} ({_e}). It is still "
+                      f"configured below — a DC that is merely restarting must not be "
+                      f"dropped — but if this persists, check that node's real address "
+                      f"against its ecc/lan-ip label.")  # automatically updated from project-settings:applicationPlacements.labels.lanIp
+        if not _reachable:
+            print("  ⚠ NO on-prem DC answered LDAP. Configuring the appliance against them "
+                  "anyway (they may all be mid-restart), but SMB/NFS logins will fail until "
+                  "at least one is reachable.")
+        else:
+            print(f"  {len(_reachable)}/{len(DC_IPS)} DC(s) answering tcp/389: "
+                  f"{', '.join(_reachable)}")
+        # ⚠ The LITERAL DC IP, deliberately — never a name the AD zone resolves. The zone
+        # publishes the on-prem DC's MESH address, so resolving by name would send every
+        # Kerberos/LDAP exchange over the overlay instead of the same switch.
+        #
+        # nameserver2 is the lab router as a FALLBACK, and it is only safe because the DC
+        # now forwards non-AD names upstream (`dns forwarder`, see samba-ad). Without that
+        # the DC answers NXDOMAIN for everything outside the AD zone — and NXDOMAIN is
+        # AUTHORITATIVE, so a client accepts it and never consults nameserver2. That would
+        # silently cost the appliance all external resolution, updates included.
+        cfg = tn.rpc("network.configuration.config")
+        # ⚠ EVERY on-prem DC, up to the three nameserver slots TrueNAS exposes. This used to
+        # be one address, and that was the appliance's single point of failure: a restart of
+        # that DC cost the appliance ALL resolution, which is also what makes the FAULTED
+        # branch below fire (it did, unattended, on 2026-08-31, and the repair deleted
+        # FS-1$). Each entry here is a DC, so each is authoritative for the realm — which is
+        # exactly what the router fallback below is rejected for not being.
+        desired = {"domain": AD_DOMAIN}
+        for i, ip in enumerate(DC_IPS[:3], start=1):
+            desired[f"nameserver{i}"] = ip
+        # Clear any slot a shrunken DC set no longer fills, so a stale address cannot linger
+        # as a black-holed resolver.
+        for i in range(len(DC_IPS[:3]) + 1, 4):
+            desired[f"nameserver{i}"] = ""
+
+        # ⚠ NO ROUTER FALLBACK WHILE THE DOMAIN JOIN MATTERS, and this was measured.
+        # The obvious config — DC as nameserver1, lab router as nameserver2 — breaks AD
+        # discovery. TrueNAS's discovery queries the configured nameservers and fails hard
+        # on the FIRST one that cannot answer for the realm:
+        #   Forward lookup of "_kerberos._tcp.AD.BASE.INTERNAL." failed with nameserver
+        #   192.168.1.1. This may indicate that the specified nameserver is not a valid
+        #   nameserver for the domain
+        # It does not simply move on to a working resolver. So a "harmless" fallback turns
+        # into a join blocker.
+        #
+        # External resolution is NOT lost by dropping it: the DC forwards non-AD names
+        # upstream (`dns forwarder`, samba-ad/statefulset-onprem.yaml), which is exactly why
+        # that forwarder was added. Verified from the DC: github.com and
+        # download.truenas.com both resolve through it.
+        #
+        # ⚠ THAT ARGUMENT IS ABOUT A NON-AD FALLBACK, AND IT DOES NOT APPLY TO A SECOND DC.
+        # Do NOT blank nameserver2/nameserver3 here after the loop above has set them: that
+        # silently defeats the loop and leaves the appliance on ONE resolver however many DCs
+        # exist. Measured 2026-09-02: nameserver2/3 empty on the live appliance while the
+        # converge step reported "already correct", because `desired` had been overwritten
+        # between building it and comparing it.
+        #
+        # The quoted failure is specific to a resolver that is NOT authoritative for the
+        # realm: discovery asks it for _kerberos._tcp.<realm>, it answers "no such name", and
+        # TrueNAS stops there rather than trying the next one. Every address the loop above
+        # writes is an on-prem DC, so each one CAN answer for the realm — which turns that
+        # hard stop into the ordinary failover it looks like it should have been.
+        #
+        # So: never the lab router, never any non-DC. Several DCs, yes — that is the entire
+        # point of running more than one.
+
+        # ⚠ A HOSTS OVERRIDE FOR THE DC, AND IT IS WHAT MAKES THE JOIN POSSIBLE AT ALL.
+        #
+        # The AD join is SRV/DNS-driven and CANNOT be pointed at a specific server:
+        # ActiveDirectoryConfig has no target_server field (that is IPA-only) — verified
+        # against core.get_methods on 25.10.4. It resolves _ldap._tcp.<realm>, gets back
+        # ad-onprem-0.<realm> / ad-cloud-0.<realm>, and dials whatever those resolve to.
+        #
+        # Those names resolve to the DCs' MESH addresses (10.0.10.x) and a pod address,
+        # by design: replication-job.yaml prunes the on-prem DC's name down to exactly its
+        # live hostIP, because extra A records there break cloud->lab replication with
+        # repeated WERR_SEM_TIMEOUT. That prune must not be relaxed.
+        #
+        # But this appliance has ONLY eno1 192.168.1.237/24 and no tailscale, so it cannot
+        # route to 10.0.10.x at all (measured: ping 192.168.1.216 True, 10.0.10.4 False).
+        # A `dc-lan.<realm>` record was added for LAN clients and resolves correctly here,
+        # but the join never looks it up — it follows the SRV targets.
+        #
+        # So the SRV TARGET NAME itself is overridden to the LAN address, on this host only,
+        # via TrueNAS's managed /etc/hosts. AD DNS is untouched, the cloud DC still sees the
+        # mesh address, and the appliance reaches the DC it is on the same switch as.
+        #
+        # ⚠ This works for the JOIN and for SMB/Kerberos because those resolve through the
+        # C library. It would NOT help samba's own DRS, which ignores /etc/hosts entirely
+        # ([[samba-drs-ignores-etc-hosts]]) — irrelevant here, since a member server does
+        # no DRS, but do not reach for this trick on a DC.
+        # ⚠ BOTH DC NAMES MUST BE OVERRIDDEN, NOT JUST THE ON-PREM ONE.
+        # DC discovery walks the SRV records for the domain and tries the targets it finds.
+        # Both DCs are listed (_ldap._tcp.dc._msdcs.<realm> returns ad-cloud-0 AND
+        # ad-onprem-0), and ad-cloud-0 resolves to a POD address (10.42.x.x) that this
+        # appliance cannot route to at all. Overriding only ad-onprem-0 still left
+        # discovery failing with
+        #   [EINVAL]...configuration.domain: Failed to discover Active Directory Domain
+        #   Controller for domain. This may indicate a DNS misconfiguration.
+        # Pointing BOTH names at the LAN DC makes every target the
+        # discovery picks reachable — the lab DC serves the whole domain, so answering as
+        # either name is correct from this appliance's point of view.
+        # ⚠ THE BARE DOMAIN NAME COUNTS TOO, and it is the one that is easy to miss.
+        # Besides the per-DC names, `ad.base.internal` itself carries A records for every
+        # DC (samba registers the realm name on each), and discovery resolves the DOMAIN
+        # directly as well as the SRV targets. From the appliance, with both per-DC
+        # overrides already in place:
+        #   ad.base.internal A -> 10.42.0.242, 10.0.10.9   both unroutable from here
+        # and the join still failed "Failed to discover Active Directory Domain
+        # Controller". Overriding the realm name to the LAN DC as well is what closes it.
+        # ⚠ KNOWN CONSEQUENCE, INVESTIGATED AND ACCEPTED: no kpasswd path for this member.
+        # Port 464 is served by the PDC EMULATOR, and that FSMO role is held by the CLOUD DC
+        # (samba-tool fsmo show). The on-prem DC therefore never binds 464 — by design, not a
+        # misconfiguration: `bind interfaces only`, the `interfaces` list, the missing `nbt`
+        # in our server-services override, and MIT-vs-Samba KDC were each ruled out by test.
+        #
+        # The cloud DC's 464 IS reachable inside the cluster, but this appliance cannot route
+        # to 10.42.x.x, and the override below deliberately points ad-cloud-0 at the LAN DC so
+        # the SRV-driven join dials something routable. Net effect: the appliance resolves the
+        # PDC emulator to a DC that does not serve kpasswd.
+        #
+        # ⚠ AND IT DOES NOT AFFECT MACHINE-ACCOUNT ROTATION, which is the thing it looks
+        # like it should break. A machine changing its own secret uses NetrServerPasswordSet2
+        # over the NETLOGON RPC channel on 445, not kpasswd. A leave+rejoin SETS this
+        # member's password — visible as a fresh FS-1$ pwdLastSet in AD — while 464 stays
+        # unbound on the lab DC throughout. 464 is for USER password changes.
+        #
+        # (`machine password timeout` here is 604800 = 7 days, not the 30 often quoted.)
+        #
+        # The residual risk is smaller and different: the appliance reaches exactly ONE DC,
+        # because the override below pins all three DC names to the lab address. A rotation
+        # attempted while that DC is down has no fallback — winbind retries rather than
+        # failing permanently. See [[samba-onprem-dc-not-binding-464-kpasswd]].
+        dc_fqdns = [h for h in
+                    os.environ.get("DC_FQDNS", "").replace(",", " ").split() if h]
+        # The discovered on-prem DCs, by AD FQDN. Appended rather than listed in the env for
+        # the same reason as their addresses: the set follows the ecc/ad-dc labels.
+        for pod, _ip in DC_HOSTS:
+            fqdn = f"{pod}.{AD_DOMAIN}"
+            if fqdn not in dc_fqdns:
+                dc_fqdns.append(fqdn)
+        if AD_DOMAIN and AD_DOMAIN not in dc_fqdns:
+            dc_fqdns.append(AD_DOMAIN)
+        if dc_fqdns:
+            hosts = list(cfg.get("hosts") or [])
+            # Drop ANY existing line naming a host in the AD domain, then add back exactly
+            # the ones we want. Two lines for one name make resolution order-dependent, and
+            # a stale line (a DC's old address after a node re-adoption) is exactly the
+            # failure this override exists to prevent.
+            #
+            # ⚠ THE PREDICATE IS THE DOMAIN, NOT THE CURRENT DC SET. Filtering on dc_fqdns
+            # only removes lines for DCs that still EXIST, so shrinking the set stranded the
+            # departed DC's entry forever — measured 2026-09-02 after scaling 3 DCs to 1:
+            # `192.168.1.116 ad-onprem-1.ad.base.internal` survived, pointing at a node that
+            # no longer runs a DC. Harmless in that instance because nothing resolves that
+            # name, but it is a stale override on a host in the realm, which is the class of
+            # thing this block exists to eliminate. Anything else in the file (unrelated
+            # hosts) is untouched.
+            kept = [h for h in hosts
+                    if not any(n == AD_DOMAIN or n.endswith("." + AD_DOMAIN)
+                               for n in h.split()[1:])]
+            # ⚠ EACH DC NAME MAPS TO ITS OWN LAN ADDRESS, not all of them to one. Mapping
+            # every DC name to a single address is what pinned the appliance to one DC:
+            # discovery would find several SRV targets and every one of them resolved to the
+            # same box. The realm name itself (AD_DOMAIN, appended above) is the exception —
+            # it is not any one DC, so it gets a line per DC and the resolver may use either.
+            by_name = dict(DC_HOSTS)
+            lines = []
+            for n in dc_fqdns:
+                short = n.split(".", 1)[0]
+                if short in by_name:
+                    lines.append(f"{by_name[short]} {n}")
+                else:
+                    # A name with no DC of its own — the realm, and the cloud DC, whose pod
+                    # address this appliance cannot route. Point them at every lab DC so
+                    # resolution has somewhere to go if one is down.
+                    lines.extend(f"{ip} {n}" for ip in DC_IPS)
+            want_hosts = sorted(kept + lines)
+            if want_hosts != sorted(hosts):
+                desired["hosts"] = want_hosts
+
+        tn.converge("resolver",
+                    {k: cfg.get(k) for k in desired},
+                    desired,
+                    lambda d: tn.rpc("network.configuration.update", [d]))
+
+    # -- 3. datasets ------------------------------------------------------------
+    def step_datasets(tn):
+        print("\n[3/6] datasets")
+        # ⚠ ORDER MATTERS: SHARED_PARENT must be created before its children — ZFS cannot
+        # create datapool/shared/data before datapool/shared exists. It is a GROUPING
+        # dataset only and is deliberately never passed to nfs_export(): exporting the
+        # parent would expose both children through one path and defeat the per-child
+        # boundary (see step 6 and remote-desktop/nfs-shared-pv.yaml). Same shape and same
+        # reasoning as datapool/eda in eda/fileserver/provision-job.yaml.
+        for name in (HOMES, SHARED_PARENT, SHARED, SHARED_TMP,
+                     GITLAB_PARENT, GITLAB_MIRROR):
+            rows = tn.rpc("pool.dataset.query", [[["name", "=", name]]])
+            if rows:
+                # ⚠ NEVER re-apply acltype on an existing dataset. It is a CREATE-TIME
+                # property and changing it rewrites permissions on everything inside.
+                # Report it instead, so a wrong one is visible rather than silently fixed.
+                got = (rows[0].get("acltype") or {}).get("value")
+                if got != "NFSV4":
+                    print(f"  {name}: EXISTS with acltype={got}, expected NFSV4 — NOT "
+                          "changing it (create-time property; a change would rewrite "
+                          "permissions). Recreate the dataset by hand if this is wrong.")
+                else:
+                    print(f"  {name}: already correct (acltype NFSV4)")
+                continue
+            # ⚠ acltype is set EXPLICITLY, not inherited: the pool root datapool is
+            # acltype=POSIX, and POSIX ACLs break SMB semantics on
+            # TrueNAS. NFSV4 also matches what the NFSv4 export needs.
+            print(f"  {name}: absent -> creating with acltype NFSV4")
+            tn.job("pool.dataset.create", [{
+                "name": name,
+                "type": "FILESYSTEM",
+                "acltype": "NFSV4",
+                "aclmode": "PASSTHROUGH",
+                "casesensitivity": "SENSITIVE",
+                "comments": "managed by wave16-truenas (ArgoCD)",
+            }])
+            tn.changes.append(f"dataset {name}")
+
+        # -- quota on the world-writable scratch dataset ------------------------
+        # ⚠ Unlike acltype, `quota` is NOT a create-time property, so it is safe to
+        # converge on every run — and it MUST be, because a dataset created before this
+        # block existed would otherwise stay uncapped forever.
+        #
+        # This is the only world-writable dataset on the pool. Without a cap one runaway
+        # job fills `datapool` and takes homes and every EDA dataset down with it. With
+        # it, the failure is a local ENOSPC to the writing user instead.
+        #
+        # `quota` (not `refquota`) so snapshots and clones count against the same cap —
+        # refquota would exclude exactly the snapshot growth that fills a pool unnoticed.
+        cur = tn.rpc("pool.dataset.query", [[["name", "=", SHARED_TMP]]])
+        if cur:
+            got = (cur[0].get("quota") or {}).get("rawvalue")
+            want = _parse_size(SHARED_TMP_QUOTA)
+            if str(got) != str(want):
+                print(f"  {SHARED_TMP}: quota {got} -> {want} ({SHARED_TMP_QUOTA})")
+                tn.rpc("pool.dataset.update", [SHARED_TMP, {"quota": want}])
+                tn.changes.append(f"quota {SHARED_TMP}={SHARED_TMP_QUOTA}")
+            else:
+                print(f"  {SHARED_TMP}: quota already {SHARED_TMP_QUOTA}")
+
+    # -- 4. AD join -------------------------------------------------------------
+    def step_ad(tn):
+        print("\n[4/6] active directory")
+        status = tn.rpc("directoryservices.status") or {}
+        # ⚠ FAULTED IS NOT "BOUND". The gate below used to treat any non-empty status as
+        # already-joined, which is wrong for exactly the state that needs repairing: a
+        # domain-joined appliance can report
+        #   status FAULTED, "File containing Active Directory machine account password is
+        #   missing from server."
+        # and in that state NOTHING resolves — every user and group lookup fails — while
+        # `type` is still ACTIVEDIRECTORY. Skipping on that would leave the fileserver
+        # permanently broken with a green-looking config. This is what
+        # idmap.clear_idmap_cache leaves behind when it destroys the secrets file
+        # ([[truenas-clear-idmap-cache-wedges-winbind]]).
+        #
+        # A re-join is the documented repair for a missing machine-account secret, and it is
+        # safe here BECAUSE the computer object still exists in AD: the re-join resets that
+        # object's password rather than creating a duplicate. It does invalidate any exported
+        # keytab, which we do not use.
+        # ⚠ REPAIR IS OPT-IN (ALLOW_AD_REPAIR), because it LEAVES the domain first.
+        # directoryservices.leave is documented as "remove its account from the domain and
+        # then reset the local directory services configuration" — so FS-1$ is DELETED from
+        # AD and recreated by the following join. That is the documented recovery for a
+        # broken member, but it is not something to do on a whim: any exported keytab dies
+        # with it, and while it is out of the domain nothing on the appliance can
+        # authenticate.
+        #
+        # It exists because a wedged member can be UNREPAIRABLE otherwise: after
+        # idmap.clear_idmap_cache, NSS returns "user with this name does not exist" for
+        # EVERY principal, and that survives a full reboot. AD itself stays verifiably fine
+        # (uidNumber present, Domain Users gidNumber present, and the KDC log still showing
+        # FS-1$ being ISSUEd tickets), so only the appliance's own
+        # directory-services state was broken. Nothing short of leave+rejoin resets it.
+        # ⚠ RE-READ BEFORE BELIEVING IT. `status` above is a SINGLE sample, and what it
+        # gates is destructive: the branch below LEAVES the domain, which deletes FS-1$.
+        #
+        # THIS HAS ALREADY FIRED. On 2026-08-31 23:28 UTC a single read returned FAULTED
+        # with "WBC_ERR_DOMAIN_NOT_FOUND: wbcPingDc2 failed" — the appliance momentarily
+        # could not reach a DC — and this Job left the domain unattended, failed the
+        # re-join, and left the appliance unjoined until its retry pod repaired it. Nothing
+        # was wrong with AD.
+        #
+        # _identity_works() below already argues exactly this case and applies a
+        # 3-sweep/20s retry for it. `faulted` bypassed that discipline entirely, so the
+        # cheaper, noisier signal was the one with no guard. Same treatment, same reasons:
+        # a wedged member reports FAULTED on every sweep, so the retry costs a minute on a
+        # genuine repair and rejects the transient.
+        def _faulted(tn):
+            for attempt in range(REPAIR_PROBE_ATTEMPTS):
+                st = tn.rpc("directoryservices.status") or {}
+                if (st.get("status") or "").upper() != "FAULTED":
+                    if attempt:
+                        print(f"  status recovered on sweep {attempt + 1} — NOT faulted "
+                              f"(the first read was transient)")
+                    return False, st
+                if attempt + 1 < REPAIR_PROBE_ATTEMPTS:
+                    print(f"  FAULTED on sweep {attempt + 1}/{REPAIR_PROBE_ATTEMPTS}: "
+                          f"{st.get('status_msg')} — re-checking in "
+                          f"{REPAIR_PROBE_INTERVAL}s")
+                    time.sleep(REPAIR_PROBE_INTERVAL)
+            return True, st
+
+        faulted, status = _faulted(tn)
+        broken = faulted or (REPAIR and status.get("type") and not _identity_works(tn))
+        if broken:
+            if faulted:
+                print(f"  ⚠ FAULTED: {status.get('status_msg')}")
+            else:
+                print("  ⚠ joined and HEALTHY, but NO domain principal resolves via NSS —")
+                print("    the appliance's directory-services state is broken, not AD's.")
+            if not REPAIR:
+                print("    ALLOW_AD_REPAIR is not true — NOT repairing. Set it to run")
+                print("    leave+rejoin, which DELETES and recreates FS-1$ in AD.")
+                return
+            if not AD_PASS:
+                raise RuntimeError(
+                    "ALLOW_AD_REPAIR=true but no domain admin password is available")
+            print("    leaving the domain (this removes FS-1$ from AD) ...")
+            left = False
+            try:
+                tn.job("directoryservices.leave", [{"credential": {
+                    "credential_type": "KERBEROS_USER",
+                    "username": "Administrator",
+                    "password": AD_PASS,
+                }}])
+                left = True
+                print("    left; re-joining below")
+            except Exception as exc:
+                # A leave can fail precisely because the member is broken — and on 25.10 it
+                # can also fail on a middleware bug of its own:
+                #   [EFAULT] status_msg is required when setting state to FAULTED
+                # (the leave job hit an error, tried to put directory
+                # services back into FAULTED, and tripped its own validation).
+                # ⚠ A REPORTED FAILURE DOES NOT MEAN NOTHING HAPPENED. The leave can return
+                # "The domain join is not healthy. This prevents the TrueNAS server from
+                # leaving the domain" while it HAS already reset the local config
+                # (service_type/configuration null, enable false) and removed FS-1$ from
+                # AD. So never infer "still joined" from a
+                # failed leave -- re-read the config, which is what the disable step below
+                # effectively does (a no-op when the leave already cleared it).
+                print(f"    leave failed ({str(exc)[:160]})")
+
+            # ⚠ A FAILED LEAVE LEAVES DIRECTORY SERVICES *ENABLED*, AND THAT MAKES THE JOIN
+            # UNCONDITIONALLY IMPOSSIBLE. 25.10 rejects every meaningful field of an
+            # enabled service:
+            #   [EINVAL] directoryservices.update.configuration: Permitted changes while
+            #   directory services are enabled are limited to account caching, DNS updates,
+            #   and timeouts.
+            # The join below sends a full `configuration` (hostname, domain, idmap), so
+            # "attempt the join anyway" — what this branch used to do — could not ever
+            # succeed. It just burned a second auth attempt against the 20-per-60s lockout
+            # and reported the EINVAL instead of the real failure.
+            #
+            # Disabling first is the one transition available from this state, and it is
+            # exactly what the error text asks for ("changes should be performed with
+            # directory services disabled").
+            #
+            # ⚠ DISABLE MEANS service_type: None, NOT service_type + enable: False. The
+            # payload is validated as a whole and naming a service_type obliges you to send
+            # a matching configuration:
+            #   [EINVAL] directoryservices_update: Value error, Explicit configuration is
+            #   required when service_type is specified
+            #. Clearing service_type/credential/configuration
+            # together is the documented "disabled" shape, and it is what the appliance
+            # reports afterwards: {"service_type": null, "configuration": null,
+            # "enable": false}.
+            if not left:
+                print("    disabling directory services so the join can reconfigure ...")
+                try:
+                    tn.job("directoryservices.update", [{
+                        "service_type": None,
+                        "credential": None,
+                        "configuration": None,
+                        "enable": False,
+                    }])
+                    print("    disabled; re-joining below")
+                except Exception as exc:
+                    # Nothing further is possible: still enabled means the join's
+                    # full-config update is a guaranteed EINVAL. Fail loudly here, on the
+                    # REAL cause, rather than a step later on a derived one.
+                    raise RuntimeError(
+                        "AD repair cannot proceed: the leave failed and directory services "
+                        f"could not be disabled either ({str(exc)[:160]}). While they stay "
+                        "enabled, 25.10 rejects every join field. Check that the DC at "
+                        f"{', '.join(DC_IPS)} are reachable from the appliance (the FAULTED reason above "
+                        "is usually DC discovery, not the appliance's own state), then "
+                        "re-run.")
+            tn.changes.append("AD leave")
+        elif status.get("type") or status.get("status"):
+            # CREATE-ONCE. A re-join rewrites the machine account password and
+            # invalidates every SPN and any exported keytab. Explicit guard with a loud
+            # log line, not an accident of ordering.
+            print(f"  already bound: type={status.get('type')} "
+                  f"status={status.get('status')} — NOT re-joining (create-once: a "
+                  "re-join invalidates FS-1$ and every SPN)")
+            return
+        if not JOIN:
+            print("  NOT JOINED, and ALLOW_AD_JOIN is not true — skipping.")
+            print("  The join is gated because it is the one irreversible step here: it")
+            print("  creates the machine account, writes DNS records into the domain, and")
+            print("  cannot be cleanly repeated. Set ALLOW_AD_JOIN=true on this Job when")
+            print("  the uid-coherence gate has been checked (verify-job.yaml).")
+            return
+        if not AD_PASS:
+            raise RuntimeError(
+                "ALLOW_AD_JOIN=true but AD_ADMIN_PASSWORD is empty — refusing to attempt "
+                "a join that would fail and burn an auth attempt")
+        # ⚠ THE REALM MUST EXIST AS AN OBJECT FIRST. `kerberos_realm` on
+        # directoryservices.update is a REFERENCE, not a string to be created on demand:
+        # passing the realm name when no realm object exists fails the whole call with
+        #   [EINVAL] directoryservices.update.kerberos_realm: Unknown kerberos realm
+        # and kerberos.realm.query was [] on a fresh appliance.
+        #
+        # Creating it also lets primary_kdc pin the DC by its LAN ADDRESS, which matters
+        # here: the SRV targets resolve to unroutable mesh addresses from this appliance,
+        # so this is a second, explicit belt alongside the /etc/hosts override in step 2.
+        realms = tn.rpc("kerberos.realm.query", [[["realm", "=", AD_REALM]]])
+        if realms:
+            print(f"  kerberos realm {AD_REALM}: already present")
+        else:
+            print(f"  kerberos realm {AD_REALM}: absent -> creating (kdc {', '.join(DC_IPS)})")
+            tn.rpc("kerberos.realm.create", [{
+                "realm": AD_REALM,
+                # ⚠ EVERY DC, not one. A single-entry kdc list means a DC restart is a
+                # site-wide Kerberos outage; the MIT resolver tries the list in order and
+                # moves on when one does not answer.
+                "primary_kdc": DC_IPS[0],
+                "kdc": list(DC_IPS),
+                "admin_server": list(DC_IPS),
+                "kpasswd_server": list(DC_IPS),
+            }])
+            tn.changes.append("kerberos realm")
+
+        print(f"  joining {AD_REALM} as {HOSTNAME} (idmap AD + RFC2307)")
+        # ⚠ idmap backend AD + RFC2307, NOT the 25.10 default RID. RID HASHES SIDs into a
+        # range and would hand out uids unrelated to what the pods' SSSD reports, so every
+        # file would land owned by the wrong user. The `ad` backend reads the uidNumber /
+        # gidNumber attributes that postsync-provision-users.yaml actually writes
+        # (uid = uidStartNumber + pk, gid = gidStartNumber).
+        tn.job("directoryservices.update", [{
+            "service_type": "ACTIVEDIRECTORY",
+            "enable": True,                     # this is what triggers the join
+            "enable_account_cache": True,
+            # ⚠ OFF, DELIBERATELY. With DNS updates enabled the join gets all the way
+            # through discovery and Kerberos auth and then dies in nsupdate:
+            #   nsupdate failed: tkey query failed: GSSAPI error...
+            #   Server DNS/z.arin.net@AD.BASE.INTERNAL not found in Kerberos database
+            #. The appliance derives an nsupdate target that is not a
+            # DC in this realm — `z.arin.net` is an ARIN whois host, i.e. a lookup that
+            # escaped to the public internet — so the GSSAPI ticket request has no
+            # principal to ask for. The join then ROLLS BACK: verified afterwards that
+            # `samba-tool computer list` still showed only the two DCs, no FS-1$, so the
+            # domain was left clean rather than half-joined.
+            #
+            # We do not need the appliance to self-register: this repo already publishes AD
+            # records from the cluster side (replication-job.yaml manages the DC names and
+            # dc-lan), and the fileserver's own A record can be published the same way —
+            # declaratively, from git, instead of depending on the appliance's nsupdate
+            # path working. That is also more robust across a re-address.
+            "enable_dns_updates": False,
+            "kerberos_realm": AD_REALM,
+            "credential": {
+                "credential_type": "KERBEROS_USER",
+                "username": "Administrator",
+                "password": AD_PASS,
+            },
+            "configuration": {
+                "service_type": "ACTIVEDIRECTORY",
+                "hostname": HOSTNAME,
+                "domain": AD_DOMAIN,
+                "idmap": {
+                    "idmap_domain": {
+                        "name": NETBIOS.upper(),
+                        "idmap_backend": "AD",
+                        "schema_mode": "RFC2307",
+                        "range_low": UID_BASE,
+                        "range_high": UID_BASE + 100000,
+                    },
+                },
+                # `site` is DELIBERATELY omitted: TrueNAS detects it during the join, and
+                # pinning a wrong value is worse than letting it discover the site itself.
+            },
+        }])
+        tn.changes.append("AD join")
+
+    # -- 5. shares --------------------------------------------------------------
+    # nfs_export <label> <dataset> — converge ONE NFSv4 export on a dataset's mountpoint.
+    #
+    # Called once per exported dataset (homes, artifacts). Both need identical semantics,
+    # and the ⚠ notes below apply to EVERY export this creates, not just homes:
+    #
+    # ⚠ maproot_user=root IS REQUIRED, and without it dynamic provisioning fails in a way
+    # that reads like a filesystem problem. NFS squashes an incoming root to `nobody` by
+    # default (the classic root_squash), so the csi-driver-nfs provisioner — which mounts
+    # the export and mkdirs a subdirectory per PVC — gets:
+    #   failed to make subdirectory: mkdir /tmp/pvc-.../<ns>-<pvc>-<pv>: permission denied
+    # and every PVC sits Pending. Nothing in that message mentions
+    # squashing or the export.
+    #
+    # The exposure is bounded by `networks`: only the lab LAN can mount these exports at
+    # all, and the appliance is not reachable from anywhere else (no tailscale on it, and
+    # the lab subnet is not routed from cloud). For homes, per-user isolation does NOT
+    # depend on this — it comes from the per-home directory being mode 0700 owned by the AD
+    # uid, which is enforced by the filesystem and was verified: uid 5007 reading uid 5008's
+    # file gets Permission denied.
+    #
+    # ⚠ ro=False on artifacts too: the EDA build jobs WRITE there (installer media staged
+    # in, built container archives written out). Read-only would break the media copy Job
+    # and the recreate-survival archive.
+    def nfs_export(tn, label, dataset):
+        path = "/mnt/" + dataset
+        rows = tn.rpc("sharing.nfs.query", [[["path", "=", path]]])
+        desired = {
+            "path": path,
+            "comment": f"{label} (managed by wave16-truenas)",
+            "networks": [LAB_CIDR],
+            "enabled": True,
+            "ro": False,
+            "maproot_user": "root",
+            "maproot_group": "root",
+        }
+        if rows:
+            cur = rows[0]
+            tn.converge(f"nfs export {label}",
+                        {k: cur.get(k) for k in desired},
+                        desired,
+                        lambda d: tn.rpc("sharing.nfs.update", [cur["id"], {
+                            k: v for k, v in d.items() if k != "path"}]))
+        else:
+            print(f"  nfs export {path}: absent -> creating")
+            tn.rpc("sharing.nfs.create", [desired])
+            tn.changes.append(f"nfs export {label}")
+
+    def step_shares(tn):
+        print("\n[5/6] shares")
+        # homes — what the desktops mount /home from (csi-driver-nfs). The ONLY export this
+        # job owns.
+        #
+        # ⚠ THE THREE EDA EXPORTS ARE NO LONGER HERE. datapool/eda/{artifacts,registry,
+        # modulefiles} are exported by deployment/argocd-apps/eda/fileserver, so disabling
+        # the EDA stack stops re-asserting them. The root datapool/artifacts export is not
+        # asserted here either — nothing mounts it. Neither is DELETED, only not
+        # re-asserted.
+        # Do NOT re-add them: nfs_export() converges BY PATH and takes rows[0], so two
+        # controllers managing one export path flap or break each other. Exactly one writer
+        # per dataset/export.
+        nfs_export(tn, "nfs-homes", HOMES)
+        # shared/data + shared/tmp — the desktop's common area (/shared, /shared/tmp).
+        # Two exports because they are two datasets: an NFS export covers one dataset,
+        # not its children, so exporting only the parent would leave /shared/tmp empty
+        # on the client (the mountpoint would show the parent's directory, not the
+        # child dataset). Same LAB_CIDR + maproot semantics as homes above.
+        nfs_export(tn, "nfs-shared-data", SHARED)
+        nfs_export(tn, "nfs-shared-tmp", SHARED_TMP)
+        # ⚠ The git mirror is the ONLY on-prem copy of the repositories (there is no other
+        # git backup), so it is exported like the rest — bounded by LAB_CIDR — and its
+        # snapshot policy is what actually protects it, not the export flags.
+        nfs_export(tn, "nfs-gitlab-mirror", GITLAB_MIRROR)
+
+        # Directory layout + modes. Done HERE rather than from the desktop pod because
+        # the appliance is the only place that can chown/chmod the dataset ROOT (an NFS
+        # client with maproot=root could, but the desktop must not need to run as root
+        # just to fix a mode, and the pod may not be running when this job does).
+        #
+        #   /shared        0755 root  — curated, users read only
+        #   /shared/tools  0755 root  — scripts delivered from git by the desktop app
+        #   /shared/tmp    1777 root  — sticky world-writable, like /tmp
+        #
+        # ⚠ 1777 (STICKY), never 0777: sticky is what stops one user deleting another
+        # user's files in a shared directory. Per-user subdirectories are NOT an option
+        # here — AD accounts have no local uid on the appliance, so creating them would
+        # guess the wrong owner (the same reasoning seed-homes records for /scratch).
+        def _ensure_dir(path, mode):
+            st = tn.rpc("filesystem.stat", [path]) if _exists(path) else None
+            if st is None:
+                print(f"  {path}: absent -> creating (mode {mode})")
+                tn.rpc("filesystem.mkdir", [{"path": path, "options": {"mode": mode}}])
+                tn.changes.append(f"dir {path}")
+                return
+            # stat's `mode` is the full st_mode; compare only the permission bits so the
+            # sticky bit on shared/tmp is included (0o7777, not 0o777).
+            got = oct(int(st.get("mode", 0)) & 0o7777)[2:].zfill(4)
+            want = mode.zfill(4)
+            if got != want:
+                print(f"  {path}: mode {got} -> {want}")
+                tn.job("filesystem.setperm", [{
+                    "path": path, "mode": mode, "options": {"recursive": False},
+                }])
+                tn.changes.append(f"mode {path}")
+            else:
+                print(f"  {path}: already mode {want}")
+
+        def _exists(path):
+            try:
+                tn.rpc("filesystem.stat", [path])
+                return True
+            except Exception:
+                return False
+
+        _ensure_dir(f"/mnt/{SHARED}", "0755")
+        _ensure_dir(f"/mnt/{SHARED}/tools", "0755")
+        # ⚠ 0777 HERE, NOT 1777 — filesystem.setperm REJECTS the sticky bit:
+        #   [EINVAL] filesystem_setperm.mode: Please supply a value between 000 and 777
+        #. The STICKY BIT IS STILL REQUIRED, and without it any
+        # user can delete another user's files in this world-writable directory. It is
+        # therefore applied from the NFS CLIENT instead, where chmod takes four digits
+        # normally — see remote-desktop/desktop-gvisor.yaml seed-homes, which runs as
+        # root and reaches the export through maproot_user=root.
+        # Setting 0777 and stopping here would be a SILENT downgrade, which is why the
+        # client-side chmod is not optional cleanup but part of the same change.
+        _ensure_dir(f"/mnt/{SHARED_TMP}", "0777")
+        # The SMB share and the service checks below concern HOMES only.
+        path = "/mnt/" + HOMES
+
+        # NFSv4 + the AD domain for id mapping. ⚠ The NFSv4 domain MUST match on server
+        # AND client or every uid maps to nobody — which looks like a permissions bug.
+        #
+        # ⚠ There is no `v4` boolean in 25.10 — the field is `protocols`, a LIST, and
+        # NFSV4 is already in the default ["NFSV3","NFSV4"]. Writing v4 fails
+        # `[EINVAL] nfs_update.v4: Extra inputs are not permitted`.
+        # NFSV3 is kept alongside V4 rather than removed: dropping it is a separate,
+        # client-visible decision and nothing here requires v4-only.
+        nfs = tn.rpc("nfs.config")
+        protocols = sorted(set(nfs.get("protocols") or []) | {"NFSV4"})
+        tn.converge("nfs service",
+                    {"protocols": sorted(nfs.get("protocols") or []),
+                     "v4_domain": nfs.get("v4_domain")},
+                    {"protocols": protocols, "v4_domain": AD_DOMAIN},
+                    lambda d: tn.rpc("nfs.update", [d]))
+
+        # SMB share on the same dataset — for laptops. The plan asks for both protocols
+        # on datapool/homes, and step 7 creates them together.
+        #
+        # ⚠ The share is NOT called "homes": TrueNAS RESERVES that name for its special
+        # auto-home share and rejects it with
+        #   [EINVAL] data.name: Value error, homes: share name is reserved
+        #. "userhomes" is the SMB share name; the NFS export above is
+        # addressed by PATH and is unaffected by this.
+        smb_rows = tn.rpc("sharing.smb.query", [[["path", "=", path]]])
+        if smb_rows:
+            print(f"  smb share {path}: already present as "
+                  f"{smb_rows[0].get('name')!r}")
+        else:
+            print(f"  smb share {path}: absent -> creating as 'userhomes'")
+            tn.rpc("sharing.smb.create", [{
+                "path": path,
+                "name": "userhomes",
+                "comment": "user homes (managed by wave16-truenas)",
+                "enabled": True,
+            }])
+            tn.changes.append("smb share")
+
+        # Enable+start the services only if they are not already. service.update with an
+        # unchanged value would still bounce them.
+        for svc in ("nfs", "cifs"):
+            rows = tn.rpc("service.query", [[["service", "=", svc]]])
+            if not rows:
+                continue
+            cur = rows[0]
+            if not cur.get("enable"):
+                print(f"  service {svc}: enabling")
+                tn.rpc("service.update", [svc, {"enable": True}])
+                tn.changes.append(f"service {svc} enabled")
+            if cur.get("state") != "RUNNING":
+                print(f"  service {svc}: starting")
+                tn.rpc("service.control", ["START", svc])
+                tn.changes.append(f"service {svc} started")
+            if cur.get("enable") and cur.get("state") == "RUNNING":
+                print(f"  service {svc}: already enabled and running")
+
+    # -- 6. per-user home directories ------------------------------------------
+    def step_homes(tn):
+        """Create each user's home on the appliance, owned by their AD uid, mode 0700.
+
+        ⚠ WHY HERE AND NOT IN samba-ad/postsync-provision-users.yaml, which is where the
+        user list actually comes from: creating the directory requires the TrueNAS API, and
+        that Job has no appliance credential (only the domain admin one). This Job has both,
+        so the split is credential-driven, not arbitrary.
+
+        ⚠ WHY NOT pam_mkhomedir, which is what the desktops use today: it creates the home
+        at FIRST LOGIN, inside the pod, on whatever /home happens to be mounted. Once /home
+        is NFS that races the mount — and SSH key auth does not need the home to exist (keys
+        come from LDAP via sss_ssh_authorizedkeys), so a user can authenticate BEFORE their
+        home is there and land in a missing directory. Creating homes declaratively removes
+        the race entirely; pam_mkhomedir is dropped at the desktop cutover.
+
+        ⚠ WHY NOT TrueNAS's SMB auto-home: it fires on SMB connect, so an NFS-mounted pod
+        never triggers it.
+
+        Ownership comes from NSS (winbind), not from recomputing uidStartNumber + pk here.
+        Reading it back is the point: if idmap is misconfigured the lookup FAILS rather than
+        silently creating a directory owned by a plausible-but-wrong uid, which is the
+        failure the whole `idmap AD + RFC2307` choice exists to prevent.
+
+        ⚠ HOMES ARE MATCHED BY USERNAME AND RE-OWNED, NOT ADOPTED. The mapping runs in ONE
+        direction — Authentik decides the uid (uidStartNumber + pk, written into AD), and
+        the appliance follows. A home that already exists for <username> is chowned to the
+        current uid rather than the uid being read back off the directory.
+
+        This matters because the homes dataset OUTLIVES the cluster: a recreate wipes AD
+        (so the write-once uidNumber guard in postsync-provision-users.yaml has no memory
+        to protect) and Authentik re-issues pks, so the same human comes back with a
+        different uid. Username is the only identifier stable across that boundary.
+        """
+        print("\n[6/6] home directories")
+        # ⚠ THE LIST IS NOT HARDCODED. It comes from the ConfigMap that
+        # samba-ad/postsync-provision-users.yaml republishes on every sync, whose contents
+        # are the members of the Authentik selector group it provisions into AD. So adding a
+        # user in Authentik is all that is required: they are provisioned into AD, the list
+        # is republished, and this step creates their home on the next sync. No roster to
+        # maintain in git.
+        #
+        # ⚠ WHY NOT ENUMERATE AD FROM HERE, which would be the obvious design: the appliance
+        # cannot. A domain-joined TrueNAS resolves a user BY NAME through NSS, but
+        # `user.query` over the directory cache returns ZERO domain users,
+        # even after directoryservices.cache_refresh. Resolution and enumeration are
+        # different capabilities and only the first one works.
+        #
+        # HOME_USERS (env) stays supported as an override for a manual run.
+        users = [u for u in os.environ.get("HOME_USERS", "").replace(",", " ").split() if u]
+        src = "HOME_USERS env"
+        if not users:
+            listed = os.environ.get("HOME_USERS_FILE", "")
+            if listed and os.path.exists(listed):
+                with open(listed) as fh:
+                    users = [u for u in fh.read().replace(",", " ").split() if u]
+                src = listed
+        if not users:
+            # Not an error: on a first bring-up the provisioning Job may not have run yet.
+            # Homes are created on the next sync once the list exists, so failing here would
+            # turn an ordering artefact into a red app.
+            print("  no user list available yet — nothing to create")
+            print("  (samba-ad/postsync-provision-users.yaml publishes configmap")
+            print("   truenas-home-users; this step consumes it on the next sync)")
+            return
+        print(f"  user list from {src}: {','.join(users)}")
+        homes_path = "/mnt/" + HOMES
+        existing = {e.get("name") for e in (tn.rpc("filesystem.listdir", [homes_path]) or [])}
+        for user in users:
+            # Domain-qualify: with use_default_domain False (the default, and correct for a
+            # single-domain member server) NSS only answers the DOMAIN\user form.
+            qualified = f"{NETBIOS.upper()}\\{user}"
+            try:
+                obj = tn.rpc("user.get_user_obj", [{"username": qualified}])
+            except Exception as exc:
+                print(f"  {user}: NOT RESOLVABLE via NSS ({str(exc)[:70]}) — SKIPPED.")
+                print("    A home owned by the wrong uid is worse than no home; fix idmap")
+                print("    first (see the Domain Users gidNumber note in samba-ad).")
+                continue
+            uid, gid = obj.get("pw_uid"), obj.get("pw_gid")
+            target = f"{homes_path}/{user}"
+            if user not in existing:
+                print(f"  {user}: creating {target} (uid {uid} gid {gid}, mode 0700)")
+                tn.rpc("filesystem.mkdir", [{"path": target, "options": {"mode": "700"}}])
+                tn.changes.append(f"home {user}")
+            st = tn.rpc("filesystem.stat", [target])
+            if st.get("uid") != uid or st.get("gid") != gid:
+                # ⚠ RECURSIVE ON PURPOSE. Authentik is the single allocator: uid =
+                # uidStartNumber + pk, and a pk is NOT stable across a cluster recreate
+                # (testuser 8 -> 10, testadmin 7 -> 9). The homes
+                # dataset lives on the appliance and SURVIVES that recreate, so a home
+                # matched by USERNAME is re-pointed at whatever uid Authentik now says.
+                #
+                # Chowning only the directory would leave every file INSIDE it owned by
+                # the previous uid — the user would own their home but not its contents,
+                # i.e. lose access to their own data on each recreate. The directory and
+                # what it holds have to move together.
+                print(f"  {user}: chown -R {st.get('uid')}:{st.get('gid')} -> {uid}:{gid}")
+                tn.job("filesystem.chown", [{
+                    "path": target, "uid": uid, "gid": gid,
+                    "options": {"recursive": True},
+                }])
+                tn.changes.append(f"home {user} owner")
+                st = tn.rpc("filesystem.stat", [target])
+            # ⚠ RECONCILE THE MODE, not just the owner. The mode was previously set ONLY at
+            # mkdir time, so anything that widened an existing home was permanent: this step
+            # printed "already correct" on a uid/gid match and never looked at the bits.
+            # Measured 2026-09-15 — both homes sat at 0770 while this job reported them
+            # correct on every run, and truenas-verify's gate 5 was the only thing that saw it.
+            #
+            # 0770 is not cosmetic here: every AD user shares gid 6000 (Domain Users), so
+            # group-readable means any user can read any other user's home. Per-user isolation
+            # on this export comes from the directory bits alone — the NFS export cannot
+            # provide it (see the nfs_export notes above).
+            #
+            # ⚠ NON-RECURSIVE, unlike the chown above. The chown is recursive because a uid
+            # change must reach existing files or the user loses their own data; the mode is
+            # about the home DIRECTORY itself, and a recursive setperm would flatten whatever
+            # modes users have deliberately set on their own files inside it.
+            mode_now = int(st.get("mode", 0)) & 0o777
+            if mode_now != 0o700:
+                print(f"  {user}: mode {oct(mode_now)} -> 0o700")
+                tn.job("filesystem.setperm", [{
+                    "path": target, "mode": "700", "options": {"recursive": False},
+                }])
+                tn.changes.append(f"home {user} mode")
+            elif user in existing:
+                print(f"  {user}: already correct (uid {uid} gid {gid}, mode 0700)")
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: truenas-configure
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # ⚠ LOW ON PURPOSE. A failed run has already spent auth attempts against the 20-per-60s
+  # limit, and a retry storm turns a small error into a ten-minute lockout of the whole
+  # appliance. One retry, then fail loudly and let a human read the log.
+  backoffLimit: 1
+  # Bounded: an unbounded Sync hook blocks the Application indefinitely (the lesson from
+  # dns-config-job.yaml). Generous enough for a real AD join, which is minutes.
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      # See the manifest header: this MUST run on the appliance's LAN.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Needed only by the initContainer below, to discover the on-prem DCs.
+      serviceAccountName: truenas-configure
+      initContainers:
+        # DISCOVER THE ON-PREM DCs — their names and their LAN addresses.
+        #
+        # ⚠ WHY NOT AN ENV VAR. This was `DC_IP: 192.168.1.216`, one literal address for one
+        # DC, and that literal WAS the appliance's single point of failure: it became
+        # nameserver1, it became every /etc/hosts override, and it became the KDC in the
+        # kerberos realm — so any restart of that one DC took SMB and NFS auth down, and the
+        # FAULTED repair path below then leaves the domain and deletes FS-1$. That fired
+        # unattended on 2026-08-31. There are several on-prem DCs now, so there is no single
+        # value to write here.
+        #
+        # ⚠ WHY NOT DNS. The obvious alternative is to read the site SRV records the
+        # replication Job publishes. It cannot be used HERE: this Job's whole purpose is
+        # configuring the resolver the appliance uses, so it must not depend on the AD zone
+        # being answerable. The API server is a separate, always-available source.
+        #
+        # The LAN address lives on the NODE (label ecc/lan-ip, from project_settings
+        # nodes.mesh[].lanIp) because it is a property of the box, not of the domain.
+        - name: read-onprem-dcs
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # WAIT FOR THE DCs TO ACTUALLY SERVE, not merely to be scheduled.
+              #
+              # ⚠ THIS IS THE JOB'S OTHER STARTUP RACE, and it is NOT the DNS one
+              # wait_for_host() already covers. Measured on the ecc196 recreate: ad-onprem-1
+              # became Ready at 05:29:00Z and this Job started at 05:28:29Z — 31s early. The
+              # join died with "[EFAULT] Failed to properly join domain and start up
+              # services"; the single retry pod succeeded ten minutes later having changed
+              # nothing.
+              #
+              # The tcp/389 probe in step_network did NOT catch it and CANNOT: these DCs are
+              # hostNetwork, so samba binds the LAN listener long before the directory can
+              # service a JOIN. It reported "2/2 DC(s) answering tcp/389" during the run that
+              # failed. That probe stays WARN-ONLY on purpose — a DC merely restarting must
+              # not be dropped from the appliance's resolver — so it is deliberately not the
+              # blocking gate. This is.
+              #
+              # ⚠ THE POD'S Ready CONDITION *IS* THE ROOT-DSE QUERY. ad-onprem's readiness
+              # probe is `ldbsearch -H ldap://127.0.0.1 -s base -b "" namingContexts`
+              # (statefulset-onprem.yaml) — a real search over the socket, not a port
+              # connect. Reading the condition reuses that proof instead of re-implementing
+              # an LDAP client in a container that has no ldbsearch.
+              #
+              # Same lever as wait_for_host(): backoffLimit IS 1 AND MUST STAY 1 (the
+              # appliance locks out for ten minutes after 20 auth attempts per 60s), so the
+              # Job gets exactly two shots and burned both here. Retrying the JOB is the
+              # wrong lever; waiting BEFORE spending an auth attempt is the right one. This
+              # runs in an initContainer, so it never opens the websocket and costs no auth
+              # attempt at all — and a timeout fails before the configure container starts.
+              #
+              # ⚠ get + jsonpath, NOT `kubectl wait --for=condition=ready`. `wait` opens a
+              # WATCH and this ServiceAccount holds only pods get/list; it would fall back to
+              # polling behind a wall of "Failed to watch ... is forbidden" that makes a
+              # healthy run look broken (cf. dc-set-watch.yaml).
+              #
+              # 600s of the Job's 1800s activeDeadlineSeconds: a DC's own readinessProbe
+              # budget is 30s + 40 x 15s = 630s, so anything slower is a DC that is not
+              # coming up rather than one that is slow. The remaining ~1200s is left for the
+              # join itself and the rest of the convergence.
+              READY_TIMEOUT=600
+              deadline=$(( $(date +%s) + READY_TIMEOUT ))
+              attempt=0
+              while :; do
+                attempt=$((attempt + 1))
+                kubectl get pods -n samba-ad -l dc=onprem \
+                  -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+                  2>/dev/null | awk 'NF==3' > /shared/dcs.all || true
+                total=$(wc -l < /shared/dcs.all)
+                awk '$3=="True" {print $1, $2}' /shared/dcs.all > /shared/dcs.raw
+                ready=$(wc -l < /shared/dcs.raw)
+                # ⚠ ALL of them, not "at least one". Every address here becomes a nameserver
+                # AND an /etc/hosts override AND a KDC on the appliance, so a DC admitted
+                # while not yet serving is a black-holed resolver the appliance then sits on
+                # — the exact single point of failure this discovery exists to remove.
+                if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
+                  [ "$attempt" -gt 1 ] && echo "all $ready on-prem DC(s) Ready after $attempt sweeps"
+                  break
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "ERROR: only $ready/$total on-prem DC(s) reached Ready within ${READY_TIMEOUT}s." >&2
+                  echo "       A DC is Ready when its own ldbsearch root-DSE probe passes, so this" >&2
+                  echo "       means the directory is not serving — not that it is slow. Joining" >&2
+                  echo "       against it would spend one of this Job's two auth attempts on a" >&2
+                  echo "       failure. Check: kubectl -n samba-ad get pods -l dc=onprem" >&2
+                  awk '$3!="True" {print "       NOT READY: " $1 " on " $2}' /shared/dcs.all >&2
+                  exit 1
+                fi
+                if [ "$attempt" -eq 1 ]; then
+                  echo "$ready/$total on-prem DC(s) Ready — waiting up to ${READY_TIMEOUT}s"
+                  echo "  (a DC serves LDAP on its LAN address before it can service a JOIN)"
+                fi
+                sleep 10
+              done
+
+              if [ ! -s /shared/dcs.raw ]; then
+                echo "ERROR: no scheduled pods with label dc=onprem in namespace samba-ad." >&2
+                echo "       The appliance's resolver, its hosts overrides and its Kerberos" >&2
+                echo "       realm all point at those DCs; configuring it against an empty" >&2
+                echo "       list would leave it with no resolver at all." >&2
+                exit 1
+              fi
+              : > /shared/dc-ips
+              : > /shared/dc-names
+              while read -r POD NODE; do
+                LANIP=$(kubectl get node "$NODE" \
+                          -o jsonpath='{.metadata.labels.ecc/lan-ip}' 2>/dev/null || true)
+                if [ -z "$LANIP" ]; then
+                  echo "ERROR: node $NODE runs on-prem DC $POD but has no ecc/lan-ip label." >&2  # automatically updated from project-settings:applicationPlacements.labels.lanIp
+                  echo "       Set lanIp on that node in project_settings.ts nodes.mesh and" >&2
+                  echo "       re-run the mesh-label reconcile (pulumi up)." >&2
+                  exit 1
+                fi
+                echo "$LANIP" >> /shared/dc-ips
+                printf '%s %s\n' "$POD" "$LANIP" >> /shared/dc-names
+                echo "on-prem DC $POD on $NODE -> $LANIP"
+              done < /shared/dcs.raw
+          volumeMounts:
+            - { name: shared, mountPath: /shared }
+      containers:
+        - name: configure
+          # Plain python; the client is dependency-free so there is no pip install (and
+          # therefore no egress requirement) on the critical path.
+          image: docker.io/library/python:3.14-slim # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "/src/configure.py"]
+          env:
+            - name: DS_GITLAB_PARENT
+              value: "datapool/gitlab"
+            - name: DS_GITLAB_MIRROR
+              value: "datapool/gitlab/mirror"
+            - name: TN_HOST
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: FS_HOSTNAME
+              value: "fs-1" # automatically updated from project-settings:storage.fileserver.hostname
+            - name: DS_HOMES
+              value: "datapool/homes" # automatically updated from project-settings:storage.fileserver.datasets.homes.dataset
+            - name: DS_SHARED_PARENT
+              value: "datapool/shared" # automatically updated from project-settings:storage.fileserver.datasets.shared.parent
+            - name: DS_SHARED
+              value: "datapool/shared/data" # automatically updated from project-settings:storage.fileserver.datasets.shared.dataset
+            - name: DS_SHARED_TMP
+              value: "datapool/shared/tmp" # automatically updated from project-settings:storage.fileserver.datasets.shared.tmpDataset
+            - name: DS_SHARED_TMP_QUOTA
+              value: "1T" # automatically updated from project-settings:storage.fileserver.datasets.shared.tmpQuota
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            # The AD NetBIOS DOMAIN (users type AD\alice), not this host's netbios name.
+            # Not anchored: netbiosName reaches nothing through the anchor mechanism (it is
+            # otherwise carried only inside the sealed sambacc config). Keep in step with
+            # project_settings.ts activeDirectory.netbiosName — the drift check in
+            # updateConfigFromProjectSettings.sh guards the sealed copy, not this one.
+            - name: AD_NETBIOS
+              value: "ad"
+            # ⚠ NO DC_IP HERE — the on-prem DC addresses are DISCOVERED by the
+            # read-onprem-dcs initContainer. See its comment for why a literal was the
+            # appliance's single point of failure.
+            #
+            # The CLOUD DC's FQDN, which is an SRV target the AD join may dial and which
+            # resolves to a pod address this appliance cannot route. It is overridden in the
+            # appliance's managed /etc/hosts (step 2) because the join cannot be pointed at a
+            # server. The on-prem DC names are added to this list at runtime from the
+            # discovered set — they are not listed here, because which ones exist depends on
+            # which nodes carry ecc/ad-dc.
+            - name: DC_FQDNS
+              value: "ad-cloud-0.ad.base.internal"
+            - name: LAB_CIDR
+              value: "192.168.1.0/24" # automatically updated from project-settings:storage.fileserver.labCidr
+            - name: UID_START
+              value: "5000" # automatically updated from project-settings:activeDirectory.uidStartNumber
+            - name: GID_START
+              value: "6000" # automatically updated from project-settings:activeDirectory.gidStartNumber
+            # ⚠ THE AD JOIN IS GATED OFF BY DEFAULT. It is the one irreversible step here:
+            # it creates the FS-1$ machine account, writes DNS records into the domain, and
+            # cannot be cleanly repeated (a re-join invalidates every SPN and any exported
+            # keytab). Flip to "true" only once the uid-coherence gate has been checked —
+            # a wrong idmap backend means every file ends up owned by the wrong user, and
+            # that is far more expensive to unwind than a delayed join.
+            # AD accounts that get a home directory on the appliance. Kept explicit
+            # rather than derived from the AD group: this Job has no Authentik token, and a
+            # wrong list here creates directories rather than failing, so it should be
+            # reviewed in git. The desktop cutover is what makes these authoritative.
+            # ⚠ EMPTY BY DESIGN — the list is derived, not declared. It arrives via the
+            # mounted truenas-home-users ConfigMap below, republished on every sync by
+            # samba-ad/postsync-provision-users.yaml from the Authentik selector group.
+            # Set this only to override the derived list for a one-off manual run.
+            - name: HOME_USERS
+              value: ""
+            - name: HOME_USERS_FILE
+              value: /home-users/users
+            - name: ALLOW_AD_JOIN
+              value: "true"
+            # ⚠ DESTRUCTIVE, AND DELIBERATELY ARMED. The code defaults it to false; this
+            # manifest turns it ON. When a joined appliance resolves no principal, it is
+            # repaired by directoryservices.leave + re-join — which DELETES FS-1$ from AD
+            # (and the kerberos realm object) and recreates both.
+            #
+            # It is on because the wedge is real, recurring and otherwise terminal: the
+            # appliance reports status HEALTHY while NOTHING resolves, and the state
+            # survives cache_refresh, a cifs/nfs restart and a full reboot. Unarmed, that
+            # fails gate 3 and blocks the whole wave until a human flips this flag.
+            #
+            # ⚠ The safety is in the PROBE, not in this flag: _identity_works() must fail
+            # REPAIR_PROBE_ATTEMPTS consecutive sweeps before the repair fires, because the
+            # app is automated+selfHeal and this Job is a Sync hook, so the check runs
+            # unattended on every sync. Do not weaken that retry and leave this on.
+            - name: ALLOW_AD_REPAIR
+              value: "true"
+            # Consecutive failed identity sweeps (and the gap between them) required before
+            # a rejoin. Raise the count, not the interval, if a slow DC restart ever trips
+            # it — the sweeps reuse one websocket and cost no auth attempts.
+            - name: REPAIR_PROBE_ATTEMPTS
+              value: "3"
+            - name: REPAIR_PROBE_INTERVAL
+              value: "20"
+            # The sealed sambacc config, mounted read-only ONLY to read
+            # domain_settings.primary.admin_password. Same Secret sites-job.yaml reads, so
+            # the domain admin credential exists in exactly one place.
+            - name: AD_ADMIN_PASSWORD_FILE
+              value: /etc/samba/container/config.json
+            - name: TN_USER
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER }
+            - name: TN_PASS
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: ad-config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: home-users, mountPath: /home-users, readOnly: true }
+            - { name: shared, mountPath: /shared, readOnly: true }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: src
+          configMap: { name: truenas-configure-src }
+        # Carries the discovered on-prem DC list from the initContainer.
+        - name: shared
+          emptyDir: {}
+        # ⚠ THIS IS WHY THE JOB RUNS IN samba-ad AND NOT truenas.
+        # It needs TWO credentials: the TrueNAS admin password (to drive the API) and the
+        # DOMAIN ADMINISTRATOR password (to join). The latter lives in
+        # samba-ad/samba-ad-config and a Secret cannot be mounted across namespaces, so one
+        # of the two has to be duplicated — and the choice is not symmetric. Duplicating
+        # the domain admin password would put the credential that owns the entire directory
+        # in a second place; duplicating the appliance's own password puts a
+        # single-appliance credential next to the DC that already trusts it. So the Job
+        # lives here and truenas/sealSecrets.sh seals a samba-ad copy of truenas-admin.
+        # `optional: true` so everything except the join still converges without it.
+        - name: ad-config
+          secret:
+            secretName: samba-ad-config
+            optional: true
+        # The provisioned user list. `optional: true` because on a first bring-up the
+        # provisioning Job may not have published it yet — the Job then converges everything
+        # else and creates homes on the next sync, rather than failing on an ordering
+        # artefact.
+        - name: home-users
+          configMap:
+            name: truenas-home-users
+            optional: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: truenas-configure
+  namespace: samba-ad
+  annotations:
+    # ⚠ NOT a hook, deliberately — and neither are the Role/RoleBinding below. dc-set-watch
+    # CLONES the hook Job's spec whenever the DC set changes (dc-set-watch.yaml), and that
+    # clone keeps `serviceAccountName: truenas-configure`. A hook ServiceAccount only exists
+    # around a sync, so every later clone died before it ever started a pod:
+    #   Error creating: pods "truenas-configure-dcset-…-" is forbidden:
+    #   error looking up service account samba-ad/truenas-configure: not found
+    # Measured on ecc213 2026-09-17 — the Job object survived (so the clone found a spec to
+    # copy) while its SA, Role and RoleBinding were all gone, which is why this reads as a
+    # scheduling problem rather than a missing-RBAC one.
+    # Wave 0 keeps it ahead of the Job on a first sync: a hook Job whose ServiceAccount does
+    # not exist yet stays Pending on an admission error rather than failing, which is the
+    # worst diagnostic outcome.
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: truenas-configure
+  namespace: samba-ad
+  annotations:
+    # Not a hook — see the ServiceAccount above; dc-set-watch's clones need this to persist.
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  # Read ONLY, and only to DISCOVER the on-prem DCs (label dc=onprem) rather than naming one
+  # in an env var — see the initContainer's comment for why a literal here was the
+  # appliance's single point of failure.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: truenas-configure
+  namespace: samba-ad
+  annotations:
+    # Not a hook — see the ServiceAccount above; dc-set-watch's clones need this to persist.
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: truenas-configure
+subjects:
+  - kind: ServiceAccount
+    name: truenas-configure
+    namespace: samba-ad
+---
+# Nodes are cluster-scoped, so reading one label needs a ClusterRole. `get`/`list` only, and
+# only because a DC's LAN address lives on its node (ecc/lan-ip, from project_settings
+# nodes.mesh[].lanIp) — copying those addresses into this Job as env vars is exactly the
+# per-node literal this design removes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: truenas-configure-nodes
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: truenas-configure-nodes
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: truenas-configure-nodes
+subjects:
+  - kind: ServiceAccount
+    name: truenas-configure
+    namespace: samba-ad

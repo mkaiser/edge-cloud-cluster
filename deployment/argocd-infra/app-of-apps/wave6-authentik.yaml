@@ -1,0 +1,67 @@
+# ArgoCD Application: Authentik — identity provider (OIDC) for the cluster.
+# Accessible at https://id.subdomain.domain.tld
+#
+# Multi-source:
+#   1. Helm chart for Authentik server + worker (bundled PostgreSQL + Redis)
+#   2. Git repo directory for blueprints, PostSync jobs, sealed secrets
+#
+# Blueprints (config-as-code) create the permission groups, OIDC providers,
+# applications and test users. Passwords are set by a PostSync job via the API.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: authentik
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  project: default
+  sources:
+    - repoURL: https://charts.goauthentik.io
+      chart: authentik
+      targetRevision: "2026.8.2" # renovate: datasource=helm depName=authentik registryUrl=https://charts.goauthentik.io
+      helm:
+        releaseName: authentik
+        valueFiles:
+          - $values/deployment/argocd-infra/authentik/values.yaml
+
+    # ref source so valueFiles ($values) can be resolved from the git repo
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    # Plain manifests: blueprints (ConfigMaps), PostSync jobs, sealed secrets
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-infra/authentik
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: authentik
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

@@ -1,0 +1,39 @@
+# TLS certificate for every GitLab hostname: gitlab.*, registry.gitlab.*, kas.*,
+# pages.*. Issuer follows project-settings:tls.certIssuerType.
+#
+# Two consumers, which is why it must exist EARLY:
+#   1. the chart-rendered Gateway `gitlab-gw` (ns gitlab) terminates TLS with it —
+#      every listener's certificateRefs is overridden to this one secret in
+#      values.yaml (gatewayApiResources.gateway.listeners.*)
+#   2. GitLab's internal TLS consumers
+#
+# It replaces the chart's self-signed gitlab-wildcard-tls (which only covers
+# registry.gitlab.*).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gitlab-tls
+  namespace: gitlab
+  annotations:
+    # MUST sync BEFORE the Gateway, which the chart renders with no annotation
+    # (= wave 0). ArgoCD applies a wave, waits for it to become healthy, then
+    # advances — and gitlab-gw can NEVER become healthy while this Secret is
+    # missing ("Listener: Secret gitlab/gitlab-tls does not exist"). At wave 1
+    # the sync therefore failed at wave 0 and never got here, so the Certificate
+    # was never created and all four HTTPRoutes failed with "There are no ready
+    # listeners for this parent ref". Deadlock, not a slow issuance.
+    #
+    # -1 is safe: the bundled gitlab-certmanager is disabled (installCertmanager:
+    # false in values.yaml), so there is no starting webhook to race. The cluster
+    # cert-manager is installed by Pulumi long before this app syncs.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  secretName: gitlab-tls
+  issuerRef:
+    name: letsencrypt-prod # automatically updated from project-settings:tls.certIssuerType
+    kind: ClusterIssuer
+  dnsNames:
+    - "gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+    - "registry.gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+    - "kas.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+    - "pages.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}

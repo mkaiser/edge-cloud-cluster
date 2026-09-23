@@ -1,0 +1,169 @@
+# Bootstrap notification, sent ONCE per cluster.
+# The notify Application is sync-wave 19, so this PostSync hook fires the first
+# time the app-of-apps reaches wave 19 (i.e. the wave-18 barrier passed) — when all
+# infrastructure apps are up. A wave19-notify-done marker ConfigMap in argocd
+# makes it idempotent: it never re-sends on subsequent re-syncs of the notify app.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notify-final
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: notify-final
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+rules:
+
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["smtp-credentials"]
+  verbs: ["get"]
+# Run-once marker: read it to skip if the mail was already sent, create it after a
+# successful send. (the create verb cannot be restricted by resourceNames.)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notify-final
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: notify-final
+subjects:
+- kind: ServiceAccount
+  name: notify-final
+  namespace: argocd-infra
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notify-final
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "20"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: notify-final
+      restartPolicy: Never
+      containers:
+      - name: notify
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: NOTIFY_TO
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: sendBootstrapFinishMailRecipient
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: host
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: port
+        - name: SMTP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: username
+        - name: SMTP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: password
+        command: ["/bin/sh", "-ec"]
+        args:
+        - |
+          # Run EXACTLY ONCE per cluster. This is a PostSync hook, so it would
+          # otherwise re-fire (and re-email) on every re-sync of the notify app.
+          # Guard with a marker ConfigMap in argocd (same idiom as the wave
+          # barriers): if wave19-notify-done exists, the mail was already sent on
+          # this cluster — skip. The marker lives in-cluster only (not git), so a
+          # fresh cluster has no marker and the mail fires once. To force a resend:
+          #   kubectl delete configmap wave19-notify-done -n argocd-infra
+          MARKER=wave19-notify-done
+          if kubectl get configmap "$MARKER" -n argocd-infra >/dev/null 2>&1; then
+            echo "Bootstrap notification already sent ($MARKER exists) — skipping."
+            exit 0
+          fi
+
+          echo "First reach of sync wave 19 — sending bootstrap notification."
+
+          python3 - <<PYEOF
+          import smtplib, os, time
+          from email.message import EmailMessage
+
+          to       = os.environ["NOTIFY_TO"]
+          host     = os.environ["SMTP_HOST"]
+          port     = int(os.environ["SMTP_PORT"])
+          username = os.environ.get("SMTP_USERNAME", "")
+          password = os.environ.get("SMTP_PASSWORD", "")
+          tld      = "subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain,general.tld}
+
+          msg = EmailMessage()
+          msg["Subject"] = f"{tld} infrastructure ready"
+          msg["From"]    = "no-reply@your-domain.tld" # automatically updated from project-settings:mail.senderEmail
+          msg["To"]      = to
+          msg.set_content(
+              "The cluster's infrastructure (argocd-infra) was successfully setup and deployment of argocd-apps is started\n"
+              f"  - Authentik/Portal: https://id.{tld}\n"
+              f"  - ArgoCD (infra):   https://argocd-infra.{tld}\n"
+              f"  - ArgoCD (apps):    https://argocd-apps.{tld}\n"
+              f"  - Monitoring:       https://prometheus.{tld}\n"
+              f"                      https://grafana.{tld}\n"
+              f"  - Headplane:        https://headplane.{tld}/admin\n"
+              f"  - VPN:              https://vpn.{tld}\n"
+              f"  - Longhorn:         https://longhorn.{tld}\n"
+          )
+
+          for attempt in range(1, 11):
+              try:
+                  with smtplib.SMTP(host, port, timeout=10) as s:
+                      s.ehlo(); s.starttls()
+                      if username:
+                          s.login(username, password)
+                      s.send_message(msg)
+                  print(f"Notification sent to {to}")
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/10 failed: {e}")
+                  if attempt < 10:
+                      time.sleep(30)
+          else:
+              raise RuntimeError("Failed to send notification after 10 attempts")
+          PYEOF
+
+          # Reached only if the send succeeded (set -e aborts on a failed PYEOF,
+          # leaving no marker so the next sync retries). Record the run-once marker.
+          kubectl create configmap "$MARKER" -n argocd-infra \
+            --from-literal=sentAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            && echo "Marker $MARKER created — will not send again."

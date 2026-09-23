@@ -1,0 +1,140 @@
+# Copies the registry's CA certificate into the two namespaces that must trust it.
+#
+# WHY A JOB: a Secret/ConfigMap cannot be mounted across namespaces, and trust-manager
+# (which exists precisely for this) is NOT installed in this cluster — verified: the
+# bundles.trust.cert-manager.io CRD is absent. So the CA is copied explicitly.
+#
+# Consumer, and there is exactly one:
+#   gitlab-runner    the [eda] CI build pod (buildah push)
+#
+# ⚠ remote-desktop is deliberately NOT here any more. A push into a namespace this app does
+# not own cannot survive that namespace being recreated: this Job runs only when the
+# IMAGE-REGISTRY app syncs, so a later recreate of remote-desktop takes the ConfigMap with
+# it and nothing re-asserts it. Measured 2026-09-04 on ecc196 — this Job completed at
+# 09:37:08Z and the remote-desktop namespace was recreated 93s later, leaving the broker
+# with no CA and every module pull failing x509 UnknownAuthority. remote-desktop now pulls
+# the CA itself in its own PreSync hook (remote-desktop/presync-registry-ca.yaml), so it
+# owns its own dependency. Do NOT re-add it here — two writers of one ConfigMap is how the
+# ownership question gets lost again.
+#
+# gitlab-runner stays because its namespace is not recreated by an app sync. If that ever
+# changes, give it the same treatment rather than widening this loop.
+#
+# ⚠ RUNS ON EVERY SYNC, on purpose. The CA is minted in-cluster, so a cluster recreate
+# mints a NEW one and any stale copy silently fails verification with x509
+# UnknownAuthority — which reads like a network fault, not a trust one. Re-asserting the
+# copy every sync is what stops that (cf. memory
+# authentik-ldaps-ca-pasted-in-git-stale-after-recreate, where a CA pinned by value went
+# stale after a recreate and the failure was invisible).
+#
+# PostSync + hook-weight: the CA Secret only exists once cert-manager has issued it, which
+# happens during the sync that applies tls-cert.yaml.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: image-registry-ca-distribute
+  namespace: image-registry
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: image-registry-ca-distribute
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# read the CA secret in image-registry, write the ConfigMap into the consumer namespaces
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: image-registry-ca-distribute
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: image-registry-ca-distribute
+subjects:
+- kind: ServiceAccount
+  name: image-registry-ca-distribute
+  namespace: image-registry
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-registry-ca-distribute
+  namespace: image-registry
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: image-registry-ca-distribute
+      restartPolicy: OnFailure
+      containers:
+      - name: distribute
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Waiting for the CA secret to be issued by cert-manager..."
+          i=1
+          while [ "$i" -le 60 ]; do
+            CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)
+            # A CA Certificate's secret carries ca.crt; fall back to tls.crt, which for an
+            # isCA cert is the same self-signed certificate.
+            [ -n "$CA" ] || CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)
+            [ -n "$CA" ] && break
+            echo "  try ${i}/60: not issued yet, retrying in 5s..."
+            i=$((i + 1)); sleep 5
+          done
+          [ -n "${CA:-}" ] || { echo "ERROR: image-registry-ca-tls never appeared"; exit 1; }
+
+          printf '%s' "$CA" | base64 -d > /tmp/ca.crt
+          # Sanity-check before distributing: an empty or malformed bundle would be copied
+          # everywhere and then fail at TLS handshake time, far from here.
+          #
+          # ⚠ NOT `openssl x509` — this image (alpine/k8s) ships NO openssl, so that check
+          # failed on every run and rejected a perfectly valid CA with "decoded CA is not a
+          # valid certificate". A PEM header/footer test needs no extra tooling and catches
+          # the failure that actually matters here (empty or truncated output).
+          head -1 /tmp/ca.crt | grep -q 'BEGIN CERTIFICATE' \
+            || { echo "ERROR: decoded CA has no PEM header"; head -3 /tmp/ca.crt; exit 1; }
+          grep -q 'END CERTIFICATE' /tmp/ca.crt \
+            || { echo "ERROR: decoded CA is truncated (no END marker)"; exit 1; }
+
+          for ns in gitlab-runner; do
+            kubectl -n "$ns" create configmap image-registry-ca \
+              --from-file=ca.crt=/tmp/ca.crt \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "  distributed image-registry-ca -> $ns"
+          done
+          echo "CA distribution complete."

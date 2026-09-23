@@ -1,0 +1,576 @@
+# GitLab CE Helm values — deployed via ArgoCD (deployment/argocd-apps/app-of-apps/gitlab.yaml).
+#
+# Secrets NOT included here (provided via helm-values-secret.yaml):
+#   global.appConfig.omniauth.providers[].secret contents
+#   global.railsSecrets
+#   global.initialRootPassword
+#
+# Sensitive S3 credentials are provided via gitlab-s3-secret sealed secret.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  edition: ce
+
+  hosts:
+    domain: subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain,general.tld}
+    gitlab:
+      name: gitlab.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+    registry:
+      name: registry.gitlab.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+    pages:
+      name: pages.gitlab.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+
+  # Ingress off — routing is Gateway API (below).
+  ingress:
+    enabled: false
+    configureCertmanager: false
+
+  # Gateway API. GitLab owns its OWN Gateway (`gitlab-gw`, this namespace) rather
+  # than borrowing listeners on the shared argocd-infra one — so that disabling
+  # GitLab removes its listeners and its prod certificate with it, instead of
+  # leaving them orphaned on shared infra. There is deliberately NO gatewayRef:
+  # its presence is what suppresses the chart's Gateway
+  # (templates/gateway.yaml is gated on `not gatewayRef`).
+  #
+  # This only works because the shared EnvoyProxy sets mergeGateways: true
+  # (src/ingress.ts) — every Gateway under the `envoy` class lands on ONE Envoy
+  # DaemonSet. Without it this Gateway would get a second DaemonSet whose pods
+  # can never bind :80/:443 on the same hosts.
+  #
+  # installEnvoy stays false: the shared class + controller + EnvoyProxy already
+  # exist. Setting it true would render a competing GatewayClass and EnvoyProxy.
+  #
+  # httpToHttpsRedirect MUST stay false. It is not cosmetic here: it is what
+  # suppresses the chart's hostname-less `http-default` :80 listener, which under
+  # merged mode would collide with the shared Gateway's hostname-less `http`
+  # listener on the (port, protocol, hostname) tuple — the newer of the two would
+  # be silently rejected with Accepted=False. The cluster-wide redirect already
+  # lives at argocd-infra/gateway/redirect-to-https.yaml.
+  gatewayApi:
+    enabled: true
+    installEnvoy: false
+    configureCertmanager: false
+    httpToHttpsRedirect: false
+
+  # Use existing cert-manager ClusterIssuer for all TLS
+  certmanager:
+    installCRDs: false
+
+  # Trust the Authentik ingress CA so OmniAuth OIDC (discovery:true) can verify
+  # its backend TLS calls. The gitlab-trusted-ca secret is populated by the
+  # gitlab-oidc-presync hook (fetches the served chain from the OIDC issuer).
+  certificates:
+    customCAs:
+      - secret: gitlab-trusted-ca
+      # The appliance's S3 listener terminates TLS with a self-signed certificate minted by
+      # truenas/s3-app-job.yaml, which publishes it into ITS OWN namespace
+      # (samba-ad/truenas-s3-onprem-ca). presync-s3-onprem-ca.yaml in this directory copies
+      # it here before GitLab's pods start — we pull, that app does not push, because a push
+      # into a namespace it does not own needs RBAC there and deadlocked the bootstrap once.
+      # It is not sealed in git on purpose: a rebuilt appliance mints a new one, and a sealed
+      # copy would be correct until the first recreate and silently wrong afterwards.
+      # ⚠ The chart mounts this bundle into the WORKHORSE container as well as Rails, which
+      # is what matters — Workhorse is what performs the upload.
+      - secret: gitlab-s3-onprem-ca
+
+  # ---------------------------------------------------------------------------
+  # Object Storage — Hetzner S3 (consolidated connection)
+  # ---------------------------------------------------------------------------
+  minio:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # External PostgreSQL — CNPG-managed Cluster (see postgres.yaml). Chart 10.0+
+  # removed the bundled sub-chart; host points at the CNPG read-write service.
+  # ---------------------------------------------------------------------------
+  psql:
+    host: gitlab-pg-rw
+    port: 5432
+    database: gitlabhq_production
+    username: gitlab
+    password:
+      secret: gitlab-db
+      key: db-password
+
+  # ---------------------------------------------------------------------------
+  # External Redis 7 (bundled sub-chart removed in chart 10.0)
+  # ---------------------------------------------------------------------------
+  redis:
+    host: gitlab-redis
+    port: 6379
+    auth:
+      enabled: false
+
+  appConfig:
+    # ⚠ CONSOLIDATED MODE IS OFF, AND THAT IS THE WHOLE POINT OF THIS BLOCK.
+    # Consolidated mode allows exactly four per-type overrides — bucket, enabled,
+    # proxy_download, cdn (ObjectStoreSettings::ALLOWED_OBJECT_STORE_OVERRIDES) — so a
+    # per-type CONNECTION is not expressible. Artifacts have to reach the appliance while
+    # everything else stays on Hetzner, so every category now carries its own connection.
+    #
+    # ⚠ AT THE RAILS LEVEL THIS FLAG IS NOT EVEN REQUIRED: use_consolidated_settings?
+    # returns false as soon as any Workhorse-accelerated type declares a differing
+    # connection, silently demoting the whole instance. It IS required here because the
+    # CHART only emits a per-type object_store block when this is false.
+    #
+    # ⚠ EVERY CATEGORY MUST SET `enabled: true` EXPLICITLY. The chart emits `connection`
+    # only under `if and .config.enabled .config.connection` — a category with a connection
+    # but no `enabled` gets NO object storage at all and silently falls back to local disk
+    # on the webservice pods.
+    #
+    # What leaving consolidated mode does NOT cost: direct upload survives (legacy_parse
+    # forces direct_upload = true, same as the consolidated path), and multi-GB multipart
+    # survives via presigned part URLs. What it does cost: the Workhorse S3 client,
+    # server-side encryption and Content-MD5 — encrypted buckets are unsupported in this
+    # form. Neither Hetzner nor the appliance relies on SSE here.
+    object_store:
+      enabled: false
+      proxy_download: true
+
+    # ── Hetzner S3 ────────────────────────────────────────────────────────────
+    lfs:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-lfs # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: &hetznerS3 { secret: gitlab-s3-connection, key: connection }
+    uploads:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-uploads # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+    packages:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-packages # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+    externalDiffs:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-external-diffs # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+    terraformState:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-terraform-state # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+    ciSecureFiles:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-ci-secure-files # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+    dependencyProxy:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-dependency-proxy # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      connection: *hetznerS3
+
+    # ── ON-PREM: the appliance, through the lab-pinned proxy ──────────────────
+    # ⚠ CI artifacts AND archived job logs. GitLab has no separate store for traces, so
+    # moving artifacts moves the logs with them; `traceChunks` is a Redis instance for LIVE
+    # chunks, not object storage. There is no way to split them.
+    #
+    # ⚠ THIS MAKES CI DEPEND ON THE MESH LINK. When the lab is unreachable, the artifact
+    # step of every job fails — cloud-run jobs included, because Workhorse performs the
+    # write and Workhorse is in the cloud — and it fails LATE, after the script already
+    # succeeded. That is the accepted cost of the appliance being the system of record;
+    # gitlab-s3-proxy-probe is what makes it diagnosable instead of mysterious.
+    #
+    # ⚠ proxy_download STAYS TRUE while the endpoint is a .svc name. With it false GitLab
+    # hands clients a presigned URL whose host is this Service — fine for Workhorse, useless
+    # for a browser or a lab client. Flipping it needs a public name plus split-horizon DNS,
+    # as one piece; see deployment/argocd-apps/gitlab-s3-proxy/README.md.
+    artifacts:
+      enabled: true
+      bucket: edgecloudinfra-gitlab-artifacts # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      proxy_download: true
+      connection: { secret: gitlab-s3-onprem-connection, key: connection }
+
+    # GitLab Pages
+    pages:
+      enabled: true
+      host: pages.gitlab.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+      objectStore:
+        bucket: edgecloudinfra-gitlab-pages # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+
+    # Backups
+    backups:
+      bucket: edgecloudinfra-gitlab-backups # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      tmpBucket: edgecloudinfra-gitlab-tmp # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+
+    # ---------------------------------------------------------------------------
+    # Authentik OIDC
+    # ---------------------------------------------------------------------------
+    omniauth:
+      enabled: true
+      autoSignInWithProvider: openid_connect
+      # SSO auto-provisioning ON: a first-time Authentik login auto-creates the
+      # GitLab account (only Authentik-known users can authenticate). Public
+      # self-registration is blocked separately via signupEnabled:false below.
+      allowSingleSignOn:
+        - openid_connect
+      blockAutoCreatedUsers: false
+      providers:
+        - secret: gitlab-oidc-provider
+          key: provider
+
+  # ---------------------------------------------------------------------------
+  # Container Registry — S3 storage
+  # ---------------------------------------------------------------------------
+  registry:
+    bucket: edgecloudinfra-gitlab-registry # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+
+# ---------------------------------------------------------------------------
+# Disabled bundled sub-charts (using existing cluster services)
+# ---------------------------------------------------------------------------
+# Chart condition for bundled cert-manager is `installCertmanager` (not certmanager.enabled).
+installCertmanager: false
+
+certmanager-issuer:
+  email: no-reply@your-domain.tld # automatically updated from project-settings:mail.senderEmail
+
+nginx-ingress:
+  enabled: false
+
+# Disable bundled Redis — external gitlab-redis StatefulSet used instead (deployment/argocd-apps/gitlab/redis.yaml).
+redis:
+  enabled: false
+
+# Bundled runner disabled — Chart.yaml condition is gitlab-runner.install (top-level).
+# Use wave7-gitlab-runner.yaml instead (token-based auth, no registration tokens).
+gitlab-runner:
+  install: false
+
+# ---------------------------------------------------------------------------
+# Gitaly — Git repository storage on NFS SSD
+# ---------------------------------------------------------------------------
+gitlab:
+  gitaly:
+    persistence:
+      storageClass: longhorn-cloud
+      size: 50Gi
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  gitlab-shell:
+    enabled: false
+
+  # gitlab-exporter image tag 16.8.0 doesn't exist in registry.gitlab.com/gitlab-org/build/cng
+  gitlab-exporter:
+    enabled: false
+
+  gitlab-pages:
+    # No pages-web listener is rendered: that listener is gated on
+    # global.pages.enabled (chart default false), and this cluster only sets
+    # global.appConfig.pages.enabled — a different key. Enabling Pages for real
+    # means setting global.pages.enabled and adding its hostname to the cert.
+    ingress:
+      tls: {}
+
+  webservice:
+    # Attaches to the gitlab-web listener on the chart's own Gateway (chart
+    # default gatewayRoute.sectionName).
+    #
+    # The chart hardcodes a 15s request timeout on the root rule
+    # (charts/gitlab/charts/webservice/templates/_datamodel.tpl) and 0s
+    # (unlimited) on a second "long-running" rule matching git-receive-pack /
+    # git-upload-pack — so git push/clone is already uncapped. But 15s is tight
+    # for ordinary UI/API requests here, which cross the mesh/WireGuard link.
+    # Raised to 120s. The long-running rule is
+    # restated verbatim because `deployments` replaces the rule list wholesale —
+    # dropping it would put a cap back on git operations.
+    deployments:
+      default:
+        gatewayRoute:
+          rules:
+            - name: root
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              timeouts:
+                request: 120s
+                backendRequest: 120s
+              filters: []
+            - name: long-running
+              matches:
+                - path:
+                    type: RegularExpression
+                    value: ^/.*/ssh-receive-pack$
+                - path:
+                    type: RegularExpression
+                    value: ^/.*/ssh-upload-pack$
+                - path:
+                    type: RegularExpression
+                    value: ^/.*/git-receive-pack$
+                - path:
+                    type: RegularExpression
+                    value: ^/.*/git-upload-pack$
+              timeouts:
+                request: 0s
+                backendRequest: 0s
+              filters: []
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+
+  sidekiq:
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          release: kube-prometheus-stack
+        namespace: prometheus
+    # ── Dynamic cloud→mesh spill ──
+    # WHY: the cloud node is the CPU bottleneck (~90% requested); mesh nodes sit
+    # near-idle. The sidekiq HPA (min 1) scales up on queue bursts, but a 2nd
+    # 900m replica does NOT fit on the single cloud node → it pends (FailedScheduling).
+    # Goal: keep the steady replica on cloud (LAN-local to gitaly/redis/postgres,
+    # which are cloud-pinned), and let HPA-burst overflow replicas SPILL onto the
+    # idle mesh nodes automatically — no manual step, works from a fresh recreate.
+    #
+    # Mesh nodes are tainted ecc/mesh=true:NoSchedule; tolerate so a burst replica
+    # CAN land there. WITHOUT the nodeAffinity below this would let sidekiq land on
+    # mesh even when cloud has room — undesirable (every job then crosses WireGuard
+    # to the cloud DBs).
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    # SOFT node affinity: strongly PREFER the cloud control-plane node. Soft (not
+    # required) so at bootstrap it still schedules, and so overflow replicas that
+    # can't fit on cloud fall back to a tolerated mesh node instead of pending.
+    # High weight keeps replica 1 on cloud; only when cloud is full does the
+    # preference go unsatisfied and a replica spill to mesh. preferredDuring is
+    # IgnoredDuringExecution — once cloud frees up, the descheduler
+    # (deployment/argocd-infra/descheduler, RemovePodsViolatingNodeAffinity)
+    # migrates the spilled replica back. All soft ⇒ recreate-safe.
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: In
+                  values:
+                    - "true"
+
+  toolbox:
+    backups:
+      # ⚠ BEFORE THIS EXISTED THERE WAS NO BACKUP AT ALL. No CronJob, no toolbox volume, no
+      # backup-utility anywhere in this repo — the `gitlab-backups` location measured empty
+      # because nothing had ever written one. Do not read the presence of a backups: block
+      # in older revisions as evidence that backups ran; only this cron does that.
+      cron:
+        enabled: true
+        # 01:00 UTC. The DB dump and the repository tar are the parts that matter; both are
+        # small today (git is ~1 MB) and the run is dominated by copying object storage.
+        schedule: "0 1 * * *"
+        # ⚠ SKIPPING THE REGISTRY IS DELIBERATE, NOT A COST DODGE ALONE. backup-utility
+        # `s3cmd sync`s every bucket in full to local disk before tarring it, so including
+        # the registry means the staging volume and the nightly transfer are both sized by
+        # container images. This cluster already treats GitLab's registry as expendable:
+        # it is S3-backed, dies with the cluster, and the images worth keeping are archived
+        # into image-registry (image-archives/*) precisely for that reason.
+        # ⚠ `--skip artifacts` IS NOT OPTIONAL NOW THAT ARTIFACTS LIVE ON THE APPLIANCE.
+        # backup-utility s3cmd-syncs each bucket IN FULL to local disk, and this Job runs
+        # cloud-side: without the skip it drags the whole artifacts bucket back over the lab
+        # uplink (~4.9 MB/s measured) every night, and with large CI artifacts it does not
+        # finish. The artifacts dataset is protected by ZFS snapshots on the appliance
+        # instead.
+        # ⚠ CONSEQUENCE, STATE IT PLAINLY: this archive is NO LONGER a full-instance
+        # backup. Restoring it yields an instance whose artifacts and archived job logs must
+        # come from the appliance.
+        # NB `agent_plan_content` and `ci_catalog_bundles` need no --skip: they are
+        # GitLab.com-only features whose buckets do not exist here, and object-storage-backup
+        # checks each bucket first and skips a missing one with a warning rather than
+        # failing. Expect two noisy lines per run; that is the tool working, not an error.
+        extraArgs: "--skip registry --skip artifacts"
+        persistence:
+          # ⚠ MANDATORY, NOT AN OPTIMISATION. Without it /srv/gitlab/tmp is an emptyDir on
+          # node ephemeral storage, and backup-utility downloads every bucket into it
+          # before tarring — so the failure mode is a node filling up, not a slow backup.
+          enabled: true
+          storageClass: longhorn-cloud
+          size: 50Gi
+      objectStorage:
+        config:
+          secret: gitlab-s3-connection
+          key: connection
+
+# ---------------------------------------------------------------------------
+# Container Registry
+# ---------------------------------------------------------------------------
+registry:
+  enabled: true
+  storage:
+    secret: gitlab-registry-storage
+    key: config
+  # Attaches to the registry-web listener on the chart's own Gateway (chart
+  # default gatewayRoute.sectionName).
+  #
+  # LOAD-BEARING TIMEOUT. Large image-layer PULLS read multi-GB blobs from
+  # S3-backed storage over the slow mesh/WireGuard link. A short timeout
+  # truncates the read mid-layer → the client gets `short read: expected N bytes
+  # but got M: unexpected EOF` and ImagePullBackOffs forever (seen on the 6.31 GB
+  # vLLM Thor image, ~2.2 GB layer).
+  #
+  # The chart's own default here is 900s (charts/registry/values.yaml
+  # gatewayRoute.timeouts), which is SHORTER than the 3600s this cluster has been
+  # running. Overridden explicitly — do not drop back to the chart default.
+  # (The CI PUSH bypasses this route via the internal registry svc; this is the
+  # PULL path, which must use the canonical registry hostname.)
+  gatewayRoute:
+    timeouts:
+      request: 3600s
+      backendRequest: 3600s
+  # ── Cloud+mesh replica placement ──
+  # WHY: the vLLM Thor CI build pushes a ~6 GB image to the registry. With both
+  # replicas on the CLOUD node, the push crosses the Thor→cloud WireGuard link at
+  # ~0.28 MB/s (~6 h, drops mid-blob). Goal: keep ONE replica reachable LAN-locally
+  # from the unibi-hclab mesh nodes so the push is fast.
+  # Pin exactly 2 replicas (chart scales via an HPA, not a bare replicas key).
+  hpa:
+    minReplicas: 2
+    maxReplicas: 2
+  # SOFT node affinity: PREFER unibi-hclab mesh nodes. Soft, so at cluster bootstrap —
+  # when no unibi-hclab node is Ready yet — replicas still schedule on the cloud node
+  # (preference unsatisfiable but not required). The GitLab registry subchart's
+  # `registry.affinity` helper reads a SPECIFIC shape: the hard/soft toggle is the
+  # STRING keys `nodeAffinity`/`antiAffinity`, while the selector details live under
+  # `affinity.nodeAffinity.{key,values}` and `affinity.podAntiAffinity.topologyKey`.
+  # (Do NOT put "soft" under affinity.nodeAffinity — that's a map field; the toggle is
+  # the separate top-level string. Mixing them = helm "can't evaluate field topologyKey
+  # in type interface {}".) It renders preferredDuringScheduling, operator In.
+  # NOTE: preferredDuringScheduling is IgnoredDuringExecution — k8s does NOT move a
+  # running pod when the preference later becomes satisfiable, so the cloud-bootstrapped
+  # replica is migrated to mesh by the descheduler (deployment/argocd-infra/descheduler/,
+  # RemovePodsViolatingNodeAffinity). soft podAntiAffinity keeps the 2 replicas on
+  # different hosts → one cloud, one mesh once a mesh node exists.
+  # ⚠ HARD on the SITE SET, soft on WHICH of them. The affinity below is `hard`, but its
+  # value list includes the CLOUD site — so the registry is REQUIRED to sit in
+  # {hetzner-fsn1, unibi-hclab} and is FORBIDDEN anywhere else, while still being schedulable
+  # at bootstrap when only the cloud node exists. The topologySpread below then puts one
+  # replica in each of those two sites.
+  #
+  # WHY the value list and not plain `soft`: with soft affinity the only hard rule was the
+  # per-SITE spread, and this cluster has a THIRD site — `unibi-recslab` (smartmirror1).
+  # Spreading across sites is satisfied just as well by cloud+unibi-recslab, so a replica
+  # landed there and stayed (preferredDuringScheduling is IgnoredDuringExecution). Every
+  # multi-GB push from the [eda] runner then crossed the unibi-hclab -> unibi-recslab
+  # WireGuard link. a 30 GB push took 16 min and a 40 GB archive
+  # restore never completed. See memory registry-preferclose-has-no-near-replica.
+  #
+  # ⚠ Do NOT narrow this to `[unibi-hclab]` alone. All three unibi-hclab nodes are MESH nodes,
+  # adopted after bootstrap, so a lab-only hard rule leaves the registry Pending on a fresh
+  # cluster — and the registry is needed early. Keeping the cloud site in the list is what
+  # makes the hard rule safe.
+  nodeAffinity: hard
+  antiAffinity: soft
+  affinity:
+    nodeAffinity:
+      key: ecc/site  # automatically updated from project-settings:applicationPlacements.labels.site
+      values:
+        - unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+        - hetzner-fsn1  # automatically updated from project-settings:applicationPlacements.cloudSite
+    podAntiAffinity:
+      topologyKey: kubernetes.io/hostname
+  # Mesh nodes are tainted ecc/mesh=true:NoSchedule — tolerate so a replica CAN land
+  # on one (the affinity only expresses preference; without this toleration the mesh
+  # node is unschedulable and the preference can never be honoured).
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # ONE replica per SITE — the "always one in cloud, one at unibi-hclab" guarantee. With
+  # 2 replicas + maxSkew 1 across ecc/site, one lands in hetzner-fsn1 (cloud) and one in
+  # unibi-hclab (mesh). Requires ecc/site on EVERY node incl. the cloud CP (added in
+  # src/nodes-k3s-base.ts). ScheduleAnyway (soft), NOT DoNotSchedule: at bootstrap only the
+  # cloud node exists, so a hard constraint would block the 2nd replica (leaving the
+  # registry single-replica until mesh joins); soft lets both start on cloud, then the
+  # nodeAffinity + the descheduler migrate one to mesh. nodeAffinityPolicy Honor so the
+  # ecc/mesh toleration and the site allow-list still apply during spread.
+  #
+  # ⚠ THIS CONSTRAINT ALONE IS NOT ENOUGH, and used not to be. "One per site" says nothing
+  # about WHICH sites when there are more than two: with a third site (unibi-recslab) it was
+  # equally satisfied by cloud+unibi-recslab, which is what actually happened. The hard
+  # nodeAffinity value list above is what limits the eligible sites to two; this constraint
+  # then distributes across them. Both are needed.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: ecc/site  # automatically updated from project-settings:applicationPlacements.labels.site
+      whenUnsatisfiable: ScheduleAnyway
+      nodeAffinityPolicy: Honor
+      labelSelector:
+        matchLabels:
+          app: registry
+          release: gitlab
+
+# ---------------------------------------------------------------------------
+# Prometheus (disable bundled — use existing kube-prometheus-stack)
+# ---------------------------------------------------------------------------
+prometheus:
+  install: false
+
+grafana:
+  install: false
+
+# Disabled: ArgoCD uses `helm upgrade --install`, so the pre-upgrade hook always
+# runs — including on fresh installs where no previous chart-info ConfigMap exists,
+# causing the script to fail unconditionally. Upgrade path verification is the
+# operator's responsibility when changing targetRevision in deployment/argocd-apps/app-of-apps/gitlab.yaml.
+upgradeCheck:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Gateway API resources — shape of the chart-owned Gateway `gitlab-gw`
+# ---------------------------------------------------------------------------
+# NB on nesting: `gateway` is a SIBLING of `class`, not a child. Putting the
+# listeners under `class` renders without error and silently leaves the chart
+# defaults in place (the certificateRefs below stay registry-tls/kas-tls).
+gatewayApiResources:
+  class:
+    # Attach to the shared GatewayClass installed by Pulumi (src/ingress.ts)
+    # instead of the chart default `gitlab-gw`. A class is cluster-scoped and
+    # names the controller + EnvoyProxy, so reusing it is what puts this Gateway
+    # on the shared, host-networked Envoy data plane.
+    name: envoy
+  gateway:
+    listeners:
+      # Point every listener at the ONE certificate this app already owns
+      # (gitlab-tls-certificate.yaml, this namespace), replacing the chart's
+      # per-listener defaults gitlab-tls / registry-tls / kas-tls — three
+      # secrets that nothing in this repo issues.
+      #
+      # A listener resolves certificateRefs only in its own Gateway's namespace.
+      # That rule blocked reusing this cert while the listeners lived on the
+      # argocd-infra Gateway; now that Gateway and cert are co-located it works
+      # in our favour and needs no ReferenceGrant.
+      #
+      # Listener hostnames are derived by the chart, NOT set here:
+      #   gitlab-web   → global.hosts.gitlab.name
+      #   registry-web → global.hosts.registry.name
+      #   kas-web      → kas.<global.hosts.domain>   (global.hosts.kas.name unset)
+      # The cert's SANs must track those three names.
+      gitlab-web:
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - name: gitlab-tls
+      registry-web:
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - name: gitlab-tls
+      kas-web:
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - name: gitlab-tls

@@ -1,0 +1,29 @@
+# Serve config for the desktop's tailscale sidecar (desktop-gvisor.yaml).
+#
+# This is the USERSPACE equivalent of TS_DEST_IP. The sidecar runs with TS_USERSPACE=true
+# because the desktop pod is runtimeClassName: runsc and cannot have the privileged
+# /dev/net/tun setup the mesh-gateway DaemonSet uses. containerboot explicitly rejects
+# TS_DEST_IP in that mode ("TS_DEST_IP is not supported with TS_USERSPACE",
+# cmd/containerboot/settings.go), so inbound forwarding is expressed here instead.
+#
+# TCPForward targets are localhost because the sidecar shares the pod's network namespace
+# with the desktop container — no Service is involved.
+#
+#   3389 -> localhost:3389   RDP (xrdp, per-user LDAP session)
+#   22   -> localhost:2222   the desktop's own sshd
+#
+# ⚠ 2222, NOT 22. The container listens on 2222; only the Service maps 22 to it
+# (vnc-services.yaml). Pointing this at 22 would make the sidecar dial ITSELF.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remote-desktop-tailscale-serve
+  namespace: remote-desktop
+data:
+  serve.json: |
+    {
+      "TCP": {
+        "3389": { "TCPForward": "localhost:3389" },
+        "22":   { "TCPForward": "localhost:2222" }
+      }
+    }

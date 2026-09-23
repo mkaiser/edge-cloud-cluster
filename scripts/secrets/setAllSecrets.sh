@@ -90,13 +90,13 @@ else
 fi
 
 echo ""
-bash "$THIS_DIR/setHcloudToken.sh"
+bash "$THIS_DIR/setHetznerCredentials.sh"
 
 echo ""
 bash "$THIS_DIR/setS3ObjectStorage.sh"
 
 echo ""
-bash "$THIS_DIR/setMailCredentials.sh"
+bash "$THIS_DIR/setMail.sh"
 
 echo ""
 bash "$THIS_DIR/setWireGuard.sh"
@@ -105,10 +105,13 @@ echo ""
 bash "$THIS_DIR/setArgoCd.sh"
 
 echo ""
-bash "$THIS_DIR/setGitHubDeployKey.sh"
+bash "$THIS_DIR/setGitCredentials.sh"
 
 echo ""
-bash "$THIS_DIR/setEdgeSshKey.sh"
+bash "$THIS_DIR/setGithubPatToken.sh"
+
+echo ""
+bash "$THIS_DIR/setSshKeys.sh"
 
 echo ""
 bash "$THIS_DIR/setSealingKey.sh"

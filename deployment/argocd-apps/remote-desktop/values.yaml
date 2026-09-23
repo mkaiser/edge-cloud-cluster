@@ -1,0 +1,58 @@
+# HelmForge Guacamole Helm values (https://github.com/helmforgedev/charts)
+# Browser-based RDP access, via Authentik OIDC, to the generic EDA desktop
+# (desktop-gvisor.yaml). It serves per-user LDAP sessions on 3389; the tile is seeded
+# by connection-seed.yaml. Modeled on xilinx-2026-1 / hyperlynx.
+#
+# Redirect URI and OIDC endpoints use the cluster subdomain —
+# updated automatically by updateConfigFromProjectSettings.sh.
+
+guacamole:
+  contextPath: ROOT
+  extraEnv:
+    - name: EXTENSION_PRIORITY
+      value: "openid"
+
+guacd:
+  logLevel: info
+
+# =============================================================================
+# OIDC — Authentik as IdP (implicit flow, public client, no client secret)
+# =============================================================================
+oidc:
+  enabled: true
+  authorizationEndpoint: "https://id.subdomain1.your-domain.tld/application/o/authorize/" # automatically updated from project-settings:{general.subdomain,general.domain}
+  jwksEndpoint: "http://authentik-server.authentik.svc.cluster.local/application/o/remote-desktop/jwks/"
+  issuer: "https://id.subdomain1.your-domain.tld/application/o/remote-desktop/" # automatically updated from project-settings:{general.subdomain,general.domain}
+  clientId: "guacamole-remote-desktop"
+  redirectUri: "https://remote-desktop.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+  scope: "openid email profile groups"
+  usernameClaim: "email"
+  groupsClaim: "groups"
+
+# =============================================================================
+# Database — external PostgreSQL (postgres.yaml in this folder, later step)
+# =============================================================================
+postgresql:
+  enabled: false
+
+database:
+  type: postgresql
+  external:
+    host: "guacamole-pg-rw"
+    port: "5432"
+    name: "guacamole_db"
+    username: "guacamole_user"
+    existingSecret: "remote-desktop-secrets"
+    existingSecretPasswordKey: "db-password"
+
+initDb:
+  enabled: true
+
+# =============================================================================
+# Ingress — shared Gateway + wildcard TLS. Long timeouts: Guacamole's browser
+# session is one long-lived websocket stream.
+# =============================================================================
+# The guacamole chart has no Gateway API support — routing is an HTTPRoute in
+# httproute.yaml beside this file, which carries the 600s websocket timeout.
+ingress:
+  enabled: false

@@ -1,0 +1,80 @@
+# ArgoCD Application: vLLM on the Jetson-Orin GPU node.
+# IN-CLUSTER ONLY — no Ingress; the sole client is the LiteLLM gateway.
+#
+# PURPOSE: a low-latency, tool-calling LLM for HOME ASSISTANT. Home Assistant is a remote,
+# EXTERNAL client (nothing for it is deployed in this cluster) and reaches this model
+# through LiteLLM at https://llm.<tld>/v1 as `orin/qwen3.5-4b-w4a16`. See
+# doc/llm-agents.md for the HA-side setup.
+#
+# ⚠ NO BACKEND EXCLUSIVITY HERE — unlike app-of-apps/vllm.yaml. On the Thor, vLLM and
+# ollama-thor fight over one non-shareable GPU and scripts/runtime/switchLLMBackend.sh
+# arbitrates by hand. This node runs NO Ollama, so nothing competes for its card: this app
+# scales itself and is not part of that dance. Consequently there is no reason to expect
+# `replicas 0 / Progressing` as a steady state here — if this app is not serving, that is
+# a fault, not the documented intermediate state the Thor app describes.
+#
+# `ignoreDifferences` on /spec/replicas is kept ANYWAY, and deliberately: the Deployment
+# omits `replicas:` so that argocd-controller never becomes its SSA field-manager owner
+# (see the comment in deployment.yaml). The ignore rule is the second half of that guard
+# and costs nothing.
+#
+# THE IMAGE IS SHARED WITH THE THOR (registry .../ai/vllm-jetson) — one CI build serves
+# both Jetsons, because the Dockerfile compiles nothing arch-specific and the vLLM wheel
+# carries sm_87 and sm_110 fatbins alike. This app therefore has NO build-trigger hook;
+# deployment/argocd-apps/vllm owns the build. It does have its own PreSync
+# presync-registry-cred.yaml, because imagePullSecrets are namespaced.
+#
+# Depends on Plan A (GPU integration): nvidia.com/gpu must be schedulable and the node must
+# carry ecc/gpu=true + ecc/gpu-model=jetson-orin and the ecc/mesh + ecc/gpu taints (which
+# this app tolerates). The nvidia device plugin already lists jetson-orin in its affinity.
+#
+# placement.ecc/tier: mesh — the pod runs on the mesh GPU node (not cloud). Wave 20.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vllm-orin
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/vllm-orin
+    directory:
+      # recurse defaults false — only top-level manifests sync. Exclude *.sh
+      # (sealSecrets.sh). No Dockerfile/.gitlab-ci.yml here: the image is built by the
+      # Thor app's pipeline.
+      exclude: "{*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: vllm-orin
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: vllm
+      namespace: vllm-orin
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # Make the sync itself respect the ignored replicas field (ignoreDifferences
+      # alone only affects diffing).
+      - RespectIgnoreDifferences=true
+    # Retry failed syncs forever (limit<0 = unlimited): on recreate the PreSync
+    # registry-cred hook races GitLab bring-up (gitlab app is also wave 20), and it
+    # additionally waits on the 'deployments' group that the Thor app's build-trigger
+    # creates. Without retry a single hook failure leaves the app Failed until a git
+    # change or drift-selfHeal.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

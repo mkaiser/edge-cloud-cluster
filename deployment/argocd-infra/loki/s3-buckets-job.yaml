@@ -1,0 +1,69 @@
+# Sync Job: ensure Loki's S3 chunk/index bucket exists.
+# Idempotent (head-bucket || create-bucket). NOT deleted on app removal (data-safe);
+# full-teardown wipe lives in scripts/environment/deleteS3Buckets.sh, which discovers
+# buckets live rather than from a list.
+#
+# NOT an argocd hook. A Sync hook would run before the plain (non-hook) resources
+# in this directory are applied — including the SealedSecret it reads its
+# credentials from — so the pod died on `secret "loki-s3-secret" not found`.
+# Hooks are ordered only against other hooks, never against normal resources.
+#
+# As a normal resource at sync-wave 0 it lands after the namespace (-2) and the
+# SealedSecret (-1), and still before the Loki Application (wave 1) starts
+# flushing chunks. ttlSecondsAfterFinished cleans it up; on re-sync ArgoCD leaves
+# the completed Job alone (its spec is unchanged), and the body is idempotent
+# anyway (head-bucket || create-bucket).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loki-s3-buckets
+  namespace: loki
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: ensure-buckets
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: loki-s3-secret
+                  key: ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: loki-s3-secret
+                  key: SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "nbg1" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+            - name: AWS_PAGER
+              value: ""
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ENDPOINT="https://nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+              for BUCKET in edgecloudinfra-loki; do # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+                if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/dev/null; then
+                  echo "Bucket $BUCKET already exists."
+                else
+                  echo "Creating bucket $BUCKET ..."
+                  aws s3api create-bucket --bucket "$BUCKET" \
+                    --endpoint-url "$ENDPOINT" --region "$AWS_DEFAULT_REGION"
+                  echo "Created $BUCKET."
+                fi
+              done
+              echo "Loki S3 buckets ready."

@@ -1,0 +1,48 @@
+# nvidia-gpu — cluster-side GPU plumbing that makes GPU mesh nodes schedulable
+# (both Tegra/SoC Jetsons and discrete PCIe cards):
+#   - RuntimeClass `nvidia` (cluster-scoped) → the containerd nvidia runtime handler that
+#     src/provisioning-scripts/20-install-gpu.sh sets up on the GPU host.
+#   - TWO NVIDIA k8s device plugin DaemonSets, one per hardware class, each selected by the
+#     ecc/gpu-model label: device-plugin.yaml (Tegra/SoC, ecc/gpu-model=jetson-thor) and
+#     device-plugin-discrete.yaml (discrete PCIe, ecc/gpu-model=nvidia-turing-sm75). A
+#     DaemonSet has one pod template, so the differing discovery/injection env cannot be
+#     expressed in a single manifest. Both tolerate ecc/mesh and
+#     the ecc/gpu=true:NoSchedule taint (they ADVERTISE nvidia.com/gpu, so they must land
+#     on the GPU node that every other workload is taint-excluded from).
+#   - metrics-exporter.yaml — ONE DaemonSet (both classes, selected on the ecc/gpu capability
+#     label) exporting nvidia-smi as Prometheus metrics, plus its headless Service and
+#     ServiceMonitor. Not dcgm-exporter: DCGM is absent on both nodes and unsupported on
+#     Tegra. It must never request nvidia.com/gpu — the Thor's single card is held by vLLM.
+#     Rendered by grafana-dashboard.yaml (a ConfigMap in ns `prometheus`, picked up by the
+#     Grafana sidecar).
+#
+# Placed early (wave 2): depends on NOTHING from mesh nodes (unlike mesh-gateway, which needs
+# the headscale preauth secret at wave 10). Deliberately NON-BLOCKING: with zero GPU nodes the
+# DaemonSet is desired=0/ready=0 → ArgoCD reports it Healthy immediately, so it never stalls a
+# wave while GPU mesh nodes join later (a separate `make provision-mesh-node` pass). No barrier
+# is added — there is nothing downstream that needs a GPU to exist, and gating on
+# nvidia.com/gpu being allocatable would deadlock for days until a GPU node joins.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nvidia-gpu
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/nvidia-gpu
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

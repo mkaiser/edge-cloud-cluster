@@ -1,0 +1,96 @@
+# TLS for the lab-local registry, from a PRIVATE CA.
+#
+# WHY A PRIVATE CA and not cert-manager's letsencrypt-* ClusterIssuers: this registry is
+# reached at `image-registry.image-registry.svc.cluster.local`, an internal name. Let's Encrypt
+# only signs publicly-resolvable names, so a public issuer cannot mint this cert at all.
+# Same reasoning and same selfsign -> CA -> leaf shape as
+# deployment/argocd-infra/samba-ad/tls-cert.yaml, which does this for the DC's LDAPS
+# listener; that file is the reference if this one ever needs extending.
+#
+# WHY TLS AT ALL, given the registry is node-local (NodePort 30500) and already behind an htpasswd
+# credential plus a CiliumNetworkPolicy: the credential is HTTP BASIC auth, so without TLS
+# it crosses the pod network base64-encoded on every push and pull. That credential is
+# effectively root-execution rights — the remote-desktop broker runs what this registry
+# serves AS ROOT, and its allowed() gate gives no protection against the CONTENT at a tag
+# being swapped. Encrypting it removes the passive-sniffing path to that.
+#
+# ⚠ CONSUMERS MUST TRUST THE CA, and there are exactly two: the [eda] CI build pod
+# (buildah) and the broker (skopeo). Both get the CA via the image-registry-ca ConfigMap
+# below. A consumer that does not trust it fails with x509 UnknownAuthority, which reads
+# like a network fault rather than a trust one.
+#
+# ⚠ The CA is minted in-cluster, so a cluster recreate mints a NEW one. Anything that
+# pinned the old CA bundle by value would silently break — this is the failure mode behind
+# memory authentik-ldaps-ca-pasted-in-git-stale-after-recreate. Hence the CA is distributed
+# by ConfigMap (regenerated with the cluster), never pasted into git.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: image-registry-selfsign
+  namespace: image-registry
+spec:
+  selfSigned: {}
+---
+# Root CA for this registry's chain. Consumers trust THIS, not the leaf, so the leaf can
+# rotate without redistributing anything.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: image-registry-ca
+  namespace: image-registry
+spec:
+  isCA: true
+  commonName: image-registry-ca
+  secretName: image-registry-ca-tls
+  duration: 87600h # 10y — a private CA for one internal service; rotation is manual and disruptive
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  issuerRef:
+    name: image-registry-selfsign
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: image-registry-ca-issuer
+  namespace: image-registry
+spec:
+  ca:
+    secretName: image-registry-ca-tls
+---
+# The registry's serving leaf.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: image-registry-tls
+  namespace: image-registry
+spec:
+  secretName: image-registry-tls
+  duration: 8760h  # 1y
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  # ⚠ ALL FOUR SANs. Clients address this Service by different names depending on where
+  # they run and how their resolver is configured, and a name missing from the SAN list
+  # fails verification even though the connection itself is fine:
+  #   - the FQDN is what INTERNAL_REGISTRY / REGISTRY_HOST are set to (both are explicit
+  #     and fully qualified, so this is the one that matters in practice)
+  #   - the shorter forms cover a consumer that relies on ndots/search-domain expansion
+  dnsNames:
+    - image-registry.image-registry.svc.cluster.local
+    - image-registry.image-registry.svc
+    - image-registry.image-registry
+    - image-registry
+  # ⚠ THE KUBELET REACHES THIS AT 127.0.0.1:30500, an IP and not a name, so it needs an IP
+  # SAN — a dnsNames entry of "127.0.0.1" does NOT satisfy verification. Without it every
+  # kubelet pull fails with "cannot validate certificate for 127.0.0.1 because it doesn't
+  # contain any IP SANs", which reads like a trust problem and is actually a naming one.
+  ipAddresses:
+    - 127.0.0.1
+  issuerRef:
+    name: image-registry-ca-issuer
+    kind: Issuer

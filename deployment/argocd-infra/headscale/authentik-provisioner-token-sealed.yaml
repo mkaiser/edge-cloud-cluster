@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: headscale
+spec:
+  encryptedData:
+    token: AgBPeBLQW73gXEXjlqDk5shh8cKYfDcCaiAGNA5ptzmFpr9suGnwLqLVS46Htd6ElEgkrmpuJhA3eDLc/LfXZsEe4PA+VTd1TWv16V3QxkSgMi0OymN6XdVIpT/OcWp9vzLHYbTF1M2QS9/a5h7Y39W/L94E7Uk87IDrnyCvddL6npoO/tQltXK1M8Iy5MWGIPPpKzp3YTY7UcmbrM4/PS/hnlyg5WlOPdPaARZCoSvgsTe7VQE+aN/loB9nYJqMEaZBNonC5g+3rT5SbvXYxo97uyWWjw5wdy0QtMMvq2g1Dw1BIkb41TDBE7VTmpcjf9KTZw0yLqC7qveGFq83dixOeJBq3bornq3X6cdlSTym55h2Di4g4taaWhChlrHbp9vVs0Yh6C3tOo+Sas450hCxNM/KNFb5KD+R0IhWyk8Wr3wmeSDL/0hI3z1Sod+Ak9P5jSEuaQurln6uqoOY06lMsGTMiuUdiWdLP8K8D2BQJ1/wklUqBA7YVj6rhtyVmubC376tvksA5ezlXZfgJNMaqjUKvesQX4nk7cfItRrvOKkIjPa/OtbpEjncatTFpZjF1ukTidr24MNV6MG9HBPIE08CmvcBDvT00R7aySEZFfKjSpwKlIyqXMLl/UOT/e6NGLrkOQ9CqXPmnpwVIdh/fWgepXWclO+GyNBPoVmbGDQRmlSrYVlxi9muXXDJxdHkV0FwtdRGKQwmTieX2/uo+dME0hojCyg3wwSHY1kugcNcVWp2gAMkB08kki0+qpYIuXEKh7bZrjUZN1+B4hnASeGdOUjkP7JcyVKnAu4azlcW2onvApCDd1dlYh59HgPMrhHlTTpcc1hx+AIg0SE45YA2vdgpRxU=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: headscale

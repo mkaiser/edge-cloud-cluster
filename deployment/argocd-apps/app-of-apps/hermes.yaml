@@ -1,0 +1,92 @@
+# ArgoCD Application: Hermes Agent (NousResearch/hermes-agent).
+# Accessible at https://hermes.<subdomain>.<domain> — an OpenAI-compatible
+# HTTP API (the "api_server" gateway platform) that VSCode extensions
+# (Continue / Cline) point at as a MODEL endpoint. Auth is a bearer key, NOT
+# OIDC: the extensions cannot do an interactive login. Inference is routed
+# through the LiteLLM gateway (litellm.litellm.svc:4000/v1) with a virtual key,
+# so Hermes traffic is attributed like every other LLM consumer.
+#
+# The admin dashboard is a SECOND host, https://hermes-admin.<tld>, gated by an
+# Authentik OAuth2/OIDC provider that this app creates itself (authentik-provider.yaml,
+# PostSync job) and bound to admins only via access-admin-only. Nothing
+# hermes-specific lives in argocd-infra/authentik/.
+#
+# Multi-user: ONE pod serving multiple Hermes profiles (gateway.multiplex_profiles).
+# The default profile answers /v1/*; each named profile answers /p/<name>/v1/*
+# with its OWN bearer key. Profiles isolate config/memory/sessions/credentials —
+# they do NOT isolate the container filesystem, so every profile's shell tool
+# sees the same disk. For MUTUALLY TRUSTED users only. Upstream has no supported
+# isolation model; the cheap levers are dropping the terminal tool or a sandboxed
+# backend, not per-user pods. See doc/hermes-agent.md.
+#
+# State: one 20Gi longhorn-cloud PVC via volumeClaimTemplates (HERMES_HOME=/opt/data
+# — config, SOUL.md, memories, sessions, per-profile .env). No database.
+#
+# placement.ecc/tier: mesh — MOVED FROM cloud 2026-09-14, to give the agent a human GUI.
+# The desktop sidecar (see statefulset.yaml) mounts the AD homes export, and
+# csi-driver-nfs's node driver runs ONLY on ecc/fileserver-lan nodes, so the pod is now
+# site-bound. The PVC moved to longhorn-unibi-hclab with it.
+#
+# ⚠ WHAT THIS TRADED AWAY, RECORDED SO IT IS NOT REDISCOVERED. The old comment here said the
+# pod "must stay on cloud nodes" because it runs ARBITRARY SHELL TOOLS, and that reasoning
+# did not stop being true — it was overruled deliberately. The pod now sits on the lab LAN
+# beside the Samba AD DCs and the image-registry. Note that networkpolicy.yaml's egress rule
+# excepts 192.168.0.0/16 by name as "the unibi-hclab / on-prem LANs": that rule still bounds
+# what the pod may TALK to, but the pod is now inside the range the exception was written to
+# keep it out of. The policy bounds egress, not the blast radius on the node itself.
+#
+# ⚠ The tier annotation is NOT cosmetic: longhorn-restore.ts reads it to decide which
+# namespaces are deferred on a restore (only mesh-tier apps are off-cloud).
+#
+# Plain manifests only (the community Helm chart is unofficial, pins appVersion
+# 0.8.0 against upstream 0.20.1, is Ingress/Istio-oriented and its runAsUser: 1000
+# default breaks the image's root-then-drop s6 bootstrap):
+#   statefulset.yaml, ingress.yaml, bootstrap-configmap.yaml, networkpolicy.yaml,
+#   authentik-provider.yaml, hermes-secrets-sealed.yaml,
+#   oidc-client-secret-sealed.yaml, authentik-provisioner-token-sealed.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hermes
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/hermes
+    directory:
+      exclude: "*.sh"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: hermes
+  ignoreDifferences:
+    # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+    # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+    # permanent drift and the app never leaves OutOfSync — even though
+    # kubectl diff against the manifest is empty. Narrow on purpose: a real
+    # hostname/path/backend/port change still shows up.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    # volumeClaimTemplates are immutable after creation; the API server defaults
+    # several fields into them, which reads as permanent drift.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

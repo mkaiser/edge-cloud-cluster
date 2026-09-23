@@ -1,0 +1,60 @@
+# ArgoCD Application: NFS CSI driver — provides the NODE driver that mounts the TrueNAS
+# exports (fs-1, datapool/* over NFSv4) for pods: /home, /shared, /artifacts, /registry.
+#
+# ⚠ NO StorageClass. Every NFS volume here is a STATIC PV (nfs-*-pv.yaml); the chart's
+# dynamic provisioner is deliberately unused, because a provisioned volume gets its own
+# per-PVC SUBDIRECTORY under the export while these mounts need the export ROOT — see
+# remote-desktop/nfs-homes-pv.yaml for the failure that caused. This app therefore ships
+# the driver only.
+#
+# Wave 17: after wave16-truenas, because the exports have to EXIST before anything mounts
+# them — truenas/configure-job.yaml is what creates the datasets, the NFSv4 exports and the
+# AD join. Before the wave-18 barrier, so it never gates bring-up.
+#
+# Deliberately NOT an early wave, for the same reason csi-driver-smb sits at 12: the node
+# DaemonSet only schedules on ecc/fileserver-lan mesh nodes, and those join ~15 min after
+# Pulumi finishes. An early wave would leave this Progressing and hold a barrier for the
+# whole cluster (the lesson from SeaweedFS at wave 0).
+#
+# ⚠ This app does NOT move /home by itself. It only makes the exports mountable. The desktop
+# cutover (dropping pam_mkhomedir, pointing the pods at the nfs-homes claim) and the data
+# migration are separate, deliberately: a driver that is present but unused is harmless,
+# while a half-finished cutover strands users' sessions in a missing directory.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: csi-driver-nfs
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "17"
+  labels:
+    # Runs only on lab nodes and serves a lab appliance.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  sources:
+    - repoURL: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+      chart: csi-driver-nfs
+      targetRevision: "4.13.4" # renovate: datasource=helm depName=csi-driver-nfs registryUrl=https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/csi-driver-nfs/values.yaml
+    # ⚠ Only two sources: the chart, and this ref for its values file. There is NO git
+    # source applying manifests from deployment/argocd-infra/csi-driver-nfs — that
+    # directory holds values.yaml alone, which the helm source consumes and which is NOT a
+    # manifest. There is no StorageClass there: every NFS volume is a
+    # static PV owned by the app that mounts it (see the ⚠ above).
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: csi-driver-nfs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

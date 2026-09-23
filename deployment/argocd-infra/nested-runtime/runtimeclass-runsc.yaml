@@ -1,0 +1,45 @@
+# RuntimeClass `runsc` — maps pods that set `runtimeClassName: runsc` onto the containerd
+# `runsc` (gVisor) runtime handler that src/provisioning-scripts/50-install-nested-runtime.sh
+# wires into k3s (config-v3.toml.d drop-in + /etc/containerd/runsc.toml) on nodes with
+# project_settings nestedRuntime:"gvisor" or "both".
+#
+# gVisor intercepts syscalls in a userspace kernel (the "sentry") instead of booting a VM,
+# so it needs NO /dev/kvm. A pod under this class can run inner OCI containers without being
+# privileged — the same Model-B property the desktop relies on — and gets a working native
+# overlay store (a VM runtime's virtiofs rootfs would force fuse-overlayfs instead; see
+# Dockerfile.base and the storage.conf patching in startup-configmap.yaml).
+#
+# ⚠ FUSE filesystems do not work here: gVisor targets FUSE 7.23 and the directory-op
+# capability negotiation fails, so every directory read returns ENOSYS. Nothing in this
+# cluster depends on one, but it bounds what can be added.
+#
+# ADOPTION NOTE: this object already existed in-cluster, created out-of-band with
+# `kubectl apply` while the gVisor desktop was being brought up. This manifest reproduces the
+# live spec EXACTLY so ArgoCD adopts it without a diff. It belongs in git because the
+# `nested-runtime` Application syncs this directory with prune:true — an untracked object
+# that the app does not know about is one manual `kubectl delete` (or a resource-pruning
+# change) away from taking the gVisor desktop unschedulable with no manifest to restore it.
+#
+# The `scheduling` block is NOT optional here (the sibling nvidia classes omit theirs):
+#   - nodeSelector keeps pods off nodes where runsc is not installed. It is the per-runtime
+#     BOOLEAN label, not `ecc/nested-runtime`, because a node carrying several handlers is
+#     labelled `ecc/nested-runtime=both` and would not match a single-valued `=gvisor` test
+#     (src/nodes-k3s-mesh.ts).
+#   - tolerations are MERGED INTO EVERY POD using this class. gVisor nodes are mesh nodes,
+#     which carry the taint ecc/mesh=true:NoSchedule, so without this a pod that forgot its
+#     own toleration would silently fail to schedule.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: runsc
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+handler: runsc
+scheduling:
+  nodeSelector:
+    ecc/nested-runtime-gvisor: "true"  # automatically updated from project-settings:applicationPlacements.labels.nestedRuntimeGvisor
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule

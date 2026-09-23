@@ -1,0 +1,32 @@
+# Shared ServiceAccount + node-read RBAC for the mesh active-probe CronJobs.
+# Both the ping and iperf3 probes enumerate CURRENT mesh nodes from the k8s API
+# (node name + mesh InternalIP + ecc/site), instead of the non-unique tailscale
+# HostName which is littered with stale registrations. Read-only, cluster-scoped
+# (nodes are not namespaced).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mesh-probe
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mesh-probe-nodes-read
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mesh-probe-nodes-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mesh-probe-nodes-read
+subjects:
+  - kind: ServiceAccount
+    name: mesh-probe
+    namespace: headscale

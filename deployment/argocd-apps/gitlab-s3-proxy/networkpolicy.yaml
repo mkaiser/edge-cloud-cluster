@@ -1,0 +1,50 @@
+# WHO MAY CROSS INTO THE LAB THROUGH THIS PROXY.
+#
+# This pod is a hole in the cloud/lab boundary: whatever reaches it reaches the appliance's
+# S3 endpoint, which holds every CI artifact. Without a policy that is every pod in the
+# cluster, because Cilium runs enable-policy=default — it denies only where a policy
+# *selects* the pod. Deleting this file does not produce an error anywhere; it silently
+# opens the path.
+#
+# Allowed in: the `gitlab` namespace only — webservice/Workhorse (uploads and, while
+# proxy_download stays true, downloads), Sidekiq (background moves and deletes) and the
+# toolbox (backups, if they are ever pointed at this bucket).
+#
+# ⚠ Namespace-level, and that is a real limit worth naming: any pod in `gitlab` passes. It
+# cannot be narrowed by pod labels here without breaking on the chart's own label changes
+# across upgrades. The S3 credential is what distinguishes callers within that namespace;
+# this policy just keeps the rest of the cluster out.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gitlab-s3-proxy-ingress
+  namespace: gitlab-s3-proxy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: gitlab-s3-proxy
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: gitlab
+        # ⚠ THE PROBE LIVES IN THIS NAMESPACE AND WAS NOT ALLOWED THROUGH. Its whole job is
+        # to prove a cloud pod can reach the endpoint, and it reported exactly the outage it
+        # is meant to detect — "no response" — because this policy admitted only `gitlab`.
+        # A monitor blocked by the thing it monitors reads as a real failure, which is worse
+        # than no monitor.
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: gitlab-s3-proxy
+      toPorts:
+        - ports:
+            - port: "30304"
+              protocol: TCP
+    # Kubelet probes come from the node, not a pod endpoint. Without this the readiness and
+    # liveness probes are dropped and the pod never becomes Ready — with the proxy itself
+    # working perfectly.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "30304"
+              protocol: TCP

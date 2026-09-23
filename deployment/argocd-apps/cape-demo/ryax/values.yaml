@@ -1,0 +1,947 @@
+# Ryax engine values. Installed by ../../app-of-apps/cape-demo-ryax.yaml.
+#
+# Shape follows upstream's GitOps how-to (docs/howto/install_ryax_argocd.md in
+# gitlab.com/ryax-tech/ryax/ryax-engine): credentials supplied rather than
+# generated, no chart Ingresses, no bundled Traefik.
+
+global:
+  # Credentials come from ryax-secrets-sealed.yaml, not from the chart.
+  #
+  # ⚠ Do not set this true. The chart generates each credential with
+  # `lookup(...) | default (randAlphaNum 12)`, and lookup() returns nothing when
+  # ArgoCD's repo server renders without a cluster — so every reconcile mints new
+  # passwords and pushes them to running pods. `ignoreDifferences` on Secret
+  # `.data` does NOT contain this: it suppresses drift detection, not a sync
+  # applying the rendered manifest.
+  #
+  # Regenerate with generateSecrets.sh; that also requires wiping the
+  # datastore/broker/minio PVCs, which keep the old passwords.
+  secrets:
+    create: false
+
+  # Mesh nodes are tainted ecc/mesh=true:NoSchedule; Ryax storage is on unibi-hclab.
+  # Covers the Ryax-own workloads only — the upstream subcharts below need their
+  # own keys, and pods in ryaxns-execs need the ryax-placement policy
+  # (admission-policies.yaml) because the Runner creates them at run time.
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+
+  # Keep Ryax off nodes whose CPU is below the x86-64-v2 baseline. The chart injects this
+  # as-is into every Ryax pod (each subchart's `affinity` overrides it); the upstream
+  # subcharts below do not read it and repeat the block themselves.
+  #
+  # unibi-hclab-fs-vm is a VM on the TrueNAS appliance and gets the QEMU default CPU model,
+  # which advertises none of SSE4.2/POPCNT/CX16 even though the host Xeon has them all.
+  # ryax-intelliscale crash-looped there on every start: NumPy is built for the v2 baseline
+  # and refuses to import. Nothing expressed the constraint, so which pods worked depended
+  # on where they happened to land.
+  #
+  # The label comes from node-feature-discovery (deployment/argocd-infra/node-feature-discovery),
+  # which reads it off the CPU rather than taking it from project_settings.ts. It is PRESENT
+  # on capable nodes and ABSENT below v2, so this matches positively and no node needs a
+  # label removed when its CPU model improves.
+  #
+  # ⚠ required, not preferred: a preferred rule still schedules onto the VM when the other
+  # nodes are pressured, and the pod then crash-loops instead of waiting. Failing to
+  # schedule is the better outcome when the process cannot start at all.
+  #
+  # ⚠ Do NOT switch to the individual flags (cpu-cpuid.SSE42 and friends). NFD's default
+  # attributeBlacklist hides exactly those, so such a selector would match a label that is
+  # never emitted and every Ryax pod would be unschedulable.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2
+                operator: In
+                values: ["true"]
+
+  tls:
+    hostname: ryax.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+    enabled: false  # the shared Envoy Gateway terminates TLS
+    environment: production # automatically updated from project-settings:{tls.certIssuerType,tls.ryaxEnvironment}
+  monitoring:
+    enabled: true
+  # Keeps Postgres block IO off the cloud disks. Covers broker, minio, registry and the
+  # action-builder nix store; datastore/grafana/tempo/loki need explicit keys.
+  # longhorn-unibi-ryax is Ryax's OWN scope — pcie-tb-s, pcie-tb-d, bender and
+  # smartmirror1, NOT the small fs-vm disk and NOT the arm64 thor-eval. It spans both
+  # Bielefeld LANs, so a replica can sit a WireGuard hop away; see
+  # project_settings.ts applicationPlacements.ryaxStorageScope for that trade.
+  defaultStorageClass: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+
+datastore:
+  storageClass: longhorn-unibi-ryax  # subchart ignores global.defaultStorageClass  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+  # Ryax's own metadata DB. Restated rather than inherited — see PVC SIZES below.
+  pvcSize: "2Gi"
+
+certManager:
+  enabled: false  # the shared Envoy Gateway terminates TLS (httproute.yaml)
+
+tempo:
+  persistence:
+    storageClassName: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+    # Restated rather than inherited; see PVC SIZES below. 1.4 GiB in use.
+    size: 10Gi
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                operator: In
+                values: ["true"]
+
+authorization:
+  ingress:
+    enabled: false
+  # Admin user on first boot, from the sealed secret.
+  extraEnv:
+    - name: RYAX_DEFAULT_USER_NAME
+      valueFrom:
+        secretKeyRef:
+          name: ryax-admin-credentials
+          key: username
+    - name: RYAX_DEFAULT_USER_PASS
+      valueFrom:
+        secretKeyRef:
+          name: ryax-admin-credentials
+          key: password
+
+# ⚠ EVERY chart Ingress stays off, registry included. Routing is Gateway API
+# (httproute.yaml) and this cluster runs no Ingress controller, so nothing fills
+# in `.status.loadBalancer` — ArgoCD health-checks such an Ingress as Progressing
+# forever and the sync operation never completes. One is enough to park it.
+#
+# ⚠ An `argocd.argoproj.io/sync-options: Skip health check` annotation does not
+# help if injected by a MutatingAdmissionPolicy: that lands on the live object,
+# while ArgoCD decides what to wait for from the manifest it renders from git.
+front:
+  ingress:
+    enabled: false
+repository:
+  ingress:
+    enabled: false
+runner:
+  ingress:
+    enabled: false
+  # Per-execution wall-clock cap for any action that declares no `time` of its own in its
+  # ryax_metadata.yaml. The runner's code default is 900s (RYAX_DEFAULT_TIME_ALLOTMENT_IN_SECONDS
+  # in ryax/runner/app.py); the chart exposes no dedicated key, so extraEnv is the supported
+  # override — see the note above `extraEnv` in the runner subchart's values.yaml.
+  #
+  # ⚠ THIS MUST STAY <= THE NODE POOLS' maximum_time_in_sec (scripts/manageWorker.sh). A pool is
+  # eligible for an action only when its maximum_time_in_sec >= the requested time (runner
+  # site_entities.py:130-135). Raise this above the pools and NOTHING can be scheduled: the
+  # execution is created but assigned no site, so no pod ever starts. That surfaces as the portal
+  # 404ing on POST and a bare `AssertionError: execution.site_id is not None` — the scheduler's
+  # real reason ("Not enough Time") never reaches a log. Measured 2026-09-23.
+  #
+  # ⚠ THE TIMEOUT KILLS A WORKING ACTION AND LOOKS LIKE A USER CANCEL. The action keeps the side
+  # effects it already committed (rows written to its own database stay), and Ryax then AUTO-RETRIES
+  # the action once; when that retry is torn down the run reports "Execution was cancel by the user
+  # while running" — with no user involved. So the symptom is a half-filled result table plus a run
+  # marked Canceled. The real message ("Execution has taken more than the allotted time") appears
+  # only on the FIRST execution object, never on the run.
+  #
+  # 900s was too low for real work: it killed the "Real-time anomaly detection" detector after ~17%
+  # of one pass. 3600s matches the node pools and is the ceiling a normal batch action gets.
+  #
+  # ⚠ DO NOT RAISE THIS TO RESCUE A NON-TERMINATING ACTION. That workflow's `detector` never exits —
+  # it loops over its dataset continuously (measured: 13950 rows over 4901 distinct windows = 2.85
+  # passes; window_1000 scored three times in one execution). It was cancelled identically at 900s,
+  # 3600s and 7200s. An action that does not terminate needs fixing in its own ryax_metadata.yaml
+  # (declare `time`, or stop after one pass), not a larger number here.
+  extraEnv:
+    - name: RYAX_DEFAULT_TIME_ALLOTMENT_IN_SECONDS
+      value: "3600"
+studio:
+  ingress:
+    enabled: false
+
+# ── PVC SIZES ────────────────────────────────────────────────────────────────
+# Every Ryax PVC's size is set EXPLICITLY, in this file, even where the value equals
+# what the chart would have produced. Sizes live in three different places upstream —
+# the umbrella values.yaml, each subchart's own values.yaml, and under three different
+# key names (`pvcSize`, `size`, `storeSize`) — so "what size will this PVC be on the
+# next recreate" was not answerable by reading this file. Now it is.
+#
+# ⚠ A REDUCTION HERE ONLY TAKES EFFECT ON A RECREATE. Kubernetes refuses to shrink a
+# bound PVC (`spec.resources.requests.storage: Forbidden: field can not be less than
+# status.capacity`) and Longhorn cannot shrink a volume either. The live volume keeps
+# its current size until the cluster is rebuilt; this file is what the rebuild reads.
+#
+# Effective sizes, and where each came from before this block existed:
+#
+#   PVC                             here   umbrella  subchart   live use (2026-09-21)
+#   ryax-action-builder-nix-store  400Gi     100Gi      50Gi     104 GiB mid-rebuild
+#     ^ Sized for the BUILD PEAK, not the idle 3.6 GiB: Ryax's built-in nix GC fires at
+#       80% of this value with no check for a running build, and deletes that build's own
+#       inputs. 100Gi was not enough for a parallel module rebuild (2026-09-22) — see the
+#       storeSize block for the measurement. Do not shrink it toward the idle figure.
+#       It also runs at numberOfReplicas 1, not the StorageClass's 3 — applied per-volume
+#       by snapshot-policy.yaml, since the class is shared with volumes that
+#       DO need redundancy.
+#   ryax-registry-pvc-0             60Gi      20Gi      10Gi      17.3 GiB
+#   ryax-minio                      20Gi      20Gi       8Gi     162 MiB
+#   ryax-datastore-pvc-0             2Gi       2Gi       2Gi     0.2 GiB
+#   data-ryax-broker-0               1Gi       1Gi       8Gi     0.0 GiB
+#   storage-ryax-loki-0             10Gi         -      10Gi     1.0 GiB
+#   storage-ryax-tempo-0            10Gi         -      10Gi     1.4 GiB
+#   ryax-grafana                     1Gi         -       1Gi     0.8 GiB
+#   prometheus-...-db-...-0         20Gi      10Gi         -    15.9 GiB (over claim)
+#
+# data-ryax-worker-postgresql-0 (2Gi) belongs to the SEPARATE ryax-worker-k8s release
+# and is set in worker-values.yaml, not here.
+#
+# Prometheus also gets its storageClassName set in the same place, because the umbrella
+# leaves it commented out and the cluster default put it on cloud disks — see the
+# kube-prometheus-stack block.
+registry:
+  ingress:
+    enabled: false
+  # ⚠ Must accompany ingress.enabled:false. The cert-setup DaemonSet nsenters into
+  # PID 1 on every node it lands on, rewrites /etc/containerd/config.toml and
+  # restarts containerd. Before 26.9.0 it was gated on `not ingress.enabled`, so
+  # the two could not be separated; this key is what makes turning the Ingress off
+  # safe.
+  registryCertSetup:
+    enabled: false
+  # With the Ingress off the chart renders ryax-registry-ext (NodePort 30012) —
+  # the loopback address the Runner stamps into every execution pod's image
+  # reference, since the kubelet cannot resolve in-cluster Service names. Paired
+  # with internalRegistryOverride in worker-values.yaml.
+  #
+  # ⚠ Without certSetup the registry serves plain HTTP. It keeps htpasswd auth and
+  # is reachable only through each node's own loopback via kube-proxy.
+
+  persistence:
+    # 60Gi, against the chart's 10Gi default.
+    #
+    # This holds every action image Ryax builds, and Ryax never deletes them: each
+    # published action version becomes its own tagged repository (plus a
+    # `-python3-filev1` sibling), so the store grows monotonically with the number of
+    # action versions ever published, not with the number in use.
+    #
+    # Measured 2026-09-21 at 20Gi: 19 repositories, every one carrying a live tag,
+    # 17.2GiB of blobs and the volume 100% full. Garbage collection reported
+    # `0 blobs and 0 manifests eligible for deletion` — correctly, since nothing was
+    # untagged. So GC does not bound this; only capacity does. ~1GiB per action
+    # version puts 60Gi at roughly 55 versions.
+    #
+    # ⚠ This is a ceiling, not a fix. If it fills again the answer is pruning old
+    # action versions in Ryax (which untags them, after which GC reclaims the blobs),
+    # not another bump — the growth is unbounded by design.
+    pvcSize: "60Gi"
+
+    # ⚠ `enable` is NOT a typo here — it is a typo in the CHART, reproduced on purpose.
+    #
+    # Chart 26.9.0's registry subchart reads `persistence.enabled` (which defaults to
+    # true, so persistence itself needs no key from us) everywhere EXCEPT cronJobs.yaml:
+    # the garbage-collect CronJob guards its volume mount on `persistence.enable`. No
+    # such value exists, so that guard is always false and the GC job renders with NO
+    # volume mount — it runs against an empty container filesystem, finds nothing, and
+    # exits. Its trailing `|| echo Nothing to be cleaned` then turns the failure into
+    # exit 0, so the CronJob reports Complete forever while reclaiming nothing.
+    #
+    # Measured 2026-09-21: the PVC hit 100% (21.43 of 21.47 GB), every image push
+    # started failing, and the only signal was a KubePersistentVolumeFillingUp alert —
+    # the CronJob's lastSuccessfulTime was current throughout.
+    #
+    # Defining the misspelled key is what makes the stock CronJob mount the PVC. It is
+    # not sufficient on its own: that job's config path is also wrong, which values
+    # cannot reach, so registry-garbage-collect.yaml replaces the job outright. This key
+    # is kept anyway so the chart's own job is not left rendering a broken mount.
+    #
+    # Upstream is unfixed on master (46099b4, 2026-09-10) and 26.9.0 is the latest
+    # release. Recheck on the next chart bump: if upstream fixes the spelling, this
+    # line becomes dead and should go.
+    enable: true
+
+# Nothing routes through it; the chart Ingresses above are off. Dropped entirely
+# via `condition: traefik.deployment.enabled` in the umbrella Chart.yaml.
+#
+# ⚠ If it is ever re-enabled: its Service defaults to LoadBalancer, and
+# MetalLB/kube-vip hands that the cluster ingress IP on 80/443 — the chart's
+# Ingresses match host `*`, so it then answers for every host in the cluster.
+# Set `traefik.service.spec.type: ClusterIP` (`spec.type`; Traefik 41.x silently
+# ignores the old `service.type`) and keep `ingressClass.isDefaultClass: false`.
+rabbitmq:
+  persistence:
+    # The broker's mnesia dir — queue metadata only, no message bodies at rest here.
+    # Restated rather than inherited; see PVC SIZES above. 0.0 GiB in use.
+    size: 1Gi
+
+traefik:
+  deployment:
+    enabled: false
+
+action-builder:
+  # ⚠ PINNED TO ONE NODE. Without this the builder floats across the unibi-hclab nodes —
+  # it moved bender <-> pcie-tb-s on restarts — and its nix store is a ReadWriteOnce
+  # volume, so every move forces a detach/reattach (`FailedAttachVolume ... already
+  # exclusively attached to one node`) followed by a multi-minute `chown -R` over the
+  # whole store in the bootstrap initContainer. Pinning makes the builder's node, and
+  # therefore its cache, stable.
+  #
+  # pcie-tb-s, because the nix store is the constraint and this node has an order of
+  # magnitude more room for it. Measured 2026-09-22 (Longhorn "real bytes usable" = free
+  # space minus the 25% storage-minimal-available floor, NOT the over-provisioned
+  # schedulable figure, which is ~2.3 TiB here and would mislead):
+  #
+  #   pcie-tb-s     1830 GiB disk,  879.8 GiB usable,  30.5 GiB RAM, 24 cpu
+  #   smartmirror1   457 GiB disk,   83.6 GiB usable,  30.3 GiB RAM, 16 cpu
+  #
+  # The store sat at 55.7 GiB — two thirds of smartmirror1's entire headroom — and grows
+  # until the weekly GC (nix-store-garbage-collect) runs, so a missed Sunday plus a heavy
+  # build week could fill that node. Here it is ~7% of the disk and the GC stops being
+  # load-bearing. Builds also parallelise, so 24 cpu beats 16.
+  #
+  # It further keeps the builder OFF the only node with GPUs: smartmirror1 holds both
+  # cards, and spending its disk and 8Gi of RAM on a build cache blocks GPU executions
+  # that actually need them.
+  #
+  # ⚠ pcie-tb-s was previously avoided as unstable — it used to reboot every few hours.
+  # That is STALE: it has been continuously Ready since 2026-09-18, the same as bender and
+  # smartmirror1. Re-check `.status.conditions[Ready].lastTransitionTime` before treating
+  # the old warning as a reason not to place work here.
+  #
+  # ⚠ NOT anchored to project_settings — no resolver produces a node id, so
+  # applyProjectSettings.py has nothing to rewrite here. Same deliberate choice as
+  # deployment/argocd-apps/remote-desktop-bender/desktop-bender.yaml. If pcie-tb-s is
+  # renamed or disabled this line must be changed BY HAND; the pod goes Pending, which is
+  # the loud failure and the intended one.
+  #
+  # ⚠ These three keys REPLACE the global ones rather than merging — the subchart template
+  # is `.Values.nodeSelector | default .Values.global.nodeSelector` (same for tolerations
+  # and affinity). So the mesh toleration and the x86-64-v2 affinity are restated below;
+  # dropping either silently un-does a constraint the global block documents at length.
+  nodeSelector:
+    kubernetes.io/hostname: unibi-hclab-pcie-tb-s
+  tolerations:
+    # The mesh taint, as in global.tolerations. pcie-tb-s carries ONLY this one — the
+    # ecc/gpu toleration that was needed for smartmirror1 is deliberately gone, since
+    # tolerating a taint this node does not have would silently re-admit the builder to
+    # the GPU node if the pin were ever loosened.
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                operator: In
+                values: ["true"]
+
+  # 8Gi, against the chart's 4Gi. The builder compiles action images with nix, and a
+  # large dependency closure (torch, CUDA userspace, the SCADA stack) exhausts 4Gi — the
+  # container is then OOM-killed mid-build, which surfaces as a bare `BuildException`
+  # with no mention of memory, so it reads as a broken action rather than a starved
+  # builder.
+  #
+  # The node has room: unibi-hclab-pcie-tb-s is 30.5 GiB allocatable with 11.6 GiB
+  # requested (37%) and 22% actually in use, measured 2026-09-21. Raising this by 4Gi
+  # takes requests to ~52%, still leaving headroom for the desktop and EDA workloads that
+  # share the box.
+  #
+  # ⚠ requests == limits, as the chart ships it. That keeps the pod in the Guaranteed QoS
+  # class, which is what stops the kubelet evicting the builder first under node
+  # pressure. If these are ever split, the builder becomes Burstable and is the first
+  # thing killed when the node fills — exactly what happened to ryax-runner and
+  # ryax-intelliscale on bender on 2026-09-20.
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "2"
+    limits:
+      memory: "16Gi"
+      cpu: "2"
+
+  nix:
+    # 30Gi, down from the umbrella's 100Gi. See the PVC SIZES block above.
+    #
+    # This is a Nix BUILD CACHE, not state: every path is content-addressed and
+    # reproducible from the action source plus the upstream binary cache.
+    #
+    # 100Gi was sized for a store that nothing ever collected. With the weekly
+    # nix-store-garbage-collect CronJob in place the working set is an order of
+    # magnitude smaller — measured 2026-09-21, the first GC deleted 7243 of 7401
+    # store paths and freed 58.1 GiB, taking the store from 63 GiB to 3.6 GiB.
+    # The live set is ~10 GiB; 30Gi leaves 3x headroom for a build spike between
+    # weekly runs.
+    #
+    # ⚠ SIZE THIS FOR THE BUILD PEAK, NOT THE IDLE WORKING SET. Ryax's action-builder has
+    # a BUILT-IN nix GC (RYAX_NIX_GARBAGE_COLLECT_ENABLED, default true) that fires when
+    # the store passes RYAX_NIX_GARBAGE_COLLECT_THRESHOLD (default 0.80) on a
+    # RYAX_NIX_GARBAGE_COLLECT_PERIOD timer (default 600s) — and it does NOT check
+    # whether a build is in flight. Its `garbage_collect()` tests the disk ratio and
+    # nothing else.
+    #
+    # So the effective build budget is 80% of this value, and exceeding it does not
+    # merely evict cold paths: it deletes the RUNNING build's own inputs (actionDir,
+    # ryax_build.yaml, the action-wrapper .drv) and the build dies with an opaque
+    # BuildException whose traceback shows only the Python call stack.
+    #
+    # Measured 2026-09-22: rebuilding the cape-agentic modules together pushed a 100Gi
+    # store from 75G to past the 78.4G trigger. The GC then deleted 707 paths / 73.4 GiB
+    # mid-build and three module builds failed. RYAX_LOG_LEVEL=warning hides the
+    # "Running garbage collection" line, so the cause is invisible in the builder log —
+    # only nix's raw "707 store paths deleted" stdout leaks through.
+    #
+    # 400Gi => a 320G trigger. Sized against the NODE, not the observed peak: pcie-tb-s
+    # has 1830 GiB of disk with 686 GiB genuinely usable (available minus Longhorn's 25%
+    # storage-minimal-available floor — NOT the over-provisioned schedulable figure), so
+    # the headroom is free. 200Gi was already 53% consumed within hours of being applied
+    # while rebuilding the cape-agentic modules, i.e. two thirds of the way to its own
+    # trigger — the peak is demand-driven and a snug fit just reintroduces the failure.
+    #
+    # ⚠ Do NOT "right-size" this down to the idle figure. The store reads ~3.6 GiB after
+    # a GC, which looks like 30Gi would be 8x headroom — it is not; that number is the
+    # post-GC trough, not the build peak. A bound PVC also cannot SHRINK: ArgoCD does not
+    # skip the attempt, the apply FAILS with
+    #   PersistentVolumeClaim ... spec.resources.requests.storage: Forbidden:
+    #   field can not be less than status.capacity
+    # which fails the whole sync and BLOCKS EVERY OTHER CHANGE to this app. Measured
+    # 2026-09-21: a 30Gi value left the app retrying that one PVC and silently prevented
+    # an unrelated Grafana fix from ever being applied. Any reduction must land WITH a
+    # recreate that provisions the volume fresh.
+    #
+    # Cost is bounded: snapshot-policy.yaml holds this volume at numberOfReplicas 1 and
+    # in no backup group, so a GiB here is a GiB on pcie-tb-s and nothing more.
+    storeSize: 400Gi
+
+# ── Placement for the upstream subcharts ─────────────────────────────────────
+# These do not read global.tolerations/nodeSelector, and each spells the keys
+# differently. Verify with a render after a chart bump: every Deployment,
+# StatefulSet and DaemonSet must carry both.
+minio:
+  persistence:
+    # Ryax's object store: the per-run inputs/outputs actions exchange. Restated here
+    # rather than inherited — see the PVC SIZES block above for why every size is
+    # explicit. Measured 2026-09-21: 162 MiB of 20Gi (1%).
+    size: 20Gi
+
+  # ⚠ Recreate, not the chart's RollingUpdate default. The PVC is ReadWriteOnce, so a rolling
+  # update deadlocks whenever the new pod is scheduled to a different node than the old one:
+  # the new pod waits on a volume the old pod still holds, and the old pod is never torn down
+  # because the new one never goes Ready. Measured here — the rollout hung until the old pod
+  # was deleted by hand.
+  #
+  # Ryax's own subcharts (action-builder, datastore, registry) already set Recreate for the
+  # same reason; minio and grafana are the two upstream ones that do not, and both deadlocked.
+  #
+  # ⚠ scripts/environment/checkRwoRolloutStrategy.py cannot catch this: it reads PVCs declared
+  # as manifests here, and these come from the chart. Its header says so — such cases must be
+  # fixed in the chart's own values, which is this.
+  updateStrategy:
+    type: Recreate
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                operator: In
+                values: ["true"]
+
+rabbitmq:
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                operator: In
+                values: ["true"]
+
+kube-prometheus-stack:
+  enabled: true
+
+  prometheus:
+    prometheusSpec:
+      # ⚠ The storage class must be stated HERE. The umbrella chart declares this
+      # volumeClaimTemplate but leaves `storageClassName` COMMENTED OUT, so the cluster
+      # default wins — longhorn-cloud. That put Ryax's metrics on CLOUD disks, off-mesh,
+      # against the rule that Ryax storage stays LAN-local, and it also put the PVC in
+      # Longhorn's `default` recurring-job group rather than Ryax's own: hourly snapshots
+      # plus all five GFS backup jobs. Measured 2026-09-21 that was 14 backups totalling
+      # 132.8 GiB in S3 — more than every other Ryax volume combined — for metrics
+      # Prometheus already retains itself and which are rebuilt by scraping.
+      #
+      # Stating it moves the volume into `longhorn-unibi-ryax`, which carries
+      # mesh-backup-daily (retain 7) and mesh-snapshot-6hourly (retain 8) instead.
+      #
+      # ⚠ storageClassName is IMMUTABLE on a bound PVC and on a StatefulSet's
+      # volumeClaimTemplates, so this takes effect on a RECREATE. The live PVC keeps
+      # longhorn-cloud; the existing backups are pruned by hand.
+      # ⚠ A SIZE cap, not just the 10d time cap the chart sets. Retention by time alone
+      # does not bound disk: how much 10 days weighs depends on the scrape set, so the
+      # PVC overran — measured 2026-09-21 at 15.9 GiB actual against a 10Gi claim, which
+      # is how a volume ends up permanently over its request with no alert to show for
+      # it. retentionSize makes Prometheus drop the oldest blocks instead.
+      #
+      # Set below the claim, not at it: Prometheus enforces this on COMPACTED blocks and
+      # needs room for the head block and compaction on top, so a value equal to the PVC
+      # still fills it. 14GiB against 20Gi leaves that margin.
+      retentionSize: 14GiB
+
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+            resources:
+              requests:
+                # Restated rather than inherited; see PVC SIZES above. 15.9 GiB in use
+                # against a 10Gi claim — Prometheus overruns it because retention is set
+                # by TIME, not size, so raise this rather than leaving it to thrash.
+                storage: 20Gi
+
+      # ⚠ SCOPED TO RYAX. The chart's defaults make this Prometheus a SECOND cluster-wide
+      # one: an empty NamespaceSelector means "every namespace", so it selected all 53
+      # ServiceMonitors in the cluster, scraped all 42 kubelets, and through cAdvisor held
+      # pod-level metrics for 41 namespaces — gitlab, authentik, samba-ad, nextcloud and the
+      # rest. That is the cluster's own stack (argocd-infra/prometheus) duplicated: double
+      # the scrape load and a second copy of the telemetry, behind Ryax's own login.
+      #
+      # Ryax needs only its own workloads, so every selector is pinned to its two
+      # namespaces. Matched on `kubernetes.io/metadata.name`, which the apiserver sets on
+      # every namespace automatically — so this needs no label of our own, and nothing
+      # breaks if the namespaces are recreated. ryaxns-execs carries no monitor today but
+      # is where execution pods run, so it is in scope deliberately.
+      serviceMonitorNamespaceSelector: &ryaxNamespaces
+        matchExpressions:
+          - key: kubernetes.io/metadata.name
+            operator: In
+            values: [ryaxns, ryaxns-execs]
+      podMonitorNamespaceSelector: *ryaxNamespaces
+      probeNamespaceSelector: *ryaxNamespaces
+      ruleNamespaceSelector: *ryaxNamespaces
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                    operator: In
+                    values: ["true"]
+
+  kube-state-metrics:
+    # ⚠ SCOPED TO RYAX. kube-state-metrics watches the API directly, so no Prometheus
+    # selector can narrow it — left at the default it reported kube_pod_info for all 54
+    # namespaces in the cluster. This is the key that actually limits it.
+    namespaces: "ryaxns,ryaxns-execs"
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                  operator: In
+                  values: ["true"]
+
+  # ⚠ OFF: the chart's 27 default rule groups. They alert and record on the cluster-level
+  # components disabled below, so with those gone they are not merely useless — they are
+  # WRONG. Measured right after the scoping change: `KubeletDown` fired against perfectly
+  # healthy kubelets, because this Prometheus can no longer see them. The recording rules
+  # (k8s.rules.container-*, node-recording) likewise evaluate against series that no longer
+  # exist.
+  #
+  # Cluster alerting belongs to argocd-infra/prometheus, which has the targets and already
+  # owns these same rules. Ryax's own application rules are published separately and are
+  # unaffected.
+  defaultRules:
+    create: false
+
+  # ⚠ OFF: cluster-wide control-plane scraping, which is the cluster's own stack's job
+  # (deployment/argocd-infra/prometheus/) and is already done there. These components are
+  # what actually reached outside Ryax — their ServiceMonitors live in ryaxns, so the
+  # namespace selectors above do NOT exclude them, but their TARGETS are every kubelet,
+  # apiserver and etcd member in the cluster. Leaving them on scrapes all 42 kubelets a
+  # second time and republishes pod-level metrics for every namespace.
+  #
+  # Ryax's own dashboards that reference these series will have empty panels. That is the
+  # intended trade: the cluster view belongs in the cluster's Grafana, which has it.
+  kubelet:
+    enabled: false
+  kubeApiServer:
+    enabled: false
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeProxy:
+    enabled: false
+  kubeEtcd:
+    enabled: false
+  coreDns:
+    enabled: false
+  kubeDns:
+    enabled: false
+
+  crds:
+    # ⚠ OFF, and the upgrade job with it. The 10 monitoring.coreos.com CRDs are
+    # cluster-scoped and already owned by argocd-infra's own kube-prometheus-stack
+    # (deployment/argocd-infra/prometheus/), so Ryax's bundled copy only re-installs
+    # what another app manages — two Applications writing the same cluster-scoped
+    # resources.
+    #
+    # It also cannot succeed here: the upgrade job ships the whole CRD bundle in a
+    # `ryax-crds-upgrade` ConfigMap as a PreSync HOOK, and ArgoCD applies hooks
+    # client-side regardless of the app's ServerSideApply / ClientSideApplyMigration
+    # sync options (both were tried, 2026-09-16). kubectl's last-applied-configuration
+    # annotation then exceeds the 262144-byte metadata limit:
+    #   ConfigMap "ryax-crds-upgrade" is invalid: metadata.annotations: Too long
+    # A failed PreSync aborts the phase, so NOTHING in the app applies — no
+    # StatefulSet, no Deployment, no PVC.
+    enabled: false
+
+  prometheusOperator:
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                  operator: In
+                  values: ["true"]
+    # Scoped to ryaxns so it does not fight the cluster's own operator.
+    namespaces:
+      releaseNamespace: true
+      additional: []
+    admissionWebhooks:
+      enabled: false
+      patch:
+        enabled: false
+    tls:
+      enabled: false
+
+  nodeExporter:
+    enabled: false  # cluster-wide node-exporter already exists; hostPort would clash
+
+  alertmanager:
+    enabled: true
+    alertmanagerSpec:
+      priorityClassName: monitoring
+    config:
+      global:
+        resolve_timeout: 5m
+      inhibit_rules:
+      - equal:
+        - namespace
+        - alertname
+        source_matchers:
+        - "severity = critical"
+        target_matchers:
+        - "severity =~ warning|info"
+      - equal:
+        - namespace
+        - alertname
+        source_matchers:
+        - "severity = warning"
+        target_matchers:
+        - "severity = info"
+      - equal:
+        - namespace
+        source_matchers:
+        - "alertname = InfoInhibitor"
+        target_matchers:
+        - "severity = info"
+
+  grafana:
+    enabled: true
+
+    # ⚠ PINNED to 13.1.0. The chart's appVersion is 13.2.0, whose image is MISSING the
+    # prometheus, loki and tempo datasource plugins — their directories under
+    # /usr/share/grafana/public/app/plugins/datasource/ do not exist at all. Only 8 of the
+    # 51 plugins the startup log claims to register are actually on disk.
+    #
+    # The failure is silent and misleading. Grafana logs `Plugin registered
+    # pluginId=prometheus` at boot, so the logs look healthy, but every runtime call fails:
+    #
+    #   GET /api/datasources/uid/prometheus/health -> 404 plugin.notRegistered
+    #
+    # Result: every panel on every dashboard is empty while Prometheus itself is perfectly
+    # healthy (15 targets up, data present for every query). It reads as a metrics or
+    # scrape-scoping problem and is neither. Measured 2026-09-21, and it survives a pod
+    # restart because it is the image, not pod state.
+    #
+    # Verified by running the stock upstream images directly — plugin directory file counts:
+    #   12.3.0  prom:7  loki:71  tempo:40     works
+    #   13.1.0  prom:6  loki:71  tempo:41     works  <- pinned here
+    #   13.2.0  prom:0  loki:0   tempo:0      BROKEN (chart default)
+    #   13.2.1  prom:0                        BROKEN
+    #   13.2.2  prom:0                        BROKEN
+    #
+    # So this is not a bad pull or a mirror artefact — it is upstream packaging, and the
+    # 13.2.x patch releases have not fixed it. Drop this pin when a release ships the
+    # datasource plugins again; test with the one-liner above rather than trusting the
+    # release notes.
+    image:
+      tag: "13.1.0"  # renovate: tracked by "Container image tags" regex (docker datasource)
+    # ⚠ OFF: the chart's 17 generic Kubernetes dashboards. Every usage panel on them reads
+    # container_* (cAdvisor), which comes ONLY from the kubelet scrape disabled above — so
+    # they render as "no data" or, worse, half-populated: the k8s-resources-* family still
+    # draws its request/limit panels from kube-state-metrics beside empty usage graphs,
+    # which reads as a broken cluster rather than an out-of-scope one.
+    #
+    # cAdvisor cannot be narrowed to a namespace: the kubelet endpoint is per-NODE and
+    # emits every pod on that node, so serving these would mean re-scraping all 42 kubelets
+    # and re-exposing all 41 namespaces. The cluster's own Grafana carries the identical
+    # dashboards with complete data; this one keeps Ryax's (datastore, registry, runner and
+    # RyaxUsageAndPerformance), which are published separately and unaffected.
+    #
+    # ⚠ All-or-nothing: it also drops alertmanager-overview, prometheus and grafana-overview,
+    # which DO work here. Accepted deliberately — argocd-infra/prometheus scrapes this stack
+    # too, so its health is visible there.
+    defaultDashboardsEnabled: false
+
+    # ⚠ SCOPED TO RYAX, same reason as prometheusSpec above. The sidecar's default
+    # searchNamespace is ALL, so it watched every namespace for grafana_dashboard=1 and
+    # pulled in all 30 of the cluster's own dashboards from the `prometheus` namespace —
+    # including ones written here (gpu-utilization, mesh-network, cnpg-databases). Their
+    # filenames collide with Ryax's bundled copies, so 57 ConfigMaps rendered as 36 files
+    # with the last writer winning, i.e. which dashboard you got was a race.
+    sidecar:
+      # ⚠ Required, or Ryax SILENTLY LOSES A DASHBOARD — the same last-writer-wins race the
+      # comment above describes, but between Ryax's OWN ConfigMaps, so narrowing
+      # searchNamespace does not fix it. The sidecar copies every matching ConfigMap's keys
+      # into ONE flat directory (/tmp/dashboards) named by the KEY, and two of the chart's
+      # three dashboards use the same key:
+      #
+      #   ryax-datastore-grafana-dashboard -> grafana-dashboard.json  (PostgreSQL Database)
+      #   ryax-registry-grafana-dashboard  -> grafana-dashboard.json  (Docker Registry)
+      #   ryax-runner-grafana-dashboard    -> RyaxUsageAndPerformance-withSites.json
+      #
+      # Measured 2026-09-21: /tmp/dashboards held TWO files, not three, and Grafana showed
+      # 2 dashboards — the PostgreSQL one was simply absent, with no error naming it.
+      #
+      # What it DID emit was misleading: Grafana 13's unified storage rejected the overwrite
+      # with `deprecatedInternalID=... is already in use` on uid 000000039 every 60s, which
+      # reads as an ID clash between dashboards rather than a filename collision between
+      # ConfigMaps.
+      #
+      # enableUniqueFilenames prefixes each file with its namespace and ConfigMap name. The
+      # dashboards come from the chart, so their keys cannot be fixed at the source.
+      enableUniqueFilenames: true
+      dashboards:
+        searchNamespace: ryaxns
+      datasources:
+        searchNamespace: ryaxns
+    # ⚠ Recreate — same ReadWriteOnce deadlock as minio above, and measured the same way: the
+    # replacement pod sat Init:0/1 waiting for a volume the running old pod held, and only
+    # deleting the old pod cleared it. The key differs from minio's (deploymentStrategy, not
+    # updateStrategy); both were confirmed by rendering the chart, not assumed.
+    deploymentStrategy:
+      type: Recreate
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                  operator: In
+                  values: ["true"]
+    persistence:
+      storageClassName: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+      # Restated rather than inherited; see PVC SIZES above. 0.8 GiB in use.
+      size: 1Gi
+
+    # ⚠ Install NO plugins. The chart default is
+    # [grafana-piechart-panel, grafana-clock-panel, vonage-status-panel], all three fetched
+    # from storage.googleapis.com at container start — and a plugin download FAILS THE WHOLE
+    # POD (`Module failed: plugin.backgroundinstaller`), it is not best-effort.
+    #
+    # Both unibi sites RESET the TLS connection to storage.googleapis.com: measured
+    # 2026-09-17 from plain curl pods, unibi-hclab and unibi-recslab both get
+    # "Recv failure: Connection reset by peer" on IPv4 while github.com and
+    # registry.ryax.org succeed from the same pod, and the cloud node and home-martin both
+    # fetch the same URL fine. So it is the university egress path, not this cluster — and
+    # grafana is pinned to ecc/site=unibi-hclab, so it can never reach them.
+    #
+    # The three are decorative panel types (pie chart, clock, status). Ryax's own dashboards
+    # are provisioned through the sidecar and render without them.
+    plugins: []
+
+    grafana.ini:
+      server:
+        domain: "{{ .Values.global.tls.hostname }}"
+        root_url: "https://{{ .Values.global.tls.hostname }}/grafana"
+        serve_from_sub_path: true
+    ingress:
+      enabled: false  # served by httproute.yaml's /grafana rule, without prefix stripping
+
+# Ryax-local observability, scoped hard to Ryax so uninstalling takes it along.
+# The cluster's own Loki (argocd-infra/loki) and Alloy (argocd-infra/alloy) are
+# separate and untouched; Ryax logs deliberately do not go there.
+#
+# ⚠ The alloy dependency's condition is `loki.enabled`, not `alloy.enabled`, so
+# the two ride together — keeping Loki means scoping Alloy below.
+loki:
+  enabled: true
+  singleBinary:
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                  operator: In
+                  values: ["true"]
+    persistence:
+      # ⚠ Required. The subchart's default is null, which emits a VCT with no
+      # storageClassName at all → the cluster default (longhorn-cloud) wins and the
+      # volume lands off-mesh, where the pod cannot schedule.
+      storageClass: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+      # Restated rather than inherited; see PVC SIZES above. 1.0 GiB in use.
+      size: 10Gi
+
+# ⚠ Upstream defaults make this a SECOND cluster-wide log collector: a ClusterRole
+# and `tolerations: [{operator: Exists}]`. All three overrides below are load-bearing.
+alloy:
+  # Roles/RoleBindings in these namespaces only — no ClusterRole. The API server
+  # then denies cluster-scoped reads even if the River config asks for them.
+  rbac:
+    namespaces:
+      - ryaxns
+      - ryaxns-execs
+
+  controller:
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    # ⚠ NO x86-64-v2 affinity here, unlike every other block in this file. Alloy is the log
+    # collector and this is a DaemonSet: its job is to run on every Ryax node, INCLUDING the
+    # ones below the v2 baseline. Adding the rule would silently stop collecting logs from
+    # exactly the node most likely to misbehave — and the loss is invisible, since the
+    # DaemonSet would simply report a smaller DESIRED count. Alloy's own binary runs fine
+    # there; the baseline only constrains what the Ryax services import.
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+  alloy:
+    # Discovery restricted to Ryax's namespaces. The nodeName selector is kept so
+    # each DaemonSet peer tails only its own node — without it every Alloy ships a
+    # duplicate of every line.
+    configMap:
+      content: |-
+        discovery.kubernetes "pods" {
+          role = "pod"
+          namespaces {
+            names = ["ryaxns", "ryaxns-execs"]
+          }
+          selectors {
+            role  = "pod"
+            field = "spec.nodeName=" + sys.env("K8S_NODE_NAME")
+          }
+        }
+
+        discovery.relabel "pod_logs" {
+          targets = discovery.kubernetes.pods.targets
+          rule {
+            source_labels = ["__meta_kubernetes_namespace"]
+            target_label  = "namespace"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_container_name"]
+            target_label  = "container"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+            separator     = "/"
+            replacement   = "/var/log/pods/*$1/*.log"
+            target_label  = "__path__"
+          }
+        }
+
+        local.file_match "pod_logs" {
+          path_targets = discovery.relabel.pod_logs.output
+        }
+
+        loki.source.file "pod_logs" {
+          targets    = local.file_match.pod_logs.targets
+          forward_to = [loki.process.pod_logs.receiver]
+        }
+
+        loki.process "pod_logs" {
+          stage.cri {}
+          forward_to = [loki.write.loki.receiver]
+        }
+
+        loki.write "loki" {
+          endpoint {
+            url = "http://ryax-loki:3100/loki/api/v1/push"
+          }
+        }
+
+# Multi-site autoscaling advisor. Nothing to advise across on a single site, but
+# it runs fine and is the upstream default.
+intelliscale:
+  enabled: true

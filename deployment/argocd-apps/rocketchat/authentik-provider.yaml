@@ -1,0 +1,270 @@
+# Authentik OAuth2 provider + application tile for Rocket.Chat — managed entirely
+# from this folder via the Authentik API (same pattern as jitsi/zulip), so nothing
+# Rocket.Chat-specific is added to the authentik folder.
+#
+#   PostSync  job → create/update the "rocketchat" OAuth2 provider and
+#                   "Rocket.Chat" application (dashboard tile, group "Communication").
+#   PreDelete job → delete the application + provider on app removal.
+#
+# Part B (self-contained OIDC): authenticates with the SCOPED provisioner token
+# (key `token` in authentik-provisioner-token, this namespace) — NOT the superuser
+# bootstrap token. No cross-namespace secret read → a plain ServiceAccount
+# suffices (ClusterRole removed). OIDC client secret from
+# rocketchat-oidc-client-secret (this ns).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rocketchat-authentik
+  namespace: rocketchat
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rocketchat-authentik-token-read
+  namespace: rocketchat
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rocketchat-authentik-token-read
+  namespace: rocketchat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rocketchat-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: rocketchat-authentik
+    namespace: rocketchat
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rocketchat-authentik-provider
+  namespace: rocketchat
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rocketchat-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PUBLIC_URL
+              value: "https://rocketchat.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rocketchat-oidc-client-secret
+                  key: OIDC_CLIENT_SECRET
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n rocketchat \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # ---- the "rocketchat-admins" group (idempotent) ----
+              # Owned HERE rather than in argocd-infra/authentik/blueprint-groups.yaml so
+              # that disabling this app creates no rocketchat group.
+              #
+              # ⚠ This group had NO writer anywhere before: the central blueprint was its
+              # only definition, and the bind_group loop below does not include it. Its
+              # only consumer is the rc_admin expression in the SHARED groups scope
+              # mapping (argocd-infra/authentik/blueprint-apps.yaml), which tests the
+              # group NAME in the claim and feeds roles_to_sync=admin in oauth-config.yaml.
+              # So a missing group is invisible: login works, the claim just never carries
+              # admin and Rocket.Chat admin silently degrades to employees-extended only.
+              #
+              # ecc/seed=admin-only: it grants ADMIN rights, so seed-user-group-sync.yaml
+              # puts only testadmin in it, never testuser.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              RC_ADMINS_GRP_PK=$(first_pk "core/groups/?name=rocketchat-admins")
+              if [ -z "$RC_ADMINS_GRP_PK" ]; then
+                echo "Creating group 'rocketchat-admins'..."
+                RC_ADMINS_GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"rocketchat-admins","is_superuser":false,"attributes":{"ecc/seed":"admin-only"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "rocketchat-admins group pk=$RC_ADMINS_GRP_PK"
+
+              # 'groups' scope carries the rc_roles claim (Authentik scope-groups
+              # mapping) used for RC role-sync (admin) below.
+              MAP_PKS="[]"
+              for s in openid profile email groups; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" PUBLIC_URL="$PUBLIC_URL" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'rocketchat',
+                'client_type': 'confidential',
+                'client_id': 'rocketchat',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict',
+                                   'url': os.environ['PUBLIC_URL'] + '/_oauth/authentik'}],
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=rocketchat")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'rocketchat'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'rocketchat' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Rocket.Chat',
+                'slug': 'rocketchat',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'Communication',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/rocket-chat.png',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app rocketchat "Rocket.Chat" "$APP_PAYLOAD"
+
+              # ---- access control: restrict the app to employee groups ----
+              # (employees / employees-extended / admins). Once ≥1 binding exists,
+              # Authentik denies everyone not matched, so external users can't enter.
+              APP_PK=$(first_pk "core/applications/?slug=rocketchat")
+              # Fetch all bindings for this app once, reuse below to avoid false-positive
+              # matches from the ?target=&group= filter (it matches across all targets).
+              BOUND_GROUPS=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                | python3 -c "import json,sys; print(','.join(b['group'] for b in json.load(sys.stdin)['results'] if b.get('group')))")
+              bind_group() {
+                gpk=$(first_pk "core/groups/?name=$1")
+                if [ -z "$gpk" ]; then echo "  group '$1' not found yet — skip"; return; fi
+                exists=$(echo "$BOUND_GROUPS" | tr ',' '\n' | grep -qx "$gpk" && echo yes || true)
+                if [ -z "$exists" ]; then
+                  echo "  binding group '$1' to Rocket.Chat (order $2)"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"group\":\"${gpk}\",\"order\":$2,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              }
+              ord=0
+              for g in employees employees-extended authentik-admins; do
+                bind_group "$g" "$ord"; ord=$((ord+1))
+              done
+
+              echo "Rocket.Chat Authentik provider + tile + access bindings configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rocketchat-authentik-provider-cleanup
+  namespace: rocketchat
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rocketchat-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n rocketchat \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'rocketchat'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/rocketchat/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=rocketchat" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'rocketchat' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "Rocket.Chat Authentik cleanup done."

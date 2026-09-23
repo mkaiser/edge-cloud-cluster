@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: open-webui-pg-user
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: AgCK1XhJv2XU/9pbIfg4bBx4d1FD0136VZWTsIqQe67esNvxp7odiJildWrtN1c1ypJaBjy8PcXkjs0oDmGeYhfjEkpOsLIbIT31jWufFGyVwtmKMj+4LlYcprtHADkOVY+fvTLZtZSAFzIr8OnPBp9WX1bSWnvbFpIs8F0T2AX33dyAoyHHuEVdbf/oUizpd6SmYVP5Piux+bXRmzmgns1IUZaO6eXoHqxe7ZMXsSgKHRsk9/S0NRf8Vy+a4eBLEpr6VtkdDBRoNDLnvuuNUJo47W5AZp0h2F3ynJ6mgDKIHJTJSMalF6C5RWh5gGaEDM0yKXn1lyxMg0qnnDZ8uW3+US19/WuQDYlwmykVcfoPEUicEqCKgqvSoui8eo/8jfrYrT4IpI8D1QIF1ky5GJBMUnabXGsqKpX3XvcmTk1Y2tKPhqyvlbzUH6+aZQFJSniicSepoyLtD5zYTviZhpLJHMzOiUWvIlrxRryxpuMxHph1BEu88faylgreuVVRbQQXojkqvTY99+bnvEzABu33M/zYTMJzS5zOrCaQ0mOfMX32rVdIYkQUDE9j+v2f8FUMl2A7Lnr402eEOciCgdsteE1eX/vK2pJDQeHZqmOp9QzaEqK9P4i04rE1ShahNAtA1LZGOhfNCreRXaHfvFILj2KQfLt8fgW8A7pa4x50X1HnK8yCrDAogOjmHYqcG4MchVB01iLWChSeLTANd/RgjUTKs0lpUUd8NKDtH3OpQOUv4D6EBUUUs9Ra8Q2UDjQ=
+    username: ""
+  template:
+    metadata:
+      name: open-webui-pg-user
+      namespace: open-webui

@@ -1,0 +1,609 @@
+# remote-desktop-gvisor — the EDA desktop, under gVisor (runsc).
+#
+# THE ONLY DESKTOP. gVisor is the cluster's only nested-container runtime
+# (argocd-infra/nested-runtime). Every EDA module is an OCI image run by the desktop's
+# own podman: ~0.7s to start one, ~30 GB store for the 29 GB HyperLynx image.
+#
+# CHOICES THAT LOOK ARBITRARY AND ARE NOT:
+#   runtimeClassName  runsc. Scheduled by LABELS rather than a hostname pin, but it needs
+#                     both ecc/nested-runtime-gvisor AND ecc/fileserver-lan — the NFS
+#                     export the broker mounts only has a CSI node driver on those nodes.
+#   /scratch          a hostPath. gVisor reaches it directly — no VM and no virtiofs in
+#                     the path — so sustained I/O here is safe.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remote-desktop-gvisor
+  namespace: remote-desktop
+  labels:
+    # Deployment-level only — NOT in spec.template, so setting it never restarts the pod.
+    # States at the object what app-of-apps/remote-desktop.yaml enforces: no automated sync,
+    # because applying a change here logs everyone out. desktop-rollout syncs it only while
+    # this Deployment has zero ready replicas.
+    ecc/rollout: manual-sync-when-up
+  annotations:
+    # This consumes an image the app's own PreSync hooks build, so health-gating would
+    # deadlock the first sync.
+    #
+    # ⚠ AND IT IS NOT JUST THE IMAGE BUILD. A Deployment that lands on the wrong node
+    # (e.g. a missing site pin) cannot start, so the sync sits on
+    #   waiting for healthy state of apps/Deployment/remote-desktop-gvisor
+    # for 145 minutes — while the fix for that very Deployment was IN the blocked sync.
+    # A broken new Deployment in this app therefore blocks its own repair. Breaking out
+    # means applying the fix directly (kubectl patch) so the sync can finish; the Skip
+    # health check below is what stops it recurring.
+    argocd.argoproj.io/sync-options: Skip health check
+    # The startup script, the tailscale-serve config and the CA bundle are all read at
+    # container start, so editing them alone changes nothing in a running desktop. Reloader
+    # (argocd-infra/reloader) rolls this Deployment when their content changes.
+    # ⚠ That roll ENDS the live desktop session (strategy: Recreate). It is still
+    # the right trade: the alternative is an edit that syncs green and silently does nothing.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 14400
+  strategy:
+    # The homes PV is RWX (NFS), so it is NOT what forbids two replicas. What does is
+    # node-local state: the podman graphroot and /scratch are hostPaths, and a second
+    # replica on another node would silently get a DIFFERENT store and a different scratch.
+    # Recreate also keeps a rolling update from running two desktops against one X session.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: remote-desktop-gvisor
+  template:
+    metadata:
+      labels:
+        app: remote-desktop-gvisor
+    spec:
+      priorityClassName: low
+      runtimeClassName: runsc
+      nodeSelector:
+        # BOTH labels are required.
+        #   nested-runtime-gvisor — runsc must actually be installed on the node.
+        #   ecc/fileserver-lan    — the broker mounts the module registry and the EDA
+        #                           artifact store from the TrueNAS fileserver, and
+        #                           csi-driver-nfs's node DaemonSet is nodeSelector-pinned
+        #                           to exactly that label (csi-driver-nfs/values.yaml),
+        #                           since the appliance is on that LAN and is not routed
+        #                           from cloud.
+        #
+        # Without the fileserver-lan pin the scheduler is free to pick any runsc node: it
+        # chose home-martin-mini0, and the pod then failed with
+        #   MountVolume.MountDevice failed ... driver name smb.csi.k8s.io not found in
+        #   the list of registered CSI drivers
+        # because no CSI node pod runs on a node without that label.
+        ecc/nested-runtime-gvisor: "true"  # automatically updated from project-settings:applicationPlacements.labels.nestedRuntimeGvisor
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 60
+      # ⚠ THE KUBELET *CAN* PULL FROM image-registry SINCE 2026-09-03 — the note below is
+      # kept because its reasoning is still exactly why the fix had to be a NodePort. What
+      # changed: image-registry gained a pinned NodePort (30500) and every lab node got a
+      # registries.yaml + CA (image-registry/node-registries-config.yaml), so the kubelet
+      # reaches it at 127.0.0.1:30500 without resolving any cluster name. Verified on all
+      # four unibi-hclab nodes with `k3s crictl pull`, and ollama pulled its 7.2 GB image
+      # through it. The desktop image therefore comes from the LAN now, not from GitLab's
+      # S3-backed registry (~5 MB/s from the lab against ~126 MB/s here).
+      #
+      # ⚠ The archive is consequently LOAD-BEARING FOR STARTUP, not just for recreate speed:
+      # the pipeline pushes to GitLab AND archives to image-registry, and if that archive
+      # step fails this pod has nothing to pull. The gate archives on skip as well as after a
+      # build precisely so a missing copy self-repairs.
+      #
+      # ⚠ THE KUBELET CANNOT REACH image-registry BY ITS SERVICE NAME, and this is not a
+      # policy choice. An imagePullSecret is used by the KUBELET, which resolves DNS through
+      # the NODE's resolver — and a node does not resolve *.svc.cluster.local. That is why
+      # this image is referenced through the NodePort on loopback instead (service.yaml).
+      #
+      # Every OTHER use of image-registry in this repo is skopeo/podman running INSIDE a pod
+      # (the broker, the [eda] CI jobs), which resolves via cluster DNS. That is the
+      # distinction: in-pod pulls use the Service name, kubelet pulls use 127.0.0.1:30500.
+      #
+      # ⚠ HENCE TWO PULL SECRETS, AND BOTH ARE NEEDED. A pull secret is matched by REGISTRY
+      # HOST STRING, so the FQDN-keyed image-registry-cred does not apply to a
+      # 127.0.0.1:30500/... reference — that pull fails with "no basic auth credentials".
+      # image-registry-cred-node carries the same read-only eda-pull account keyed to the
+      # NodePort host. The registry's CA is trusted via containerd's certs.d directory,
+      # written by image-registry/node-registries-config.yaml.
+      imagePullSecrets:
+        - name: remote-desktop-registry-cred
+        - name: image-registry-cred-node
+      initContainers:
+        - name: seed-homes
+          image: 127.0.0.1:30500/image-archives/remote-desktop:base-r69
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              # ⚠ The mount is now the NFS export ROOT (datapool/homes), not a volume with a
+              # `homes/` subdirectory inside it — so these paths lost one level. Getting this
+              # wrong creates /home/homes/... and every login lands in an empty directory.
+              #
+              # These two are the image's LOCAL accounts (uid 2001 `desktop`, and
+              # `headless`), not AD users. AD users' homes are created on the appliance by
+              # truenas/configure-job.yaml, owned by their real AD uid with mode 0700 — do
+              # NOT seed those from here: a root-owned or 2001-owned directory would shadow
+              # the correct one and be very hard to spot.
+              mkdir -p /pvc/desktop
+              if [ ! -d /pvc/headless ]; then
+                cp -a /home/headless /pvc/ 2>/dev/null || mkdir -p /pvc/headless
+              fi
+              chown -R 2001:2001 /pvc/desktop
+
+              # Node-local /scratch: make it world-writable with the STICKY bit, like /tmp.
+              # 1777 rather than per-user dirs because the users are AD accounts that do not
+              # exist as local uids here — this container cannot resolve them, and guessing
+              # would create directories owned by the wrong id (the failure the whole
+              # idmap/uidNumber work exists to avoid). Sticky means a user can create their
+              # own directory and nobody else can delete it.
+              #
+              # Idempotent: chmod every run, because a fresh node starts with the
+              # DirectoryOrCreate default (0755, root) and users could not write to it.
+              mkdir -p /scratch
+              chmod 1777 /scratch
+
+              # /shared/tmp: the STICKY bit, which the appliance cannot set itself.
+              # filesystem.setperm caps mode at 777 ([EINVAL] "Please supply a value
+              # between 000 and 777"), so truenas/configure-job.yaml leaves this 0777 and
+              # the sticky bit is applied HERE, over NFS, where chmod takes four digits.
+              # Without it this world-writable directory lets any user delete any other
+              # user's files. Idempotent, and cheap enough to re-assert every start.
+              if [ -d /shared-tmp ]; then
+                chmod 1777 /shared-tmp
+              else
+                echo "WARNING: /shared-tmp not mounted — sticky bit NOT applied"
+              fi
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: homes
+              mountPath: /pvc
+            - name: scratch
+              mountPath: /scratch
+            # Mounted at a FLAT path, not /shared/tmp: this init container does not mount
+            # `shared`, so a nested path would need both and gains nothing here.
+            - name: shared-tmp
+              mountPath: /shared-tmp
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+      containers:
+        - name: desktop
+          image: 127.0.0.1:30500/image-archives/remote-desktop:base-r69
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              # Under gVisor capabilities never reach the host kernel at all ("gVisor
+              # never runs with capabilities on the host Linux kernel"), so this grant does
+              # not extend past the sandbox.
+              add: ["SYS_ADMIN"]
+          command: ["/bin/bash", "-c"]
+          args: ["/opt/desktop-startup/desktop-startup.sh"]
+          env:
+            - name: RDP_PASSWORD
+              valueFrom: { secretKeyRef: { name: remote-desktop-secrets, key: rdp-password } }
+            # The AD identity the startup script asserts sssd.conf against. These ARE
+            # anchored — the comment can sit on its own line here, unlike inside the
+            # sssd.conf heredoc — so a realm rename propagates and the guard catches drift.
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            # The machine account whose keytab this pod mounts. Must match MACHINE in
+            # remote-desktop/keytab-job.yaml, and carries the trailing `$` AD uses for
+            # computer principals.
+            # The DC's AD FQDN — must be its Kerberos SPN name, NOT the k8s Service name
+            # (an SPN for the Service name does not exist; see startup-configmap.yaml).
+            # Resolves in-cluster via the CoreDNS forward that dns-config-job.yaml writes.
+            # ⚠ NOT ANCHORED: only the `.{adDomain}` SUFFIX is machine-managed — the leading
+            # `ad-cloud-0` is the DC pod's own name. Both halves are dotted labels, so no
+            # regex can tell where one ends and the other begins, and an adDomain anchor here
+            # rewrites the WHOLE token to `ad.base.internal`, destroying the SPN. Renaming
+            # activeDirectory.adLabel means editing this line by hand; the AD_REALM line above
+            # IS anchored, so the mismatch surfaces immediately as a Kerberos failure.
+            - name: AD_DC_FQDN
+              value: "ad-cloud-0.ad.base.internal"
+            - name: AD_MACHINE_ACCOUNT
+              value: "rdesk-gvisor$"
+            # Per-user xrdp sessions — every login gets its own X server + Xfce session,
+            # authenticated against LDAP. Both desktops run this mode; see the SESSION_MODE
+            # block in startup-configmap.yaml.
+            - name: SESSION_MODE
+              value: "per-user"
+            # ⚠ FROM `eda-secrets`, NOT remote-desktop-secrets. Licensing is an EDA
+            # concern and this pod is one of TWO runtimes that needs it (the [eda-run] CI
+            # runner is the other), so it is owned by eda/secrets and sealed into both
+            # namespaces from one value. remote-desktop-secrets keeps db/rdp only.
+            # ⚠ THE FLEXNET KEY, NOT `license-server`. Vivado needs EVERY port the site
+            # serves (the lab runs five) and FlexNet takes them ';'-separated;
+            # `license-server` holds a SINGLE port because SALT/HyperLynx below cannot parse
+            # a list. One key served all three until 2026-09-08, which meant Vivado only
+            # ever saw 27000 — do not merge them back.
+            - name: XILINXD_LICENSE_FILE
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-flexnet } }
+            - name: LM_LICENSE_FILE
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-flexnet } }
+            # ⚠ THE FLEXNET LIST TOO. The xilinx module maps this to XILINXD_LICENSE_FILE
+            # via module.yaml set_from_secret, so a single-port value here would undo the
+            # split above for anything launched through `module load`.
+            - name: MODULE_LICENSE_SERVER
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-flexnet } }
+            # ⚠ HyperLynx reads SALT_LICENSE_SERVER (Siemens/SALT), not the Xilinx names.
+            # module-podmand passes through only the license vars it can SEE in this pod's
+            # env, so a module declaring `SALT_LICENSE_SERVER` in env.set_from_secret needs
+            # it exported HERE as well — otherwise `module load hyperlynx/2604` succeeds, the
+            # launcher runs, and hldrcqt dies with SIGABRT (rc=134) for want of a license.
+            # ⚠ THE SINGLE-PORT KEY, deliberately — see the FlexNet note above. Same host
+            # as Vivado's, but Siemens/SALT does not use FlexNet's ';' list syntax.
+            - name: SALT_LICENSE_SERVER
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-server } }
+            # ⚠ MGLS_LICENSE_FILE IS SEPARATE FROM SALT_LICENSE_SERVER, and HyperLynx needs
+            # BOTH. Siemens splits licensing across two vendor daemons on the same host:
+            # `saltd` answers SALT_LICENSE_SERVER, but HyperLynx's PRIMARY features are served
+            # by `mgcld` and that daemon is addressed through MGLS (Mentor Graphics Licensing
+            # System) — a different env var entirely. Measured 2026-09-15: with only
+            # SALT_LICENSE_SERVER set, the GUI opened and then reported
+            #   "No licenses for HyperLynx's primary features were obtained"
+            #   hypbsw  - BoardSim SI/PI product — License server is not defined.
+            # while `salt_ok --feature hypbsw` said the licence WAS available (via
+            # `hypbswsiext_c` on the mgcld daemon). So the entitlement was fine the whole
+            # time and only the address was missing — "not defined", not "not available".
+            # ⚠ salt_ok CANNOT detect this gap: it reads SALT_LICENSE_SERVER and reports
+            # success identically whether or not MGLS is set. Only the GUI surfaces it.
+            # The SINGLE-PORT key, like SALT: mgcld is on the same 27300 and MGLS does not
+            # take FlexNet's ';' list.
+            - name: MGLS_LICENSE_FILE
+              valueFrom: { secretKeyRef: { name: eda-secrets, key: license-server } }
+            # ⚠ THE SAME REGISTRY THE BROKER USES, and it must be set HERE too.
+            # module-podmand runs in THIS container (started by startup-configmap.yaml), and
+            # it is what actually pulls a container module's image at launch. Left unset it
+            # falls back to module-podman.sh's built-in default, which is GITLAB's registry —
+            # and EDA module images are published ONLY to the lab-local image-registry. The
+            # result is a module that prepares fine (the broker has the right host) and then
+            # fails at first run with "could not pull ... (pull failed)", which reads like a
+            # credential or network fault rather than a wrong registry.
+            - name: REGISTRY_HOST
+              value: "image-registry.image-registry.svc.cluster.local:5000"
+            - name: MODULE_IMAGE_BASE
+              value: "deployments/infrastructure/eda/modules"
+          ports:
+            # RDP + SSH. SESSION_MODE=per-user means nothing binds 5901/6901 in this pod.
+            - { name: rdp,   containerPort: 3389 }
+            # sshd (startup-configmap.yaml) — 2222, not 22, so a tailnet grant for the
+            # desktop can never be mistaken for a grant to the NODE's sshd on 22.
+            - { name: ssh,   containerPort: 2222 }
+          volumeMounts:
+            # ⚠ NO subPath. The NFS export root IS the homes directory (datapool/homes,
+            # one 0700 dir per user, created by the fileserver Job), so a subPath would look
+            # for /home inside /home. The old Longhorn volume needed one because it also
+            # held the `headless` skeleton alongside.
+            - { name: homes, mountPath: /home }
+            # The common area. /shared/tmp is a SEPARATE dataset and therefore a separate
+            # mount nested inside /shared — mounting only `shared` would leave tmp empty.
+            - { name: shared, mountPath: /shared }
+            - { name: shared-tmp, mountPath: /shared/tmp }
+            # ⚠ A PLAIN DIRECTORY MOUNT, deliberately NOT the subPath-over-
+            # ca-certificates.crt trick the tailscale sidecar uses. That one SHADOWS the
+            # system roots, which staging-ca.yaml says is safe only for a container with
+            # exactly one TLS peer. This container needs PUBLIC roots too, so the bundle
+            # is merely made readable here and desktop-startup.sh installs it ADDITIVELY
+            # with update-ca-certificates.
+            - { name: staging-ca, mountPath: /run/staging-ca, readOnly: true }
+            # ⚠ NODE-LOCAL and EPHEMERAL, deliberately. /home is NFS over a 1 GbE link
+            # (measured 92 MB/s write); EDA project dirs, Vivado `.runs/`, synthesis temp
+            # and waveform dumps do not belong there. This is the fast tier for that work.
+            #
+            # THE CONTRACT, which must be told to users rather than discovered:
+            #   - NOT backed up, NOT replicated, NOT snapshotted.
+            #   - NOT the same files after a reschedule. This pod is placed by LABELS
+            #     (ecc/nested-runtime-gvisor + ecc/fileserver-lan), not a hostname pin, so the
+            #     hostPath follows it to whichever runsc lab node it lands on.
+            #   - NOBODY CLEANS IT. There is no pruning CronJob, by explicit decision —
+            #     users manage their own space. It shares one ~1.8 TiB disk
+            #     with the EDA build area (/var/lib/xilinx-build), so filling it starves
+            #     image builds. EDA CI's own `df` guard (warns under 200 GB free on
+            #     /build-scratch) is the early signal that this happened.
+            #
+            # Sticky 1777 like /tmp (set by seed-homes): users create their own
+            # subdirectories and cannot delete each other's.
+            - { name: scratch, mountPath: /scratch }
+            # ⚠ The Kerberos machine keytab, WITHOUT which sssd's `ad` provider fails at
+            # startup ("No suitable principal found in keytab") and every lookup returns
+            # "no such user" while the pod still reports 2/2 Running. Minted by
+            # remote-desktop/keytab-job.yaml for the rdesk-gvisor$ machine account — NOT
+            # FS-1$, which belongs to the fileserver.
+            - { name: krb5-keytab, mountPath: /etc/krb5.keytab, subPath: krb5.keytab, readOnly: true }
+            # Mounted as a DIRECTORY, not subPath. A subPath mount is a one-time copy the
+            # kubelet never refreshes, so an edited script reaches the ConfigMap but never
+            # the pod — and a container crashlooping on the stale script cannot self-heal
+            # (it re-reads the same copy forever), needing a manual pod delete.
+            # A plain ConfigMap volume is kept in sync by the kubelet instead.
+            - { name: startup, mountPath: /opt/desktop-startup, readOnly: true }
+            - { name: dev-fuse, mountPath: /dev/fuse }
+            # Module dir: the broker publishes manifests and modulefiles here as plain
+            # files, which is all a module needs — nothing is mounted into it.
+            - name: modules
+              mountPath: /modules
+            - { name: module-requests, mountPath: /run/module-requests }
+            - { name: registry-cred, mountPath: /var/run/registry-cred, readOnly: true }
+            - { name: podman-store, mountPath: /var/lib/containers/storage }
+            - { name: dshm, mountPath: /dev/shm }
+          resources:
+            # There is no VM here, so these limits do not size a guest — they cap the
+            # inner podman containers.
+            #
+            # ⚠ THE CPU LIMIT IS NOT ENFORCED UNDER runsc — it is documentation, not a cap.
+            # Under load this pod reaches ~24 CPU (the whole node) against this 12-CPU limit.
+            # The runsc shim creates a FLAT cgroup dir named after the systemd path instead
+            # of resolving it, so cpu.max stays `max`.
+            # Keep the value: it still drives scheduling/QoS and documents intent, and it
+            # becomes real if the shim is ever fixed. But do NOT rely on it to protect this
+            # node's other tenants (Samba AD DC, Longhorn instance-manager).
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "12", memory: 20Gi }
+        # ── BROKER ──────────────────────────────────────────────────────────────
+        - name: broker
+          image: 127.0.0.1:30500/image-archives/remote-desktop:base-r69
+          command: ["/usr/local/bin/broker"]
+          securityContext:
+            # ⚠ NOT privileged, and it MUST NOT BE: runsc cannot start a privileged
+            # SUBCONTAINER on unibi-hclab-pcie-tb-d (Ubuntu 26.04 / kernel 7.0.0), and since
+            # the broker is a sidecar it is always a subcontainer. The sandbox dies mid
+            # `/sys` mount writing nothing further, so the kubelet sees only
+            #   urpc method "containerManager.StartSubcontainer" failed: EOF
+            # and ALL THREE containers fail together — which reads like a pod-wide fault
+            # rather than one container's securityContext.
+            #
+            # Reproducible with a 2-container busybox pod on that node: with
+            # `privileged: true` the second container gets exactly that error; with the flag
+            # removed and nothing else changed, both run. One variable, opposite outcomes.
+            # It is NOT a kernel/runsc incompatibility — plain runsc works there, and the
+            # SIGSYS in dmesg is normal systrap operation (SECCOMP_RET_TRAP), not the fault.
+            #
+            # ⚠ Do NOT re-add it "because skopeo needs it". The broker mounts nothing —
+            # there is no mount/losetup/mknod anywhere in broker.sh. What it does is
+            # skopeo copy/inspect into an `oci:` DIRECTORY — no image unpacking, no uid
+            # mapping, no privilege required.
+            #
+            # runAsUser is still root (the default here): it writes to /registry, an NFS
+            # export with maproot_user=root.
+            allowPrivilegeEscalation: false
+          env:
+            # The registry coordinates the broker pulls module images from. Omitting these
+            # is not a soft failure: broker.sh:50 aborts with
+            #   "REGISTRY_HOST: REGISTRY_HOST must be set"
+            # and the sidecar crashloops while the desktop container runs fine, so the pod
+            # sits at 1/2 Ready.
+            # ⚠ THE LAB-LOCAL REGISTRY, not GitLab's. EDA module images
+            # are published there and only there (deployment/argocd-apps/image-registry);
+            # GitLab's registry remains the home for everything else, including this
+            # desktop's own base image. Pulling over the LAN is ~126 MB/s against ~5.3 MB/s
+            # from GitLab's S3 backend in Nuremberg.
+            #
+            # ⚠ It is AUTHENTICATED (htpasswd) — the credential is image-registry-cred, sealed
+            # by image-registry/sealSecrets.sh. Not optional hardening: what the broker pulls
+            # from here it runs AS ROOT, and allowed() authorises by <repo>:<tag> without
+            # verifying the content at that tag.
+            - name: REGISTRY_HOST
+              value: "image-registry.image-registry.svc.cluster.local:5000"
+            # ⚠ TRUE, and deliberately NOT anchored to tls.certIssuerType. image-registry
+            # serves TLS from a PRIVATE in-cluster CA (image-registry/tls-cert.yaml), which
+            # has nothing to do with which ACME issuer the cluster uses — anchoring it
+            # would write "false" under letsencrypt-staging and silently disable
+            # verification. Verification works because the CA is mounted below and skopeo is
+            # pointed at it; if this ever fails with x509 UnknownAuthority, the CA copy is
+            # stale (a cluster recreate mints a new one — the ca-distribute Job re-asserts
+            # it on every sync).
+            - name: REGISTRY_TLS_VERIFY
+              value: "true"
+            # Where broker.sh points skopeo's --cert-dir. That flag takes a PLAIN directory
+            # of *.crt files, which is exactly what a ConfigMap mount is — unlike
+            # SSL_CERT_DIR, which expects an OpenSSL hash directory (c_rehash symlinks) and
+            # would silently ignore a bare ca.crt.
+            - name: REGISTRY_CERT_DIR
+              value: /run/image-registry-ca
+            - name: IMAGE_BASE
+              value: "deployments/infrastructure/eda/modules"
+          volumeMounts:
+            # The module REGISTRY (<name>/<version>/module.yaml) on the TrueNAS export.
+            # ⚠ BROKER ONLY, and that mount list IS the security boundary — writing here
+            # authorises this privileged broker to pull and run an image as root
+            # (broker.sh allowed()). Never add it to the desktop container or the [eda]
+            # runner. See nfs-eda-modulefiles-pv.yaml.
+            - { name: registry, mountPath: /registry }
+            - name: modules
+              mountPath: /modules
+            - { name: module-requests, mountPath: /run/module-requests }
+            - { name: registry-cred, mountPath: /run/registry-cred, readOnly: true }
+            - { name: image-registry-ca, mountPath: /run/image-registry-ca, readOnly: true }
+            - { name: podman-store, mountPath: /var/lib/containers/storage }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "4", memory: 8Gi }
+        # ── tailscale sidecar: native RDP/SSH over the mesh VPN ──────────────────────
+        # Publishes this pod on the tailnet as `remote-desktop.ts.internal` so a laptop
+        # joined as `human` can use a real RDP client instead of Guacamole in a browser.
+        #
+        # WHY A SIDECAR AND NOT A SUBNET ROUTE: the CP mesh-gateway advertises ONLY
+        # 10.0.0.0/23. Advertising the service CIDR (10.43.0.0/16) instead would make
+        # EVERY ClusterIP in the cluster routable from the tailnet and leave the ACL as
+        # the only thing containing it. A sidecar is tag-scoped by construction and gets
+        # a stable MagicDNS name; ClusterIPs are not stable across redeploys anyway.
+        #
+        # WHY USERSPACE AND NOT THE MESH-GATEWAY RECIPE: mesh-gateway runs tailscaled
+        # privileged with a /dev/net/tun hostPath. This pod is runtimeClassName: runsc
+        # and can have NEITHER. Userspace networking (TS_USERSPACE, the containerboot
+        # default) needs no TUN device and no NET_ADMIN.
+        #
+        # ⚠ AND THEREFORE **NOT** TS_DEST_IP. containerboot hard-errors
+        #   "TS_DEST_IP is not supported with TS_USERSPACE"
+        # (cmd/containerboot/settings.go), as it does for TS_EXPERIMENTAL_DEST_DNS_NAME
+        # and TS_TAILNET_TARGET_*. Inbound forwarding in userspace mode is expressed as a
+        # serve config instead — that is what TS_SERVE_CONFIG below is.
+        #
+        # Ports: 3389 -> localhost:3389 (RDP) and 22 -> localhost:2222 (the desktop's own
+        # sshd). Note 2222, NOT 22: the container listens on 2222 and only the Service
+        # maps 22 (see vnc-services.yaml). Sidecar and desktop share a network namespace,
+        # so `localhost` is the desktop container directly — no Service hop involved.
+        #
+        # The ACL side needs no edit: policy-configmap.yaml already declares tag:desktop
+        # in tagOwners and grants autogroup:member -> tag:desktop on ["22","3389"]. The grant simply
+        # starts matching once this node carries the tag, which it gets from the pre-auth
+        # key minted with --tags tag:desktop (headscale post-deploy job).
+        - name: tailscale
+          image: ghcr.io/tailscale/tailscale:v1.102.3 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef: { name: headscale-preauthkey-desktop, key: key }
+            - name: TS_HOSTNAME
+              value: remote-desktop
+            # headscale, not tailscale SaaS.
+            - name: TS_EXTRA_ARGS
+              value: --login-server=https://vpn.subdomain1.your-domain.tld --accept-dns=false # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: TS_USERSPACE
+              value: "true"
+            - name: TS_SERVE_CONFIG
+              value: /etc/tailscale/serve.json
+            # ⚠ TS_KUBE_SECRET MUST be set and MUST be empty. containerboot auto-detects
+            # Kubernetes (KUBERNETES_SERVICE_HOST) and then defaults to storing tailscaled
+            # state in a Secret literally named `tailscale`, IGNORING TS_STATE_DIR — it
+            # crash-loops at boot with "missing get permission on secret \"tailscale\"".
+            # An explicitly empty value disables Secret storage and skips the permission
+            # check entirely (cmd/containerboot/settings.go: "An explicitly empty
+            # TS_KUBE_SECRET disables Secret storage"). Leaving the var UNSET is NOT the
+            # same thing — unset falls back to the "tailscale" default.
+            - name: TS_KUBE_SECRET
+              value: ""
+            # State in an emptyDir: this is a Recreate-strategy pod, so a roll re-registers
+            # under the same hostname. headscale de-duplicates the name with a -N suffix,
+            # which is exactly the churn `make prune-orphaned-mesh-nodes` cleans up. Keeping
+            # state would need an RWO PVC for a sidecar that owns no data — not worth it.
+            - name: TS_STATE_DIR
+              value: /var/lib/tailscale
+            - name: TS_AUTH_ONCE
+              value: "true"
+          volumeMounts:
+            - { name: tailscale-serve, mountPath: /etc/tailscale, readOnly: true }
+            - { name: tailscale-state, mountPath: /var/lib/tailscale }
+            # ⚠ subPath: replaces the ONE file, not /etc/ssl/certs — mounting the directory
+            # would hide every other root. See staging-ca.yaml for why this is safe here
+            # (this container speaks TLS to headscale and nothing else).
+            - name: staging-ca
+              mountPath: /etc/ssl/certs/ca-certificates.crt
+              subPath: ca-bundle.pem
+              readOnly: true
+          securityContext:
+            # No NET_ADMIN, no privileged, no /dev/net/tun — the whole point of userspace.
+            runAsUser: 0
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+      volumes:
+        - name: tailscale-serve
+          configMap: { name: remote-desktop-tailscale-serve }
+        # LE staging CA chain — see staging-ca.yaml. Inert on letsencrypt-prod, but it
+        # SHADOWS the system roots either way, so it must remain a complete chain.
+        - name: staging-ca
+          configMap: { name: staging-ca-bundle }
+        - name: tailscale-state
+          emptyDir: {}
+        - name: homes
+          # RWX, served by the TrueNAS fileserver over NFSv4 — NOT a Longhorn RWX volume:
+          # Longhorn's needs an NFS-Ganesha share-manager and it landed on the arm64 Jetson,
+          # which has no iSCSI ([[thor-no-iscsi-longhorn-attach-fails]]), so the volume never
+          # became available. csi-driver-nfs has no share-manager and no iSCSI in the path.
+          # See pvc.yaml.
+          persistentVolumeClaim: { claimName: nfs-homes }
+        # The common area (nfs-shared-pv.yaml). Two claims because they are two datasets:
+        # /shared/tmp is nested inside /shared but backed separately, so mounting only
+        # `shared` would show an EMPTY tmp directory.
+        - name: shared
+          persistentVolumeClaim: { claimName: nfs-shared-data }
+        - name: shared-tmp
+          persistentVolumeClaim: { claimName: nfs-shared-tmp }
+        - name: registry
+          persistentVolumeClaim: { claimName: nfs-eda-modulefiles }
+        # A dedicated podman graphroot: the store has its own locking, so it must not be
+        # shared with another pod.
+        #
+        # ⚠ THE HOSTPATH IS THE GRAPHROOT ITSELF, not its parent: it is mounted at
+        # /var/lib/containers/storage (see volumeMounts), so this directory's CHILDREN are
+        # overlay/, overlay-images/, overlay-layers/ — there is no nested storage/ level.
+        # A store copied from somewhere that mounted at /var/lib/containers instead will
+        # arrive one level too deep and podman will report an EMPTY image list while the
+        # bytes are plainly on disk. Flattening it with `mv <dir>/storage/* <dir>/`
+        # OVERWRITES the outer dirs rather than merging and destroys the layers — a 30 GB
+        # store becomes ~178 MB that way. Stage into a fresh path and verify before
+        # deleting anything.
+        # Node-local scratch — see the mount above for the contract. Separate from
+        # /var/lib/xilinx-build on purpose: user scratch and EDA build state must not be
+        # able to delete each other, and `du` should attribute usage to the right consumer.
+        - name: scratch
+          hostPath: { path: /var/lib/desktop-scratch, type: DirectoryOrCreate }
+        # ⚠ optional: true, deliberately. On a FIRST bring-up this Secret does not exist yet
+        # — the keytab Job is a PostSync hook on wave13-samba-ad, which runs after this pod
+        # is already scheduled. Without `optional` the pod would sit in ContainerCreating
+        # forever on a missing Secret, and the Job that creates it would never get a healthy
+        # cluster to run in. The Job rolls this Deployment once the Secret lands.
+        # ⚠ 0600: krb5 refuses a group- or world-readable keytab.
+        - name: krb5-keytab
+          secret:
+            secretName: remote-desktop-keytab
+            defaultMode: 0600
+            optional: true
+        # ⚠ SHARED PER-NODE MODULE CACHE — the same literal path appears in
+        # app-of-apps/gitlab-runner-eda-run.yaml, and it must stay that way. The xilinx
+        # module image's second layer is a single 42.8 GB blob (~23 min at the ~32 MB/s this
+        # registry sustains); pcie-tb-s runs both the desktop and EDA CI, so sharing the
+        # graphroot means the node pays that once. Safety comes from two locks that live in
+        # the STORE, not in a pod: podman's own storage.lock, and module-podman.sh's
+        # per-image pull lock in <graphroot>/.module-pull-locks. See the long block at the
+        # eda-run call site for why a pod-local lock is not sufficient here.
+        - name: podman-store
+          hostPath: { path: /var/lib/eda-module-podman, type: DirectoryOrCreate }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+        - name: modules
+          emptyDir: {}
+        - name: module-requests
+          emptyDir: {}
+        - name: registry-cred
+          secret:
+            # image-registry credential (sealed by image-registry/sealSecrets.sh), NOT the
+            # GitLab pull token: the broker pulls module images from the lab-local registry
+            # with skopeo, IN-POD, so it resolves the Service name through cluster DNS. The
+            # desktop's own base image is pulled by the KUBELET via imagePullSecrets above,
+            # which cannot resolve that name — see the note there.
+            secretName: image-registry-cred
+        - name: image-registry-ca
+          configMap:
+            # Written by the image-registry app's PostSync ca-distribute Job. optional:true so
+            # the desktop still starts before that Job has ever run — the broker then fails
+            # its first pull with a clear x509 error rather than the pod being stuck
+            # ContainerCreating with an unmountable volume.
+            name: image-registry-ca
+            optional: true
+            # ⚠ THE KEY IS ca.crt. This read `.dockerconfigjson` — copy-pasted from the
+            # adjacent registry-CREDENTIAL volume — which is a key this ConfigMap does not
+            # have. A projected volume whose `items` name a missing key mounts NOTHING, and
+            # `optional: true` makes that silent: the directory exists, contains only the
+            # atomic-update scaffolding, and skopeo --cert-dir finds no CA. The symptom is
+            # a pull failing with "x509: certificate signed by unknown authority" against a
+            # registry whose CA is present and correct in the ConfigMap all along.
+            # Written as ca.crt by image-registry/ca-distribute.yaml (--from-file=ca.crt=...).
+            items:
+              - { key: ca.crt, path: ca.crt }
+        - name: dev-fuse
+          hostPath: { path: /dev/fuse, type: CharDevice }
+        - name: startup
+          configMap:
+            name: remote-desktop-startup
+            defaultMode: 0755

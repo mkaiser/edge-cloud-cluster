@@ -1,0 +1,160 @@
+# NVIDIA k8s device plugin — DaemonSet. Runs ON each GPU node, detects the GPU and advertises
+# `nvidia.com/gpu` as an allocatable resource so pods can request it. Adapted from the upstream
+# static manifest (external/git_NVIDIA_k8s-device-plugin/deployments/static/nvidia-device-plugin.yml).
+#
+# NON-BLOCKING BY DESIGN: node-affinity gates this DaemonSet on the `ecc/gpu-model` label (set
+# on GPU mesh nodes at join, see src/provisioning-scripts/40-join-cluster.sh). With zero
+# matching nodes desired=0/ready=0 → ArgoCD reports it Healthy immediately, so it never stalls a
+# wave while we wait (possibly days) for a GPU mesh node to be provisioned. When a GPU node later
+# joins, the built-in DaemonSet controller schedules this pod onto it automatically — no cron/watcher.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      # Route this pod through the containerd `nvidia` runtime (the RuntimeClass in
+      # runtimeclass.yaml) so it can talk to the GPU.
+      runtimeClassName: nvidia
+      # The plugin generates its own tegra CDI spec into the host /var/run/cdi and
+      # reads the L4T CSV/device tree from the host root mounted at /driver-root
+      # (see the cdi-cri block + volumes below). hostPID not required.
+      priorityClassName: "system-node-critical"
+      # TEGRA/SoC GPU nodes ONLY. This DaemonSet is Jetson-specific in three independent
+      # ways (DEVICE_DISCOVERY_STRATEGY=tegra, DEVICE_ID_STRATEGY=index, the L4T
+      # /driver-root mount), so it must NOT land on a discrete PCIe GPU node — there the
+      # tegra strategy finds no L4T device tree and advertises nothing. Discrete nodes are
+      # served by device-plugin-discrete.yaml instead.
+      #
+      # A DaemonSet has ONE pod template, so per-node env is impossible; two manifests with
+      # precise selectors is the honest expression. Keyed on ecc/gpu-model (the CUDA-arch
+      # label) rather than the ecc/gpu=true capability label, which now matches both classes.
+      # Zero matching nodes → DaemonSet desired=0 → ArgoCD Healthy (non-blocking).
+      #
+      # The plugin itself is board-agnostic ACROSS Tegra (the tegra strategy reads the L4T
+      # device tree, which every Jetson has), so every jetson-* model belongs here — it is
+      # what advertises nvidia.com/gpu at all on an SoC box, and without a matching entry
+      # the node joins healthy with a card that is simply never schedulable.
+      # ⚠ The anchor comment covers the label KEY only (applicationPlacements.labels.gpuModel);
+      # the VALUE list is hand-maintained — updateConfigFromProjectSettings.sh does not touch
+      # it. Add each new jetson-* model here by hand.
+      # An affinity matchExpressions rather than a nodeSelector, because a nodeSelector can
+      # only express ONE value per key.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ecc/gpu-model  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+                operator: In
+                values:
+                - jetson-thor
+                - jetson-orin
+      tolerations:
+      # GPU nodes are mesh nodes (tainted ecc/mesh=true:NoSchedule) — tolerate it so the plugin
+      # runs there. Also tolerate the conventional nvidia.com/gpu taint if one is ever added.
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Exists
+        effect: NoSchedule
+      # GPU nodes are additionally tainted ecc/gpu=true:NoSchedule (dedicated scarce resource).
+      # The plugin is what ADVERTISES nvidia.com/gpu, so it must be able to land there.
+      - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - image: nvcr.io/nvidia/k8s-device-plugin:v0.20.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        name: nvidia-device-plugin-ctr
+        env:
+        - name: FAIL_ON_INIT_ERROR
+          value: "false"
+        # Jetson/Tegra integrated GPU: force the `tegra` device-discovery strategy. The default
+        # `auto` failed to detect the iGPU inside the container and fell back to NVML, whose
+        # memory query is unsupported on Tegra → "error getting device memory: Not Supported"
+        # crash-loop. `tegra` discovers the iGPU via the L4T device tree instead of NVML.
+        - name: DEVICE_DISCOVERY_STRATEGY
+          value: "tegra"
+        # GPU INJECTION via CDI-over-CRI. The plugin both advertises nvidia.com/gpu AND
+        # injects the GPU into workloads by returning a CRI CDIDevices entry
+        # (nvidia.com/gpu=tegra) in its Allocate response. containerd 2.x honors the CRI
+        # CDIDevices field directly — unlike the cdi.k8s.io/* pod ANNOTATION path, which
+        # containerd 2.x silently ignores (that was the old, broken approach).
+        #
+        # SELF-CONSISTENT NAMING: the plugin GENERATES ITS OWN CDI spec (CreateSpecFile →
+        # /var/run/cdi/*.json, built from the L4T CSVs) into the host /var/run/cdi and then
+        # requests that device over CRI. Both the spec device name and the allocate request
+        # are named by DEVICE_ID_STRATEGY=index → `nvidia.com/gpu=0`, so containerd resolves
+        # exactly what the plugin wrote. No dependency on the node's separate nvidia-ctk
+        # /var/run/cdi/nvidia.yaml (which also names the GPU `0` but is generated elsewhere).
+        # (The node runtime is still mode=cdi from
+        # src/provisioning-scripts/20-install-gpu.sh, but with cdi-cri the plugin passes the
+        # device over CRI rather than via NVIDIA_VISIBLE_DEVICES envvar resolution.)
+        - name: DEVICE_LIST_STRATEGY
+          value: "cdi-cri"
+        # Name the GPU device by INDEX (`0`), for BOTH the generated CDI spec and the
+        # allocate request. The tegra RM entry is keyed by index but its GetUUID() is
+        # hardcoded to the string "tegra" (internal/rm/tegra_devices.go). With the default
+        # deviceIDStrategy=uuid the CDI spec namer gets no real UUID → the spec build dies
+        # with "failed to get device name: no names defined", and the request would ask for
+        # nvidia.com/gpu=tegra. index makes the spec name the device `0` AND the allocate
+        # request ask for nvidia.com/gpu=0 — the two stay consistent and resolvable.
+        - name: DEVICE_ID_STRATEGY
+          value: "index"
+        # The plugin builds its spec from the host L4T stack: mount the host root at
+        # /driver-root and point the plugin at it. The spec's device-node/lib paths are
+        # transformed back to host-absolute (transform WithRelativeTo=host) so containerd
+        # bind-mounts the real host devices/libs into the workload.
+        - name: CONTAINER_DRIVER_ROOT
+          value: "/driver-root"
+        - name: NVIDIA_DRIVER_ROOT
+          value: "/"
+        # nvidia-ctk on the HOST provides the CDI hooks the generated spec references.
+        - name: NVIDIA_CTK_PATH
+          value: "/usr/bin/nvidia-ctk"
+        # Make the nvidia container runtime inject the Tegra GPU device nodes + driver libs into
+        # THIS pod so the tegra strategy can see them (the plugin container is otherwise minimal).
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "all"
+        securityContext:
+          # Writing the generated CDI spec to the host /var/run/cdi and reading the host
+          # driver root need privilege; the minimal drop-ALL sandbox blocks both.
+          privileged: true
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        # The plugin writes its generated tegra CDI spec here (cdiRoot="/var/run/cdi");
+        # it must be the HOST dir so containerd sees it when resolving the CRI CDIDevice.
+        - name: cdi-root
+          mountPath: /var/run/cdi
+        # Host root: the plugin reads the L4T CSV files + device tree from here to build
+        # the spec (DEVICE_DISCOVERY_STRATEGY=tegra + CONTAINER_DRIVER_ROOT=/driver-root).
+        - name: driver-root
+          mountPath: /driver-root
+          readOnly: true
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+      - name: cdi-root
+        hostPath:
+          path: /var/run/cdi
+          type: DirectoryOrCreate
+      - name: driver-root
+        hostPath:
+          path: /

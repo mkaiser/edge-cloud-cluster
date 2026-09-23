@@ -1,0 +1,92 @@
+# ArgoCD Application: Zulip team messaging
+# Accessible at https://zulip.subdomain.domain.tld
+# Auth: Authentik via native OIDC (GenericOpenIdConnectBackend), local accounts disabled
+# Storage: S3 for uploads/avatars (Hetzner nbg1), Longhorn for PostgreSQL
+# Datastores: PostgreSQL/Redis/RabbitMQ/Memcached are self-managed (datastores.yaml);
+# all 4 bundled subcharts are disabled and wired via external* (see values.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: zulip
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: oci://ghcr.io/zulip/helm-charts/zulip
+      chart: zulip
+      targetRevision: "2.2.0" # renovate: datasource=docker depName=ghcr.io/zulip/helm-charts/zulip
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-apps/zulip/values.yaml
+        valuesObject:
+          image:
+            repository: ghcr.io/zulip/zulip-server
+            tag: "12.2-0" # renovate: datasource=docker depName=ghcr.io/zulip/zulip-server
+
+          postgresql:
+            primary:
+              persistence:
+                storageClass: longhorn-cloud
+                size: 8Gi
+              containerSecurityContext:
+                runAsUser: 70
+                runAsGroup: 70
+                readOnlyRootFilesystem: false
+
+          rabbitmq:
+            persistence:
+              enabled: false
+
+          redis:
+            master:
+              persistence:
+                enabled: false
+
+          global:
+            security:
+              allowInsecureImages: true
+
+    # Git ref for valueFiles above
+    - repoURL: git@github.com:YourProject/yourGit.git
+      ref: values
+      targetRevision: main
+
+    # Plain manifests: sealed secrets + postsync jobs
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/zulip
+      directory:
+        exclude: '{sealSecrets.sh,values.yaml}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: zulip
+  # The self-managed datastore StatefulSets (datastores.yaml) declare
+  # volumeClaimTemplates; k8s injects immutable defaults (volumeMode: Filesystem,
+  # status) that ArgoCD can't reconcile, causing perpetual OutOfSync. Ignore the
+  # whole subtree (same pattern as wave6-authentik.yaml).
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

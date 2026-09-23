@@ -1,0 +1,59 @@
+# HyperLynx 2604 module manifest — baked into the runnable module image at
+# /module.yaml and read by the remote-desktop broker (which publishes it) + the module
+# CLI (which generates `podman run` launchers from it). `runtime: container` marks it:
+# the tool runs in ITS OWN container via podman inside the sandboxed desktop pod
+# (NOT on the desktop's own PATH).
+#
+# HyperLynx on Linux has NO single entry — three Qt/console GUIs (memory
+# hyperlynx-linux-launch-quirks): HyperLynxDRC, hlsagui.sh, run_bswConsole. Each is a
+# desktop_entry with its own in-container `command`. hyperlynx.so is a LIBRARY — never
+# an entry. All launch quirks (SDD_PATCH_SKIP, QTWEBENGINE_DISABLE_SANDBOX, RHEL compat
+# libs, stale-socket cleanup) are handled INSIDE the image (Dockerfile), not here.
+name: hyperlynx
+version: "2604"
+runtime: container
+env:
+  # SIP's SALT license server — injected by the launcher as `podman run -e
+  # SALT_LICENSE_SERVER=$MODULE_LICENSE_SERVER`. The VALUE is NEVER baked into the
+  # image or written to git; it comes from the RUNTIME's MODULE_LICENSE_SERVER, which is fed from
+  # `eda-secrets` (eda/secrets, sealed into every namespace that runs a module).
+  set_from_secret:
+    SALT_LICENSE_SERVER: license-server
+    # ⚠ BOTH VARS, ONE VALUE. Siemens serves HyperLynx from TWO vendor daemons on the same
+    # host: `saltd` (addressed by SALT_LICENSE_SERVER) and `mgcld` (addressed by MGLS —
+    # Mentor Graphics Licensing System). The PRIMARY features — hypbsw/hyplsw (BoardSim and
+    # LineSim SI/PI) — live on mgcld, so with SALT alone the GUI starts and then reports
+    # "No licenses for HyperLynx's primary features were obtained ... License server is not
+    # defined" while `salt_ok` reports the very same features as AVAILABLE. Entitlement fine,
+    # address missing. Do not drop this because a SALT-only probe looks green.
+    MGLS_LICENSE_FILE: license-server
+desktop_entries:
+  - name: "HyperLynx DRC"
+    exec: "drc"
+    command: "/opt/hyperlynx/HL2604/SDD_HOME/bin/run-drc"
+    categories: "Development;Engineering;"
+  - name: "HyperLynx Schematic Analysis"
+    exec: "hlsa"
+    command: "/opt/hyperlynx/HL2604/SDD_HOME/bin/run-hlsa"
+    categories: "Development;Engineering;"
+  - name: "HyperLynx BoardSim Console"
+    exec: "bsw"
+    command: "/opt/hyperlynx/HL2604/SDD_HOME/bin/run-bsw"
+    categories: "Development;Engineering;"
+# Short names on PATH, alongside the GUI tiles above — the SAME three tools and the same
+# in-container commands; only the way you invoke them differs:
+#   desktop_entries -> $HOME/.local/bin/module-hyperlynx-<exec>, which is ALWAYS on PATH.
+#                      Hence the `module-<name>-` prefix: unprefixed, those would collide
+#                      across modules and versions and could shadow a system binary in
+#                      every shell, loaded or not.
+#   cli_entries     -> $HOME/.local/module-bin/hyperlynx/2604/<name>, on PATH ONLY while
+#                      `module load hyperlynx/2604` is in effect, so a bare name is safe.
+# ⚠ Only `bsw` (run_bswConsole) is a console entry. `drc` and `hlsa` are Qt GUIs and still
+# need a DISPLAY — they are here for typing convenience, not to work in a batch job.
+cli_entries:
+  - name: drc
+    command: /opt/hyperlynx/HL2604/SDD_HOME/bin/run-drc
+  - name: hlsa
+    command: /opt/hyperlynx/HL2604/SDD_HOME/bin/run-hlsa
+  - name: bsw
+    command: /opt/hyperlynx/HL2604/SDD_HOME/bin/run-bsw

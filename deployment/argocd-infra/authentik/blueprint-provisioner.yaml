@@ -1,0 +1,123 @@
+# Authentik blueprint: OIDC provisioner service account (config-as-code).
+#
+# ONE-TIME central setup for Part B (self-contained per-app OIDC). Creates a
+# SCOPED (non-superuser) service account + API token that each app uses to
+# register its own OAuth2 provider + application + access bindings live via the
+# Authentik REST API at deploy time. A compromised app job using this token can
+# only touch providers/applications/policy-bindings — NEVER users, flows, or
+# secrets. Do NOT hand an app the SUPERUSER bootstrap token instead.
+#
+# The token's plaintext value comes from AUTHENTIK_PROVISIONER_TOKEN in the
+# authentik-secrets bundle (generated once by authentik/sealSecrets.sh). Each app
+# seals a COPY of that same plaintext into its own namespace; this is the only
+# shared OIDC secret and it is NOT the superuser token.
+#
+# Permission codenames verified against the deployed Authentik blueprint schema
+# (external/git_goauthentik_authentik/blueprints/schema.json). If they shift on a
+# version bump, re-verify with: GET /api/v3/rbac/permissions/?search=oauth2provider
+#
+# Mounted at worker boot via blueprints.configMaps in values.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-provisioner
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  provisioner.yaml: |
+    version: 1
+    metadata:
+      name: oidc-provisioner
+    entries:
+      # Scoped service account the per-app jobs authenticate as.
+      - model: authentik_core.user
+        id: provisioner-user
+        identifiers:
+          username: oidc-provisioner
+        attrs:
+          name: "OIDC Provisioner"
+          type: service_account
+          path: users/service-accounts
+
+      # Role: scoped to OIDC provisioning. The per-app PostSync jobs need:
+      #   - write on oauth2provider + application + policybinding (create the tile)
+      #   - write on scimprovider + scimmapping (xwiki SCIM provisioning)
+      #   - write on group + expressionpolicy (windows: windows-users group +
+      #     access-windows policy created live by the app job)
+      #   - VIEW on the lookup models the jobs GET (flows, signing cert, scope/
+      #     property mappings, groups, users) — without these the scoped token 403s
+      #     on the lookups every app job has to perform.
+      # NO access to user/flow/secret WRITE, so a compromised app job cannot touch
+      # the IdP's identity surface — only providers/apps/bindings it provisions.
+      - model: authentik_rbac.role
+        id: provisioner-role
+        identifiers:
+          name: oidc-provisioner
+        attrs:
+          permissions:
+            # OAuth2 providers
+            - authentik_providers_oauth2.add_oauth2provider
+            - authentik_providers_oauth2.change_oauth2provider
+            - authentik_providers_oauth2.delete_oauth2provider
+            - authentik_providers_oauth2.view_oauth2provider
+            # Applications (tiles)
+            - authentik_core.add_application
+            - authentik_core.change_application
+            - authentik_core.delete_application
+            - authentik_core.view_application
+            # Policy bindings (app access control)
+            - authentik_policies.add_policybinding
+            - authentik_policies.delete_policybinding
+            - authentik_policies.view_policybinding
+            # SCIM providers + mappings (xwiki)
+            - authentik_providers_scim.add_scimprovider
+            - authentik_providers_scim.change_scimprovider
+            - authentik_providers_scim.delete_scimprovider
+            - authentik_providers_scim.view_scimprovider
+            - authentik_providers_scim.view_scimmapping
+            # Groups + expression policies (windows creates its own)
+            - authentik_core.add_group
+            - authentik_core.view_group
+            - authentik_policies_expression.add_expressionpolicy
+            - authentik_policies_expression.change_expressionpolicy
+            - authentik_policies_expression.delete_expressionpolicy
+            - authentik_policies_expression.view_expressionpolicy
+            # VIEW-only lookups the jobs perform
+            - authentik_flows.view_flow
+            - authentik_crypto.view_certificatekeypair
+            - authentik_providers_oauth2.view_scopemapping
+            - authentik_core.view_propertymapping
+            - authentik_core.view_user
+
+      # Group binds the role to the service account.
+      - model: authentik_core.group
+        id: provisioner-group
+        identifiers:
+          name: oidc-provisioner
+        attrs:
+          is_superuser: false
+          # Service account: never a seed-user member (seed-user-group-sync.yaml).
+          attributes:
+            ecc/seed: none
+          roles:
+            - !KeyOf provisioner-role
+          users:
+            - !KeyOf provisioner-user
+
+      # Long-lived, non-expiring API token. Its key is the shared
+      # AUTHENTIK_PROVISIONER_TOKEN (from the authentik-secrets bundle, injected via
+      # global.envFrom → resolvable by !Env).
+      #
+      # ⚠ `identifier` must stay oidc-provisioner-token even though the config key is
+      # named differently: it is LIVE IdP state, and blueprints do NOT rename in place.
+      # Changing it creates a SECOND token and orphans the first, which keeps working
+      # unnoticed until someone deletes it by hand.
+      - model: authentik_core.token
+        identifiers:
+          identifier: oidc-provisioner-token
+          intent: api
+          expiring: false
+          user: !KeyOf provisioner-user
+        attrs:
+          key: !Env AUTHENTIK_PROVISIONER_TOKEN

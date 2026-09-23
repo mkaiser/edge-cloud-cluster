@@ -31,7 +31,7 @@ export class ExternalDnsComponent extends pulumi.ComponentResource {
             "external-dns-hetzner-secret",
             {
                 metadata: { name: "hetzner-dns-token", namespace: "external-dns" },
-                stringData: { token: project_settings.general.hcloudToken },
+                stringData: { token: project_settings.hetzner.hcloudToken },
             },
             { provider: k8sProvider, parent: this, dependsOn: [externalDnsNs] },
         );

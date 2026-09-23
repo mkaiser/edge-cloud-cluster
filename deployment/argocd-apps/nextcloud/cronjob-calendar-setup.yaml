@@ -1,0 +1,155 @@
+# CronJob: ensure every Nextcloud user has a "Urlaub" calendar shared
+# read-only with the "employees-extended" group. Runs hourly.
+#
+# Logic:
+#   1. List all NC users via occ user:list
+#   2. For each user: occ dav:create-calendar (no-op if calendar already exists)
+#   3. For each user: GET ?shares on the calendar; POST share with
+#      employees-extended only if not yet present (idempotent).
+#
+# New users are picked up after their first OIDC login (oidc_login
+# auto-creates NC accounts on first login; occ user:list only lists
+# users with existing NC accounts).
+#
+# Auth:
+#   NC admin credentials: nextcloud-admin secret (username/password)
+#   occ:                  kubectl exec into the running nextcloud pod
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nextcloud-calendar-setup
+  namespace: nextcloud
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nextcloud-calendar-setup
+  namespace: nextcloud
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nextcloud-calendar-setup
+  namespace: nextcloud
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nextcloud-calendar-setup
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-calendar-setup
+  namespace: nextcloud
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nextcloud-calendar-setup
+  namespace: nextcloud
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: nextcloud-calendar-setup
+          restartPolicy: Never
+          containers:
+          - name: setup
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            - name: NC_URL
+              value: "https://nextcloud.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: NC_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-admin
+                  key: username
+            - name: NC_ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-admin
+                  key: password
+            # Staging LE cert is untrusted → curl rejects it (exit 60). "-k" skips
+            # verification. updateConfigFromProjectSettings.sh clears this to "" for prod.
+            - name: CURL_INSECURE
+              value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+            command: ["/bin/sh", "-ec"]
+            args:
+            - |
+              apk add --no-cache curl jq >/dev/null 2>&1
+
+              NS="nextcloud"
+              SHARE_GROUP="employees-extended"
+
+              echo "Finding running nextcloud pod..."
+              POD=""
+              i=0
+              while [ "$i" -lt 30 ]; do
+                POD=$(kubectl get pods -n "$NS" -l app.kubernetes.io/name=nextcloud \
+                  --field-selector=status.phase=Running \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                [ -n "$POD" ] && break
+                echo "  waiting... ($i/30)"; sleep 10; i=$((i+1))
+              done
+              [ -n "$POD" ] || { echo "ERROR: no running nextcloud pod"; exit 1; }
+              echo "Pod: $POD"
+
+              occ() { kubectl exec -n "$NS" "$POD" -c nextcloud -- php /var/www/html/occ "$@"; }
+
+              echo "Listing Nextcloud users..."
+              USERS=$(occ user:list --output=json | jq -r 'keys[]')
+              COUNT=$(echo "$USERS" | grep -c . || true)
+              echo "Found $COUNT users."
+
+              echo "$USERS" | while IFS= read -r USER; do
+                [ -z "$USER" ] && continue
+
+                # Create calendar (exits non-zero if already exists — suppress)
+                occ dav:create-calendar "$USER" Urlaub 2>/dev/null \
+                  && echo "  [$USER] Created Urlaub calendar" \
+                  || true
+
+                # Check existing shares for this calendar
+                SHARES=$(curl -sf $CURL_INSECURE \
+                  -u "$NC_ADMIN_USER:$NC_ADMIN_PASS" \
+                  "$NC_URL/remote.php/dav/calendars/$USER/Urlaub/?shares" 2>/dev/null || echo "[]")
+
+                ALREADY=$(echo "$SHARES" | \
+                  jq -r --arg g "principal:principals/groups/$SHARE_GROUP" \
+                  '.[] | select(.href == $g) | .href' 2>/dev/null || true)
+
+                if [ -z "$ALREADY" ]; then
+                  curl -sf $CURL_INSECURE \
+                    -X POST \
+                    -u "$NC_ADMIN_USER:$NC_ADMIN_PASS" \
+                    -H "Content-Type: application/json" \
+                    "$NC_URL/remote.php/dav/calendars/$USER/Urlaub/?shares" \
+                    -d "[{\"href\":\"principal:principals/groups/$SHARE_GROUP\",\"commonName\":\"$SHARE_GROUP\",\"summary\":\"\",\"readOnly\":true,\"writtenAddress\":\"\"}]" \
+                    && echo "  [$USER] Shared Urlaub with $SHARE_GROUP" \
+                    || echo "  [$USER] WARNING: share request failed"
+                else
+                  echo "  [$USER] Already shared with $SHARE_GROUP — skip"
+                fi
+              done
+
+              echo "Calendar setup complete."

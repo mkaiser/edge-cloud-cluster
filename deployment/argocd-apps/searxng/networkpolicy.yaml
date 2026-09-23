@@ -1,0 +1,57 @@
+# SearXNG network bounds.
+#
+# INGRESS: only the Hermes pod. SearXNG is effectively an open fetch-proxy — anything that can
+# query it can make it retrieve arbitrary URLs from the internet on its behalf. There is no
+# Ingress and no Gateway route, so this policy is what stops any other in-cluster workload
+# using it as one.
+#
+# EGRESS: the internet plus DNS, and nothing lateral. A metasearch engine must reach upstream
+# search providers, so blanket egress is unavoidable — but it has no business talking to any
+# ClusterIP, so the private ranges are excluded rather than allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: searxng
+  namespace: searxng
+spec:
+  podSelector:
+    matchLabels:
+      app: searxng
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: hermes
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS to the cluster resolver.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Upstream search engines: public internet on 443/80, with RFC1918 + link-local +
+    # CGNAT carved OUT so a query cannot be turned into an in-cluster or LAN probe.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

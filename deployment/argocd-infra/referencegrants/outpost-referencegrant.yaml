@@ -1,0 +1,45 @@
+# Allows HTTPRoutes in other namespaces to use the Authentik embedded outpost
+# (the `authentik-server` Service) as a cross-namespace backend.
+#
+# Gateway API forbids a backendRef that crosses namespaces unless the TARGET
+# namespace opts in with a ReferenceGrant. The grant therefore lives IN the
+# `authentik` namespace (that is where the opt-in must be declared), but it is
+# deliberately NOT shipped by the authentik app.
+#
+# WHY IT IS ITS OWN EARLY-WAVE APP: a grant is a routing PERMISSION, not an
+# authentik component — it is valid before authentik-server exists. Shipping it
+# with authentik (wave 6) created a circular deadlock: longhorn-config (wave 3)
+# and kube-prometheus-stack (wave 2) both have OIDC HTTPRoutes backed by
+# authentik-server, so without the grant they reported
+# ResolvedRefs=False/RefNotPermitted, went Degraded, and blocked wave3-barrier
+# — which means wave 6 could never deploy the grant that would fix them.
+# Keep this at a wave BELOW every consumer.
+#
+# ⚠ Do NOT go back to per-namespace `authentik-embedded-outpost` ExternalName
+# Services aliasing authentik-server into each consumer namespace. Those look
+# correct and even resolve from inside the cluster, but Envoy Gateway does NOT
+# build an upstream cluster for an ExternalName Service: the HTTPRoute reports
+# Accepted=True / ResolvedRefs=True while every request is answered locally with
+# HTTP 500 ("direct_response", upstream_cluster null). A cross-namespace ref
+# through this grant is what actually routes.
+#
+# Each consuming namespace needs an entry in `from` below.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: outpost-backend
+  namespace: authentik
+spec:
+  from:
+    # OIDC-proxied UIs with no native auth. Each has an HTTPRoute whose backend
+    # is the embedded outpost, which authenticates and then proxies to the app.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: prometheus # prometheus-oidc + alertmanager-oidc
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: longhorn-system # longhorn-ui
+  to:
+    - group: ""
+      kind: Service
+      name: authentik-server

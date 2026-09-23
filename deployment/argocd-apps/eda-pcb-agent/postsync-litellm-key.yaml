@@ -1,0 +1,308 @@
+# PostSync: mint this agent's OWN LiteLLM virtual key, and write it into this app's Secret.
+#
+# ── WHY NOT THE MASTER KEY ────────────────────────────────────────────────────
+# The `hermes` app presents LiteLLM's MASTER key. That is defensible for one trusted service
+# and wrong here — remote-desktop/hermes-setup.sh already spells out the reason:
+#
+#   the in-cluster Hermes presents LiteLLM's MASTER key. That is correct for one trusted
+#   service and wrong for people — it carries no per-user budget, no attribution and no
+#   revocation.
+#
+# This pod is worse than "people": a SHARED account running ROOT-CAPABLE LLM-generated shell,
+# with the key in cleartext at ~/.hermes/.env on an NFS home two humans can read. A master
+# key there is an unbounded, unattributable, unrevocable credential — effectively an RCE
+# credential for every model in the cluster.
+#
+# A virtual key gives a budget, an rpm limit, attribution under `key_alias` in the LiteLLM
+# UI, and revocation that does not disturb any other consumer.
+#
+# ── WHY AUTOMATING THIS IS FINE, THOUGH hermes-setup.sh MAKES HUMANS PASTE ONE ─
+# That script is manual only because LiteLLM's JWT auth is enterprise-gated, so an OIDC
+# device-code exchange is impossible for a person. A SERVICE holding the master key briefly,
+# inside a short-lived Job that never gives it to the workload, has no such problem.
+#
+# ⚠ The master key is read LIVE from the litellm namespace through a resourceNames-pinned
+# ClusterRole — never sealed here. A sealed copy would be a second thing to rotate, and a
+# rotated original would silently diverge.
+#
+# ⚠ The WORKLOAD never sees the master key. It reaches only the minted virtual key, via the
+# Secret. The pod also runs automountServiceAccountToken: false, so it could not read the
+# litellm Secret even if it tried.
+#
+# Idempotent on `key_alias`: virtual keys persist in LiteLLM's CNPG Postgres, so a re-sync
+# must not mint duplicates. If a key with this alias already exists AND this app's Secret
+# already holds a real (non-placeholder) key, the Job does nothing.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-pcb-agent-litellm-key
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eda-pcb-agent-litellm-master-key
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["litellm-secrets"]   # ⚠ this one Secret, nothing else
+    verbs: ["get"]                       # ⚠ get only — no list, no watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eda-pcb-agent-litellm-master-key
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eda-pcb-agent-litellm-master-key
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-litellm-key
+    namespace: eda-pcb-agent
+---
+# Writing the minted key back into this app's own Secret, and rolling the pod so it picks it
+# up — both in THIS namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-pcb-agent-litellm-key
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-pcb-agent-litellm-key
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-pcb-agent-litellm-key
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-litellm-key
+    namespace: eda-pcb-agent
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-pcb-agent-litellm-key
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-8"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — hook-delete-policy already cleans up on the next sync, and a
+  # TTL would delete the pod along with the only copy of the logs.
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-pcb-agent-litellm-key
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: mint-key
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: KEY_ALIAS
+              value: "eda-pcb-agent"
+            - name: TARGET_SECRET
+              value: "eda-pcb-agent-secrets"
+            - name: TARGET_DEPLOY
+              value: "eda-pcb-agent"
+            # The models this agent is allowed to call. Scoped rather than unrestricted: a
+            # shared agent should not be able to spend on every model in the cluster.
+            # ⚠ Must CONTAIN model.default from hermes-bootstrap-configmap.yaml, or every
+            # completion 400s with "key not allowed to access model".
+            #
+            # Comma-separated, because a per-task `hermes kanban create --model <id>` override
+            # is only usable for models this key may reach. The first two are the working
+            # pair: qwen3-coder:30b is MoE with just 3.3B ACTIVE params (128 experts, 8
+            # active), which is fine for single-shot tool calls but thin for the long kanban
+            # agent loop; devstral:24b is 24B dense, Apache-2.0, built with All Hands AI for
+            # agent loops (53.6% SWE-bench Verified on Mistral's own card).
+            # The three extra entries are COMPARISON candidates, all pulled on thor: a
+            # model missing from this list fails with HTTP 403 key_model_access_denied, and
+            # because hermes exits 0 on a non-retryable client error the dispatcher records
+            # it as "worker exited cleanly without calling kanban_complete". That reads as a
+            # model that cannot follow the protocol rather than a key that cannot reach it —
+            # it voided a whole comparison round on 2026-09-15. Keep this list in step with
+            # `ollama list` on thor whenever a candidate is added.
+            - name: ALLOWED_MODELS
+              value: "thor/qwen3.6-35b-a3b-nvfp4,thor/qwen3-coder:30b,thor/devstral:24b,thor/qwen3.5:27b,thor/gpt-oss:20b,thor/qwen2.5-coder:32b-instruct-q8_0"
+            # Budget and rate limit. Deliberately finite: the point of a virtual key is that
+            # a runaway agent loop costs a bounded amount and shows up against this alias.
+            - name: MAX_BUDGET
+              value: "50"
+            - name: RPM_LIMIT
+              value: "60"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://litellm.litellm.svc:4000"
+
+              MASTER=$(kubectl get secret litellm-secrets -n litellm \
+                -o jsonpath='{.data.master-key}' | base64 -d)
+              [ -z "$MASTER" ] && { echo "ERROR: could not read the LiteLLM master key"; exit 1; }
+              AUTH="Authorization: Bearer ${MASTER}"
+
+              echo "Waiting for LiteLLM..."
+              i=1
+              until curl -fsS -H "$AUTH" "${API}/health/liveliness" >/dev/null 2>&1; do
+                [ "$i" -ge 60 ] && { echo "ERROR: LiteLLM not reachable after 10m"; exit 1; }
+                echo "  try ${i}/60..."; i=$((i+1)); sleep 10
+              done
+              echo "  LiteLLM is up."
+
+              # ── Already provisioned? ────────────────────────────────────────────
+              # Two conditions must BOTH hold to skip: a key with this alias exists in
+              # LiteLLM, AND our Secret holds a real key rather than the sealed placeholder.
+              # Checking only the first would leave the pod authenticating with the
+              # placeholder forever after a Secret was re-sealed; checking only the second
+              # would mint a duplicate on every re-seal.
+              CURRENT=$(kubectl get secret "$TARGET_SECRET" -n eda-pcb-agent \
+                -o jsonpath='{.data.litellm-key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+              HAVE_REAL=0
+              case "$CURRENT" in
+                ""|sk-placeholder*) HAVE_REAL=0 ;;
+                *)                  HAVE_REAL=1 ;;
+              esac
+
+              # ⚠ /key/list?key_alias=, NOT /key/info?key_alias=. `key/info` takes a TOKEN and
+              # 404s on an alias (verified against the live gateway), so using it made this
+              # gate report "alias absent" for an alias that plainly existed — the delete
+              # below was skipped and /key/generate then failed with
+              #   Key with alias 'eda-pcb-agent' already exists
+              # leaving the pod on the sealed placeholder and every completion 401ing with
+              #   Received API Key = sk-...-job
+              # `key/list` returns {"keys":[...]}; an empty list is the real "absent".
+              ALIAS_EXISTS=0
+              if curl -fsS -H "$AUTH" "${API}/key/list?key_alias=${KEY_ALIAS}&return_full_object=true" 2>/dev/null \
+                   | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('keys') else 1)" 2>/dev/null; then
+                ALIAS_EXISTS=1
+              fi
+              echo "  alias present in LiteLLM: $([ "$ALIAS_EXISTS" = 1 ] && echo yes || echo no); secret holds a real key: $([ "$HAVE_REAL" = 1 ] && echo yes || echo no)"
+
+              if [ "$HAVE_REAL" = "1" ] && [ "$ALIAS_EXISTS" = "1" ]; then
+                # ⚠ The key exists, but its MODEL ALLOW-LIST may be stale, so this is not a
+                # no-op. ALLOWED_MODELS is only ever applied at MINT time; when this branch
+                # used to `exit 0` outright, widening the list in git changed nothing on a
+                # live cluster and the key silently kept its original models. Measured
+                # 2026-09-15: git listed five models, the live key allowed two, and every
+                # request for one of the other three came back
+                #   403 key_model_access_denied ... This key can only access models=[...]
+                # Hermes exits 0 on a non-retryable client error, so the dispatcher recorded
+                # it as "worker exited cleanly without calling kanban_complete" — it read as
+                # three models unable to follow the protocol for hours.
+                # /key/update is idempotent, so reconcile on every sync.
+                echo "virtual key '${KEY_ALIAS}' exists — reconciling its model allow-list"
+                KEY_ID=$(curl -fsS -H "$AUTH" "${API}/key/list?key_alias=${KEY_ALIAS}&return_full_object=true" 2>/dev/null \
+                         | python3 -c "import json,sys; ks=json.load(sys.stdin).get('keys') or []; k=ks[0] if ks else {}; print(k.get('token','') if isinstance(k,dict) else '')" 2>/dev/null || true)
+                if [ -z "$KEY_ID" ]; then
+                  echo "  ⚠ could not read the key id back — leaving the allow-list untouched" >&2
+                  exit 0
+                fi
+                UPD=$(ALLOWED_MODELS="$ALLOWED_MODELS" KEY_ID="$KEY_ID" python3 -c 'import json,os; print(json.dumps({"key":os.environ["KEY_ID"],"models":os.environ["ALLOWED_MODELS"].split(",")}))')
+                if curl -fsS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                     -d "$UPD" "${API}/key/update" >/dev/null 2>&1; then
+                  echo "  allow-list now: ${ALLOWED_MODELS}"
+                else
+                  echo "  ⚠ /key/update failed — the key keeps its previous allow-list" >&2
+                fi
+                exit 0
+              fi
+
+              # ⚠ If the alias exists but we do NOT hold the key, the old one is unrecoverable
+              # (LiteLLM returns key metadata, never the key itself). Delete it and mint a
+              # fresh one, so the alias keeps meaning exactly one live credential rather than
+              # accumulating orphans that still bill.
+              #
+              # ⚠ THIS DELETE MUST SUCCEED, so it is no longer best-effort. A swallowed
+              # failure here is exactly what produced the duplicate-alias error above: the
+              # mint that follows CANNOT succeed while the alias is still taken, so carrying
+              # on merely turns a fixable state into a failed Job with a confusing message.
+              # /key/delete takes `key_aliases` (a list) OR `keys`; both are POST.
+              if [ "$ALIAS_EXISTS" = "1" ] && [ "$HAVE_REAL" = "0" ]; then
+                echo "alias '${KEY_ALIAS}' exists but this app does not hold its key — rotating it."
+                del_code=$(curl -sS -o /tmp/del.out -w '%{http_code}' -X POST \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "{\"key_aliases\":[\"${KEY_ALIAS}\"]}" "${API}/key/delete")
+                case "$del_code" in
+                  20*) echo "  deleted the stale key." ;;
+                  *)   echo "ERROR: deleting the stale key returned HTTP ${del_code}:" >&2
+                       head -c 300 /tmp/del.out >&2; echo >&2
+                       echo "  Refusing to continue: /key/generate cannot succeed while this" >&2
+                       echo "  alias is taken, and retrying would only repeat the failure." >&2
+                       exit 1 ;;
+                esac
+              fi
+
+              echo "Minting a virtual key (alias=${KEY_ALIAS}, budget=${MAX_BUDGET}, rpm=${RPM_LIMIT})..."
+              PAYLOAD=$(KEY_ALIAS="$KEY_ALIAS" ALLOWED_MODELS="$ALLOWED_MODELS" \
+                        MAX_BUDGET="$MAX_BUDGET" RPM_LIMIT="$RPM_LIMIT" python3 -c 'import json,os; print(json.dumps({"key_alias":os.environ["KEY_ALIAS"],"models":os.environ["ALLOWED_MODELS"].split(","),"max_budget":float(os.environ["MAX_BUDGET"]),"rpm_limit":int(os.environ["RPM_LIMIT"]),"metadata":{"owner":"eda-pcb-agent","managed_by":"argocd"}}))')
+
+              code=$(curl -sS -o /tmp/key.json -w '%{http_code}' -X POST \
+                -H "$AUTH" -H "Content-Type: application/json" \
+                -d "$PAYLOAD" "${API}/key/generate")
+              case "$code" in
+                20*) : ;;
+                *)   echo "ERROR: /key/generate returned HTTP ${code}:"
+                     head -c 400 /tmp/key.json; echo; exit 1 ;;
+              esac
+
+              NEW_KEY=$(python3 -c "import json; print(json.load(open('/tmp/key.json')).get('key',''))")
+              rm -f /tmp/key.json
+              [ -z "$NEW_KEY" ] && { echo "ERROR: /key/generate returned no key"; exit 1; }
+              echo "  minted (${#NEW_KEY} chars)."
+
+              # ── Write it into this app's Secret ────────────────────────────────
+              # patch, not apply: the Secret is owned by the SealedSecret controller, and a
+              # full apply would fight it. Patching one key leaves the rest intact.
+              NEW_B64=$(printf '%s' "$NEW_KEY" | base64 | tr -d '\n')
+              kubectl patch secret "$TARGET_SECRET" -n eda-pcb-agent --type merge \
+                -p "{\"data\":{\"litellm-key\":\"${NEW_B64}\"}}" >/dev/null
+              echo "  wrote it into ${TARGET_SECRET}."
+
+              # ⚠ The pod reads this key ONCE, in its seed initContainer. Reloader watches the
+              # Secret and would roll it anyway, but rolling here makes the ordering explicit
+              # rather than depending on another controller's timing.
+              kubectl rollout restart deploy/"$TARGET_DEPLOY" -n eda-pcb-agent >/dev/null 2>&1 \
+                && echo "  rolled ${TARGET_DEPLOY} to pick it up." \
+                || echo "  WARNING: could not roll ${TARGET_DEPLOY} — restart it by hand." >&2
+
+              echo "LiteLLM virtual key provisioned; spend is attributed to '${KEY_ALIAS}'."
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }

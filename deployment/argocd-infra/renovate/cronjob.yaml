@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: renovate
+  namespace: renovate
+spec:
+  schedule: "0 */2 * * *"  # every two hours
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: renovate
+              image: ghcr.io/renovatebot/renovate:44  # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
+              env:
+                - name: RENOVATE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: renovate-token
+                      key: token
+                - name: RENOVATE_REPOSITORIES
+                  value: "YourProject/yourGit"
+                # pypi.jetson-ai-lab.io (vLLM Thor wheels) blocks the default
+                # "RenovateBot/x.y.z" UA with 403 — any UA without "Bot" passes.
+                - name: RENOVATE_USER_AGENT
+                  value: "renovate/43 (self-hosted; git_infra)"
+                - name: LOG_LEVEL
+                  value: "info"

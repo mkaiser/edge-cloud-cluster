@@ -1,0 +1,64 @@
+# ArgoCD Application: lab-local OCI registry for EDA module images.
+#
+# WHY: the GitLab registry stores blobs in Hetzner S3 (nbg1), so every EDA push leaves the
+# Bielefeld lab for Nuremberg — measured ~5.3 MB/s (a 31 GB push = 16 min; a 40 GB restore
+# never finished). The TrueNAS appliance on the lab LAN does ~92 MB/s write / ~126 MB/s
+# read. This registry is that LAN path; GitLab's own registry is untouched and stays on S3.
+#
+# ⚠ Guarded in three layers, all of them load-bearing: an htpasswd credential, a
+# CiliumNetworkPolicy limiting reachability to the [eda] runner and the broker, and TLS
+# from a PRIVATE in-cluster CA. What it serves is executed AS ROOT by the remote-desktop
+# broker, so publish rights are effectively root-execution rights. ClusterIP-only — the CA
+# is private, so an external client could not verify it. Never give it an HTTPRoute.
+#
+# ⚠ Its blob dataset (datapool/images) is NOT the module manifest store. That is
+# datapool/eda/modulefiles, kept separate so this ordinary workload never mounts the
+# export whose contents authorise the privileged broker to run images as root.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: image-registry
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: NFS-backed and hard-pinned to the appliance LAN — there is nothing to restore on
+    # a cloud-only cluster.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/image-registry
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: image-registry
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # ⚠ RETRY FOREVER — the recreate race here is the CSI driver, not a hook. The registry
+    # Deployment pins the lab site and mounts RWX NFS, so on a recreate the pod sits in
+    # ContainerCreating on "driver name nfs.csi.k8s.io not found in the list of registered
+    # CSI drivers" until csi-driver-nfs finishes coming up on the mesh node — around
+    # 33 min from sync start to Running.
+    #
+    # deployment.yaml raises progressDeadlineSeconds to 1800s so the rollout itself no
+    # longer reports failed at 600s. This is the belt to that suspenders: 1800s is close to
+    # the 33 min already observed, and the bound is really "when do the mesh nodes join",
+    # which is not something this app controls. Retrying means a slower-than-measured
+    # bring-up self-heals instead of parking the app Failed until someone re-syncs.
+    #
+    # Do NOT push progressDeadlineSeconds up further to cover that instead — past a point
+    # it stops distinguishing a slow bring-up from a genuinely wedged rollout, which is the
+    # signal it exists to give.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

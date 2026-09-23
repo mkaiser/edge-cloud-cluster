@@ -1,0 +1,121 @@
+# ArgoCD Application: TrueNAS file server integration (appliance fs-1, unibi lab).
+#
+# WHAT THIS APP OWNS TODAY: the sealed appliance admin credential and the Authentik
+# proxy-provider blueprint (admin-only UI behind a lab-pinned, non-embedded outpost).
+#
+# ⚠ configure-job.yaml runs in the samba-ad NAMESPACE, not truenas — it needs the domain
+# admin password out of samba-ad/samba-ad-config, which cannot be mounted across
+# namespaces. The file is still owned and deployed by this app; only its namespace
+# differs. See its header for the full reasoning. (datasets, AD join,
+# SMB/NFS shares) and verify-job.yaml (the gates) are NOT written yet — they must be
+# authored against a `core.get_methods` dump from the live box, because TrueNAS 25.10
+# folded activedirectory/ldap/idmap into ONE `directoryservices` config and removed the
+# AUTORID idmap backend, so every pre-25.10 recipe has wrong method names. Writing 15 API
+# calls from documentation instead of the live method list is the known way this goes wrong.
+# Until then this app deploys identity/access plumbing only, and the appliance is untouched.
+#
+# WAVE 16, and the ordering is load-bearing in both directions:
+#   - AFTER wave13-samba-ad: the AD join needs a domain that answers, and TrueNAS
+#     authenticates against the ON-PREM DC while Authentik writes cloud-side. Working
+#     replication is a precondition (see samba-ad/replication-job.yaml + replication-guard.yaml).
+#   - AFTER wave6-authentik: the blueprint ConfigMap is mounted by the authentik worker.
+#     The mount is `optional: true` (values.yaml worker.volumes), so the worker boots fine at
+#     wave 6 without it and picks the blueprint up when this app syncs.
+#   - BEFORE wave18-barrier, so a failure here is visible before the cluster is declared up.
+# 14/15 are taken (grafana/loki/alloy), hence 16 rather than the 14 the plan first sketched.
+#
+# ⚠ Anything added here that talks to the appliance MUST be pinned to a lab node with the
+# ecc/mesh toleration.
+# Cloud pods cannot reach 192.168.1.0/24. The headscale subnet route IS approved and serving;
+# what is missing is `--accept-routes` on the cloud CP, deliberately off because it is
+# all-or-nothing and would also install 10.0.0.0/23, collapsing etcd quorum. A Job without the
+# toleration stays Pending forever rather than failing, which is the worst diagnostic outcome.
+#
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: truenas
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "16"
+  labels:
+    # The appliance and its outpost live at the lab; the sealed Secret is cluster-wide.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/truenas
+    directory:
+      # Enumerate what ArgoCD applies, so sealSecrets.sh / removeSealedSecret.sh are never
+      # mistaken for manifests.
+      #
+      # ⚠ THIS IS AN ALLOW-LIST: A NEW MANIFEST IN THIS DIRECTORY IS IGNORED UNTIL IT IS
+      # NAMED HERE, AND NOTHING REPORTS THAT. The app stays Synced and Healthy while the
+      # file does nothing. s3-app-job.yaml shipped on 2026-09-02 without being added, so on
+      # the ecc193 recreate the S3 converge never ran — and because GitLab references the
+      # certificate that job publishes from `global.certificates.customCAs`, EVERY GitLab
+      # pod sat in Init for three hours on a `custom-ca-certificates` volume that could not
+      # mount. The app that was supposed to fix it read Healthy the whole time.
+      include: "{truenas-secrets-sealed.yaml,truenas-secrets-samba-ad-sealed.yaml,truenas-s3-admin-sealed.yaml,authentik-blueprint.yaml,configure-job.yaml,certificate-job.yaml,verify-job.yaml,s3-app-job.yaml,dc-set-watch.yaml,identity-watch.yaml}"
+  destination:
+    server: https://kubernetes.default.svc
+    # The sealed Secret targets ns `truenas`; the blueprint ConfigMap carries its own
+    # `namespace: authentik` and so lands there regardless of this default.
+    namespace: truenas
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # ⚠ THE FIRST retry IN argocd-infra (0 of the other 40 apps use one). Infra ordering is
+    # expressed with waves and barriers, and that convention is deliberate — this is an
+    # exception with a specific reason, not a new default to copy.
+    #
+    # The reason: this app's hooks talk to a machine OUTSIDE the cluster, so waves cannot
+    # order them. A wave guarantees the previous wave's Kubernetes resources are healthy;
+    # it says nothing about whether the TrueNAS appliance is reachable, whether the lab DC
+    # it depends on is up, or whether winbind has finished restarting. Those are the real
+    # preconditions here and they are not expressible as a wave — the barrier upstream
+    # cannot wait on them either.
+    #
+    # Same class of failure and same appliance as eda-fileserver, which carries this exact
+    # block; see its comment for the full rationale.
+    #
+    # ⚠ duration 1m, NOT the 30s used elsewhere, because of the appliance's 20-auth/60s
+    # limit: a retry storm trips a TEN-MINUTE lockout cluster-wide, /home included. For the
+    # same reason the outer loop is the right lever — do NOT raise the Jobs' own
+    # backoffLimit (1) or activeDeadlineSeconds to compensate.
+    #
+    # Costs nothing in steady state: only a FAILED sync retries. It does NOT paper over the
+    # verify gates — verify-job asserts and never repairs, so a genuine drift still fails
+    # every attempt and ends Degraded, which is the intent.
+    #
+    # ⚠ limit -1 (RETRY FOREVER), not a finite count. A finite budget is spent against
+    # WALL-CLOCK, and this app's real preconditions can be down for hours — e.g. a lab DC
+    # that cannot join while samba-ad drops LDAP sessions. A finite budget is then spent
+    # inside the first ~15 minutes and never retried: the app settles at Synced/Healthy
+    # with `phase=Failed, retried N times`, so nothing re-drives it and no gate reports a
+    # problem, while the datasets, NFSv4 exports and the AD join it owns were never
+    # created. csi-driver-nfs (wave 17)
+    # mounts those exports, so everything behind it was silently built on nothing.
+    #
+    # 5 was chosen when the only expected failure was the short dns-config race. It does not
+    # survive a dependency being down for longer than the backoff series (1+2+4+8+10 min).
+    # eda-fileserver — same appliance, same class of failure, and the app this block cites —
+    # already uses -1 for exactly this reason, and it DID recover on its own from the same
+    # outage. The asymmetry was the bug.
+    #
+    # Still costs nothing in steady state: only a FAILED sync retries, and maxDuration caps
+    # the interval at 10m, so a permanently-broken precondition is 6 attempts/hour, not a
+    # storm against the appliance's 20-auth/60s lockout.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,104 @@
+# CNPG (PostgreSQL) overview, discovered by the Grafana dashboard sidecar.
+#
+# Lives in ns `prometheus` next to Grafana, matching the Loki dashboards.
+#
+# WHAT THIS DASHBOARD IS FOR: the databases behind almost every app are CNPG Clusters, and
+# their two silent failure modes are both about recoverability rather than availability —
+# an app keeps working perfectly while its backups are broken. So the top row is backups,
+# not connections. Every query uses a metric read off the live exporter on :9187
+# (verified 2026-09-03); the collector exports a deliberately small set, which is why there
+# are no per-query or connection panels here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cnpg-databases-dashboard
+  namespace: prometheus
+  labels:
+    grafana_dashboard: "1"
+data:
+  cnpg-databases.json: |
+    {
+      "title": "PostgreSQL (CNPG) — clusters & recoverability",
+      "uid": "cnpg-databases",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "1m",
+      "time": { "from": "now-24h", "to": "now" },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Clusters reachable",
+          "description": "cnpg_collector_up is the exporter's own connection to its PostgreSQL. 0 while the pod runs is the case nothing else notices.",
+          "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+          "targets": [
+            { "expr": "sum(cnpg_collector_up)", "legendFormat": "up", "refId": "A" },
+            { "expr": "count(cnpg_collector_up)", "legendFormat": "total", "refId": "B" }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+        },
+        {
+          "type": "stat",
+          "title": "Clusters with NO base backup",
+          "description": "WAL archiving alone restores nothing — PITR replays WAL on top of a base backup. A non-zero count here means those clusters have no recoverable copy at all.",
+          "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+          "targets": [
+            { "expr": "count(cnpg_collector_last_available_backup_timestamp == 0) or vector(0)", "legendFormat": "clusters", "refId": "A" }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "Age of newest base backup",
+          "description": "Clusters with no backup at all are excluded (their timestamp is 0, which would render as decades). Watch for a line that climbs past a day — the scheduled backup has stopped succeeding.",
+          "gridPos": { "h": 5, "w": 12, "x": 12, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+          "targets": [
+            { "expr": "time() - (cnpg_collector_last_available_backup_timestamp > 0)", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "WAL segments waiting to be archived",
+          "description": "Anything above 0 that does not drain means barman is not shipping to S3: PITR stops being possible from the last archived segment onward, and pg_wal grows until the data volume fills.",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 5 },
+          "targets": [
+            { "expr": "cnpg_collector_pg_wal_archive_status{value=\"ready\"}", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "pg_wal directory size",
+          "description": "The other half of a stuck archive: unshipped WAL accumulates on the data volume (longhorn-cloud-db, 8Gi on most clusters).",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 5 },
+          "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+          "targets": [
+            { "expr": "cnpg_collector_pg_wal{value=\"size\"}", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "WAL written",
+          "description": "Write volume per cluster — the input side of both the archive backlog above and the S3 object count.",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 11 },
+          "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+          "targets": [
+            { "expr": "rate(cnpg_collector_wal_bytes[5m])", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Collector errors",
+          "description": "Non-zero means the exporter itself is failing, so every panel and cnpg alert here may be evaluating stale or partial data.",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 11 },
+          "targets": [
+            { "expr": "cnpg_collector_last_collection_error", "legendFormat": "{{namespace}}/{{pod}}", "refId": "A" }
+          ]
+        }
+      ]
+    }

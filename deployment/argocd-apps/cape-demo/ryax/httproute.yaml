@@ -1,0 +1,277 @@
+# Ryax routing (Gateway API). The cluster runs NO Ingress controller; ingress is
+# Envoy Gateway (src/ingress.ts + deployment/argocd-infra/gateway).
+#
+# TLS terminates at the shared Gateway's https-wildcard listener, so this route
+# carries no certificate config and needs no Certificate of its own (the old
+# ryax-main-cert is gone). The HTTP->HTTPS redirect is handled once, globally,
+# by argocd-infra/gateway/redirect-to-https.yaml — hence no per-route
+# ssl-redirect equivalent.
+#
+# Prefix stripping: every backend expects requests at its own root
+# (e.g. /authorization/login -> /login). Under Gateway API that is a per-RULE
+# URLRewrite filter, which is why the /grafana rule (which must NOT be stripped)
+# can live on this same route instead of needing a second object.
+#
+# Path matching is longest-prefix-first regardless of rule order, so
+# /api/authorization and /authorization coexist unambiguously.
+#
+# NOT routed here: registry.ryax.<tld>. That host is MULTI-LEVEL and the
+# cluster's *.<tld> wildcard is single-label, so it is covered by neither the
+# shared Gateway's listener nor external-dns (whose ingress source is disabled).
+# Publishing it needs its own Gateway + Certificate + DNSEndpoint in this
+# namespace — see deployment/argocd-apps/gitlab for the worked example. Ryax's
+# own components reach the registry in-cluster as ryax-registry:5000, so
+# registry.ingress.enabled is false in values.yaml.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ryax
+  namespace: ryaxns
+spec:
+  parentRefs:
+    # group/kind/weight below are what the API server defaults to anyway. Written
+    # out so the rendered manifest matches the live object and ArgoCD reports the
+    # app Synced instead of a permanent cosmetic diff.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - ryax.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    # Bare / -> /app/. An explicit redirect rule is the Gateway API idiom; there is
+    # no app-root filter. Exact match so it only catches the document root.
+    - matches:
+        - path:
+            type: Exact
+            value: /
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /app/
+            statusCode: 302
+
+    # Angular frontend. nginx document root is /data and the app has
+    # <base href="/app/">, so assets arrive prefixed and the prefix is stripped.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /app
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-front
+          port: 80
+          weight: 1
+
+    # API services. timeouts replace the former timeout-server: 600s annotation.
+    #
+    # NOTE: each prefix needs its OWN rule. Gateway API rejects a rule that pairs a
+    # ReplacePrefixMatch URLRewrite with more than one match ("exactly one
+    # PathPrefix match must be specified") — the rewrite would otherwise be
+    # ambiguous about which prefix to strip. So /x and /api/x are separate rules
+    # even though they share a backend.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /authorization
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-authorization
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/authorization
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-authorization
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /studio
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-studio
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/studio
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-studio
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /repository
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-repository
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/repository
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-repository
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /runner
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-runner
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/runner
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-runner
+          port: 8080
+          weight: 1
+
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /user-api
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-runner
+          port: 10080
+          weight: 1
+
+    # Grafana: served WITHOUT prefix stripping. It runs with
+    # serve_from_sub_path=true and root_url=.../grafana (see values.yaml), so it
+    # expects the /grafana prefix intact. Adding a URLRewrite filter here strips
+    # it and grafana 301-redirects / -> /grafana/ in an INFINITE LOOP. Do not
+    # "make this consistent" with the rules above.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /grafana
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: ryax-grafana
+          port: 80
+          weight: 1

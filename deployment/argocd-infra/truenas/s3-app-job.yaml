@@ -1,0 +1,583 @@
+# ArgoCD Sync hook: converge the appliance's S3 endpoint (SeaweedFS as a TrueNAS app).
+#
+# WHY THIS EXISTS: GitLab's CI artifacts belong on the appliance, and the appliance is the
+# system of record for them. Everything that makes that possible — the Apps engine, the
+# datasets, the certificate and the app itself — was created by hand once
+# (plans/truenas-s3-setup.md). Without this Job a rebuilt appliance comes back with none of
+# it, and the failure is silent: GitLab simply cannot reach an S3 endpoint that was never
+# installed.
+#
+# ⚠ SINGLE WEBSOCKET, SINGLE AUTH. The appliance locks out for TEN MINUTES after 20
+# authentication attempts in 60 s. One connection per run, many RPCs on it. Never loop a
+# script that reconnects per call, and keep backoffLimit low for the same reason.
+#
+# ⚠ MERGE ONTO app.config, NEVER ONTO THE CATALOG DEFAULTS. The defaults publish the admin,
+# master, volume and filer ports on the LAN and carry no AWS_* identity. A converge built on
+# them would re-open an UNAUTHENTICATED object store on every run — and seaweedfs does not
+# fail closed: `isAuthEnabled = len(identities) > 0`, so no credential means no authentication
+# at all, not "deny". Measured: before this was fixed, an anonymous PUT created a bucket.
+#
+# ⚠ RUNS ON THE APPLIANCE LAN (ecc/fileserver-lan). Cloud pods have no route to
+# 192.168.1.0/24.
+#
+# Runs at sync-wave 3, i.e. after configure-job (1) and certificate-job (2).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truenas-s3-src
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # Hook resources order by HOOK-WEIGHT: the ConfigMap must exist before the Job mounts it.
+    argocd.argoproj.io/sync-wave: "3"
+data:
+  s3.py: |
+    """Converge the appliance's S3 endpoint. Read before write, at every step."""
+    import copy
+    import datetime
+    import os
+    import sys
+
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    POOL       = os.environ["S3_POOL"]            # datapool
+    PARENT     = os.environ["S3_PARENT"]          # datapool/s3
+    CERT_NAME  = os.environ["S3_CERT_NAME"]       # ecc_s3_seaweedfs
+    PROXY_SVC  = os.environ["S3_PROXY_SVC"]       # gitlab-s3-proxy...svc.cluster.local
+    FS_FQDN    = os.environ["FS_FQDN"]
+    FS_HOST    = os.environ["FS_HOSTNAME"]
+    FS_IP      = os.environ["FS_ENDPOINT"]
+    AK         = os.environ["S3_ACCESS_KEY"]
+    SK         = os.environ["S3_SECRET_KEY"]
+    TRAIN      = os.environ.get("S3_TRAIN", "stable")
+    APP        = os.environ.get("S3_APP", "seaweedfs")
+
+    CHILDREN   = ["master", "volume", "filer", "admin", "worker"]
+    APPS_UID   = APPS_GID = 568
+    # Everything except the S3 port stays OFF the LAN. Each of these serves an API with no
+    # authentication of its own — the volume server alone will read and write blobs for
+    # anyone who asks — and `published` binds them to the appliance's LAN address.
+    UNPUBLISH  = ["admin_port", "master_port", "volume_port", "filer_port"]
+
+    changes = []
+
+    def norm_sans(entries):
+        """The appliance returns `IP Address:<ip>`; this repo writes `IP:<ip>`. Comparing
+        the two spellings literally never matches, so a drift check would mint a new
+        certificate on EVERY run — that is exactly how a dozen stale
+        ecc_fs1_selfsigned-* rows accumulated before certificate-job was fixed."""
+        return sorted(e.replace("IP Address:", "IP:") for e in (entries or []))
+
+    def gen_cert(names):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import ipaddress
+        key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, PROXY_SVC)])
+        san = []
+        for entry in names:
+            kind, _, value = entry.partition(":")
+            san.append(x509.IPAddress(ipaddress.ip_address(value))
+                       if kind == "IP" else x509.DNSName(value))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(subject).issuer_name(subject)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(minutes=5))
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName(san), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None),
+                               critical=True)
+                .sign(key, hashes.SHA256()))
+        return (cert.public_bytes(serialization.Encoding.PEM).decode(),
+                key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()).decode())
+
+    def deep_merge(base, over):
+        out = copy.deepcopy(base)
+        for k, v in over.items():
+            out[k] = (deep_merge(out[k], v)
+                      if isinstance(v, dict) and isinstance(out.get(k), dict)
+                      else copy.deepcopy(v))
+        return out
+
+    SAFE = (int, float, bool, type(None))
+
+    def print_drift(a, b, prefix=""):
+        """⚠ REDACT BY DEFAULT, NOT BY KEY NAME. The S3 credentials live inside a LIST under
+        seaweedfs.additional_envs, so a printer that redacts only keys matching pass/secret
+        prints them in full — into the Job log and from there into Loki. That happened once;
+        the exposed pair had to be rotated. Say THAT a value changed, not what it became."""
+        for k in sorted(set(a) | set(b)):
+            av, bv = a.get(k), b.get(k)
+            if isinstance(av, dict) and isinstance(bv, dict):
+                print_drift(av, bv, f"{prefix}{k}.")
+            elif av != bv:
+                if isinstance(av, SAFE) and isinstance(bv, SAFE):
+                    print(f"    {prefix}{k}: {av} -> {bv}")
+                else:
+                    print(f"    {prefix}{k}: (changed, redacted)")
+
+    with TrueNAS(os.environ["TN_HOST"], os.environ["TN_USER"],
+                 os.environ["TN_PASS"]) as tn:
+        info = tn.rpc("system.info") or {}
+        print(f"appliance {info.get('hostname')} running {info.get('version')}")
+
+        # -- 1. Apps engine -----------------------------------------------------
+        print("\n[1/7] apps engine")
+        cur = tn.rpc("docker.config") or {}
+        if cur.get("pool") == POOL:
+            print(f"  already initialized on {POOL} (dataset {cur.get('dataset')})")
+        else:
+            print(f"  pool={cur.get('pool')!r} -> initializing on {POOL}")
+            tn.job("docker.update", [{"pool": POOL}], timeout=1800)
+            changes.append("apps engine")
+        print("  docker.status:", (tn.rpc("docker.status") or {}).get("status"))
+
+        # -- 2. datasets --------------------------------------------------------
+        # host_path, not the app's default ix_volume: this holds the only copy of the CI
+        # artifacts, so it must have a name this repo chose, survive `app.delete`, and be
+        # snapshottable on its own. PARENT is a grouping dataset and is never handed to the
+        # app — same shape as datapool/shared and datapool/eda.
+        print("\n[2/7] datasets")
+        for name in [PARENT] + [f"{PARENT}/{c}" for c in CHILDREN]:
+            if tn.rpc("pool.dataset.query", [[["name", "=", name]]]):
+                print(f"  {name}: already present")
+                continue
+            print(f"  {name}: absent -> creating")
+            # ⚠ acltype is a CREATE-TIME property; it is set here and never re-applied,
+            # because changing it rewrites permissions on everything inside.
+            tn.job("pool.dataset.create", [{
+                "name": name, "type": "FILESYSTEM",
+                "acltype": "POSIX", "aclmode": "DISCARD",
+                "casesensitivity": "SENSITIVE",
+                "comments": "managed by wave16-truenas (S3/SeaweedFS)",
+            }])
+            changes.append(f"dataset {name}")
+        for c in CHILDREN:
+            path = f"/mnt/{PARENT}/{c}"
+            st = tn.rpc("filesystem.stat", [path]) or {}
+            if st.get("uid") == APPS_UID and st.get("gid") == APPS_GID:
+                print(f"  {path}: owner already {APPS_UID}:{APPS_GID}")
+            else:
+                print(f"  {path}: owner {st.get('uid')}:{st.get('gid')} -> {APPS_UID}:{APPS_GID}")
+                tn.job("filesystem.chown", [{"path": path, "uid": APPS_UID,
+                                             "gid": APPS_GID,
+                                             "options": {"recursive": True}}])
+                changes.append(f"chown {path}")
+
+        # -- 3. certificate -----------------------------------------------------
+        # ⚠ THE PROXY'S .svc NAME MUST BE A SAN. GitLab dials the proxy Service name and the
+        # TLS session is passed through to this listener, so a certificate without that name
+        # fails verification — and the error reads as a proxy fault, not a certificate one.
+        # A DEDICATED certificate, not the shared ecc_fs1_selfsigned: that one is bound to
+        # the appliance UI, and its rotation would flap the S3 endpoint with it.
+        print("\n[3/7] certificate")
+        want = ["DNS:" + PROXY_SVC, "DNS:" + FS_FQDN, "DNS:" + FS_HOST,
+                "DNS:localhost", "IP:" + FS_IP]
+        rows = [c for c in (tn.rpc("certificate.query") or [])
+                if (c.get("name") or "").startswith(CERT_NAME)]
+        row = rows[-1] if rows else None
+        if row and norm_sans(row.get("san")) == norm_sans(want):
+            cert_id = row["id"]
+            print(f"  {row['name']} (id {cert_id}): already correct")
+        else:
+            why = "absent" if not row else f"SANs drifted ({row.get('san')})"
+            print(f"  {CERT_NAME}: {why} -> minting")
+            pem_cert, pem_key = gen_cert(want)
+            name = (CERT_NAME if not row
+                    else f"{CERT_NAME}-{datetime.datetime.now():%Y%m%d%H%M%S}")
+            res = tn.job("certificate.create", [{
+                "name": name, "create_type": "CERTIFICATE_CREATE_IMPORTED",
+                "certificate": pem_cert, "privatekey": pem_key,
+                "add_to_trusted_store": True,
+            }])
+            cert_id = res.get("id") if isinstance(res, dict) else res
+            changes.append(f"certificate {name}")
+        print(f"  certificate_id = {cert_id}")
+
+        # -- 4. the app ---------------------------------------------------------
+        print("\n[4/7] app")
+        existing = tn.rpc("app.query", [[["name", "=", APP]]]) or []
+
+        # ⚠ THE CATALOG IS ONLY CONSULTED TO INSTALL, NEVER TO CONVERGE AN INSTALLED APP.
+        # An earlier version always called catalog.get_app_details, and on the ecc193
+        # recreate that failed the whole job with
+        #   [ENOENT] Unable to locate 'seaweedfs' at
+        #   '/mnt/.ix-apps/truenas_catalog/trains/stable/seaweedfs'
+        # even though the app was installed and RUNNING — the appliance's catalog checkout
+        # is its own state and can be absent or stale independently of what is deployed.
+        # Converging an existing app needs only its own config, so ask for nothing more.
+        if existing:
+            base = tn.rpc("app.config", [APP])
+            version = existing[0].get("version")
+            print(f"  installed version: {version}")
+        else:
+            # ⚠ catalog.apps is NOT the listing method (it rejects these params);
+            # app.available is. catalog.get_app_details takes POSITIONAL params — a dict as
+            # the first argument is rejected with a message about app_name not being a
+            # string. A missing train entry here is recoverable: sync the catalog once and
+            # retry, rather than failing an install for a stale checkout.
+            try:
+                det = tn.rpc("catalog.get_app_details", [APP, {"train": TRAIN}])
+            except Exception as exc:
+                print(f"  catalog lookup failed ({exc}); syncing the catalog and retrying")
+                tn.job("catalog.sync", timeout=900)
+                det = tn.rpc("catalog.get_app_details", [APP, {"train": TRAIN}])
+            version = det["latest_version"]
+            base = det["versions"][version]["values"]
+        envs = [e for e in (base.get("seaweedfs", {}).get("additional_envs") or [])
+                if e.get("name") not in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")]
+        # seaweedfs turns these into an ACTION_ADMIN identity
+        # (loadEnvironmentVariableCredentials). This is what switches authentication ON at
+        # all; admin_user/admin_password govern the app's admin UI, not the S3 API.
+        envs += [{"name": "AWS_ACCESS_KEY_ID", "value": AK},
+                 {"name": "AWS_SECRET_ACCESS_KEY", "value": SK}]
+
+        over = {
+            "seaweedfs": {"data_center_name": "unibi-hclab", "rack_name": FS_HOST,  # automatically updated from project-settings:applicationPlacements.meshSite
+                          "additional_envs": envs},
+            "run_as": {"user": APPS_UID, "group": APPS_GID},
+            "network": dict({p: {"bind_mode": ""} for p in UNPUBLISH},
+                            s3_port={"bind_mode": "published", "port_number": 30304,
+                                     "certificate_id": cert_id}),
+            "storage": {f"{c}_data": {"type": "host_path",
+                                      "host_path_config": {"acl_enable": False,
+                                                           "path": f"/mnt/{PARENT}/{c}"}}
+                        for c in CHILDREN},
+        }
+        values = deep_merge(base, over)
+
+        if not existing:
+            print(f"  {APP}: absent -> app.create ({TRAIN} {version})")
+            tn.job("app.create", [{"app_name": APP, "catalog_app": APP,
+                                   "train": TRAIN, "version": version,
+                                   "values": values}], timeout=1800)
+            changes.append(f"app {APP}")
+        elif values != base:
+            print(f"  {APP}: drift ->")
+            print_drift(base, values)
+            tn.job("app.update", [APP, {"values": values}], timeout=1800)
+            changes.append(f"app {APP} (update)")
+        else:
+            print(f"  {APP}: already correct")
+
+        row = (tn.rpc("app.query", [[["name", "=", APP]]]) or [{}])[0]
+        state = row.get("state")
+        if state == "STOPPED":
+            # Deliberately only from STOPPED: DEPLOYING/CRASHED are transient or broken
+            # states that a start would paper over.
+            print(f"  state={state} -> starting")
+            tn.job("app.start", [APP], timeout=900)
+            changes.append(f"app {APP} (start)")
+            row = (tn.rpc("app.query", [[["name", "=", APP]]]) or [{}])[0]
+        print("  state:", row.get("state"))
+
+        # -- 5. retire superseded certificates ----------------------------------
+        # The mint above names a replacement `<CERT_NAME>-<timestamp>` and leaves the old
+        # row behind, so without this every SAN change adds a certificate that nothing
+        # ever removes. It runs AFTER the app converge on purpose: the listener must
+        # already reference cert_id before its predecessor is deleted.
+        #
+        # `force` is deliberately NOT passed — a certificate still in use must fail loudly
+        # rather than be yanked out from under a live service. A failure here is a WARNING,
+        # not a job failure: the endpoint is converged either way and the next run retries.
+        print("\n[5/7] superseded certificates")
+        stale = [c for c in (tn.rpc("certificate.query") or [])
+                 if (c.get("name") or "").startswith(CERT_NAME) and c["id"] != cert_id]
+        if not stale:
+            print("  none")
+        for c in stale:
+            try:
+                tn.job("certificate.delete", [c["id"]])
+                changes.append(f"retired certificate {c['name']}")
+                print(f"  retired {c['name']} (id {c['id']})")
+            except Exception as exc:
+                print(f"  WARNING: could not delete {c['name']} (id {c['id']}): {exc}")
+
+        # -- 6. buckets ---------------------------------------------------------
+        # ⚠ GitLab does NOT create its buckets; a missing one surfaces as an upload failure,
+        # not as a setup error. They are created HERE rather than in gitlab's own
+        # s3-buckets-job because that Job runs cloud-side and would have to reach the
+        # appliance through the proxy, while this one is already on the LAN with the
+        # credentials in hand.
+        import hashlib, hmac, ssl as _ssl2, urllib.request as _u2, datetime as _dt
+        S3_HOST, S3_PORT, S3_REGION = FS_IP, 30304, "us-east-1"
+        _ctx2 = _ssl2.create_default_context()
+        _ctx2.check_hostname = False          # the listener's cert names the proxy, not the IP
+        _ctx2.verify_mode = _ssl2.CERT_NONE   # ...and this hop is the LAN, not the cluster
+        def s3(method, path):
+            t = _dt.datetime.now(_dt.timezone.utc)
+            amz, ds = t.strftime("%Y%m%dT%H%M%SZ"), t.strftime("%Y%m%d")
+            payload = hashlib.sha256(b"").hexdigest()
+            host = f"{S3_HOST}:{S3_PORT}"
+            canon = (f"{method}\n{path}\n\nhost:{host}\n"
+                     f"x-amz-content-sha256:{payload}\nx-amz-date:{amz}\n\n"
+                     f"host;x-amz-content-sha256;x-amz-date\n{payload}")
+            scope = f"{ds}/{S3_REGION}/s3/aws4_request"
+            sts = (f"AWS4-HMAC-SHA256\n{amz}\n{scope}\n"
+                   + hashlib.sha256(canon.encode()).hexdigest())
+            def _sign(key, msg):
+                return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+            k = _sign(_sign(_sign(_sign(("AWS4" + SK).encode(), ds), S3_REGION), "s3"),
+                      "aws4_request")
+            sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+            req = _u2.Request(f"https://{host}{path}", method=method, headers={
+                "Host": host, "x-amz-date": amz, "x-amz-content-sha256": payload,
+                "Authorization": (f"AWS4-HMAC-SHA256 Credential={AK}/{scope}, "
+                                  "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+                                  f"Signature={sig}")})
+            try:
+                return _u2.urlopen(req, context=_ctx2, timeout=30).status
+            except Exception as exc:
+                return getattr(exc, "code", 0)
+
+        print("\n[6/7] buckets")
+        for bucket in [b for b in os.environ.get("S3_BUCKETS", "").split() if b]:
+            code = s3("HEAD", f"/{bucket}")
+            if code == 200:
+                print(f"  {bucket}: already present")
+            elif code in (404, 403):
+                created = s3("PUT", f"/{bucket}")
+                print(f"  {bucket}: absent -> create ({created})")
+                if created not in (200, 204):
+                    raise SystemExit(f"could not create bucket {bucket}: HTTP {created}")
+                changes.append(f"bucket {bucket}")
+            else:
+                raise SystemExit(f"unexpected HTTP {code} probing bucket {bucket}")
+
+        # -- 6. publish the listener's certificate for GitLab to trust ----------
+        # ⚠ WHY THE JOB PUBLISHES THIS INSTEAD OF IT BEING SEALED IN GIT: the certificate is
+        # minted HERE, and a rebuilt appliance mints a NEW one. A sealed copy would be
+        # correct exactly until the first recreate and then silently wrong — GitLab would
+        # fail TLS verification against a certificate nobody had rotated. Publishing it from
+        # the same step that owns it keeps the two from drifting apart.
+        # It is a self-signed leaf, so it is its own trust anchor: GitLab references this
+        # secret from global.certificates.customCAs.
+        pem = (tn.rpc("certificate.query", [[["id", "=", cert_id]]]) or [{}])[0].get("certificate")
+        if not pem:
+            raise SystemExit(f"certificate {cert_id} has no PEM to publish")
+        import base64, json as _json, ssl as _ssl, urllib.request as _u
+        # ⚠ PUBLISHED INTO OUR OWN NAMESPACE, and GitLab PULLS it from here.
+        # This used to write straight into ns `gitlab`, which was wrong twice over:
+        #
+        #  1. OWNERSHIP. A push into a namespace this app does not own cannot survive that
+        #     namespace being recreated — the same lesson image-registry/ca-distribute.yaml
+        #     records for remote-desktop (pushed copy lost 93s later on ecc196). The
+        #     consumer must own its own dependency.
+        #  2. A DEADLOCK, measured on ecc214 2026-09-17. The Role authorising the write ships
+        #     with GitLab's manifests (it cannot be applied before ns gitlab exists), GitLab
+        #     is synced by the APPS instance, and the apps instance is created at wave 19 —
+        #     behind the wave-18 barrier, which waits for THIS app to stop syncing. truenas
+        #     retried forever (retry limit -1) against a namespace that could not appear
+        #     until truenas stopped retrying. Nothing could break that cycle from inside.
+        #
+        # Publishing here breaks both: no cross-namespace write, no RBAC in a namespace we do
+        # not own, and nothing for the barrier to wait on. GitLab copies it in its own PreSync
+        # hook (argocd-apps/gitlab/presync-s3-onprem-ca.yaml), which re-asserts on every
+        # GitLab sync — so a re-minted certificate after a recreate lands without this app
+        # having to know GitLab exists.
+        ns, name, key = "samba-ad", "truenas-s3-onprem-ca", "s3-onprem.crt"
+        api = "https://kubernetes.default.svc"
+        tok = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+        ctx = _ssl.create_default_context(
+            cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+        def k8s(method, path, body=None, tolerate_404=False):
+            """⚠ 404 IS ONLY EVER OK ON A LOOKUP. An earlier version swallowed it for every
+            method, so on a FRESH cluster — where this infra job runs long before the apps
+            instance has created the gitlab namespace — the POST 404'd, returned None, and
+            the job printed "created" and exited 0 having written nothing. GitLab would then
+            sit in ContainerCreating forever waiting for a customCAs secret that was never
+            published, with the job that should have published it reporting success."""
+            req = _u.Request(api + path, method=method,
+                             data=_json.dumps(body).encode() if body else None,
+                             headers={"Authorization": "Bearer " + tok,
+                                      "Content-Type": "application/json"})
+            try:
+                return _json.loads(_u.urlopen(req, context=ctx, timeout=30).read() or "{}")
+            except Exception as exc:
+                if tolerate_404 and getattr(exc, "code", None) == 404:
+                    return None
+                detail = ""
+                try:
+                    detail = exc.read().decode()[:300]
+                except Exception:
+                    pass
+                raise SystemExit(f"k8s {method} {path} failed: {exc} {detail}")
+
+        # The write is into THIS app's own namespace, which exists by construction, so a
+        # failure here is a real one (the Role below is applied with this Job) and failing
+        # the Job is right: ArgoCD re-runs Sync hooks on a sync rather than on every
+        # reconcile, so a run that exited 0 having published nothing would never be retried.
+        #
+        # Everything above this point is already converged when this fails: a failure here
+        # means the CA publish is outstanding, not that the endpoint is unconfigured.
+        want = base64.b64encode(pem.encode()).decode()
+        cur_sec = k8s("GET", f"/api/v1/namespaces/{ns}/secrets/{name}", tolerate_404=True)
+        if cur_sec and (cur_sec.get("data") or {}).get(key) == want:
+            print(f"\n[7/7] {ns}/{name}: already current")
+        else:
+            body = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name},
+                    "type": "Opaque", "data": {key: want}}
+            if cur_sec:
+                k8s("PUT", f"/api/v1/namespaces/{ns}/secrets/{name}", body)
+                print(f"\n[7/7] {ns}/{name}: updated")
+            else:
+                k8s("POST", f"/api/v1/namespaces/{ns}/secrets", body)
+                print(f"\n[7/7] {ns}/{name}: created")
+            # Read back: a write that silently did nothing is the failure mode this whole
+            # block exists to avoid.
+            check = k8s("GET", f"/api/v1/namespaces/{ns}/secrets/{name}", tolerate_404=True)
+            if not check or (check.get("data") or {}).get(key) != want:
+                raise SystemExit(f"{ns}/{name} did not contain the certificate after writing")
+            changes.append(f"secret {ns}/{name}")
+
+        print("\nCHANGES:", changes or "none (idempotent no-op)")
+---
+# Lets the converge Job publish the S3 listener's certificate into the gitlab namespace.
+# Scoped to that ONE secret name: this is a write into another app's namespace, so the
+# grant says exactly which object rather than "secrets".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: truenas-s3-app
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "3"
+---
+# Publishing the S3 listener's CA into THIS namespace, for GitLab to pull. Scoped to the one
+# secret name — the Job needs nothing else, and nothing outside samba-ad.
+#
+# ⚠ Not hooks. A hook Role is deleted after the sync, and this grant has to outlive it:
+# wave16-truenas retries the Job on its own schedule, and cf. c9390729 where the truenas
+# CONFIGURE job's hook RBAC vanished and left every later run unable to start a pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: truenas-s3-app-ca
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["truenas-s3-onprem-ca"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: truenas-s3-app-ca
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: truenas-s3-app-ca
+subjects:
+  - kind: ServiceAccount
+    name: truenas-s3-app
+    namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: truenas-s3-app
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  # ⚠ 1, AND IT MUST STAY 1. Each retry is a fresh websocket and a fresh auth; the appliance
+  # locks out for ten minutes after 20 auth attempts in 60 s, so a generous backoffLimit
+  # turns one transient failure into a ten-minute outage of every other appliance job.
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: truenas-s3-app
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: converge
+          image: docker.io/library/python:3.14-slim # renovate: tracked by "Container image tags" regex (docker datasource)
+          # The one pip install here, for the same reason certificate-job has one: minting a
+          # certificate needs real ASN.1, and hand-rolling it is the worse option.
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir --quiet cryptography && python3 /s3/s3.py
+          env:
+            - name: TN_HOST
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: FS_FQDN
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: FS_HOSTNAME
+              value: "fs-1" # automatically updated from project-settings:storage.fileserver.hostname
+            - name: FS_ENDPOINT
+              value: "192.168.1.237" # automatically updated from project-settings:storage.fileserver.endpoint
+            - name: S3_POOL
+              value: "datapool"
+            - name: S3_PARENT
+              value: "datapool/s3"
+            # ⚠ Must match the bucket names GitLab is configured with
+            # (deployment/argocd-apps/gitlab/values.yaml). GitLab does not create buckets.
+            #
+            # `<cluster>-eda-builds` is NOT a GitLab bucket: it is the ON-PREM target for EDA
+            # BUILD OUTPUTS. It exists because bulk output must never travel through GitLab's
+            # `artifacts:` — that path runs via Workhorse in the CLOUD even when both the
+            # runner and the bucket are in the lab (gitlab/check-ci-artifacts.sh has the
+            # measured cost). A job pushes straight to this endpoint instead.
+            - name: S3_BUCKETS
+              value: "edgecloudinfra-gitlab-artifacts edgecloudinfra-eda-builds" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+            - name: S3_CERT_NAME
+              value: "ecc_s3_seaweedfs"
+            # ⚠ Must match the Service in deployment/argocd-apps/gitlab-s3-proxy: it is the
+            # name GitLab signs its requests against, so it has to be a SAN on the listener's
+            # certificate. Renaming that Service without changing this breaks TLS with an
+            # error that reads like a proxy fault.
+            - name: S3_PROXY_SVC
+              value: "gitlab-s3-proxy.gitlab-s3-proxy.svc.cluster.local"
+            - name: TN_USER
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER }
+            - name: TN_PASS
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD }
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: truenas-s3-admin, key: S3_ACCESS_KEY }
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: truenas-s3-admin, key: S3_SECRET_KEY }
+          volumeMounts:
+            - { name: s3, mountPath: /s3 }
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+      volumes:
+        - name: s3
+          configMap: { name: truenas-s3-src }
+        # tnclient.py is shared with configure-job rather than copied again — verify-job
+        # mounts it the same way.
+        - name: src
+          configMap: { name: truenas-configure-src }

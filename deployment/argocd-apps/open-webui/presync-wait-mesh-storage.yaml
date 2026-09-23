@@ -1,0 +1,135 @@
+# Hard gate: block the open-webui sync until unibi-hclab mesh storage is actually usable.
+#
+# WHY: the CNPG cluster open-webui-pg (postgres.yaml) sits on longhorn-unibi-hclab — the
+# only mesh-scope CNPG cluster. That StorageClass (and its backing Longhorn disk) only
+# exists after `make provision-mesh-node`, potentially hours after the apps sync. CNPG
+# exposes NO knob for its initdb Job's backoffLimit or any retry: if initdb pods fail
+# while storage isn't ready, CNPG latches phase "Cluster is unrecoverable and needs
+# manual intervention" PERMANENTLY (observed: 7 initdb pod failures — the
+# failures continued ~24 min AFTER the mesh nodes joined, because Longhorn disk-tag/CSI
+# readiness lags node join; the volume was never attached). Hence this gate checks the
+# Longhorn DISK, not just the StorageClass, and the CNPG Cluster is only applied once a
+# tagged disk is Ready+Schedulable. Paired with syncPolicy.retry (unlimited) on the
+# Application, the net effect is: re-check forever until the operator provisions the
+# mesh node, then bootstrap exactly once on ready storage.
+#
+# Trade-off (deliberate): this PreSync gate holds the ENTIRE app (deployment, ingress,
+# tile) until mesh storage is up — acceptable, the app is useless without its DB (its
+# own PVC is also longhorn-unibi-hclab). Once storage exists the gate passes in ~1s on
+# every re-sync.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: open-webui-wait-mesh-storage
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: open-webui-wait-mesh-storage
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# gate (a): the per-scope StorageClass exists (created by Pulumi once a mesh node
+# with storageScope unibi-hclab is provisioned)
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get"]
+# gate (b): a Longhorn disk tagged unibi-hclab is Ready+Schedulable
+- apiGroups: ["longhorn.io"]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: open-webui-wait-mesh-storage
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: open-webui-wait-mesh-storage
+subjects:
+- kind: ServiceAccount
+  name: open-webui-wait-mesh-storage
+  namespace: open-webui
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-wait-mesh-storage
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
+spec:
+  # 30 min in-pod poll; on timeout the sync fails and the Application's
+  # syncPolicy.retry (unlimited, backoff capped 10m) recreates the gate — re-check
+  # forever without one eternal hook pinning the sync operation.
+  activeDeadlineSeconds: 2000
+  backoffLimit: 0
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: open-webui-wait-mesh-storage
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: wait-mesh-storage
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: SC_NAME
+          value: "longhorn-unibi-hclab"  # automatically updated from project-settings:applicationPlacements.meshStorageClass
+        - name: DISK_TAG
+          value: "unibi-hclab"  # automatically updated from project-settings:applicationPlacements.meshSite
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Waiting for mesh storage: StorageClass ${SC_NAME} + a Ready+Schedulable Longhorn disk tagged '${DISK_TAG}'..."
+          max_tries=180
+          i=1
+          while [ "$i" -le "$max_tries" ]; do
+            if kubectl get storageclass "${SC_NAME}" >/dev/null 2>&1; then
+              # Join spec.disks (tags/allowScheduling live ONLY in spec) with
+              # status.diskStatus (conditions) by disk-name key; the condition check is
+              # what covers the post-join CSI/disk-tag readiness lag.
+              READY=$(kubectl -n longhorn-system get nodes.longhorn.io -o json 2>/dev/null \
+                | jq -r --arg tag "${DISK_TAG}" '
+                  [ .items[]
+                    | (.spec.disks // {}) as $spec
+                    | (.status.diskStatus // {}) | to_entries[]
+                    | select(($spec[.key].tags // []) | index($tag))
+                    | select($spec[.key].allowScheduling == true)
+                    | select(any(.value.conditions[]?; .type == "Ready" and .status == "True"))
+                    | select(any(.value.conditions[]?; .type == "Schedulable" and .status == "True"))
+                  ] | length' || echo 0)
+              if [ "${READY:-0}" -ge 1 ]; then
+                echo "Mesh storage ready (${READY} disk(s) tagged '${DISK_TAG}' Ready+Schedulable)."
+                exit 0
+              fi
+              echo "Try ${i}/${max_tries}: StorageClass exists but no Ready+Schedulable '${DISK_TAG}' disk yet, retrying in 10s..."
+            else
+              echo "Try ${i}/${max_tries}: StorageClass ${SC_NAME} not created yet (mesh node not provisioned), retrying in 10s..."
+            fi
+            i=$((i + 1)); sleep 10
+          done
+          echo "Timed out waiting for mesh storage; sync fails and ArgoCD retry re-runs this gate."
+          exit 1

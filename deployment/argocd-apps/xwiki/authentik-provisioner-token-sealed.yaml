@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: xwiki
+spec:
+  encryptedData:
+    token: AgBZJQIuJCdx+wbv8YnDN+0gIH7q/c6pVnHZOPIQrJJAAYIuupR1Do1qsyIddjo1pJhqJIXR6puadGoCIT566OOhiAhC81H4VWcU1W8IhT3C6wtt50Q+2XgX/Bw2VZUuELoJtEKms+n86wyQWg+cXJLwzFMB41s+hGqAsmM4pUNXYlk0Igf9UYn+r+49wcJ74IYqvasANKH/O5rzxYRbxvvUjUueZoBDMHwdFHIK0dAzVv1d8qAo11NQIEM0vyE6ZoKLim0Yj2cskbzu6mzsiBmKzs3YjkFsU6oaKuq63qa2YTdYetG373Nkdd3RnoBd1NGGqeqicIzb7hPsZdqE5F7DSZoxo+K+CKuNYYTl1FOhyi6Pr2zSr00ax3kjUdufODsyhQ2ce2564FonugmxGtJjKJjXyxHjFU/k4X37ij/Q7e0Jcwwr4aR9fEKMBgwPOYJNKFYGu6CZ7fWzyv6wVDE6+r6slQwPQqqT/ARp5xI37Af8h1A5Aw3v0MGLAqrMKQ5qXD26aQ/wQH6PkzJBthL1stVuBOK77GOsqNIFTGpHVfuG/UMT/t7b2fuaeLkH8KVejPc1LKQo3YvxhZMRe2ZBiP9MKOImQIT9f/aUra+oXRr3JFcoigmDT+hJJskIWOD+hGHUQXlDr1VuI/GAVpNkUGpJHlz8RzeC53hgXZ/9JhUTKaMVBpbC6Q+QvOWKW/cMczIotJMNh0/95TKh8PUeEAJEhBN6tBJ95ku/0Y72K5m41hafjr0ey9E6vHVmnQPfMXHFwmLGPCgFBNsnBZcOC9PS2KnW3K4RbfLs9wMSniqk7ojlL0LW9eFKYxqciVKXVYrEWfeXYgylyc6EREM2iXiY88jIA6A=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: xwiki

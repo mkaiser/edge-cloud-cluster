@@ -45,9 +45,44 @@
             ]
         }
     },
-    // Added 1.1.1.1/8.8.8.8 as fallbacks after intermittent DNS timeouts on the WSL2 gateway during pulumi up
-    "runArgs": ["--dns=1.1.1.1", "--dns=8.8.8.8"],
-    "postCreateCommand": "make install && echo 'Devcontainer started. Invoke source initPulumiStack.sh now' && echo pwd ",
+    // - --dns: 1.1.1.1/8.8.8.8 fallbacks after intermittent DNS timeouts on the WSL2 gateway during pulumi up.
+    // - --cap-add=NET_ADMIN + --device=/dev/net/tun: let WireGuard run INSIDE the
+    //   devcontainer (admin VPN → reach cluster private IPs 10.0.x.x). Userspace
+    //   wireguard-go/boringtun needs only these two (no kernel module → works on WSL2).
+    // - sysctl src_valid_mark=1: required by wg-quick when it installs the routes.
+    // - --device=/dev/ppp: L2TP/IPsec VPN to the EMDC lab (secret/vpn-emdc.sh).
+    //   CONFIG_PPP=y is builtin in the WSL2 kernel, but cgroup v2 gates devices
+    //   via eBPF, so an ungranted /dev/ppp gives EPERM even to root. The WSL2
+    //   kernel has "# CONFIG_L2TP is not set", so xl2tpd runs "force userspace"
+    //   and needs nothing beyond this device.
+    // - --cap-add=SYS_ADMIN: pppd sets the pty's line discipline to N_PPP via
+    //   TIOCSETD, which the kernel gates on CAP_SYS_ADMIN regardless of
+    //   /dev/ppp access — NET_ADMIN does not cover it. Confirmed via strace:
+    //   ioctl(TIOCSETD, [N_PPP]) = -1 EPERM without this.
+    // NB: runArgs/devices apply only on container (re-)create — rebuild after editing.
+    "runArgs": [
+        "--dns=1.1.1.1",
+        "--dns=8.8.8.8",
+        "--cap-add=NET_ADMIN",
+        "--cap-add=SYS_ADMIN",
+        "--device=/dev/net/tun",
+        "--device=/dev/ppp",
+        "--sysctl",
+        "net.ipv4.conf.all.src_valid_mark=1"
+    ],
+    // Named volume (not a bind mount): ~/.claude holds Claude Code session
+    // transcripts and auth, otherwise lost on every rebuild since it lives on
+    // the container's overlay fs. A named volume works the same on Windows
+    // Docker Desktop and native Linux Docker without a host path.
+    "mounts": [
+        // "source=git_infra-claude-home,target=/home/user/.claude,type=volume"
+        "source=${localEnv:USERPROFILE}\\.claude,target=/home/user/.claude,type=bind"
+    ],
+    // VS Code copies the HOST ~/.gitconfig into the container on every create.
+    // On a Windows host that drags in safe.directory entries like C:\\...\\esphome,
+    // which are not absolute paths on Linux — git then prints a warning on EVERY
+    // invocation. Drop the drive-letter ones; the rest of the config is kept.
+    "postCreateCommand": "git config --global --unset-all safe.directory '^[A-Za-z]:' || true; make setup && echo 'Devcontainer started. Invoke source initPulumiStack.sh now'",
     "containerEnv": {
         "TZ": "Europe/Berlin"
     },

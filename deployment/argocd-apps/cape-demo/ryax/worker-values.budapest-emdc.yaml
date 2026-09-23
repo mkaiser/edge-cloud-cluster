@@ -1,0 +1,30 @@
+# Per-site overrides for the budapest-emdc Ryax worker, layered ON TOP of
+# worker-values.yaml by manageWorker.sh (`--site budapest-emdc`). Only what differs
+# from the default site belongs here — everything else is shared.
+#
+# The release is `ryax-worker-budapest-emdc`, separate from the default site's
+# `ryax-worker`: the worker's own pods carry the nodeSelector and storage class
+# below, so a shared release would move them.
+#
+# ⚠ The Site and its Node Pools live in the RUNNER'S DATABASE, not in this file or
+# the release — manageWorker.sh creates them over the API and generates the
+# config.site block. Registering a node stays a manual step by design.
+global:
+  nodeSelector:
+    ecc/site: budapest-emdc  # automatically updated from project-settings:applicationPlacements.labels.site
+
+  # The site's OWN Longhorn scope, not a ryax-specific one: the worker's only
+  # persistent claim is a 2 Gi postgres (see postgresql in worker-values.yaml), and
+  # user action pods are ephemeral and bind no volume at all. A dedicated scope
+  # would mean a new anchor, a new StorageClass and a new backup group for 2 Gi.
+  #
+  # budapest-emdc is a single-node scope today => replica 1, with the S3 backup as
+  # the net (the RecurringJob group list in
+  # deployment/argocd-infra/longhorn-system/recurring-jobs.yaml is generated from the
+  # storageScope set, so this scope is covered automatically).
+  defaultStorageClass: longhorn-budapest-emdc
+
+# internalRegistryOverride is deliberately NOT set here. It stays the inherited
+# 127.0.0.1:30012 because ryax-registry-ext is a NodePort, which every node in the
+# cluster answers on its own loopback — the kubelet resolves that address locally, so
+# it is correct at any site. Override it only if this site ever runs its own registry.

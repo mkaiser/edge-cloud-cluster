@@ -1,0 +1,142 @@
+# Authentik group `eda-developer` — who may write to the EDA installer-media SMB share.
+#
+#   PostSync job → create the eda-developer group (idempotent)
+#
+# There is NO OIDC provider or application here, unlike the other authentik-provider.yaml
+# files: this group gates an SMB share, not a web app. Nothing logs in "to eda-developer".
+#
+# ⚠ THE GROUP ALONE GRANTS NOTHING. The full chain, and every link is required:
+#   1. Authentik `eda-developer`            — this file
+#   2. Authentik `employees`                — what actually creates the user's AD ACCOUNT
+#      (argocd-infra/samba-ad/postsync-provision-users.yaml step 2). A member of
+#      eda-developer who is NOT also in employees has no AD account, so there is nothing to
+#      add to the AD group — that job reports it and carries on.
+#   3. AD group `eda-developer`             — mirrored from (1) by that same job, step 2a
+#   4. the SMB share ACL                    — restricts the share to (3)
+# Without (3) and (4) the share is writable by EVERY domain user.
+#
+# ⚠ IT IS CREATED HERE, NOT in argocd-infra/authentik/blueprint-groups.yaml. That file is
+# explicit: app-specific groups live with the app that owns them, so a DISABLED APP CREATES
+# NOTHING. Migrating it back would be two commits, never one — consumers fail OPEN, so a
+# one-commit move loses access with a green sync.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token, this
+# namespace), sealed by this app's sealSecrets.sh.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-fileserver-authentik
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+# The job reads the scoped provisioner token from this namespace via `kubectl get secret`
+# — grant the SA get on exactly that secret, by name. No list, no watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-fileserver-authentik-token-read
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-fileserver-authentik-token-read
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-fileserver-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: eda-fileserver-authentik
+    namespace: eda-fileserver
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-fileserver-authentik-group
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # AFTER the RBAC above (weight 5) and after the provisioning/verify hooks.
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-fileserver-authentik
+      # Talks to the in-cluster Authentik API only — no appliance access, so this one is
+      # NOT lab-pinned, unlike the provisioning/verify jobs in this app.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: group
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n eda-fileserver \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              # eda-developer access group (idempotent).
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at CREATE TIME ONLY: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              GRP_PK=$(first_pk "core/groups/?name=eda-developer")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'eda-developer'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"eda-developer","is_superuser":false,"attributes":{"ecc/seed":"all"}}' \
+                  "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Group 'eda-developer' already present."
+              fi
+              echo "eda-developer group pk=$GRP_PK"
+
+              echo
+              echo "NOTE: membership does not take effect until samba-ad's provisioning job"
+              echo "      runs (step 2a), which mirrors this group into AD. A member must"
+              echo "      ALSO be in employees — that is what creates their AD"
+              echo "      account in the first place."
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }

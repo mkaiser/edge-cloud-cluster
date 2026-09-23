@@ -1,0 +1,18 @@
+# DELIBERATE DUPLICATE of the `longhorn-backup-target` command in src/storage.ts — do not
+# "clean up" either copy. Pulumi seeds this same spec before ArgoCD exists, because the
+# restore step (src/longhorn-restore.ts) hard-fails if the target is not `available`. This
+# app then owns it in steady state and self-heals it. Keep the two specs identical.
+---
+apiVersion: longhorn.io/v1beta2
+kind: BackupTarget
+metadata:
+  name: default
+  namespace: longhorn-system
+spec:
+  # Bucket name keys off project_settings.general.name ("edgecloudinfra"), NOT
+  # the subdomain — so it is constant across subdomain bumps.
+  # The anchor below lets updateConfigFromProjectSettings.sh rewrite the bucket
+  # token if general.name changes; constant across subdomain bumps otherwise.
+  backupTargetURL: "s3://edgecloudinfra-longhorn-backup@nbg1/" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+  credentialSecret: longhorn-s3-credentials
+  pollInterval: 5m0s

@@ -1,0 +1,159 @@
+# Retention for image-registry: keep the 2 most recent tags per ARCHIVE repository, then
+# reclaim the blobs nothing references any more.
+#
+# WHY: this store has never had garbage collection. `delete` is off, nothing prunes, and it
+# only ever grows — 166.9 GB as of 2026-09-02, roughly +6 GB/week, on a dataset shared with
+# everything else on the pool. EDA images are 20–40 GB each, so the failure lands mid-build
+# with a full pool rather than as a gradual warning.
+#
+# ⚠ IT TOUCHES `image-archives/**` AND NOTHING ELSE, BY CONSTRUCTION. Measured 2026-09-02,
+# that is also where all the growth is:
+#
+#     deployments/infrastructure/eda/modules/xilinx-2026-1   1 tag
+#     deployments/infrastructure/eda/modules/xilinx-2024-1   1 tag
+#     deployments/infrastructure/eda/modules/hyperlynx       1 tag
+#     image-archives/vllm                                    1 tag
+#     image-archives/ollama                                  1 tag
+#     image-archives/remote-desktop                          4 tags   <- the accumulation
+#
+# The module repositories carry exactly one tag each and are what the privileged broker
+# pulls and runs AS ROOT, selected by `<name>/<version>/module.yaml` on a different dataset.
+# Scoping retention to the archives means this job never needs to read that module store to
+# know what is protected — which matters, because WHICH PODS MOUNT `datapool/eda/modulefiles`
+# is itself the security boundary (see remote-desktop/nfs-eda-modulefiles-pv.yaml). A
+# retention job that mounted it to check digests would widen that boundary to save work the
+# scope rule already does. ⚠ Do not "generalise" this to all repositories.
+#
+# ⚠ NO REGISTRY API, NO CREDENTIAL, NO `delete` FLAG. Removing a tag here is removing its
+# link directory, and `garbage-collect -m` then collects the now-untagged manifest and the
+# blobs nothing else references. That keeps `REGISTRY_STORAGE_DELETE_ENABLED` off — with it
+# on, every account that can push can also DELETE, and the authz front cannot distinguish a
+# retention delete from a malicious one.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: image-registry-retention
+  namespace: image-registry
+spec:
+  # Weekly, in the quietest window. See the in-flight-push note below for why the hour
+  # matters at all.
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          # The blob store is the appliance's NFS export; only lab nodes can mount it.
+          nodeSelector:
+            ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          priorityClassName: low
+          containers:
+            - name: retention
+              # Same image as the registry itself: it is the only place the
+              # `registry garbage-collect` binary and a matching config.yml exist.
+              image: docker.io/library/registry:3.1.1 # renovate: tracked by "Container image tags" regex (docker datasource)
+              env:
+                - name: KEEP
+                  value: "2" # R7: keep the 2 most recent tags per archive repository
+              volumeMounts:
+                - name: blobs
+                  mountPath: /var/lib/registry
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  ROOT=/var/lib/registry/docker/registry/v2/repositories
+                  ARCHIVES="$ROOT/image-archives"
+
+                  [ -d "$ARCHIVES" ] || { echo "no image-archives/ — nothing to do"; exit 0; }
+
+                  pruned=0
+                  for repo in "$ARCHIVES"/*; do
+                    [ -d "$repo/_manifests/tags" ] || continue
+                    name=${repo#"$ROOT/"}
+
+                    # ⚠ SORTED BY THE TAG LINK'S mtime, NOT BY NAME. Tag names here are
+                    # base-r35 / v0.32.15-cu13-sm110-r2 and similar: `sort -V` gets the first
+                    # family right and the second wrong, and "newest" is what the policy
+                    # actually means. The link file is written when the tag is pushed.
+                    #
+                    # ⚠ `stat -c`, NOT `find -printf`. This runs in the registry image, which
+                    # is BusyBox: `-printf` is a GNU extension and BusyBox find rejects it.
+                    # The first version used it, and the failure was SILENT AND SAFE-LOOKING
+                    # — every repo reported "0 tag(s), keeping all" and the job pruned
+                    # nothing while exiting 0.
+                    tags=$(for t in "$repo"/_manifests/tags/*/current/link; do
+                             [ -f "$t" ] || continue
+                             stat -c '%Y %n' "$t"
+                           done | sort -rn | awk '{print $2}' | sed 's#/current/link$##')
+                    total=$(printf '%s' "$tags" | grep -c . || true)
+                    [ "$total" -gt "$KEEP" ] || { echo "$name: $total tag(s), keeping all"; continue; }
+
+                    echo "$name: $total tag(s), keeping newest $KEEP"
+                    i=0
+                    for tagdir in $tags; do
+                      i=$((i+1))
+                      tag=$(basename "$tagdir")
+                      if [ "$i" -le "$KEEP" ]; then
+                        echo "    keep   $tag"
+                        continue
+                      fi
+                      # Belt to the scope rule above: refuse to delete anything whose path
+                      # is not under image-archives/, whatever the loop thinks it found.
+                      case "$tagdir" in
+                        "$ARCHIVES"/*) : ;;
+                        *) echo "    REFUSING to touch $tagdir (outside image-archives)"; exit 1 ;;
+                      esac
+                      echo "    prune  $tag"
+                      rm -rf "$tagdir"
+                      pruned=$((pruned+1))
+                    done
+                  done
+                  echo "tags pruned: $pruned"
+
+                  # ⚠ IN-FLIGHT PUSHES. Upstream says GC is only safe with the registry
+                  # read-only or stopped. What GC actually removes is blobs no manifest
+                  # references — which includes the blobs of a push still in `_uploads`. So
+                  # the risk is a CONCURRENT PUSH FAILING (and being retried), not stored
+                  # images being corrupted. Skipping when an upload is in progress keeps that
+                  # from happening on a normal week; the weekly 03:00 Sunday slot is chosen
+                  # so it rarely can.
+                  # ⚠ A SHELL LOOP, NOT `find -exec test -n "$(ls -A {})"`. In that form the
+                  # command substitution is expanded ONCE BY THE SHELL, with `{}` still
+                  # literal, so the test is always false and the guard silently never fires —
+                  # it looks like a check and is a no-op. Same failure shape as the
+                  # `find -printf` above; both were written that way first.
+                  busy=""
+                  for u in $(find "$ROOT" -type d -name _uploads 2>/dev/null); do
+                    if [ -n "$(ls -A "$u" 2>/dev/null)" ]; then
+                      echo "  in-flight upload: $u"
+                      busy=1
+                    fi
+                  done
+                  if [ -n "$busy" ]; then
+                    echo "upload in progress — skipping garbage-collect this cycle."
+                    echo "Tag pruning above is already durable; the blobs are collected next run."
+                    exit 0
+                  fi
+
+                  echo "running garbage-collect ..."
+                  # -m also collects manifests left untagged by the pruning above.
+                  registry garbage-collect /etc/distribution/config.yml -m
+                  echo "done. store now: $(du -sh /var/lib/registry 2>/dev/null | cut -f1)"
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                # GC walks every manifest; it is IO-bound on NFS, not memory-hungry.
+                limits: { memory: 1Gi }
+          volumes:
+            - name: blobs
+              persistentVolumeClaim:
+                claimName: nfs-images

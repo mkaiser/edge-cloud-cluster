@@ -1,0 +1,129 @@
+# PreSync: pull the TrueNAS S3 listener's CA into THIS namespace, rather than waiting for
+# the appliance job to push it here.
+#
+# WHY THIS EXISTS — it replaces a cross-namespace push that deadlocked the bootstrap.
+# truenas/s3-app-job.yaml used to write `gitlab-s3-onprem-ca` straight into ns gitlab, which
+# needed a Role in a namespace that app does not own. That Role could only ship with GitLab's
+# manifests (a Role cannot be applied before its namespace exists), GitLab is synced by the
+# APPS instance, and the apps instance is created at wave 19 — behind the wave-18 barrier,
+# which waits for the truenas app to stop syncing. truenas retried forever (retry limit -1)
+# against a namespace that could not appear until truenas stopped retrying. Measured on
+# ecc214 2026-09-17: nothing could break that cycle from inside the cluster.
+#
+# It was also the ownership mistake image-registry/ca-distribute.yaml already records for
+# remote-desktop: a push into a namespace you do not own cannot survive that namespace being
+# recreated, because it only re-runs when the PUSHING app syncs. The consumer owns its own
+# dependency instead — same shape as remote-desktop/presync-registry-ca.yaml.
+#
+# The appliance job now publishes the certificate into its OWN namespace
+# (samba-ad/truenas-s3-onprem-ca) and this copies it here on every GitLab sync.
+#
+# ⚠ RE-ASSERTS ON EVERY SYNC, on purpose. The certificate is minted ON THE APPLIANCE and a
+# rebuilt appliance mints a NEW one, so a stale copy fails TLS verification against the S3
+# endpoint — which reads as a storage or network fault, not a trust one. Copying it every
+# sync is what stops that.
+#
+# ⚠ PreSync, not PostSync: `global.certificates.customCAs` in values.yaml mounts this secret,
+# and a secret that is ABSENT WHEN A POD STARTS never populates in that pod even after it is
+# created — the kubelet leaves the mounted path empty and the pod must restart. It must
+# therefore exist before GitLab's own manifests are applied.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-s3-onprem-ca
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-s3-onprem-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  # read the published CA in samba-ad; write the copy into our own namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-s3-onprem-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-s3-onprem-ca
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-s3-onprem-ca
+    namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-s3-onprem-ca
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # After the RBAC above (-1), before GitLab's own manifests.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — hook-delete-policy already removes this on the next sync,
+  # and a TTL would delete the pod holding the only copy of the logs.
+  template:
+    spec:
+      serviceAccountName: gitlab-s3-onprem-ca
+      restartPolicy: OnFailure
+      containers:
+        - name: fetch-ca
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "Fetching the TrueNAS S3 listener CA from samba-ad..."
+              i=1
+              CA=""
+              while [ "$i" -le 60 ]; do
+                CA=$(kubectl -n samba-ad get secret truenas-s3-onprem-ca \
+                       -o jsonpath='{.data.s3-onprem\.crt}' 2>/dev/null || true)
+                [ -n "$CA" ] && break
+                echo "  try ${i}/60: not published yet, retrying in 5s..."
+                i=$((i + 1)); sleep 5
+              done
+              # ⚠ FAIL if it never appears. An empty customCAs secret is worse than none:
+              # GitLab would start, fail TLS to the S3 endpoint, and the cause would be a
+              # trust error nobody connects back to this hook.
+              if [ -z "$CA" ]; then
+                echo "ERROR: samba-ad/truenas-s3-onprem-ca has no s3-onprem.crt after 5 min." >&2
+                echo "       The appliance job (argocd-infra/truenas/s3-app-job.yaml) publishes" >&2
+                echo "       it at wave 16 — check that the truenas app has synced." >&2
+                exit 1
+              fi
+              # Build the Secret with the base64 value verbatim — `create secret generic`
+              # would re-encode it, and --from-literal cannot take pre-encoded data.
+              printf '%s\n' \
+                'apiVersion: v1' \
+                'kind: Secret' \
+                'metadata:' \
+                '  name: gitlab-s3-onprem-ca' \
+                '  namespace: gitlab' \
+                'type: Opaque' \
+                'data:' \
+                "  s3-onprem.crt: ${CA}" \
+                | kubectl apply -f - >/dev/null
+              echo "gitlab/gitlab-s3-onprem-ca published."

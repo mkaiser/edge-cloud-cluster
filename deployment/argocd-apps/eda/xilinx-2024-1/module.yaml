@@ -1,0 +1,83 @@
+# Xilinx 2024.1 CONTAINER module manifest — baked into the runnable module image at
+# /module.yaml. Read by the remote-desktop broker (which publishes it) and the module CLI
+# (which generates `podman run` launchers from it).
+#
+# `runtime: container` marks it: the tool runs in ITS OWN container via podman inside the
+# sandboxed desktop pod, NOT natively on PATH.
+#
+# NAMED `xilinx`, NOT `vivado`, because the image is not Vivado-only: the full module set
+# installs Vitis (under its own root /opt/Xilinx/Vitis/2024.1), Vitis Networking P4, Model
+# Composer and PDM alongside Vivado. `module load xilinx/2024.1` is the user-facing name.
+#
+# Consequences of the container path, all deliberate:
+#   - NO Lmod modulefile is generated, so `env.set`, `env.prepend_path`, `env.source` and
+#     `conflicts` would all be INERT here and are omitted rather than shipped as dead keys.
+#   - `module load` generates wrappers rather than manipulating the env via Lmod. GUI entries
+#     (desktop_entries) are printed by name; CLI entries (cli_entries) go on PATH via a
+#     per-module shim dir. The shim dir is NOT Lmod — the `env.*` keys above stay inert.
+#   - Only `license-server` is honoured in set_from_secret (module-cli.sh maps it to the
+#     pod's MODULE_LICENSE_SERVER and passes it as a `podman run -e` flag).
+name: xilinx
+version: "2024.1"
+runtime: container
+# Publish/pull from THIS app's own GitLab project rather than the default
+# <IMAGE_BASE>/<name>, which for name `xilinx` would resolve to .../modules/xilinx — a path
+# no app owns and which would put this image and the 2026.1 one in the SAME repo, differing
+# only by tag. Keeping an explicit per-app project is what lets the two be independently
+# deletable and independently restorable from their own NFS archives.
+# Honoured by broker.sh module_image() + module-cli.sh (base-r14+).
+image: deployments/infrastructure/eda/modules/xilinx-2024-1
+env:
+  # FlexNet license host, injected by the launcher as `podman run -e
+  # XILINXD_LICENSE_FILE=$MODULE_LICENSE_SERVER`. The VALUE is never baked into the image
+  # or written to git; it comes from the RUNTIME's MODULE_LICENSE_SERVER, which is fed from
+  # `eda-secrets` (eda/secrets, sealed into every namespace that runs a module).
+  set_from_secret:
+    XILINXD_LICENSE_FILE: license-server
+desktop_entries:
+  # `command` is the full in-CONTAINER path (there is no PATH set up for us); `exec` is only
+  # the short wrapper/desktop-file name -> $HOME/.local/bin/module-vivado-vivado.
+  - name: "Vivado 2024.1"
+    exec: "vivado"
+    command: "/opt/Xilinx/2024.1/Vivado/bin/vivado"
+    categories: "Development;Engineering;"
+# CLI entries — for BATCH/scripted use, not the Applications menu. Each generates a wrapper
+# named after the REAL binary into a per-module shim dir
+# ($HOME/.local/module-bin/xilinx/2024.1/) which `module load` prepends to PATH.
+# An existing batch script then runs unchanged: `vivado -mode batch -source build.tcl`.
+#
+# Distinct from desktop_entries on purpose: those are named `module-<mod>-<exec>` and must
+# stay that way (menu + no PATH collisions), whereas these MUST carry the tool's own name or
+# a script would not find them. `vivado` therefore appears in both lists — one menu entry,
+# one PATH shim — which is intended, not a duplicate.
+#
+# Every path below was verified against the BUILT image (podman run … -x test), not inferred
+# from the Dockerfile:
+#   - NO xsct YET, even though Vitis IS installed. install_config.txt sets
+#     `Vitis Embedded Development:1`, and the built image really does carry Vitis — but at
+#     /opt/Xilinx/Vitis/2024.1, NOT under the normalised /opt/Xilinx/2024.1/ root: the
+#     Dockerfile's layout normalisation moves only Vivado. Add an xsct entry pointing at the
+#     path a BUILT image confirms, never one inferred from the Dockerfile. (xsdb below is
+#     Vivado's own copy and already works.)
+#   - NO vivado_lab: that is the separate Lab Edition install, not part of this image.
+cli_entries:
+  - name: vivado
+    command: /opt/Xilinx/2024.1/Vivado/bin/vivado
+  - name: hw_server
+    command: /opt/Xilinx/2024.1/Vivado/bin/hw_server
+  - name: xsdb
+    command: /opt/Xilinx/2024.1/Vivado/bin/xsdb
+  - name: xsim
+    command: /opt/Xilinx/2024.1/Vivado/bin/xsim
+  - name: xelab
+    command: /opt/Xilinx/2024.1/Vivado/bin/xelab
+  - name: xvlog
+    command: /opt/Xilinx/2024.1/Vivado/bin/xvlog
+  - name: xvhdl
+    command: /opt/Xilinx/2024.1/Vivado/bin/xvhdl
+  - name: xsc
+    command: /opt/Xilinx/2024.1/Vivado/bin/xsc
+  - name: updatemem
+    command: /opt/Xilinx/2024.1/Vivado/bin/updatemem
+  - name: bootgen
+    command: /opt/Xilinx/2024.1/Vivado/bin/bootgen

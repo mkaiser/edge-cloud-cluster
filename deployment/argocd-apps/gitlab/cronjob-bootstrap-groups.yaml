@@ -1,0 +1,260 @@
+# CronJob: create the deployments/ group hierarchy and keep the Authentik access
+# groups' Owner membership on it in sync — config-as-code, self-healing, survives
+# cluster recreation.
+#
+# HIERARCHY (GitLab groups/subgroups; projects live under the leaf subgroups):
+#   deployments/
+#     infrastructure/
+#       AI/          → projects: vllm-jetson (created by CI/users, NOT here)
+#       Xilinx/      → projects: 2026.1              (created by CI/users, NOT here)
+#
+# Only the GROUPS are created here (idempotently). Projects are left to CI / users
+# — this job never deletes or touches projects, so it is data-safe to re-run.
+#
+# ACCESS: the Authentik groups "employees-extended" and "gitlab-admins" get Owner
+# (access_level 50) on the top-level "deployments" group (inherited by all
+# subgroups). Both groups are ALSO made GitLab instance admins by
+# cronjob-sync-admins, so this membership is belt-and-suspenders today; it becomes
+# the real grant if a member is ever dropped from the admin set but should still
+# own deployments/.
+#
+# WHY a CronJob (like cronjob-sync-admins): GitLab's OmniAuth openid_connect
+# provider does NOT support SAML Group Links (a SAML-only feature, same limitation
+# as admin_groups — see cronjob-sync-admins.yaml). Membership therefore cannot be a
+# live SSO group-link; it must be materialized. A member only gets added once they
+# have a GitLab account. cronjob-sync-admins PRE-CREATES those accounts from the
+# Authentik member list, so this job finds them without waiting for a first OIDC
+# login. Running every 5 min keeps the deployments/ Owner set in sync with the
+# Authentik access set as members are added and removed there.
+#
+# Runs `gitlab-rails runner` in the toolbox pod. Reuses the gitlab-sync-admins
+# ServiceAccount (pods get/list + pods/exec, and the cluster-scoped read of
+# authentik-secrets) defined in cronjob-sync-admins.yaml.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gitlab-bootstrap-groups
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Offset by one minute from cronjob-sync-admins (*/5): that job PRE-CREATES the
+  # GitLab accounts this one grants Owner to. Firing on the same minute is a race —
+  # a brand-new Authentik member would be missed here and only picked up 5 min later.
+  schedule: "1-56/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 3
+      template:
+        spec:
+          serviceAccountName: gitlab-sync-admins
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: bootstrap-groups
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            # In-cluster API call → internal Service (no dependency on public DNS).
+            - name: AUTHENTIK_URL
+              value: "http://authentik-server.authentik.svc.cluster.local"
+            # Space-separated: union of these Authentik groups → Owner on deployments/.
+            - name: ACCESS_GROUPS
+              value: "employees-extended gitlab-admins"
+            # Authentik ingress cert is LE STAGING (untrusted CA) while testing → "-k".
+            # updateConfigFromProjectSettings.sh clears this to "" (verify) on prod.
+            - name: CURL_INSECURE
+              value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+            command: ["/bin/sh", "-ec"]
+            args:
+            - |
+              apk add --no-cache curl jq >/dev/null 2>&1
+
+              # --- Create the group hierarchy via rails (idempotent) ---
+              # Each path segment: reuse if it exists, else create under its parent.
+              # Groups::CreateService needs a user with permission — use the first admin.
+              TOOLBOX=deploy/gitlab-toolbox
+              echo "Creating deployments/ group hierarchy..."
+              kubectl -n gitlab exec -i "$TOOLBOX" -c toolbox -- \
+                gitlab-rails runner - <<'RUBY'
+              actor = User.find_by(username: 'root') || User.admins.first
+              raise 'no admin user to own group creation' if actor.nil?
+
+              # [path, name, description] for each level; parent is the previous entry.
+              tree = [
+                { path: 'deployments',    name: 'deployments',    desc: 'Deployment sources (GitOps).' },
+                { path: 'infrastructure', name: 'infrastructure', desc: 'Infrastructure deployments.' },
+              ]
+              # leaf subgroups under infrastructure (siblings):
+              leaves = [
+                { path: 'AI',     name: 'AI',     desc: 'AI serving (vllm-jetson).' },
+                { path: 'Xilinx', name: 'Xilinx', desc: 'Xilinx toolchains (e.g. 2026.1).' },
+              ]
+
+              def ensure_group(actor, path, name, desc, parent)
+                # Match the path CASE-INSENSITIVELY. GitLab enforces group-URL uniqueness
+                # without regard to case, so a group created as "ai" makes a later
+                # find_by(path: "AI") miss while the create then fails with
+                #   Group URL has already been taken
+                # — the job dies on a hierarchy that is in fact already correct. (Real case:
+                # ecc168 had deployments/infrastructure/ai while this list says 'AI'.)
+                scope = parent ? parent.children : Group.where(parent_id: nil)
+                existing = scope.find_by(path: path) ||
+                           scope.find_by('LOWER(path) = ?', path.downcase)
+                if existing
+                  puts "  exists: #{existing.full_path}"
+                  return existing
+                end
+                params = { path: path, name: name, description: desc, visibility_level: Gitlab::VisibilityLevel::PRIVATE }
+                params[:parent_id] = parent.id if parent
+                # GitLab 16.11+ made organization_id mandatory on groups; on 19.2 omitting it
+                # fails validation with "Organization can't be blank" and NO group is created.
+                # Inherit the parent's org so subgroups always match, else fall back to the
+                # instance default (id 1, path "default" on a stock install).
+                org_id = parent&.organization_id ||
+                         (Organizations::Organization.default_organization&.id rescue nil) ||
+                         Organizations::Organization.first&.id
+                params[:organization_id] = org_id if org_id
+                g = Groups::CreateService.new(actor, params).execute
+                # The return shape varies by GitLab version and ALL THREE forms exist in the
+                # wild: a bare Group (old), a Hash with :group, and — since GitLab 16.x, and
+                # what 19.2 actually returns — a ServiceResponse whose payload holds :group.
+                # Handling only Hash/bare made the job die with
+                #   undefined method `persisted?' for an instance of ServiceResponse
+                # AFTER the RBAC fix let it reach the toolbox, so it looked like a new
+                # failure rather than the next one in line.
+                grp = if g.respond_to?(:payload) && g.payload.is_a?(Hash)
+                        g.payload[:group]
+                      elsif g.is_a?(Hash)
+                        g[:group]
+                      else
+                        g
+                      end
+                if grp.nil? || !grp.respond_to?(:persisted?) || !grp.persisted?
+                  errs = if grp.respond_to?(:errors) then grp.errors.full_messages.join(', ')
+                         elsif g.respond_to?(:message) then g.message.to_s
+                         else g.inspect end
+                  raise "failed to create group #{path}: #{errs}"
+                end
+                puts "  created: #{grp.full_path}"
+                grp
+              end
+
+              parent = nil
+              tree.each { |n| parent = ensure_group(actor, n[:path], n[:name], n[:desc], parent) }
+              infra = parent
+              leaves.each { |n| ensure_group(actor, n[:path], n[:name], n[:desc], infra) }
+
+              # Every instance ADMIN becomes an Owner of `deployments`.
+              #
+              # Being a GitLab admin does NOT put a private group on your dashboard: the
+              # project/group lists are scoped to MEMBERSHIPS, so after a recreate an admin
+              # logs in and sees nothing at all — the projects exist and are readable, but
+              # only via /admin/projects or a direct URL. That reads as "GitLab lost all the
+              # projects" and is what happened.
+              #
+              # Membership is inherited by every subgroup and project, so granting it once on
+              # the root group is enough. Idempotent: skip anyone who already has a direct
+              # membership, and never DOWNGRADE an existing one.
+              root_group = Group.find_by_full_path('deployments')
+              if root_group
+                User.where(admin: true).where(state: 'active').find_each do |adm|
+                  existing = root_group.members.find_by(user_id: adm.id)
+                  if existing
+                    if existing.access_level < Gitlab::Access::OWNER
+                      existing.update!(access_level: Gitlab::Access::OWNER)
+                      puts "  raised #{adm.username} to Owner on deployments"
+                    else
+                      puts "  admin ok: #{adm.username}"
+                    end
+                  else
+                    root_group.add_member(adm, Gitlab::Access::OWNER)
+                    puts "  added #{adm.username} as Owner on deployments"
+                  end
+                end
+              end
+              puts "Group hierarchy ready."
+              RUBY
+
+              # --- Resolve Authentik access-group members → GitLab Owners on deployments ---
+              AUTHENTIK_TOKEN=$(kubectl get secret authentik-secrets -n authentik \
+                -o jsonpath='{.data.AUTHENTIK_BOOTSTRAP_TOKEN}' | base64 -d)
+              [ -z "$AUTHENTIK_TOKEN" ] && { echo "ERROR: could not read AUTHENTIK_BOOTSTRAP_TOKEN"; exit 1; }
+
+              echo "Fetching Authentik access members (groups: $ACCESS_GROUPS)..."
+              # `groups_by_name`, NOT `groups__name` — see the long note in
+              # cronjob-sync-admins.yaml: the latter is not a declared filter and is
+              # silently IGNORED, returning every user in the instance. This one fails
+              # closed (400) on an unknown group. type/is_active drop service and
+              # disabled accounts.
+              MEMBER_EMAILS=""
+              for GRP in $ACCESS_GROUPS; do
+                PAGE=1
+                while true; do
+                  RESP=$(curl -sf $CURL_INSECURE \
+                    -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+                    "$AUTHENTIK_URL/api/v3/core/users/?groups_by_name=${GRP}&type=internal&is_active=true&page_size=100&page=${PAGE}") \
+                    || { echo "ERROR: Authentik user query failed for group '$GRP' (unknown group?)"; exit 1; }
+                  BATCH=$(echo "$RESP" | jq -r '.results[].email // empty')
+                  [ -z "$BATCH" ] && break
+                  MEMBER_EMAILS=$(printf '%s\n%s' "$MEMBER_EMAILS" "$BATCH")
+                  NEXT=$(echo "$RESP" | jq -r '.pagination.next // 0')
+                  [ "$NEXT" = "0" ] || [ "$NEXT" = "null" ] && break
+                  PAGE=$((PAGE + 1))
+                done
+              done
+              MEMBER_EMAILS=$(echo "$MEMBER_EMAILS" | tr '[:upper:]' '[:lower:]' | sort -u | grep -v '^$' || true)
+              echo "access members (employees-extended ∪ gitlab-admins): $(printf '%s\n' "$MEMBER_EMAILS" | grep -c . || true)"
+
+              # JSON array passed as ARGV[0] — nothing interpolated into the ruby script.
+              EMAILS_JSON=$(printf '%s\n' "$MEMBER_EMAILS" | jq -R . | jq -s -c 'map(select(length>0))')
+
+              echo "Reconciling Owner membership on deployments/ ..."
+              # Authentik access set is authoritative: add/raise members to Owner, and
+              # remove Owners that fell out of the set (never root/bots, never Owners
+              # who were granted at a level OTHER than the top group i.e. inherited).
+              kubectl -n gitlab exec -i "$TOOLBOX" -c toolbox -- \
+                gitlab-rails runner - "$EMAILS_JSON" <<'RUBY'
+              require 'json'
+              grp = Group.find_by_full_path('deployments')
+              raise 'deployments group missing' if grp.nil?
+              emails = JSON.parse(ARGV[0]).map(&:downcase)
+
+              # add / raise
+              emails.each do |e|
+                u = User.find_by('lower(email) = ?', e)
+                if u.nil?
+                  puts "  WARN no GitLab account for #{e} (pre-creation should have made one)"
+                  next
+                end
+                m = grp.members.find_by(user_id: u.id)
+                if m && m.access_level >= Gitlab::Access::OWNER
+                  next
+                elsif m
+                  m.update!(access_level: Gitlab::Access::OWNER)
+                  puts "  raised to Owner: #{u.username}"
+                else
+                  grp.add_member(u, Gitlab::Access::OWNER)
+                  puts "  added Owner: #{u.username}"
+                end
+              end
+
+              # demote/remove stale direct Owners no longer in the access set.
+              # Only DIRECT members of this group (source_id == grp.id); never root/bots.
+              grp.members.where(access_level: Gitlab::Access::OWNER).find_each do |m|
+                u = m.user
+                next if u.nil? || u.username == 'root' || u.bot?
+                unless emails.include?(u.email.to_s.downcase)
+                  m.destroy!
+                  puts "  removed Owner: #{u.username}"
+                end
+              end
+              puts "Membership sync done."
+              RUBY
+
+              echo "deployments/ bootstrap completed successfully."

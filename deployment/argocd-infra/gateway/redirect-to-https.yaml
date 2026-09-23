@@ -1,0 +1,23 @@
+# Single cluster-wide HTTP→HTTPS redirect, attached to the Gateway's plain-HTTP
+# listener — app HTTPRoutes never have to think about it.
+#
+# Binds to the `http` listener only (sectionName), so it cannot shadow any
+# real route on the HTTPS listeners.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: redirect-to-https
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: http
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

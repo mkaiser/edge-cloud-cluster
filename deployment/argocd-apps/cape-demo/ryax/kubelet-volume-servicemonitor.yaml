@@ -1,0 +1,77 @@
+# Kubelet scrape for PVC STORAGE metrics only — the storage panels in Ryax's Grafana.
+#
+# WHY THIS EXISTS: values.yaml sets `kubelet.enabled: false` for Ryax's
+# kube-prometheus-stack, deliberately (see the comment there). That switched off the whole
+# kubelet scrape, and with it `kubelet_volume_stats_*` — so Ryax's Grafana has no way to
+# show how full its own PVCs are, which is exactly the number an operator wants when a
+# build cache or a registry starts filling.
+#
+# WHY NOT THE LONGHORN EXPORTER: it cannot be scraped at all. longhorn-system ships a
+# NetworkPolicy (`longhorn-manager`) whose ingress allows only Longhorn's own pods —
+# longhorn-manager, longhorn-ui, longhorn-csi-plugin, the recurring-job pods and the
+# driver-deployer. It has no namespaceSelector and no exception for Prometheus, so port
+# 9500 is unreachable from any monitoring namespace. Measured 2026-09-21: the CLUSTER's
+# own Prometheus has all 7 longhorn-backend targets DOWN with
+# `context deadline exceeded`, and zero `longhorn_volume_*` series. That is a
+# pre-existing cluster-wide fault, not something scoped monitoring caused — but it does
+# mean a longhorn ServiceMonitor here would scrape nothing.
+#
+# The kubelet reports the same thing from the other side (it stats the mounted
+# filesystem), needs no NetworkPolicy exception, and is already permitted: Ryax's
+# Prometheus ClusterRole grants nodes/metrics and the /metrics nonResourceURL.
+#
+# ⚠ SCOPE IS ENFORCED BY metricRelabelings, NOT by the namespace selectors in
+# values.yaml. Those select which ServiceMonitors are read; they cannot narrow what a
+# selected one scrapes. A kubelet target returns metrics for EVERY pod and volume on that
+# node, so without the two keep rules below this would re-import pod-level telemetry for
+# all 54 namespaces — precisely what disabling `kubelet` removed. The rules run in order:
+#
+#   1. keep only the kubelet_volume_stats_* family (drops cAdvisor, runtime, everything);
+#   2. of those, keep only series whose `namespace` label is Ryax's.
+#
+# The result is ~20 series instead of the thousands a full kubelet scrape yields.
+#
+# ⚠ The Service is `ryax-kube-prometheus-stack-kubelet` in kube-system, which the
+# prometheus-operator creates and maintains for this release. It exists even with
+# `kubelet.enabled: false` because the operator manages it per-release, but it is NOT ours
+# — do not template or delete it here.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ryax-kubelet-volume-stats
+  namespace: ryaxns
+  labels:
+    app.kubernetes.io/name: ryax-kubelet-volume-stats
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubelet
+      k8s-app: kubelet
+  endpoints:
+    - port: https-metrics
+      scheme: https
+      interval: 60s
+      honorLabels: true
+      # The kubelet's serving cert is signed for the node's own name/IP, which does not
+      # match the headless Service address the operator targets. Every kube-prometheus-stack
+      # kubelet endpoint in this cluster skips verification for that reason.
+      tlsConfig:
+        insecureSkipVerify: true
+      # The pod's own projected ServiceAccount token. The cluster's kubelet
+      # ServiceMonitor instead names a `*-prometheus-token` Secret, which the operator
+      # creates per release — that Secret does NOT exist for the Ryax release (verified
+      # 2026-09-21), so naming it here would make every scrape fail on a missing secret.
+      # bearerTokenFile is what Prometheus mounts unconditionally.
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      metricRelabelings:
+        # 1. Volume stats only — drop cAdvisor and every other kubelet metric family.
+        - action: keep
+          sourceLabels: [__name__]
+          regex: kubelet_volume_stats_.*
+        # 2. Ryax's namespaces only — a kubelet reports every PVC mounted on its node.
+        - action: keep
+          sourceLabels: [namespace]
+          regex: (ryaxns|ryaxns-execs)

@@ -1,0 +1,183 @@
+# Provisions the project's Admin account in Ryax on every sync. Its username, password and
+# email all come from the `ryax-user-credentials` secret (sealed by sealSecrets.sh), so no
+# identity is hard-coded here.
+#
+# Ryax seeds only ONE account: RYAX_DEFAULT_USER_* (from ryax-admin-credentials) creates
+# `admin`, and only on FIRST BOOT. Every further account lives solely in the Ryax datastore,
+# so without this Job a recreate comes up with `admin` alone and the account has to be
+# recreated by hand against the API.
+#
+# It also assigns the account to a project. That is a SEPARATE step from creating it:
+# a projectless user logs in fine but every runner call dies on it, and the UI shows
+# nothing at all -- see the block below.
+#
+# Talks to the authorization service in-cluster (ryax-authorization:8080). The public host
+# carries an /authorization prefix that the Gateway strips; internally the routes are at the
+# root, so it is /login and /users here, NOT /authorization/login.
+#
+# ⚠ A role can NOT be changed after the fact. authorization/application/user_service.py:
+#
+#     if user_data.role is not None and user.role != UserRoles.admin:
+#         raise RoleUpdateForbiddenError()
+#
+# `user` there is the TARGET being edited, not the caller — so PUT can only set the role of
+# someone who is ALREADY an Admin, and a non-admin can never be promoted. (It surfaces as a
+# bare HTTP 500, not a 403.) The role therefore has to be right at CREATE time, and repairing
+# an account that exists with the wrong role means delete + recreate, which is what this Job
+# does. Deleting is safe only because this account is provisioned, never hand-curated.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ryax-provision-user
+  namespace: ryaxns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ryax-provision-user-secret-read
+  namespace: ryaxns
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ryax-admin-credentials", "ryax-user-credentials"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ryax-provision-user-secret-read
+  namespace: ryaxns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ryax-provision-user-secret-read
+subjects:
+  - kind: ServiceAccount
+    name: ryax-provision-user
+    namespace: ryaxns
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-provision-user
+  namespace: ryaxns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ryax-provision-user
+      # Only talks to the in-cluster Ryax API and the k8s API — no mesh toleration needed,
+      # same placement as the other ryax provisioning jobs.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provision
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              API="http://ryax-authorization.ryaxns.svc.cluster.local:8080"
+
+              rd() { kubectl get secret "$1" -n ryaxns -o jsonpath="{.data.$2}" | base64 -d; }
+              ADMIN_USER=$(rd ryax-admin-credentials username)
+              ADMIN_PASS=$(rd ryax-admin-credentials password)
+              RYAX_CREDENTIAL_USER=$(rd ryax-user-credentials username)
+              RYAX_CREDENTIAL_PASS=$(rd ryax-user-credentials password)
+              # The address is a secret key rather than "<user>@<domain>" assembled here: the
+              # domain is not knowable from this manifest, and Ryax stores the value verbatim.
+              RYAX_CREDENTIAL_EMAIL=$(rd ryax-user-credentials email)
+              for v in ADMIN_USER ADMIN_PASS RYAX_CREDENTIAL_USER RYAX_CREDENTIAL_PASS RYAX_CREDENTIAL_EMAIL; do
+                [ -n "${!v}" ] || { echo "ERROR: $v empty"; exit 1; }
+              done
+
+              login() {
+                curl -fsS -X POST "$API/login" -H 'Content-Type: application/json' \
+                  -d "{\"username\":\"$1\",\"password\":\"$2\"}" \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["jwt"])'
+              }
+
+              # Ryax is Healthy well before the authorization service serves logins.
+              echo "Waiting for the Ryax authorization API..."
+              JWT=""
+              for i in $(seq 1 60); do
+                JWT=$(login "$ADMIN_USER" "$ADMIN_PASS" 2>/dev/null) && [ -n "$JWT" ] && break
+                echo "  waiting... ($i/60)"; sleep 10
+              done
+              [ -n "$JWT" ] || { echo "ERROR: authorization API never accepted the admin login"; exit 1; }
+
+              AUTH="Authorization: $JWT"   # bare JWT — the Bearer form 401s with an empty body
+              users() { curl -fsS -H "$AUTH" "$API/users"; }
+
+              # id + role of RYAX_CREDENTIAL_USER, or empty when absent.
+              read -r RYAX_USER_ID RYAX_USER_ROLE < <(users | CU="$RYAX_CREDENTIAL_USER" python3 -c '
+              import json, os, sys
+              want = os.environ["CU"]
+              for u in json.load(sys.stdin):
+                  if u["username"] == want:
+                      print(u["id"], u["role"]); break
+              else:
+                  print(" ")') || true
+
+              create() {
+                curl -fsS -X POST "$API/users" -H "$AUTH" -H 'Content-Type: application/json' \
+                  -d "{\"username\":\"$RYAX_CREDENTIAL_USER\",\"password\":\"$RYAX_CREDENTIAL_PASS\",\"role\":\"Admin\",\"email\":\"$RYAX_CREDENTIAL_EMAIL\",\"comment\":\"Provisioned by postsync-ryax-user.yaml\"}" \
+                  >/dev/null
+              }
+
+              if [ -z "${RYAX_USER_ID:-}" ]; then
+                echo "Creating '$RYAX_CREDENTIAL_USER' (Admin)..."
+                create
+              elif [ "$RYAX_USER_ROLE" != "Admin" ]; then
+                # Cannot be promoted in place (see the header) — replace it.
+                echo "'$RYAX_CREDENTIAL_USER' exists with role $RYAX_USER_ROLE, not Admin — recreating..."
+                curl -fsS -X DELETE "$API/users/$RYAX_USER_ID" -H "$AUTH" >/dev/null
+                create
+              else
+                # Already an Admin, so PUT is permitted: resync the password from the secret.
+                echo "'$RYAX_CREDENTIAL_USER' is already an Admin — syncing password from the sealed secret."
+                curl -fsS -X PUT "$API/users/$RYAX_USER_ID" -H "$AUTH" -H 'Content-Type: application/json' \
+                  -d "{\"password\":\"$RYAX_CREDENTIAL_PASS\"}" >/dev/null
+              fi
+
+              # A user with no project is accepted by /login but is DEAD for every runner
+              # call: /projects/users/<id>/current returns {}, the runner does
+              # response_json["id"] on it and raises KeyError, so a deploy is dropped with
+              # NO error surfaced in the UI -- it just never starts. Measured 2026-09-15.
+              # Creating a user does NOT assign one, so this has to be done explicitly.
+              RYAX_USER_ID=$(users | CU="$RYAX_CREDENTIAL_USER" python3 -c '
+              import json, os, sys
+              want = os.environ["CU"]
+              print(next(u["id"] for u in json.load(sys.stdin) if u["username"] == want))')
+
+              CUR=$(curl -fsS -H "$AUTH" "$API/projects/users/$RYAX_USER_ID/current")
+              if printf '%s' "$CUR" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("id") else 1)'; then
+                echo "'$RYAX_CREDENTIAL_USER' already has a current project."
+              else
+                # Attach to the project admin is on -- the chart seeds exactly one
+                # ("Default Project"), and naming it here would break if that changes.
+                PROJ_ID=$(curl -fsS -H "$AUTH" "$API/projects" \
+                  | python3 -c 'import json,sys; ps=json.load(sys.stdin); print(ps[0]["id"] if ps else "")')
+                [ -n "$PROJ_ID" ] || { echo "ERROR: no project exists to assign '$RYAX_CREDENTIAL_USER' to"; exit 1; }
+                echo "Assigning '$RYAX_CREDENTIAL_USER' to project $PROJ_ID..."
+                curl -fsS -X POST "$API/projects/$PROJ_ID/user" -H "$AUTH" \
+                  -H 'Content-Type: application/json' -d "{\"user_id\":\"$RYAX_USER_ID\"}" >/dev/null
+                curl -fsS -H "$AUTH" "$API/projects/users/$RYAX_USER_ID/current" \
+                  | python3 -c 'import json,sys; assert json.load(sys.stdin).get("id"), "still no current project"'
+              fi
+
+              # Prove it: log in AS the account rather than trusting the write.
+              login "$RYAX_CREDENTIAL_USER" "$RYAX_CREDENTIAL_PASS" >/dev/null \
+                || { echo "ERROR: '$RYAX_CREDENTIAL_USER' cannot log in after provisioning"; exit 1; }
+              users | CU="$RYAX_CREDENTIAL_USER" python3 -c '
+              import json, os, sys
+              want = os.environ["CU"]
+              u = next(u for u in json.load(sys.stdin) if u["username"] == want)
+              print("OK: %s role=%s id=%s" % (u["username"], u["role"], u["id"]))
+              assert u["role"] == "Admin", "role is not Admin"'

@@ -1,0 +1,235 @@
+# Seed-user group reconciler — keeps the two bootstrap accounts in the right groups
+# WITHOUT the central folder ever naming an application.
+#
+# Why this exists: membership canNOT live in blueprint-initial-users.yaml as a `groups:`
+# list of !Find tags. That would (a) force every app group to be declared centrally in
+# blueprint-groups.yaml — so a disabled app still gets its group — and (b) be a trap:
+# !Find returns None on a miss rather than raising, and a None in that list invalidates
+# the whole entry, so the importer silently skips it INCLUDING THE PASSWORD. See that
+# file's header.
+#
+# Classification is driven by an attribute on each GROUP, not by a name pattern
+# (a name heuristic would misread e.g. "gitlab-owner"):
+#
+#   ecc/seed: all         → both seed users. Ordinary access groups: employees,
+#                           mfa-exempt, jitsi, zulip, ai, remote-desktop-users,
+#                           windows-users, ryax, …
+#   ecc/seed: admin-only  → testadmin only. authentik-admins, employees-extended,
+#                           argocd-admins, xwiki-oidc-admins, gitlab-admins,
+#                           rocketchat-admins.
+#   ecc/seed: none        → neither. `external` (whose whole point is no access
+#                           until explicitly bound) and the service-account groups
+#                           (oidc-provisioner, ad-provisioner, authentik Admins,
+#                           authentik Read-only).
+#
+# An app adds the label in the SAME create call that makes its group, so a new app
+# needs no change here. Groups are created by the apps with
+#   {"name": ..., "attributes": {"ecc/seed": "all"}}
+# — see deployment/argocd-apps/windows/authentik-provider.yaml for the pattern.
+#
+# ⚠ UNLABELLED groups are NOT synced and are printed as a WARN. That warning is the
+# operational signal that a newly added app still needs its label. Failing closed is
+# deliberate: defaulting to "all" would hand testuser membership in any group anyone
+# creates by hand.
+#
+# ⚠ ADD-ONLY. This never calls remove_user. A reconciler that also removed would turn
+# a single mislabelled group into instant lockout of the admin account you would need
+# in order to fix it. Removing a seed user from a group is a manual operation.
+#
+# ⚠ Auth uses AUTHENTIK_BOOTSTRAP_TOKEN (akadmin), NOT the shared provisioner token.
+# Adding a user to a group requires authentik_core.add_user_to_group, which cannot be
+# scoped to a single group — granting it to the token that 13 app namespaces hold
+# would let any app move any user into authentik-admins. blueprint-provisioner.yaml
+# deliberately grants only add_group/view_group/view_user; keep it that way.
+#
+# Uses POST /core/groups/{pk}/add_user/ rather than PATCH /core/users/{pk}/: the
+# add_user action skips the group-superuser validator, which matters because
+# authentik-admins carries is_superuser (a PATCH would need enable_group_superuser).
+#
+# Set DRY_RUN=1 to log what would change without writing anything.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: authentik-seed-user-group-sync
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: authentik-seed-user-group-sync
+  namespace: authentik
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 300
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: authentik-seed-user-group-sync
+          restartPolicy: Never
+          # Run on the CLOUD nodes, same failure domain as authentik itself (server,
+          # worker and authentik-pg are all cloud-pinned). This talks to the in-cluster
+          # authentik-server Service and writes to its DB; running it from a mesh node
+          # would push every API call across WireGuard for no benefit, and a mesh-node
+          # outage would then also stop seed-user reconciliation.
+          #
+          # Belt-and-braces: mesh nodes are tainted ecc/mesh=true:NoSchedule and this
+          # pod carries NO toleration, so it already cannot land there. The affinity is
+          # the explicit, self-documenting half — it keeps holding if a mesh node ever
+          # comes up before its taint is applied (which has happened on recreate: the
+          # ecc/* labels lag the join), and it states the intent rather than leaving it
+          # to be inferred from an absent toleration.
+          #
+          # REQUIRED, not preferred: unlike a burstable web workload (cf. gitlab
+          # sidekiq's soft affinity), there is nothing to gain from spilling this
+          # 10m-CPU job onto mesh, and failing to schedule is the better outcome than
+          # running somewhere that cannot reach the API.
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/mesh
+                        operator: DoesNotExist
+          containers:
+            - name: sync
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              resources:
+                requests: { cpu: 10m, memory: 48Mi }
+                limits: { memory: 96Mi }
+              env:
+                - name: AUTHENTIK_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: authentik-secrets
+                      key: AUTHENTIK_BOOTSTRAP_TOKEN
+                - name: ADMIN_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: authentik-secrets
+                      key: CLUSTER_ADMIN_USERNAME
+                - name: TEST_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: authentik-secrets
+                      key: TEST_USER_USERNAME
+                - name: DRY_RUN
+                  value: "0"
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  export AUTHENTIK_TOKEN ADMIN_USERNAME TEST_USERNAME DRY_RUN
+                  python3 - <<'PY'
+                  import json, os, urllib.parse, urllib.request, urllib.error
+
+                  API = "http://authentik-server.authentik.svc.cluster.local/api/v3"
+                  LABEL = "ecc/seed"
+                  DRY_RUN = os.environ.get("DRY_RUN", "0") not in ("0", "", "false")
+                  HDRS = {
+                      "Authorization": "Bearer " + os.environ["AUTHENTIK_TOKEN"],
+                      "Content-Type": "application/json",
+                  }
+
+                  def req(method, path, body=None):
+                      data = json.dumps(body).encode() if body is not None else None
+                      r = urllib.request.Request(API + path, data=data, headers=HDRS, method=method)
+                      with urllib.request.urlopen(r, timeout=30) as resp:
+                          raw = resp.read()
+                          return resp.status, (json.loads(raw) if raw else {})
+
+                  def paged(path):
+                      out, page = [], 1
+                      sep = "&" if "?" in path else "?"
+                      while True:
+                          _, r = req("GET", f"{path}{sep}page_size=100&page={page}")
+                          out += r["results"]
+                          nxt = (r.get("pagination") or {}).get("next") or 0
+                          if not nxt or nxt in (0, "null"):
+                              return out
+                          page += 1
+
+                  def find_user(username):
+                      q = urllib.parse.quote(username)
+                      _, r = req("GET", f"/core/users/?username={q}")
+                      for u in r.get("results", []):
+                          if u.get("username") == username:
+                              return u
+                      return None
+
+                  admin_name = os.environ["ADMIN_USERNAME"]
+                  test_name = os.environ["TEST_USERNAME"]
+
+                  # An unreachable API (worker/server restart) is a no-op run, not a failure.
+                  try:
+                      admin = find_user(admin_name)
+                  except urllib.error.URLError as e:
+                      print("Authentik API not reachable yet:", e)
+                      raise SystemExit(0)
+                  test = find_user(test_name)
+
+                  if not admin and not test:
+                      print(f"neither seed user exists yet ({admin_name}, {test_name}) — skipping this run")
+                      raise SystemExit(0)
+
+                  groups = paged("/core/groups/?include_users=false")
+
+                  # username -> set of group pks it should be in
+                  want = {}
+                  if admin:
+                      want[admin["username"]] = (admin, set())
+                  if test:
+                      want[test["username"]] = (test, set())
+
+                  unlabelled, unknown = [], []
+                  for g in groups:
+                      tag = (g.get("attributes") or {}).get(LABEL)
+                      if tag is None:
+                          unlabelled.append(g["name"])
+                          continue
+                      if tag == "all":
+                          for _u, s in want.values():
+                              s.add(g["pk"])
+                      elif tag == "admin-only":
+                          if admin:
+                              want[admin["username"]][1].add(g["pk"])
+                      elif tag != "none":
+                          unknown.append(f"{g['name']}={tag!r}")
+
+                  by_pk = {g["pk"]: g["name"] for g in groups}
+                  added = 0
+                  for username, (user, wanted) in sorted(want.items()):
+                      have = set(user.get("groups") or [])
+                      missing = sorted(wanted - have, key=lambda p: by_pk.get(p, ""))
+                      for gpk in missing:
+                          name = by_pk.get(gpk, gpk)
+                          if DRY_RUN:
+                              print(f"  DRY_RUN would add {username} -> {name}")
+                              continue
+                          try:
+                              req("POST", f"/core/groups/{gpk}/add_user/", {"pk": user["pk"]})
+                              print(f"  added {username} -> {name}")
+                              added += 1
+                          except urllib.error.HTTPError as e:
+                              print(f"  ERROR adding {username} -> {name}: {e.code} {e.read()[:200]}")
+                      if not missing:
+                          print(f"  {username}: already in all {len(wanted)} expected groups")
+
+                  if unknown:
+                      print(f"WARN: groups with an unrecognised {LABEL} value (treated as none): {', '.join(sorted(unknown))}")
+                  if unlabelled:
+                      print(f"WARN: unlabelled groups (not synced) — add {LABEL} to each: {', '.join(sorted(unlabelled))}")
+                  print(f"done: {added} membership(s) added, {len(groups)} group(s) inspected"
+                        + (" [DRY_RUN]" if DRY_RUN else ""))
+                  PY

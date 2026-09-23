@@ -1,0 +1,251 @@
+# Headplane — admin GUI for Headscale
+# Deployed at https://headplane.subdomain.domain.tld/admin/
+# Uses the same OIDC client as headscale for reliable user matching.
+# Connects to headscale via internal cluster service URL.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headplane-config
+  namespace: headscale
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 3000
+      base_url: "https://headplane.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+      cookie_secure: true
+      cookie_domain: "headplane.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+      cookie_max_age: 86400
+      cookie_secret_path: "/etc/headplane/secrets/cookie-secret"
+      data_path: "/data"
+
+    headscale:
+      url: "http://headscale:8080"
+      api_key_path: "/etc/headplane/secrets/api-key"
+      config_strict: false
+
+    oidc:
+      issuer: "https://id.subdomain1.your-domain.tld/application/o/headscale/" # automatically updated from project-settings:{general.subdomain,general.domain}
+      client_id: "headscale"
+      # Read directly from the sealed OIDC secret to avoid PostSync timing races.
+      client_secret_path: "/etc/headplane/oidc/client-secret"
+      # Required by current Headplane OIDC validation (deprecated in favor of headscale.api_key_path).
+      headscale_api_key_path: "/etc/headplane/secrets/api-key"
+
+    integration:
+      kubernetes:
+        # Explicitly disable k8s integration for this topology (headscale runs in a different pod).
+        enabled: false
+        pod_name: "headplane"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headplane
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headplane
+  namespace: headscale
+rules:
+# Headplane needs to read headscale pods and trigger restarts
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headplane
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headplane
+subjects:
+- kind: ServiceAccount
+  name: headplane
+  namespace: headscale
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headplane
+  namespace: headscale
+  annotations:
+    # headplane parses its config at startup only, so editing headplane-config alone leaves
+    # the running pod on the old settings with ArgoCD reporting Synced/Healthy. Reloader
+    # (argocd-infra/reloader) rolls this Deployment when the mounted ConfigMap or Secret
+    # content changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.headplane}
+  # Recreate (not RollingUpdate): headplane mounts a ReadWriteOnce PVC (headplane-data).
+  # A rolling update starts the new pod before terminating the old one, but both want
+  # the same RWO volume → Multi-Attach deadlock (new pod stuck Init, rollout wedged).
+  # Recreate tears the old pod down first, freeing the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: headplane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: headplane
+    spec:
+      serviceAccountName: headplane
+      # Soft spread across nodes so HA replicas land on distinct hosts when possible.
+      # ScheduleAnyway (not DoNotSchedule) keeps the single replica schedulable when
+      # HA is off / fewer nodes than replicas. No-op at replicas:1.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: headplane
+      initContainers:
+      - name: wait-for-headplane-api-key
+        image: busybox:1.38  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          for i in $(seq 1 240); do
+            if [ -s /etc/headplane/secrets/api-key ]; then
+              echo "headplane-secrets.api-key is present"
+              exit 0
+            fi
+            echo "Waiting for headplane-secrets.api-key... ($i/240)"
+            sleep 5
+          done
+          echo "ERROR: headplane-secrets.api-key not available after 20 minutes"
+          exit 1
+        volumeMounts:
+        - name: secrets
+          mountPath: /etc/headplane/secrets
+          readOnly: true
+      containers:
+      - name: headplane
+        image: ghcr.io/tale/headplane:0.7.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+          # Authentik's ingress cert is Let's Encrypt STAGING (untrusted CA) while
+          # testing, so Node.js rejects it during OIDC discovery. "0" disables Node
+          # TLS verification. updateConfigFromProjectSettings.sh sets this to "1"
+          # (verify) when certIssuerType is letsencrypt-prod (trusted certs).
+          - name: NODE_TLS_REJECT_UNAUTHORIZED
+            value: "1" # automatically updated from project-settings:{tls.certIssuerType,tls.nodeTlsReject}
+        volumeMounts:
+        - name: config
+          mountPath: /etc/headplane/config.yaml
+          subPath: config.yaml
+          readOnly: true
+        - name: secrets
+          mountPath: /etc/headplane/secrets
+          readOnly: true
+        - name: data
+          mountPath: /data
+        - name: oidc-client-secret
+          mountPath: /etc/headplane/oidc
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /admin/healthz
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /admin/healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: config
+        configMap:
+          name: headplane-config
+      - name: secrets
+        # headplane-secrets is seeded with cookie-secret by the PreSync bootstrap job.
+        # api-key and oidc-client-secret are added by the PostSync job.
+        # The secret always exists by Sync time (cookie-secret key at minimum).
+        secret:
+          secretName: headplane-secrets
+      - name: data
+        persistentVolumeClaim:
+          claimName: headplane-data
+      - name: oidc-client-secret
+        secret:
+          secretName: headscale-oidc-client-secret
+          items:
+          - key: client-secret
+            path: client-secret
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: headplane-data
+  namespace: headscale
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn-cloud
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headplane
+  namespace: headscale
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: headplane
+  ports:
+  - port: 3000
+    targetPort: http
+    name: http
+---
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once by argocd-infra/gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: headplane
+  namespace: headscale
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - headplane.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # Gateway API backendRefs take a numeric port, not a named one.
+        - name: headplane
+          port: 3000

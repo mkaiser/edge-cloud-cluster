@@ -1,0 +1,35 @@
+# Hand-written HTTPRoute: the zulip chart (2.1.0) has no Gateway API support —
+# only an Ingress template — so its ingress is disabled in values.yaml and the
+# route lives here instead.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once by argocd-infra/gateway.
+#
+# UPLOAD SIZE LIMIT: none at the edge, deliberately.
+# Envoy Gateway v1.5.4 has no typed request-body size cap — neither
+# BackendTrafficPolicy nor ClientTrafficPolicy exposes one (the only maxRequestBytes
+# in its CRDs is SecurityPolicy's ExtAuth body buffer, which is unrelated). A hard
+# cap would need an EnvoyPatchPolicy setting the HTTP connection manager's
+# max_request_bytes — raw Envoy config that must also be enabled in the EnvoyGateway
+# config. Uploads are left unbounded at the edge rather than silently capped; Zulip
+# enforces its own limit application-side (MAX_FILE_UPLOAD_SIZE).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: zulip
+  namespace: zulip
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - zulip.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: zulip
+          port: 80

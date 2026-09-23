@@ -1,0 +1,223 @@
+# Per-node outbound WAN speed probe — DaemonSet on mesh nodes AND control planes.
+#
+# WHY (flappy-network debug, hypothesis 3 "genuinely slow/lossy site link"):
+# the ping/iperf3 probes measure node↔node OVER the mesh. They can't tell "the
+# mesh overlay is bad" from "this site's raw internet is bad". This probe adds
+# the ground truth: each node measures its OWN outbound WAN, download AND upload,
+# against a single common endpoint (Cloudflare's speed API — plain HTTPS/443, no
+# client binary, reachable even from the egress-restricted edge nodes), and
+# pushes the result to the same Pushgateway the other mesh probes use.
+#
+# Bidirectional matters: home/asymmetric links have DL >> UL, and it is the
+# UPLOAD ceiling that throttles Longhorn replica rebuilds and CNPG WAL shipping
+# OUT of a site. Running it on the CPs too gives a cloud-egress baseline to
+# compare the edge numbers against.
+#
+# Scheduling: two near-identical DaemonSets (mesh + control-plane) so it lands on
+# every mesh node (nodeSelector mesh-worker + ecc/mesh toleration, mirroring
+# mesh-iperf3-server) AND every CP (control-plane nodeSelector + tolerate all).
+# CronJobs can't fan out one-pod-per-node, hence DaemonSets with an internal
+# sleep-loop cadence.
+#
+# Image: curlimages/curl has curl baked in — do NOT apk-add at runtime, several
+# edge nodes are behind restrictive egress and can't reach the Alpine CDN (the
+# same failure iperf3-server.yaml documents). site label is read from the k8s
+# API via the shared mesh-probe ServiceAccount (curl + the pod's SA token), same
+# source the ping/iperf3 probes use.
+#
+# Cadence: 10 MB @ 30 min ≈ 480 MB/day/node — negligible on a LAN, non-trivial on
+# a metered home uplink, so INTERVAL_SEC and PAYLOAD_BYTES are env-configurable
+# and default conservative.
+#
+# Metrics pushed (gauge, labels node, site) to
+#   .../metrics/job/mesh_wan/instance/<node>:
+#   - mesh_wan_download_mbps
+#   - mesh_wan_upload_mbps
+#   - mesh_wan_up          (1 if BOTH curls succeeded, else 0 — no egress at all)
+#   - mesh_wan_latency_ms  (time_total of the download, latency-to-CDN figure)
+# No prometheus.yaml change: the Pushgateway ServiceMonitor already scrapes it.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-wan-speedtest
+  namespace: headscale
+data:
+  speedtest.sh: |
+    #!/bin/sh
+    # POSIX sh (curlimages/curl is busybox). Loops forever; one measurement per
+    # INTERVAL_SEC. All arithmetic via awk (busybox has no bc / floats in $()).
+    set -u
+    PUSHGATEWAY="${PUSHGATEWAY:-http://prometheus-pushgateway.prometheus.svc:9091}"
+    INTERVAL_SEC="${INTERVAL_SEC:-1800}"       # 30 min default
+    PAYLOAD_BYTES="${PAYLOAD_BYTES:-10000000}" # ~10 MB each direction
+    NODE="${NODE_NAME:?NODE_NAME must be set}"
+
+    KUBE="https://kubernetes.default.svc"
+    TOKEN_FILE=/var/run/secrets/kubernetes.io/serviceaccount/token
+    CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+    # ecc/site label for THIS node from the k8s API (empty on failure — the CPs
+    # carry no ecc/site, that's fine).
+    SITE_LABEL_KEY="ecc/site"  # automatically updated from project-settings:applicationPlacements.labels.site
+    site_label() {
+      [ -f "$TOKEN_FILE" ] || { echo ""; return; }
+      curl -s --cacert "$CA" -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+        "$KUBE/api/v1/nodes/$NODE" 2>/dev/null \
+        | tr ',{}' '\n\n\n' \
+        | awk -F'"' -v k="$SITE_LABEL_KEY" '$2 == k { print $4; exit }'
+    }
+
+    mbps() { # bytes_per_sec -> Mbit/s, 2 decimals
+      awk -v b="$1" 'BEGIN{ printf "%.2f", (b*8)/1000000 }'
+    }
+
+    push() {
+      SITE="$1"; DL="$2"; UL="$3"; UP="$4"; LAT="$5"
+      BODY=$(printf '%s\n' \
+        "# TYPE mesh_wan_up gauge" \
+        "mesh_wan_up{site=\"$SITE\"} $UP" \
+        "# TYPE mesh_wan_download_mbps gauge" \
+        "mesh_wan_download_mbps{site=\"$SITE\"} $DL" \
+        "# TYPE mesh_wan_upload_mbps gauge" \
+        "mesh_wan_upload_mbps{site=\"$SITE\"} $UL" \
+        "# TYPE mesh_wan_latency_ms gauge" \
+        "mesh_wan_latency_ms{site=\"$SITE\"} $LAT")
+      printf '%s\n' "$BODY" | curl -s --max-time 20 -X PUT \
+        --data-binary @- \
+        "$PUSHGATEWAY/metrics/job/mesh_wan/instance/$NODE" >/dev/null 2>&1
+    }
+
+    while true; do
+      SITE=$(site_label)
+      # Download: report speed_download (bytes/s) and time_total (s). One curl.
+      DLOUT=$(curl -s -o /dev/null \
+        --max-time 120 \
+        -w '%{speed_download} %{time_total}' \
+        "https://speed.cloudflare.com/__down?bytes=$PAYLOAD_BYTES" 2>/dev/null)
+      DL_BPS=$(echo "$DLOUT" | awk '{print $1+0}')
+      DL_TIME=$(echo "$DLOUT" | awk '{print $2+0}')
+      # Upload: stream PAYLOAD_BYTES of zeros, report speed_upload (bytes/s).
+      UL_BPS=$(head -c "$PAYLOAD_BYTES" /dev/zero 2>/dev/null \
+        | curl -s -o /dev/null --max-time 120 \
+            -w '%{speed_upload}' --data-binary @- \
+            'https://speed.cloudflare.com/__up' 2>/dev/null | awk '{print $1+0}')
+
+      DL_MBPS=$(mbps "${DL_BPS:-0}")
+      UL_MBPS=$(mbps "${UL_BPS:-0}")
+      LAT_MS=$(awk -v t="${DL_TIME:-0}" 'BEGIN{ printf "%.1f", t*1000 }')
+      # up=1 only if BOTH directions moved real bytes.
+      UP=$(awk -v d="${DL_BPS:-0}" -v u="${UL_BPS:-0}" \
+        'BEGIN{ print (d>0 && u>0) ? 1 : 0 }')
+
+      push "$SITE" "$DL_MBPS" "$UL_MBPS" "$UP" "$LAT_MS"
+      echo "$(date -u +%FT%TZ) node=$NODE site=$SITE dl=${DL_MBPS}Mbps ul=${UL_MBPS}Mbps up=$UP lat=${LAT_MS}ms"
+      sleep "$INTERVAL_SEC"
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-wan-speedtest
+  namespace: headscale
+  labels:
+    app: mesh-wan-speedtest
+  annotations:
+    # The probe script is read from its ConfigMap at container start. Reloader
+    # (argocd-infra/reloader) rolls this DaemonSet when that content changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: mesh-wan-speedtest
+  template:
+    metadata:
+      labels:
+        app: mesh-wan-speedtest
+    spec:
+      serviceAccountName: mesh-probe
+      nodeSelector:
+        node.kubernetes.io/mesh-worker: "true"
+      tolerations:
+        - key: "ecc/mesh"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      volumes:
+        - name: script
+          configMap:
+            name: mesh-wan-speedtest
+            defaultMode: 0755
+      containers:
+        - name: speedtest
+          image: curlimages/curl:8.22.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "/script/speedtest.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # INTERVAL_SEC / PAYLOAD_BYTES defaulted in the script; override here
+            # per-site if a metered uplink needs a longer interval.
+          volumeMounts:
+            - name: script
+              mountPath: /script
+          resources:
+            requests:
+              cpu: "5m"
+              memory: "16Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
+---
+# Same probe on the control planes — cloud-egress baseline to compare edge WAN
+# numbers against. Separate DaemonSet because the nodeSelector/tolerations differ
+# (CPs carry no mesh-worker label and taint everything NoSchedule).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-wan-speedtest-cp
+  namespace: headscale
+  labels:
+    app: mesh-wan-speedtest
+  annotations:
+    # Same ConfigMap, same startup-read: see the mesh-wan-speedtest DaemonSet above.
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: mesh-wan-speedtest-cp
+  template:
+    metadata:
+      labels:
+        app: mesh-wan-speedtest-cp
+    spec:
+      serviceAccountName: mesh-probe
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: script
+          configMap:
+            name: mesh-wan-speedtest
+            defaultMode: 0755
+      containers:
+        - name: speedtest
+          image: curlimages/curl:8.22.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "/script/speedtest.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: script
+              mountPath: /script
+          resources:
+            requests:
+              cpu: "5m"
+              memory: "16Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"

@@ -1,0 +1,66 @@
+# Sync Job: ensure the Guacamole (xilinx) CNPG pg-backup S3 bucket exists.
+# Idempotent (head-bucket || create-bucket). NOT deleted on app removal (data-safe);
+# full-teardown wipe lives in scripts/environment/deleteS3Buckets.sh.
+#
+#
+# Uses the remote-desktop-s3-secret sealed secret (Hetzner S3 keys, ACCESS_KEY_ID /
+# SECRET_ACCESS_KEY). Hook: Sync + sync-wave -1 so the bucket exists BEFORE the CNPG
+# cluster starts archiving WAL.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-s3-buckets
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: ensure-buckets
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: remote-desktop-s3-secret
+                  key: ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: remote-desktop-s3-secret
+                  key: SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "nbg1" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+            - name: AWS_PAGER
+              value: ""
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ENDPOINT="https://nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+              for BUCKET in edgecloudinfra-remote-desktop-pg; do # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+                if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/dev/null; then
+                  echo "Bucket $BUCKET already exists."
+                else
+                  echo "Creating bucket $BUCKET ..."
+                  aws s3api create-bucket --bucket "$BUCKET" \
+                    --endpoint-url "$ENDPOINT" --region "$AWS_DEFAULT_REGION"
+                  echo "Created $BUCKET."
+                fi
+              done
+              echo "remote-desktop S3 buckets ready."

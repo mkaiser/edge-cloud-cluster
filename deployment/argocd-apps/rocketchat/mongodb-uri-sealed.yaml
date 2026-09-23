@@ -1,0 +1,15 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  name: rocketchat-mongodb-uri
+  namespace: rocketchat
+spec:
+  encryptedData:
+    mongo-uri: AgBnbJW1EK7JoQqCYuqS6PvJl0kuN4zGC/2PCVVPXIGVZbNPUIyxAsZYd5OBqKNEXNM2trY/gXTqgA5+dJdvHuinWU2z6IdD2TES7QBgVbjLaKoUrDdrRYmSWhmRy+8uSpUMFFBBdmMK0lZS1fn+nDetbCOiPOkVu2Yb8SDhn10JNA4fGigzHEvjbrtidPEbtZ42Gd8bSB5e849IFr009KzInmjMXxS1w8j1ufOyN2EU67R4Sx+WcZkJcICMfVWqIm1KUwNtpMM2V9XyJlNOhra8dZ2ZGwNE7CVt0x3ivvwoUkfDedXWESCSMfL+InT5GQ/1E3UF90kPUVXyNhDHBunjKfavNXVpqlS+cjm8htimRQrkB8ydY8M3wls64fy3nWiz7Yc9KXhG/QdeaqJ3Y+Mul3REYp61oDovkBhxpok3O31oQ/ZXHZtZXdYQdYPus0l4F4pjvEf/hq9ZbPAhCFwKRgkmUOtU4ZmlK4OfCsEfv7l4X3rmDQP2XK8i1qnhma3hF6KntGgpBwbl0a7tx25pKYZ9dQjFBdYvJQOw5VIJ29jrojs3dAaQCoqBm46S/XQ60xNFi6xWYU39OfUD87k2dGeXnUSEq1a+l4Vw/maRBgYQaWIjDuH+Qi+PhziKMuZdNMK6KwO5PdSfKJd+LIUrQ960CIJFaZrw4SFWRhjjbM0lR+ayC2qRS216VpUD9QyWZH6nTNl8VSI7FW2M9K3ZSta+nAHpGMVkColSDW2AeRmE2WPs5rT05ilqd1XxBmQV3ncfTP4YOWGsVPi52RHB5f5lWfJU15vjHxKWUs5zRH3REDV7BEvbAedjpF2Zh/qtkSBvzFL5XUsZJ1aMzc90W6oZeoBylgK7I0WkbK62LgaOQ/QClM63Q9R0YSUvRM3VQZF8EHHje1eehvVdlN5IM2JOtxAmeE7KHOzzbK3WUpKjT5bRuopdPIJ2IeJ7sr4=
+  template:
+    metadata:
+      name: rocketchat-mongodb-uri
+      namespace: rocketchat

@@ -1,0 +1,47 @@
+# ArgoCD Application: osxcar-sdv-switch — the external-repo checkout + EDA deploy run.
+#
+# Creates the in-cluster GitLab project (owned by testuser), then checks the EXTERNAL
+# repository out into testuser's home inside the remote-desktop pod, loads
+# xilinx/2024.1 + petalinux/2024.1 and runs ./deploy.sh -hw.
+#
+# ⚠ mesh tier. The work runs inside the remote-desktop pod, which is pinned to the lab, and
+# the modules are pulled from the LAB-LOCAL image registry. There is nothing to do on a
+# cloud-only restore.
+#
+# BEFORE FIRST DEPLOY:
+#   deployment/argocd-apps/osxcar-sdv-switch/sealSecrets.sh   (seal the external Git credentials)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: osxcar-sdv-switch
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/osxcar-sdv-switch
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: osxcar-sdv-switch
+  syncPolicy:
+    # ⚠ NO `automated`, deliberately — the same reasoning as remote-desktop's.
+    # A sync RUNS ./deploy.sh -hw — a Vivado synthesis build inside the desktop pod, which
+    # occupies that pod's CPU for a long stretch. selfHeal would re-run it whenever ArgoCD
+    # saw drift, and prune would delete a Job mid-build. Starting a build is a decision a
+    # human makes: sync this app from the UI, or `argocd app sync osxcar-sdv-switch`.
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # Only a FAILED sync retries. The PreSync project job legitimately waits on GitLab's
+    # cold start after a recreate, which can exceed ArgoCD's default 5 attempts.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

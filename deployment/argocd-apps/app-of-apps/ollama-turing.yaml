@@ -1,0 +1,111 @@
+# ArgoCD Application: Ollama on the discrete-GPU mesh node (smartmirror1, 2x RTX 2070).
+# IN-CLUSTER ONLY — no Ingress; the sole client is the LiteLLM gateway (`turing/*` route),
+# which is what supplies auth, budgets and per-user attribution (the latter needs
+# ENABLE_FORWARD_USER_INFO_HEADERS + user_header_name; see litellm/config.yaml).
+#
+# Distinct from the `ollama` app, which is Thor-only (aarch64, CI-built image, exclusive with
+# vLLM). This one is x86_64 upstream-image and runs 2 replicas pinned one-per-GPU.
+#
+# ignoreDifferences on /spec/replicas, like ollama.yaml and vllm.yaml. Originally omitted on
+# the grounds that "there is nothing to switch here" — the scheduler enforces one pod per
+# card, so the replica count could be a plain git fact. Two things changed that:
+#
+#   * The node has 2 GPUs, so serving a model LARGER than one card means running ONE pod with
+#     nvidia.com/gpu: 2 instead of two 1-GPU pods (llama.cpp layer-splitting; measured
+#     working). That is a
+#     runtime trade between capacity and concurrency, i.e. exactly a replica change.
+#   * Without the ignore, selfHeal reverts any scale within SECONDS. Measured: a 2-GPU test
+#     pod was evicted mid-download and never ran. Suspending the Application's syncPolicy
+#     does NOT help either — the app-of-apps re-applies it from git.
+#
+# So the replica count here is runtime state, not a git fact. Git still supplies the DEFAULT
+# (2 replicas, one per card); a deliberate scale survives until changed back.
+#
+# placement.ecc/tier: mesh — the pod runs on the mesh GPU node (not cloud).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ollama-turing
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/ollama-turing
+    directory:
+      # *.sh + README are dev docs, not cluster objects. No Dockerfile/.gitlab-ci.yml here:
+      # this app uses the upstream image, so there is no CI build to seed.
+      # tools/*.py is an Open WebUI Tool installed by hand through its UI (see README) —
+      # not a k8s object. recurse is left OFF (the default) so the subdirectory is never
+      # scanned; the exclude is belt-and-braces in case recurse is ever turned on.
+      exclude: "{*.sh,README.md,*.py,tools/*}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ollama-turing
+  # The GPU-mode switch must survive selfHeal. It needs BOTH pointers, because the modes
+  # differ in two places at once:
+  #
+  #   2x1-GPU  replicas: 2   nvidia.com/gpu: 1    two models, 2x concurrency (default)
+  #   1x2-GPU  replicas: 1   nvidia.com/gpu: 2    one model up to ~14 GiB (layer split)
+  #   1x1-GPU  replicas: 1   nvidia.com/gpu: 1    HALF this node's serving capacity, one
+  #                                               card left free for another consumer
+  #
+  # ⚠ The first two modes both consume BOTH cards. 1x1-GPU is the only one that leaves a
+  # card free — it exists so Ryax can register a GPU Node Pool on this node
+  # (scripts/midterm-review/ryax-prov.sh, which refuses a node with no free GPU). Switching
+  # to it halves Turing LLM serving, so it is a deliberate capacity trade, not a default.
+  #
+  # ⚠ Open WebUI's set_gpu_mode tool (open-webui/tools-configmap.yaml) knows only the first
+  # two modes and will patch 1x1-GPU away. Use kubectl for this mode.
+  #
+  # /spec/replicas alone was not enough: the GPU count lives in the POD TEMPLATE, so changing
+  # it rolls a new ReplicaSet and selfHeal reverts it within seconds. The escaped `~1` is a
+  # JSON-Pointer literal slash — the key really is "nvidia.com/gpu".
+  #
+  # The rollingUpdate fields are included because the SWITCH needs them, not just the modes.
+  # maxSurge stays 0 (a surge pod on a fully-booked 2-card node has no card and deadlocks),
+  # but maxUnavailable has to rise to the replica count during a GPU-count change. Measured
+  # going 1x2 -> 2x1 with maxUnavailable 1: the controller kept the old 2-GPU pod alive because
+  # it satisfied availability, then tried to schedule a 1-GPU pod with ZERO free cards — the
+  # new pod sat Pending for 7+ minutes and only cleared when the old pod was deleted by hand.
+  # On a 2-card node a GPU-count change simply cannot be done without an interruption.
+  #
+  # Precedent for ignoring an indexed container path: wave8-headscale.yaml, which ignores
+  # /spec/template/spec/containers/0/{args,env,volumeMounts}. The rule those apps established
+  # is that EVERY path a
+  # patcher writes must be ignored, or patch-vs-selfHeal becomes an infinite rollout loop.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: ollama-turing
+      namespace: ollama-turing
+      jsonPointers:
+        - /spec/replicas
+        - /spec/strategy/rollingUpdate/maxSurge
+        - /spec/strategy/rollingUpdate/maxUnavailable
+        # limits only — verified on the live Deployment that spec.requests carries no GPU key
+        # (the API does not mirror an extended resource into requests in the stored spec), so
+        # a requests pointer here would be inert.
+        - /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # ignoreDifferences only silences the DIFF by default; this makes the SYNC itself
+      # respect it, so a sync does not overwrite live replicas.
+      - RespectIgnoreDifferences=true
+    # Retry forever, matching the other GPU apps: the mesh node can be offline (lab LAN /
+    # WireGuard), and without retry a transient failure leaves the app Failed until the next
+    # git change.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

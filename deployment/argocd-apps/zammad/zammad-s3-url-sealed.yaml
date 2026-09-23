@@ -1,0 +1,15 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zammad-s3-url
+  namespace: zammad
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    s3-url: AgCcgVafv5H1JyCBLq6W/Igp6isn2Pv8LlqK703wqolep83ds6e7mK6p/njLD9k6ZDki6/hdNX0DegqFU8hrgB0AKDRDEfDZ09r0aKExQmZ8k8w8O5slt0WvIEh2TOl+7seyiYw7LfBz5qlXw9j/a4AC+apaFUW63f+1c/W0rz01nnYZtBOzhIPVvHhD690kxYHUpx/QkimGPtEuk3i02Kae+h5Bwqnut8hD4xkDuSn+G+n4G+S3ekxro5PPio7WoHsQurz2S/AI4YQVoi+11bF+aH+zAdjhRGYjRMTEMoIXDwh3zc9zqZdyTYpcV/MVyCfUw4ztH2vrzT5M3YfoKyLFXCjhiJRVfZyAZL3i2bigHkYxGv6bMr0CZm89BZ0URhihsLyHx3ZsfDMB51wfSC+4QsEnm4hSjXaI2uovmXm11+maPEs6jURXGcpctOdB3hgtHstJwrgfnbpRF0dEEZEwIwWOuyHgABqgbVcqEzlp3IloRUlVRhXtq7jzrnEbBZ4EHGpsjwKPoC3zrq8PJbjKh11QlIE0VyqHN5cYVhMr/GAFow/Zu48j8Gg/zZpS01193dE90b2FaaTjyVe4GjaQuay2dBYWn4S2P6nIPOnApfaSsFoem5LyMBBqMwMBz6dUGSs39iFuihWPvZJMMxMrRero0vlsQ8rzgDtt7bB7flK1mW9Q5Kh+hZ1sd0gb2uzo9Vdiax63hbEtW6HafVMLe0NDSPIHvGcm+IY5qBA0w8Omnw3Z+8Xm8uq1r+Veqah3jME0UStzT+X9p767dNNiZigy8GqrhOoshtqD8thtZHsBUOu8nYCk/BsTnTmyvgirtG+HmjgLteNetsiTLew1wyTnitF3XzKi7Wsgm1ncVYKFvw3ukvQUDl07nnx6HcX0UYmdyA5PWvY=
+  template:
+    metadata:
+      name: zammad-s3-url
+      namespace: zammad

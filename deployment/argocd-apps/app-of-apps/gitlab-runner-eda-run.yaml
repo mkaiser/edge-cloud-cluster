@@ -1,0 +1,364 @@
+# ArgoCD Application: the [eda-run] GitLab runner — RUNS the EDA toolchains in CI.
+#
+# ⚠ THE POINT OF A SECOND EDA RUNNER. The Kubernetes executor's `runtime_class_name` and
+# `privileged` are RUNNER-WIDE (the runner's own help: "A Runtime Class to use for all
+# created pods"), and the two EDA job kinds need OPPOSITE postures:
+#
+#   [eda]      privileged, NO gVisor  — BUILDS module images. Rootless buildah does not work
+#                                       under k3s/containerd, hence privileged.
+#   [eda-run]  gVisor, unprivileged   — RUNS the toolchains through `module load`. The gVisor
+#                                       sandbox is what makes podman-as-root acceptable; see
+#                                       argocd-apps/module-runtime/README.md.
+#
+# So this cannot be a tag on the existing runner: adding gVisor there would break all six
+# image builds that use [eda].
+#
+# GENERAL PURPOSE, deliberately. Any pipeline that needs Vivado, PetaLinux or HyperLynx to
+# DO WORK — synthesis, simulation (xsim/xvlog), a PetaLinux build, a HyperLynx SI run —
+# selects `tags: [eda-run]`, loads the modules it wants and runs. There is nothing
+# project-specific in this app; osxcar-sdv-switch is simply its first consumer.
+#
+# ⚠ EVERY BUILD POD IS A module-runtime CONSUMER, so it carries the fragment from
+# module-runtime/README.md: the broker sidecar, /modules + /run/module-requests emptyDirs,
+# and /registry mounted READ-ONLY in the broker only. check-module-runtime.sh enforces that.
+#
+# ⚠ `bash -lc`, not `bash -c`, in any job here. /etc/profile.d is sourced by LOGIN shells
+# only and the base image's bashrc fallback is guarded to INTERACTIVE shells; a CI job's
+# shell is neither, so `module` does not exist without -l.
+#
+# Two sources: [1] the runner chart (inline values), [2] this app's git dir carrying the
+# token-mint PreSync hook and the two static NFS PVs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab-runner-eda-run
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: the toolchains and their images live at the lab, and the build pods pin to
+    # ecc/eda-builder nodes there. Nothing to run on a cloud-only restore.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  sources:
+    # [1] the runner chart (inline values)
+    - repoURL: https://charts.gitlab.io
+      chart: gitlab-runner
+      targetRevision: "0.92.2" # renovate: datasource=helm depName=gitlab-runner registryUrl=https://charts.gitlab.io
+      helm:
+        releaseName: gitlab-runner-eda-run
+        valuesObject:
+          gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+          # ⚠ 1, NOT 2. Unlike the [eda] builder there is no per-node hostPath state to
+          # serialise, but a synthesis run is CPU-hungry and these are the same two boxes
+          # that host the AD DC and the desktop. Raise it only with a matching anti-affinity,
+          # and only once a real workload shows the headroom.
+          concurrent: 1
+          runners:
+            secret: gitlab-runner-token-eda-run
+            config: |
+              [[runners]]
+                # Internal clone URL — the external https://gitlab.<tld> is untrusted inside
+                # build pods under letsencrypt-staging.
+                # ⚠ PORT 8181 = workhorse. git-over-HTTP needs the workhorse JWT; 8080 hits
+                # puma directly and returns "Nil JSON web token" 403.
+                clone_url = "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+                # ── env the IN-POD broker needs ───────────────────────────────────────────
+                # broker.sh aborts immediately without REGISTRY_HOST
+                # (`REGISTRY_HOST must be set`), and module-podmand resolves module images as
+                # <REGISTRY_HOST>/<MODULE_IMAGE_BASE>/<name>:<version>. Both point at the
+                # LAB-LOCAL registry over the LAN — the same values desktop-gvisor.yaml sets,
+                # and the reason they are in-cluster names rather than the public GitLab
+                # registry (~126 MB/s against ~5 MB/s, and the public host is unreachable
+                # from the lab under `make production`).
+                #
+                # REGISTRY_TLS_VERIFY=true with REGISTRY_CERT_DIR: image-registry serves TLS
+                # from a PRIVATE in-cluster CA, so skopeo needs that CA explicitly.
+                # ⚠ --cert-dir takes a PLAIN directory of *.crt files, not an OpenSSL hash
+                # dir. presync-registry-ca.yaml publishes it.
+                environment = [
+                  "REGISTRY_HOST=image-registry.image-registry.svc.cluster.local:5000",
+                  "IMAGE_BASE=deployments/infrastructure/eda/modules",
+                  "MODULE_IMAGE_BASE=deployments/infrastructure/eda/modules",
+                  "REGISTRY_TLS_VERIFY=true",
+                  "REGISTRY_CERT_DIR=/run/image-registry-ca",
+                  # ⚠ GATES THE pod_spec PATCH BELOW. Without it the patch is silently
+                  # ignored — no warning, no error — and /dev/fuse reverts to the 9p mount
+                  # that makes fuse-overlayfs spin.
+                  "FF_USE_ADVANCED_POD_SPEC_CONFIGURATION=true",
+                ]
+                # The FlexNet licence server, as a FILE (see the job-script note below).
+                #
+                # ⚠ IT HAS TO BE ON THE POD, not merely in the generated launcher.
+                # module-podmand forwards MODULE_LICENSE_SERVER into the module container
+                # ONLY if it can SEE it in this pod's environment (module-podman.sh:
+                # `${MODULE_LICENSE_SERVER:+-e ...}`) — "a new tool needs BOTH sides". The
+                # xilinx module then maps it to XILINXD_LICENSE_FILE via module.yaml
+                # set_from_secret.
+                #
+                # ⚠ A FILE, NOT AN ENV VAR, because the Kubernetes executor has NO
+                # env-from-secret setting (checked: only node_selector / tolerations /
+                # pod_labels take substitutions). So the JOB SCRIPT reads this file and
+                # exports the variable. Do not "simplify" it into `environment = [...]`
+                # above — that would put the licence host in git.
+                #
+                # `eda-secrets`, owned by eda/secrets and sealed into BOTH this namespace
+                # and remote-desktop from ONE value — licensing is an EDA concern, and this
+                # runner is one of two runtimes that needs it. Never remote-desktop-secrets:
+                # that one carries the RDP and Postgres passwords, which a CI job has no
+                # business with.
+                # ⚠ The job reads license-flexnet (the full FlexNet list) — see the script.
+                #
+                # Reachability: tcp/27000 on the lab licence server answers from the lab
+                # nodes (verified from pcie-tb-d) and NOT from cloud pods — fine, because
+                # these build pods pin to ecc/eda-builder, i.e. the lab.
+                [[runners.kubernetes.volumes.secret]]
+                  name = "eda-secrets"
+                  mount_path = "/run/license"
+                  read_only = true
+                [runners.kubernetes]
+                  namespace = "gitlab-runner"
+                  # The desktop base image: it already carries `broker`, `module-podmand` and
+                  # the /etc/profile.d/z10-module.sh drop-in, i.e. three of the four
+                  # module-runtime pieces. Pulled from the lab-local registry over the LAN
+                  # (127.0.0.1:30500 is the image-registry NodePort) rather than GitLab's
+                  # S3-backed one — ~126 MB/s against ~5 MB/s.
+                  # ⚠ Keep this tag in step with remote-desktop's IMAGE_TAG; a module built
+                  # against a newer base can need libraries only that base has.
+                  image = "127.0.0.1:30500/image-archives/remote-desktop:base-r69"
+                  # ⚠ NOT privileged, and NOT negotiable. This runner exists because the
+                  # gVisor sandbox — not a capability grant — is what makes podman-as-root
+                  # acceptable for running module images. privileged would also stop the
+                  # broker sidecar starting at all (runsc cannot start a privileged
+                  # subcontainer on pcie-tb-d; ALL containers then fail together).
+                  privileged = false
+                  # ⚠ SYS_ADMIN, AND IT IS NOT A LOOSENING OF `privileged = false`. Nested
+                  # podman needs mknod to create /dev/null inside the module container;
+                  # without it every launcher dies with
+                  #   Error: crun: mknod `/dev/null`: Operation not permitted: OCI
+                  #   permission denied
+                  # which module-podmand reports only as `container exited rc=125` — the
+                  # tool's own log stops after "Invoking vivado in batch mode" and names
+                  # nothing. Reproduced directly in an unprivileged gVisor pod on ecc204.
+                  #
+                  # ⚠ WHAT CONTAINS IT IS THE SANDBOX, NOT THE CAPABILITY SET. This is the
+                  # same grant desktop-gvisor.yaml already makes, with its reasoning: "under
+                  # gVisor capabilities never reach the host Linux kernel at all", so
+                  # SYS_ADMIN here is authority over the sandbox, not the node. The exposure
+                  # is strictly SMALLER than the desktop's — that pod gives shells to
+                  # unprivileged LDAP users, whereas these pods run only the pipeline from
+                  # the mirrored repo.
+                  #
+                  # ⚠ IT DOES NOT MAKE THE POD PRIVILEGED, and must not be replaced by
+                  # `privileged = true`: runsc cannot start a privileged SUBCONTAINER on
+                  # pcie-tb-d, and every container in the pod then fails together.
+                  cap_add = ["SYS_ADMIN"]
+                  # ⚠ THE WHOLE REASON THIS RUNNER IS SEPARATE. Applies to every pod this
+                  # runner creates, which is why it cannot be a per-job setting on [eda].
+                  # `runsc` is registered as a RuntimeClass on both ecc/eda-builder nodes.
+                  runtime_class_name = "runsc"
+                  # ⚠ THE KUBELET PULLS THE JOB IMAGE, so it needs a secret keyed to the
+                  # NodePort host `127.0.0.1:30500` — NOT the FQDN-keyed image-registry-cred,
+                  # because a pull secret is matched by registry HOST STRING. Without this
+                  # the pod never starts and the job dies in prepare_script with
+                  # `no basic auth credentials`, before a single script line runs (measured
+                  # on ecc204). Sealed by image-registry/sealSecrets.sh into this namespace.
+                  image_pull_secrets = ["image-registry-cred-node"]
+                  # Same capability label as the [eda] builder — these are the boxes with the
+                  # toolchain images cached and the LAN path to the registry.
+                  [runners.kubernetes.node_selector]
+                    "ecc/eda-builder" = "true"  # automatically updated from project-settings:applicationPlacements.labels.edaBuilder
+                  # Mesh nodes are tainted; without this the build pod stays Pending.
+                  [[runners.kubernetes.node_tolerations]]
+                    key = "ecc/mesh"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+                    operator = "Exists"
+                    effect = "NoSchedule"
+                  # A synthesis run is the workload; size it like one rather than the 2-core
+                  # default the scheduler would otherwise see.
+                  cpu_request = "8"
+                  memory_request = "16Gi"
+                  cpu_limit = "12"
+                  memory_limit = "48Gi"
+                  # Module images are tens of GB and podman unpacks them into the pod.
+                  ephemeral_storage_request = "120Gi"
+                  # The image-registry CA. REGISTRY_CERT_DIR above NAMES this path, but an
+                  # env var mounts nothing on its own — without this volume skopeo cannot
+                  # verify the registry's private CA and the broker reports
+                  #   ERROR <module>: image ...@sha256:... is not in the registry and there
+                  #   is no archive
+                  # for an image that IS present (measured on ecc204: both module digests
+                  # existed in the blob store). The message names the wrong cause, so check
+                  # this mount FIRST when a module will not load in CI.
+                  # ⚠ --cert-dir takes a PLAIN directory of *.crt files, hence the ca.crt key.
+                  [[runners.kubernetes.volumes.config_map]]
+                    name = "image-registry-ca"
+                    mount_path = "/run/image-registry-ca"
+                    read_only = true
+                  # ── the module-runtime fragment ────────────────────────────────────────
+                  # /modules and /run/module-requests are the broker↔CLI protocol and MUST
+                  # be pod-local emptyDirs: the status files are per-pod, so a shared volume
+                  # would cross-talk between builds.
+                  [[runners.kubernetes.volumes.empty_dir]]
+                    name = "modules"
+                    mount_path = "/modules"
+                  [[runners.kubernetes.volumes.empty_dir]]
+                    name = "module-requests"
+                    mount_path = "/run/module-requests"
+                  # ⚠ /dev/fuse IS DELIVERED BY A POD-SPEC PATCH, NOT AN EXECUTOR VOLUME,
+                  # because an executor host_path has no `type` field and would mount a
+                  # DIRECTORY over /dev/fuse.
+                  #
+                  # ⚠ BUT IT IS NOT WHAT MAKES MODULES RUN, and the note that used to stand
+                  # here ("the base image configures podman with mount_program =
+                  # /usr/bin/fuse-overlayfs, which needs the FUSE CHARACTER DEVICE") pointed
+                  # at the wrong fix. Under gVisor /dev/fuse arrives inside the sandbox as a
+                  # 9p FILESYSTEM even WITH type: CharDevice — verified in the running
+                  # desktop pod, major/minor 0/0, and `fuse-overlayfs` cannot mount there at
+                  # all. Modules run because the job STRIPS that mount_program and uses
+                  # KERNEL overlay (which does work under runsc), exactly as
+                  # remote-desktop's startup script has always done. See step 0 of
+                  # osxcar-sdv-switch/ci/osxcar-sdv-switch.yml.
+                  # This patch is kept because podman still probes the device, and removing
+                  # it is a separate experiment from the rc=126 fix.
+                  #
+                  # An executor `[[runners.kubernetes.volumes.host_path]]` has NO `type`
+                  # field, so it produces a hostPath with type unset. Under gVisor that
+                  # arrives inside the pod as a 9p FILESYSTEM:
+                  #   none /dev/fuse 9p rw,trans=fd,rfdno=60,...
+                  # fuse-overlayfs then opens a filesystem where it expects a device and
+                  # SPINS: measured on ecc204, `podman pull` alive with no child process,
+                  # one thread in state R and ~412 s of CPU, the store frozen at 79 MB on
+                  # BOTH builder nodes while nginx showed only 3 blob requests served.
+                  # It never errors — it just never finishes, so the job burns its timeout.
+                  #
+                  # desktop-gvisor.yaml gets this right with `type: CharDevice`, which only
+                  # a real pod spec can express — hence the patch below.
+                  # ⚠ Requires FF_USE_ADVANCED_POD_SPEC_CONFIGURATION (set in `environment`
+                  # above); without the flag the patch is SILENTLY IGNORED and the spin
+                  # returns.
+                  [[runners.kubernetes.pod_spec]]
+                    name = "fuse-device"
+                    patch_type = "strategic"
+                    patch = """
+                    containers:
+                    - name: build
+                      volumeMounts:
+                      - name: dev-fuse
+                        mountPath: /dev/fuse
+                    volumes:
+                    - name: dev-fuse
+                      hostPath:
+                        path: /dev/fuse
+                        type: CharDevice
+                    """
+                  # ⚠ A hostPath, AND IT IS LOAD-BEARING: the xilinx module image is
+                  # TWO layers, the second a SINGLE 42.8 GB BLOB (read the manifest —
+                  # `layers: 2`, 31.6 MB then 42767 MB). At the ~32 MB/s this registry
+                  # sustains that is ~23 min, and an emptyDir dies with the pod, so every
+                  # job would pay it again.
+                  #
+                  # ⚠ AN emptyDir WAS TRIED (df7194c6) TO CHASE A BUG THAT DOES NOT EXIST.
+                  # The "rc=126 / fuse-overlayfs cannot mount / store frozen at 79 MB" it
+                  # was blamed for was THIS DOWNLOAD, killed mid-flight by 12-15 min probe
+                  # timeouts. 79 MB is layer 1 extracted; the store cannot grow again until
+                  # the 42.8 GB blob finishes, so a flat `du` is the EXPECTED shape, not a
+                  # stall. Do not re-derive that: read the manifest first.
+                  #
+                  # ⚠ THE PATH IS SHARED WITH THE DESKTOP, ON PURPOSE — same literal in
+                  # remote-desktop/desktop-gvisor.yaml. pcie-tb-s runs both, so one 42.8 GB
+                  # pull there now serves the desktop AND every CI job instead of each
+                  # paying its own ~23 min. The kubelet's image cache cannot do this for us:
+                  # podman inside the pod does the pull, so containerd never sees the layers
+                  # (measured — 43 cached images on pcie-tb-s, none of them EDA).
+                  #
+                  # Two writers into one store is safe on TWO locks, and both are in the
+                  # store rather than in a pod:
+                  #   - podman's own storage.lock in the graphroot, which serialises the
+                  #     metadata writes;
+                  #   - module-podman.sh's per-image pull lock, which it now takes in
+                  #     <graphroot>/.module-pull-locks. That one used to live in the
+                  #     pod-local /run/module-pulls emptyDir, where it serialised only the
+                  #     users of ONE pod — two pods would each have taken their own copy and
+                  #     both started the same 42.8 GB fetch. Do NOT move it back.
+                  #
+                  # ⚠ SAFE ONLY WHILE concurrent = 1 (above). A hostPath is per-NODE, so
+                  # raising concurrency needs a hard one-build-per-node anti-affinity first
+                  # — the same coupling gitlab-runner-eda documents for /build-scratch.
+                  [[runners.kubernetes.volumes.host_path]]
+                    name = "podman-store"
+                    mount_path = "/var/lib/containers/storage"
+                    host_path = "/var/lib/eda-module-podman"
+                  # The module MANIFESTS, READ-ONLY.
+                  #
+                  # ⚠ THE PRIVILEGE SPLIT IS DIFFERENT HERE THAN IN THE DESKTOP, ON PURPOSE.
+                  # There the broker is a separate sidecar and this mount appears ONLY in it,
+                  # because the desktop container is where unprivileged LDAP users have
+                  # shells. The Kubernetes executor has no sidecar setting, so a CI job runs
+                  # `broker` inside its OWN container and the mount has to be there too.
+                  #
+                  # What keeps that acceptable is that the mount is READ-ONLY: writing
+                  # <name>/<version>/module.yaml is what authorises running an image as root
+                  # (broker.sh allowed(), fail-closed), and a CI job cannot write. It can run
+                  # only modules an EDA app has already registered. Do NOT drop read_only —
+                  # a job could then authorise its own arbitrary image as root.
+                  #
+                  # ⚠ And unlike the desktop there is no untrusted user in this pod: the job
+                  # script IS the payload, and it comes from the mirrored repo.
+                  [[runners.kubernetes.volumes.pvc]]
+                    name = "nfs-eda-modulefiles-ci"
+                    mount_path = "/registry"
+                    read_only = true
+                  # Build OUTPUTS, read-write. Jobs must write under
+                  # <project>/<branch>-<short-sha>/ — the export is shared with every
+                  # interactive machine.
+                  [[runners.kubernetes.volumes.pvc]]
+                    name = "nfs-eda-builds-ci"
+                    mount_path = "/builds-out"
+                  # The registry credential the in-pod broker pulls module images with.
+                  #
+                  # ⚠ THE READ-ONLY `eda-pull` ACCOUNT, and that is load-bearing. The
+                  # gitlab-runner namespace ALREADY has `image-registry-cred`, but that one
+                  # carries `eda-push` for the image BUILDS on the [eda] runner. What this
+                  # registry serves is executed AS ROOT by the broker, so push rights are
+                  # effectively root-execution rights — image-registry/sealSecrets.sh spells
+                  # this out and nginx (authz-configmap.yaml) answers 405 to a non-GET from
+                  # eda-pull precisely to enforce it.
+                  #
+                  # Hence its OWN secret name rather than reusing image-registry-cred.
+                  # ⚠ It must be sealed first — image-registry/sealSecrets.sh needs an entry
+                  # for (gitlab-runner, image-registry-cred-pull) with PULL_USER. Until then
+                  # a job fails at the first module pull with "no basic auth credentials".
+                  [[runners.kubernetes.volumes.secret]]
+                    name = "image-registry-cred-pull"
+                    mount_path = "/run/registry-cred"
+                    read_only = true
+          rbac:
+            create: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+    # [2] this app's own git dir — the token-mint PreSync job and the two static NFS PVs
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/gitlab-runner-eda-run
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab-runner
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    # ⚠ RETRY FOREVER — the PreSync hook mints its token through the GitLab API, which is
+    # not serving yet on a recreate. ArgoCD's default budget is 5 retries; the [eda] runner
+    # burned all five on the ecc187 recreate and stayed Failed permanently, taking the whole
+    # EDA desktop with it. Same block as gitlab-runner-eda.yaml — read its comment.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

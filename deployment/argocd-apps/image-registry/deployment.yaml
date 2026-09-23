@@ -1,0 +1,250 @@
+# Lab-local OCI registry for EDA module images — plain `registry:3`, NFS-backed.
+#
+# WHY A SECOND REGISTRY rather than moving GitLab's onto NFS (Option A in
+#): GitLab's registry subchart is the only one of twelve that
+# never calls the `gitlab.extraVolumes`/`extraVolumeMounts` helpers, so a PVC cannot be
+# mounted into it without forking the chart or post-rendering it — and an NFS-backed GitLab
+# registry would have to be lab-only, leaving it Pending on every fresh cluster (all
+# appliance-LAN nodes are MESH nodes adopted AFTER bootstrap) while other apps' PreSync jobs
+# wait on a registry that cannot start. This app carries none of that: lab-only is correct
+# BY DESIGN here, and deleting it reverts everything.
+#
+# ⚠ SINGLE REPLICA, and it must stay that way while this uses the `filesystem` driver on a
+# shared NFS export. Upstream permits multi-replica on shared storage, but only the
+# database-backed registry serialises writes safely; with `database.enabled: false` (as
+# here) two replicas can interleave blob uploads on one directory.
+#
+# ⚠ HTTPS on :5000, from a PRIVATE in-cluster CA, and `auth: htpasswd` is required.
+#
+# WHY AUTH IS MANDATORY HERE, unlike gitlab/registry-preferclose-service.yaml (which fronts
+# GitLab's registry and inherits ITS auth): what this registry serves gets executed AS ROOT.
+# The broker's allowed() gate authorises a module by <repo>:<tag>; it does NOT verify the
+# CONTENT at that tag. So an unauthenticated registry lets anything that can reach the
+# Service overwrite an already-registered tag — including the remote-desktop container,
+# where unprivileged LDAP users have shells — and the next `module load` would have the
+# PRIVILEGED broker pull and run it as root. That is the same boundary the image-registry /
+# eda-modulefiles dataset split exists to protect, so leaving it open here would have
+# defeated the split.
+#
+# Defence in depth, both layers deliberate:
+#   1. htpasswd credential (this file + registry-auth-sealed.yaml) — proves WHO is pushing.
+#   2. CiliumNetworkPolicy (networkpolicy.yaml) — limits WHO CAN REACH the Service at all,
+#      to the [eda] runner's build pods and the remote-desktop broker.
+# Cilium runs enable-policy=default (deny only where a policy selects), so layer 2 does
+# nothing until a policy selects this pod — which networkpolicy.yaml does.
+#
+#   3. TLS from a private CA (tls-cert.yaml) — encrypts the basic-auth credential, which
+#      would otherwise cross the pod network base64-encoded on every push and pull.
+#
+# ⚠ The cert comes from an in-cluster CA, NOT Let's Encrypt: the served name is
+# image-registry.image-registry.svc.cluster.local, which a public issuer cannot sign. Consumers
+# must trust the image-registry-ca ConfigMap or they fail with x509 UnknownAuthority.
+#
+# Still ClusterIP with no HTTPRoute, and it should stay that way: the CA is private, so an
+# external client would have no way to verify it.
+#
+# ⚠ `REGISTRY_STORAGE_DELETE_ENABLED` IS STILL FALSE, AND STAYS FALSE. Reclaim happens in
+# retention-cronjob.yaml, which removes tag links on the filesystem and then runs
+# `registry garbage-collect -m` — no API delete, so no account ever gains DELETE. Turning
+# this on would give every pusher that power, and the authz front cannot tell a retention
+# delete from any other. See README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-registry
+  namespace: image-registry
+  annotations:
+    # ⚠ WITHOUT THIS THE APP DEADLOCKS ON ITS OWN FIRST SYNC. the
+    # sync sat on "waiting for healthy state of apps/Deployment/image-registry" while the
+    # pod was stuck ContainerCreating on `secret "image-registry-auth" not found` — and the
+    # SealedSecret that creates that secret was IN THE SAME SYNC, still OutOfSync behind
+    # the health gate. The Deployment cannot become healthy until the sync completes, and
+    # the sync will not complete until the Deployment is healthy.
+    #
+    # Same annotation and same reasoning as remote-desktop/desktop-gvisor.yaml, which hit
+    # this class of deadlock for 145 minutes. Skipping the health check does not make the
+    # pod any less observable — `kubectl -n image-registry get pods` still tells the truth;
+    # it only stops ArgoCD from blocking a sync on it.
+    argocd.argoproj.io/sync-options: Skip health check
+    # The registry and its nginx authz sidecar read their config, htpasswd and TLS keypair
+    # at startup. Reloader (argocd-infra/reloader) rolls the Deployment when
+    # image-registry-authz, image-registry-auth or image-registry-tls change — the last of those
+    # is cert-manager-renewed, so without this the pod keeps serving an expired cert.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  # k8s default is 600s. Too short here: on a cluster recreate this app can be synced
+  # while csi-driver-nfs is still coming up on the mesh node, so the pod sits in
+  # ContainerCreating on "driver name nfs.csi.k8s.io not found in the list of registered
+  # CSI drivers". ~33 min from sync start to Running, so the
+  # Deployment tripped its progress deadline at 600s and ArgoCD marked the operation
+  # Failed (after 5 retries) even though the pod came up fine and served afterwards.
+  # 1800s covers the CSI bring-up without hiding a genuinely wedged rollout.
+  progressDeadlineSeconds: 1800
+  strategy:
+    # RWX NFS + filesystem driver: never two writers at once, not even briefly.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: image-registry
+  template:
+    metadata:
+      labels:
+        app: image-registry
+    spec:
+      # Below the EDA builds it serves but above best-effort: a build blocked on a missing
+      # registry wastes far more than this pod's footprint.
+      priorityClassName: standard
+      # ⚠ HARD pin to the appliance LAN. The NFS CSI node DaemonSet runs ONLY on nodes
+      # carrying ecc/fileserver-lan
+      # (csi-driver-nfs/values.yaml nodeSelector), so this pod is unschedulable anywhere
+      # else — and the whole point is to be LAN-local to the appliance.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: registry
+          image: docker.io/library/registry:3.1.1 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /var/lib/registry
+            # ⚠ LOOPBACK ONLY. The registry is reachable exclusively through the `authz`
+            # nginx container in this pod, which owns TLS, authentication AND authorisation
+            # (authz-configmap.yaml). Binding this back to 0.0.0.0 would expose an
+            # UNAUTHENTICATED registry on the pod IP, behind a Service that looks unchanged.
+            - name: REGISTRY_HTTP_ADDR
+              value: "127.0.0.1:5100"
+            # Behind a proxy the registry must emit RELATIVE Location headers for uploads;
+            # with absolute ones the client is redirected to 127.0.0.1:5100 and the push
+            # dies on the second request with a connection error that names the wrong host.
+            - name: REGISTRY_HTTP_RELATIVEURLS
+              value: "true"
+            # Multi-GB layer uploads: keep the whole blob out of /tmp in the container's
+            # own (small) filesystem — inprogress uploads live under the rootdirectory.
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "false"
+            # ⚠ NO REGISTRY_AUTH HERE ANY MORE, DELIBERATELY. htpasswd in distribution
+            # authenticates without authorising: every account that can log in can push.
+            # nginx does both now. Re-adding it would not be harmful in itself, but it
+            # would make the loopback bind look optional — it is not.
+            # ⚠ HEALTH PROBES CANNOT USE /v2/. That endpoint is behind the htpasswd
+            # challenge, so the kubelet — which sends no credentials — gets a 401 and the
+            # pod NEVER becomes Ready even though the registry is serving perfectly
+            # (observed on the first deploy: "error authorizing context ... invalid
+            # authorization credential", GET /v2/ 401, from useragent kube-probe).
+            #
+            # The debug server's /debug/health is unauthenticated and plain HTTP. It
+            # defaults to binding LOCALHOST, which the kubelet cannot reach, so the address
+            # is set explicitly here.
+            - name: REGISTRY_HTTP_DEBUG_ADDR
+              value: "0.0.0.0:5001"
+          ports:
+            # ⚠ THE REGISTRY'S OWN PORT IS DELIBERATELY NOT DECLARED. It binds 127.0.0.1:5100
+            # (REGISTRY_HTTP_ADDR above), so there is nothing for a Service or a probe to
+            # target and declaring it would only advertise a port that cannot be reached.
+            # It also matters mechanically: `ports` merges on containerPort, so re-pointing
+            # a NAMED port at a new number leaves the old entry in place and the apply fails
+            # with `ports[1].name: Duplicate value: "registry"` — against the live object,
+            # under both client- and server-side apply.
+            #
+            # Debug/health + prometheus. Not exposed by the Service — probes are local to
+            # the node and nothing off-pod should reach an unauthenticated endpoint.
+            - name: debug
+              containerPort: 5001
+          volumeMounts:
+            - name: blobs
+              mountPath: /var/lib/registry
+          readinessProbe:
+            # Plain HTTP on the DEBUG port, not /v2/ on 5000 — see REGISTRY_HTTP_DEBUG_ADDR.
+            httpGet: { path: /debug/health, port: 5001 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /debug/health, port: 5001 }
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            # Generous: a multi-GB push keeps the process busy and a 1s default timeout
+            # would restart the pod mid-upload.
+            timeoutSeconds: 10
+          # ⚠ THE LIMIT MUST COVER NFS WRITEBACK, NOT THE PROCESS. The registry's own heap is
+          # tiny (~15 MB anon under load); what fills this cgroup is PAGE CACHE for the blob
+          # store, which is an NFS export. Incoming blob data becomes dirty pages faster than
+          # NFS drains them (~22 MB/s effective under two concurrent pushes vs LAN-speed
+          # writers), and dirty/writeback pages count against the container's memory limit.
+          #
+          # At 2Gi this OOMKilled 12 times once the [eda] runner went
+          # to concurrent=2: cgroup pinned 790 KB under the limit with file_writeback at
+          # 1.52 GB and 292470 throttle events, while `kubectl top` reported a harmless
+          # "25Mi" (it samples ~60s and does not account page cache — do NOT diagnose this
+          # with top). Each kill drops the push mid-PATCH, which the client sees as
+          # "connection reset by peer" then "connection refused" — it reads as a network
+          # fault, and buildah does NOT resume, so every retry re-pushes from byte 0 and
+          # strands another multi-GB partial under _uploads.
+          #
+          # 8Gi is headroom for two concurrent multi-GB pushes against this export. Raising
+          # `concurrent` in gitlab-runner-eda.yaml or adding a third pusher means revisiting
+          # this number. requests stays low: the steady-state RSS really is ~15 MB.
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "2", memory: 8Gi }
+        # ── AUTHZ FRONT ──────────────────────────────────────────────────────────
+        # Owns TLS, authentication and, unlike the registry, AUTHORISATION. See
+        # authz-configmap.yaml for why this is a separate process rather than registry
+        # configuration: htpasswd in distribution cannot express read-only.
+        - name: authz
+          image: docker.io/library/nginx:1.31.6-alpine # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
+          ports:
+            - name: https
+              containerPort: 5000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: authz-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: nginx-tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket: { port: 5000 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            # A byte pump in front of multi-GB pushes: no CPU limit, for the same reason as
+            # gitlab-s3-proxy. Memory stays small because nothing is buffered.
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: authz-config
+          configMap:
+            name: image-registry-authz
+        - name: nginx-tmp
+          emptyDir: {}
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: nfs-images
+        - name: auth
+          secret:
+            secretName: image-registry-auth
+        - name: tls
+          secret:
+            # Populated by cert-manager from tls-cert.yaml. The pod will not start until
+            # the Certificate is issued — that is the intended ordering, not a deadlock.
+            secretName: image-registry-tls

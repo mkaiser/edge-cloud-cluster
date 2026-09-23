@@ -1,0 +1,597 @@
+# Seed content for HERMES_HOME (/home/eda-pcb-agent/.hermes, on the NFS home).
+#
+# ⚠ HERMES_HOME IS ON THE SHARED NFS HOME, not a private PVC as in the `hermes` app. That is
+# the point: ~/.hermes/kanban.db and the agent's memories then survive the pod, the node and
+# a cluster recreate. The X session does not — tmux makes it re-attachable, not immortal.
+#
+# WHY A ConfigMap + an initContainer copy rather than a mount: a subPath mount into a
+# populated directory does not track ConfigMap updates, and mounting over ~/.hermes would
+# hide the agent's own state. The seed step in deployment.yaml copies instead — config.yaml
+# is overwritten on EVERY start (git is the source of truth) while SOUL.md and the Kanban
+# board are seeded ONCE, because the agent edits both and stomping them would erase its work.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-pcb-agent-hermes-bootstrap
+  namespace: eda-pcb-agent
+data:
+  # ⚠ `_config_version` IS DELIBERATELY ABSENT. Every start logs
+  #     WARNING: This config predates version 12 (~2 years old) and can no longer be
+  #     auto-migrated ... or manually set _config_version: 12
+  # Do NOT follow that advice. Three reasons, checked against the vendored source at
+  # v2026.9.11:
+  #   1. An absent key coerces to 0 (config.py _coerce_config_version), which is BELOW
+  #      config_migrations.py SUPPORT_FLOOR_VERSION = 12. Below the floor the file is left
+  #      BYTE-FOR-BYTE UNTOUCHED and defaults are deep-merged at read time — exactly what we
+  #      want from a git-owned config. The docstring is explicit that a raw absent version
+  #      "must remain visible as legacy instead of inheriting the latest default version".
+  #   2. The current version is 38, not 12. Setting 12 would invite 26 real migration steps
+  #      to run against this file instead of silencing anything.
+  #   3. It could not persist anyway: the seed initContainer rewrites config.yaml from this
+  #      ConfigMap on EVERY start (git is the source of truth), so any migration Hermes wrote
+  #      back would be erased on the next boot.
+  # The warning is therefore cosmetic here. Verified on ecc205 after the v2026.9.11 bump: the
+  # live config keeps provider "custom" -> the LiteLLM base_url and answers a real completion.
+  config.yaml: |
+    # Managed by ArgoCD (deployment/argocd-apps/eda-pcb-agent/hermes-bootstrap-configmap.yaml).
+    # Overwritten on every pod start — edit it in git, not in the pod.
+
+    # --- Inference backend -----------------------------------------------------
+    # Everything goes through the LiteLLM gateway so this agent's spend is attributed to its
+    # OWN virtual key. "custom" is the provider id for any OpenAI-compatible endpoint.
+    model:
+      provider: "custom"
+      base_url: "http://litellm.litellm.svc:4000/v1"
+      # ⚠ MUST be set explicitly. Hermes resolves the custom-provider credential as
+      #   explicit api_key  ->  $OPENAI_API_KEY  ->  literal "no-key-required"
+      # and s6 does NOT pass the container environment to supervised services, so relying on
+      # env yields `HTTP 401: LiteLLM Virtual Key expected. Received=no-k****ired` on every
+      # request. An explicit value short-circuits the chain.
+      #
+      # ${LITELLM_KEY} is substituted by the seed initContainer, which guards against a
+      # missed substitution — the ConfigMap in git holds the literal, never the secret.
+      api_key: "${LITELLM_KEY}"
+      # LiteLLM route: `coder` = vLLM on the Thor, serving
+      # unsloth/Qwen3.6-35B-A3B-NVFP4-Fast.
+      #
+      # ⚠ MOVED OFF thor/qwen3-coder:30b 2026-09-18 BECAUSE THAT ROUTE CANNOT CALL TOOLS.
+      # ollama's compiled-in `PARSER qwen3-coder` never engages when the model omits the
+      # opening <tool_call> tag, so the whole call leaked into message content as literal
+      #     <function=terminal><parameter=command>…</parameter></function></tool_call>
+      # (note the orphan closing tag) and the agent executed nothing — every turn ended
+      # finish_reason=stop, tool_turns=0, with the call printed as prose in the chat. That is
+      # ollama/ollama#16686, OPEN since 2026-06-12, with fixes #17742/#16398/#17021 all
+      # unmerged; no ollama release fixes it. vLLM parses the SAME XML shape correctly via
+      # --tool-call-parser qwen3_xml.
+      #
+      # MEASURED on this cluster with the agent's real 38 tool schemas + its real SOUL.md:
+      #   thor/qwen3-coder:30b (ollama)   4/4 FAILED, leaked <function=…> every time
+      #   coder (vLLM)                    0/4 failed, proper tool_calls every time
+      #
+      # ⚠ The earlier note here preferred ollama on speed (56.8 vs 9.0 tok/s). That number
+      # was Marlin FP4 EMULATION on the old AWQ checkpoint — a different build from today's
+      # native NVFP4 — and speed is worth nothing to a tool-loop agent that cannot call a
+      # tool at all. Re-measure before treating the comparison as current.
+      #
+      # ⚠ Do NOT point at a `turing/*` id without checking the provider: a route on the plain
+      # `ollama/` provider SILENTLY DROPS tool_calls (returns tool_calls:null while billing
+      # the tokens), which for a tool-loop agent is fatal AND invisible.
+      default: "thor/qwen3.6-35b-a3b-nvfp4"
+      # ⚠ Keep in step with vLLM's `--max-model-len` in ../vllm/deployment.yaml (262144,
+      # the model's own trained window). Note the FLOOR: Hermes hard-refuses any model
+      # whose served window is below 64,000
+      # ("below the minimum 64,000 required by Hermes Agent", HTTP 500 on every turn). A
+      # context_length above what the server accepts is the other dangerous direction.
+      #
+      # WHY IT MATTERS: compression triggers at threshold x context_length, floored at 0.75
+      # for sub-512K models, so this value decides WHEN Hermes compacts. Set it ABOVE what
+      # the server accepts and the trigger sits past the real window — the agent never
+      # compacts in time and the request is rejected or truncated mid-loop, which surfaces
+      # as a "protocol violation" rather than as a context problem. At 262144 the trigger is
+      # 196,608, below vLLM's wall.
+      #
+      # ⚠ A pin is REQUIRED here, not belt-and-braces: LiteLLM does not populate
+      # max_input_tokens by default for OpenAI-compatible backends (BerriAI/litellm#27830,
+      # still OPEN), so Hermes cannot reliably auto-detect the window. If vLLM's
+      # --max-model-len is ever raised (it is deliberately conservative — the KV budget on
+      # the Thor's shared unified memory, not a model limit), raise this WITH it.
+      context_length: 262144
+      # ⚠ OUTPUT budget, unrelated to context_length above — and it is what decides whether
+      # a tool call SURVIVES. The model emits tool calls as XML (<tool_call><function=...>
+      # <parameter=...>), and vLLM's qwen3_xml parser only extracts a call once that XML is
+      # COMPLETE. If generation stops mid-call the parser finds nothing to extract, so the
+      # fragment is returned as ordinary message content, `tool_calls` is null, and the turn
+      # ends — the tell is an orphan `</parameter>` at the end of the assistant text with no
+      # opening tag, and `finish_reason: length`.
+      #
+      # That is not a hypothetical: it killed two multi-hour eda-pcb-agent turns on
+      # 2026-09-19, each ending mid-sentence on exactly that tag. Measured on this model, a
+      # single write_file call carrying a ~60-line script needs ~5,900-6,400 completion
+      # tokens; the same request capped at 2,000 returns `finish_reason: length` with
+      # tool_calls NONE, and at 8,000 returns a clean tool call. Anything that writes a file
+      # in one call — which is most real agent work — needs headroom well past 4k.
+      #
+      # 32768 leaves room for a long file write plus the reasoning that precedes it, while
+      # staying far below context_length so a long conversation still fits around it.
+      max_tokens: 32768
+
+    # --- Tool sandbox ----------------------------------------------------------
+    # backend "local" = the agent's shell/file tools run IN THIS CONTAINER, which is why
+    # networkpolicy.yaml and automountServiceAccountToken: false matter as much as they do.
+    # See this app's README.
+    #
+    # ⚠ THE AGENT IS NOT ROOT, despite the pod's runAsUser: 0. The upstream image drops the
+    # gateway — and every worker it spawns — to the unprivileged `hermes` user, hardcoded and
+    # with no opt-out env var:
+    #     /run/service/gateway-default/run:
+    #       exec s6-setuidgid hermes hermes gateway run --replace
+    # (`docker/main-wrapper.sh` drop(), `docker/stage2-hook.sh` as_hermes() and the exec shim
+    # all do the same.) A `kubectl exec` lands as root and therefore MISREPORTS this — check
+    # the identity the GATEWAY runs as, not the one you get interactively.
+    #
+    # Consequence: `apt-get` fails with `Permission denied` on /var/lib/apt/lists/lock, and
+    # there is no sudo to regain root. So the agent CANNOT install system packages, and
+    # anything it needs must be baked into the image. It CAN write ~/.local and the rest of
+    # the NFS home, which is where anything durable belongs; /usr is an ephemeral overlay.
+    # (The desktop container is the one with a sudoers drop-in, for the humans' RDP session.)
+    terminal:
+      backend: "local"
+      # ⚠ On the NFS home, so the agent's work survives the pod. Absolute, and matching the
+      # dir: pins on the Kanban tasks below.
+      cwd: "/home/eda-pcb-agent/work"
+      # ⚠ Long installs MUST be backgrounded by the agent: the foreground path is hard-capped
+      # at 600s and a longer request is REJECTED BEFORE RUNNING. SOUL.md says so; this
+      # timeout only bounds ordinary commands.
+      timeout: 180
+      lifetime_seconds: 300
+      # ⚠ MUST be "real", or the agent cannot see its own home. In "auto" (the default)
+      # get_subprocess_home() returns {HERMES_HOME}/home for any container, so every shell
+      # tool call runs with HOME=/home/eda-pcb-agent/.hermes/home — a near-empty sandbox
+      # holding only .gitconfig/.cache/.local. The symptom is NOT an error: `ls ~` exits 0
+      # and prints NOTHING, so the agent reports the home directory as empty while
+      # /home/eda-pcb-agent is in fact populated and readable to it (verified: mode 700,
+      # owned by the agent's own uid 5021).
+      #
+      # ⚠ "real" ALONE IS NOT ENOUGH, and this is the part that is easy to get wrong.
+      # In "real" mode the resolver returns the OS account home — but the upstream image's
+      # /run/service/gateway-default/run hardcodes `export HOME=/opt/data`, and the baked
+      # passwd entry for `hermes` also reads /opt/data. Both candidates therefore point at
+      # the image's ephemeral data dir, so "real" would simply leave HOME=/opt/data: still
+      # not the NFS home, and now ALSO not persistent. HERMES_REAL_HOME is consulted FIRST
+      # by _iter_real_home_candidates(), so the seed initContainer writes it into
+      # $HERMES_HOME/.env (loaded with override=True) to name the true home explicitly.
+      # Keep the two in step — this key is inert without that .env line.
+      home_mode: "real"
+
+    # --- Agent behaviour -------------------------------------------------------
+    # Both target the same failure: the model narrating a tool call as text instead of
+    # emitting one. Upstream defaults match only gpt/codex model names, so a Qwen model gets
+    # neither. enforcement = preventive (system-prompt guidance); intent_ack_continuation =
+    # corrective (nudges a turn that ended after only stating intent).
+    agent:
+      tool_use_enforcement:
+        - "qwen"
+      intent_ack_continuation:
+        - "qwen"
+
+    # --- Toolsets --------------------------------------------------------------
+    # ⚠ `kanban` MUST be listed, or the Kanban tools are hidden and the durable-task story
+    # does not exist. tools/kanban_tools.py `_check_kanban_mode` returns True only when
+    # HERMES_KANBAN_TASK is set (a dispatcher-spawned worker) OR the profile's `toolsets`
+    # contains "kanban" — so the ORCHESTRATOR side, which is what creates and routes tasks,
+    # needs it explicitly. Without it the gateway starts and then logs
+    #   check_fn _check_kanban_mode returned False; dependent tools will be unavailable
+    # and the agent simply has no board tools, so a long task can only live inside a chat
+    # turn — which is exactly what dies when the browser tab goes away. Measured on ecc205.
+    #
+    # `coding` is the shell/file/edit surface the agent needs for KiCad work.
+    toolsets:
+      - coding
+      - kanban
+
+    # --- Kanban: the DURABLE task state ---------------------------------------
+    # ⚠ CHOSEN OVER A /goal LOOP DELIBERATELY. A goal loop's state needs an explicit /resume
+    # after a restart; the board does not. ~/.hermes/kanban.db is on the NFS home, so it
+    # survives the pod, the node and a recreate, and the gateway dispatcher reclaims crashed
+    # workers (PID gone, TTL not yet expired) on its own.
+    kanban:
+      dispatch_in_gateway: true
+
+    # --- Web search ------------------------------------------------------------
+    # Pinned explicitly rather than relying on the fallback walk: an explicit backend wins
+    # "ignoring availability", so if SearXNG is down the agent reports a precise error instead
+    # of silently routing to a rate-limited third party.
+    # ⚠ extract_backend deliberately UNSET — SearXNG is search-ONLY, and naming it would make
+    # every web_extract call hard-fail rather than degrade.
+    web:
+      search_backend: "searxng"
+
+    # --- Admin dashboard auth --------------------------------------------------
+    # ⚠ MUST be set HERE, in config, not only as env: s6 does not pass the container
+    # environment to supervised services, and the basic plugin treats a blank username as
+    # "register no password provider" — the gate then becomes a NO-OP that answers 200 with
+    # no credentials at all, rather than a second factor.
+    dashboard:
+      # ⚠ REQUIRED, not cosmetic. The redirect_uri handed to Authentik is built from this
+      # verbatim with "/auth/callback" appended. Without it the plugin reconstructs the URL
+      # from the request, trusting X-Forwarded-Proto — which the Gateway does not set, so the
+      # scheme comes back "http" and Authentik rejects the redirect_uri (matching_mode strict).
+      public_url: "https://pcb-agent.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+      # ⚠ DISABLED AS A LOGIN METHOD — see plugins.disabled at the end of this file.
+      # Authentik is the ONLY way in. This block deliberately STAYS: the credentials are the
+      # documented break-glass path, and deleting it would mean resealing secrets to recover.
+      # `secret` also signs the stateless session tokens, so it is still load-bearing even
+      # with the password form gone — blank would mean a random per-process key and sessions
+      # would not survive a pod restart.
+      basic_auth:
+        username: "${DASHBOARD_USERNAME}"
+        password: "${DASHBOARD_PASSWORD}"
+        secret: "${DASHBOARD_SESSION_SECRET}"
+
+      # --- Dashboard OIDC (Authentik) — the PRIMARY gate for people --------------
+      # Without this block the dashboard offers ONLY the username/password form: the plugin
+      # registers itself when BOTH issuer and client_id resolve
+      # (plugins/dashboard_auth/self_hosted/__init__.py register()), and there is no
+      # `provider:` selector key — the PRESENCE of this block is the switch. Omitting it is
+      # why authentik-provider.yaml's provider sat created-but-unused.
+      #
+      # ⚠ The issuer path segment is the APPLICATION SLUG ("eda-pcb-agent"), not the provider
+      # NAME ("eda-pcb-agent-dashboard") — Authentik publishes the discovery document under
+      # /application/o/<app-slug>/. client_id must match the provider's client_id, which is
+      # the provider name. The two differ here, so do not "tidy" them into agreement.
+      #
+      # client_secret is deliberately ABSENT: config.yaml lands in cleartext on the shared
+      # NFS home, which both humans can read. It arrives as
+      # HERMES_DASHBOARD_OIDC_CLIENT_SECRET through $HERMES_HOME/.env (written by the seed
+      # initContainer), which _resolve_setting() reads with env-wins-config precedence.
+      oauth:
+        self_hosted:
+          issuer: "https://id.subdomain1.your-domain.tld/application/o/eda-pcb-agent/" # automatically updated from project-settings:{general.subdomain,general.domain}
+          client_id: "eda-pcb-agent-dashboard"
+
+    # --- Database: where the agent's JOBS and SESSIONS live --------------------
+    # state.db (sessions, the Kanban board, background-process records), projects.db and
+    # sessions/ all sit under HERMES_HOME, which this app puts on the SHARED NFS HOME — so
+    # they already survive a pod restart, a node move and a cluster recreate. That is what
+    # makes "carry on with the previous jobs" possible at all.
+    #
+    # ⚠ journal_mode MUST BE "delete" HERE, and this is not a preference. SQLite's WAL mode
+    # coordinates readers and writers through a shared-memory index (the -shm file) and
+    # requires real byte-range locking; NFS provides neither reliably. On NFS, WAL risks a
+    # corrupt database or silently lost COMMITTED transactions — i.e. exactly the job state
+    # this app exists to preserve. The `hermes` app can safely use WAL because its
+    # HERMES_HOME is a Longhorn RWO block volume with a local filesystem; ours is not, and
+    # the default is WAL, so it must be overridden explicitly.
+    # (Measured on ecc205 before this was set: state.db and projects.db were both
+    # journal_mode=wal, with -wal and -shm files present on the NFS export.)
+    #
+    # The cost is throughput — delete-mode takes a write lock for the whole transaction —
+    # which is irrelevant for a single-agent workload writing a few rows per tool call.
+    database:
+      journal_mode: "delete"
+
+    # --- Only Authentik may log a human in -------------------------------------
+    # Disabling the bundled `basic` provider leaves the Authentik OIDC button as the ONLY
+    # option on the login page. Requested deliberately: a shared, root-capable account
+    # should be reachable through one auditable identity path, not a password form that
+    # every viewer of this repo's sealed secrets could use.
+    #
+    # ⚠ THIS DOES NOT WEAKEN THE GATE, it narrows it. web_server.py refuses to bind at all
+    # when NO auth provider registers (SystemExit, "There is no unauthenticated
+    # public-dashboard option"), so a broken OIDC config yields a DEAD dashboard, never an
+    # open one. Verified before disabling this that the OIDC path actually works: the login
+    # page offered "Sign in with Self-Hosted OIDC" and /auth/login?provider=self-hosted
+    # returned 302 to Authentik's authorize endpoint with an https redirect_uri.
+    #
+    # ⚠ It DOES remove the fallback that works while Authentik is down. Break-glass, in
+    # order of preference:
+    #   1. Delete this key and push — Reloader rolls the pod on the ConfigMap change and the
+    #      password login returns (dashboard.basic_auth credentials are still set above).
+    #   2. `kubectl port-forward -n eda-pcb-agent deploy/eda-pcb-agent 9119:9119` — loopback
+    #      still needs a provider, so this only helps once (1) is applied.
+    # The agent itself is unaffected: it runs in-process and never authenticates to the
+    # dashboard, and the RDP desktop is a separate path through Guacamole.
+    #
+    # Key names accepted: "basic" or "dashboard_auth/basic"
+    # (hermes_cli/plugins_cmd.py _BASIC_AUTH_PLUGIN_KEYS).
+    # ── MCP servers ────────────────────────────────────────────────────────────
+    #
+    # kicad-mcp-pro runs in the DESKTOP sidecar (startup-configmap.yaml): it drives
+    # /usr/bin/kicad-cli and kicad-sch-api, neither of which exists in this container.
+    # Both containers share the pod's network namespace, so loopback reaches it with NO
+    # NetworkPolicy change — verified by curl from `hermes` to 127.0.0.1:3400 answering
+    # 406, which is the correct MCP reply to a bare GET.
+    #
+    # ⚠ NO Authorization HEADER. `hermes mcp add` writes one by default
+    # (Bearer ${MCP_KICAD_API_KEY}); that variable does not exist here and the server does
+    # not check auth on a loopback bind, so the placeholder would sit unresolved in config
+    # forever while looking like a security control. Omitted on purpose.
+    #
+    # ⚠ TWO SERVERS, and both are required — the profiles are disjoint.
+    #   kicad        :3400  build/write     17 tools, the ONLY authoring path
+    #   kicad-review  :3401  review/readonly 24 tools, the ONLY verification path
+    # `build` carries NO run_erc, so authoring alone cannot check its own work; `review`
+    # carries no write tools, so verification alone pushes the agent into hand-writing
+    # s-expressions (which is what produced a night of unloadable schematics on
+    # 2026-09-22). The full measurement is in startup-configmap.yaml beside the launch —
+    # read it before removing either entry.
+    # The `expert` profile is 387 tools / ~57k tokens and must never be used here.
+    #
+    # ⚠ 41 tools total across the two. That is deliberate and affordable; `expert` alone
+    # would be 387. If tool selection degrades, drop `review`'s inspection tools before
+    # touching either transaction cycle.
+    mcp_servers:
+      kicad:
+        url: http://127.0.0.1:3400/mcp
+        connect_timeout: 60.0
+        enabled: true
+      kicad-review:
+        url: http://127.0.0.1:3401/mcp
+        connect_timeout: 60.0
+        enabled: true
+
+    plugins:
+      disabled:
+        - "dashboard_auth/basic"
+
+  # Seeded to ~/.hermes/skills/kicad/SKILL.md by the initContainer. Frontmatter
+  # format per Hermes' creating-skills doc; upstream endorses this shape for "wraps an
+  # external CLI via terminal".
+  kicad-SKILL.md: |
+    ---
+    name: kicad
+    description: Run KiCad (kicad-cli, pcbnew scripting) through the bridge into the desktop sidecar, and install KiCad plugins, libraries and Python packages into the persistent home. Use for any board or schematic work. KiCad ITSELF is already installed - do not build it.
+    ---
+
+    # Running KiCad
+
+    KiCad 10.0.6 is installed and ready. You do NOT build it and you do NOT install it.
+
+    ## How to run it
+
+    Use the `kicad` command. It takes a shell command line and runs it against the real
+    KiCad, returning that command's stdout, stderr and exit code:
+
+        kicad kicad-cli version
+        kicad kicad-cli pcb export gerbers --output /home/eda-pcb-agent/work/gerbers/ BOARD.kicad_pcb
+        kicad python3 /home/eda-pcb-agent/work/convert.py
+
+    ⚠ KiCad is NOT in your container. It lives in the `desktop` sidecar, which shares
+    /home with you and nothing else. `kicad-cli` and `import pcbnew` therefore FAIL if you
+    run them directly — always go through `kicad`.
+
+    ⚠ Use the `terminal` tool to run it, and if `kicad` is ever reported as `command not
+    found` (exit 127), call it by its absolute path instead:
+    `/home/eda-pcb-agent/.local/bin/kicad ...`. Do NOT conclude that KiCad is missing and
+    do NOT try to install it — it is there.
+
+    ⚠ Only /home/eda-pcb-agent is shared. A path under /tmp, or any file you wrote outside
+    the home, does not exist for the command you are launching. Write scripts and read and
+    write data under /home/eda-pcb-agent. `~` and `$HOME` do resolve to that directory, but
+    prefer ABSOLUTE paths anyway — the command runs in the OTHER container, so a relative
+    path is read against its working directory, not yours.
+
+    ⚠ Quote what the shell must not eat. `kicad python3 -c "import pcbnew; print(1)"` is
+    fine; be careful with unescaped $, backticks and newlines.
+
+    Jobs time out after 30 minutes. `kicad` exits 127 if the sidecar is not up.
+
+    ## What it is good for
+
+    - `kicad-cli pcb export gerbers|drill|pos` — JLCPCB fabrication outputs.
+    - `kicad-cli sch export` — schematic PDFs and netlists.
+    - `python3` with `import pcbnew` — the scripting API. Altium boards load with
+      `pcbnew.PCB_IO_MGR.Load(pcbnew.PCB_IO_MGR.ALTIUM_DESIGNER, path)` and save as KiCad
+      with `pcbnew.PCB_IO_MGR.Save(pcbnew.PCB_IO_MGR.KICAD_SEXP, out, board)`.
+
+    ## Authoring schematics: the MCP tools, and ONLY the MCP tools
+
+    You have two MCP servers, and they do different halves of the job:
+
+    | server | tools | use it for |
+    | --- | --- | --- |
+    | `kicad` | `sch_plan_from_spec`, `sch_preview_plan`, `sch_verify_plan`, `sch_apply_plan`, `sch_rollback_plan`, `pcb_*`, `vcs_*` | CREATING and CHANGING a design |
+    | `kicad-review` | `run_erc`, `run_drc`, `validate_design`, `sch_get_connectivity_graph`, `validate_footprints_vs_schematic`, `sch_get_symbols` | CHECKING a design |
+
+    The authoring cycle is: `sch_plan_from_spec` -> `sch_preview_plan` -> `sch_verify_plan`
+    -> `sch_apply_plan`, then **verify with `run_erc` from `kicad-review`**, and
+    `sch_rollback_plan` if it fails. `vcs_commit_checkpoint` before a risky change gives you
+    a second way back.
+
+    ## ⚠ NEVER hand-write a .kicad_sch or .kicad_pcb
+
+    Do NOT generate schematic or board files by writing s-expressions yourself — not with
+    `python3`, not with a heredoc, not with string templates, not "just this once" to work
+    around a tool that is refusing. **This has already failed here.** Hand-rolled sheets
+    carried `(id N)` inside properties and `(wire (start ...) (end ...))`, which KiCad 10
+    rejects outright, and a whole night of work produced files that could not be opened at
+    all. The format is bigger than it looks and the errors are silent.
+
+    If an MCP authoring tool will not do what you need: say so and stop. Do not fall back to
+    writing the file yourself. A missing capability is a thing to REPORT, not to route
+    around.
+
+    ⚠ Do NOT `pip install` KiCad tooling into your own venv, and do not create one. The MCP
+    servers and `kicad-sch-api` live in the DESKTOP sidecar, which is the only container
+    with `kicad-cli`. A copy installed beside you cannot reach KiCad and will only produce
+    confusing results.
+
+    ## What the bridge is still for
+
+    `kicad` (the command) remains the right tool for everything that is not schematic
+    authoring: exports, conversions, batch scripting, and reading a board with `pcbnew`.
+    Altium migration goes through it. It is also how you run a manual ERC when you want one
+    outside the MCP path.
+
+    ## ⚠ ALWAYS validate after an apply, before building anything on it
+
+    A schematic that was written but cannot be LOADED is the failure mode to guard against:
+    nothing errors at write time, and every later step quietly operates on nothing.
+
+    After every `sch_apply_plan`, call `run_erc` on the `kicad-review` server. If you wrote
+    a file any other way, check it through the bridge:
+
+        kicad kicad-cli sch erc --output /tmp/erc.rpt PATH.kicad_sch
+        kicad kicad-cli pcb drc --output /tmp/drc.rpt PATH.kicad_pcb
+
+    **`Failed to load schematic` (or `Failed to load board`) means the file is BROKEN.**
+    It exits 3, so an exit-status check catches it — but read the OUTPUT too and treat that
+    message as fatal however you notice it. Do not continue, do not write more sheets, and
+    do not report progress: roll the change back (`sch_rollback_plan`) and report what
+    happened.
+
+    A healthy file exits 0 and reports ERC/DRC findings (possibly many) instead — findings
+    mean the file LOADED, which is what this check is for. Fix them on their own merits.
+
+    ⚠ Do NOT use the `(version ...)` string as the test. KiCad 10 writes `20260206` but
+    READS older formats happily — `kicad-sch-api` emits `20250114` and its files load and
+    pass ERC. Only the load itself tells you whether a file is good, which is why the check
+    above is a real ERC/DRC run and not a grep.
+
+    ## Verifying
+
+    Prove it works before building anything on top:
+
+        kicad kicad-cli version
+
+    If that prints a version, the path is good. If it prints nothing, report that rather
+    than trying to install KiCad yourself — you cannot, and it is already there.
+
+    ## Installing plugins and libraries
+
+    You are NOT root — `apt-get` fails and there is no `sudo`. A system package has to be
+    added to the image; report that and stop rather than retrying. What you CAN write is
+    `/home/eda-pcb-agent` and `$AGENT_PREFIX` (= `~/.local`), already first on `PATH`.
+
+    ⚠ The container filesystem is an ephemeral overlay — `/usr` resets on the next pod
+    restart. Only `/home/eda-pcb-agent` persists, so everything you install goes there.
+
+    KiCad reads plugins from `~/.local/share/kicad/<version>/3rdparty/plugins/`.
+    ⚠ `<version>` is the KiCad MAJOR.MINOR — `10.0` for the KiCad in this image. A plugin
+    under the wrong version directory is silently not loaded; check what
+    `kicad kicad-cli version` reports rather than assuming.
+
+    ```sh
+    mkdir -p /home/eda-pcb-agent/.local/share/kicad/10.0/3rdparty/plugins
+    cd /home/eda-pcb-agent/.local/share/kicad/10.0/3rdparty/plugins
+    git clone --depth 1 <plugin-repo-url>
+    ```
+
+    ⚠ There is no `pip3` in this image, and `python3` is the gateway's own venv — use `uv`:
+
+    ```sh
+    uv pip install --python "$(command -v python3)" <package>
+    ```
+
+    ⚠ **A plugin's Python must match KiCad's.** KiCad's plugin API IS wxPython
+    (`python3-wxgtk4.0`, from the same PPA as KiCad so the two agree). A package installed
+    against a different interpreter loads and then fails inside wx with an error that reads
+    like a plugin bug. If a plugin imports `wx`, check it is picking up the system wxPython
+    before debugging anything else.
+
+    ⚠ **Do not build KiCad from source.** It is already installed. A source build would take
+    1-3 hours, needs development headers this image does not have and you cannot install, and
+    would produce an older or equal version. If a DIFFERENT version is genuinely needed, that
+    is an image change (`Dockerfile` + its `IMAGE_TAG`) — say so and stop; that is a complete
+    answer, not a failure.
+
+  SOUL.md: |
+    # EDA PCB Agent
+
+    You are a shared engineering agent working on EDA and PCB design tasks with KiCad,
+    alongside two humans who watch this session live over RDP.
+
+    ## Your environment
+
+    - ⚠ **You are NOT root. You run as the unprivileged user `hermes`, and `apt-get` will
+      fail.** The container starts as uid 0, but the image drops the gateway — and therefore
+      you — with `s6-setuidgid hermes`, unconditionally. There is no `sudo` and no way to
+      regain root. `apt-get update` fails with:
+          E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)
+      That is expected and permanent. **Do not retry it, and do not look for a way around
+      it** — if a package is genuinely missing, say so and ask the humans to add it to the
+      image, which is the only place it can come from.
+    - **`/usr` is read-only to you. Your home is not.** You CAN write
+      `/home/eda-pcb-agent` and `$AGENT_PREFIX` (= `~/.local`), which is already first on
+      your `PATH`. So anything you install must go there:
+        - built from source: `--prefix=$AGENT_PREFIX` / `-DCMAKE_INSTALL_PREFIX=$AGENT_PREFIX`
+        - Python: `uv pip install --python "$(command -v python3)" <pkg>` (there is no `pip3`)
+        - KiCad plugins: `~/.local/share/kicad/`
+      This is also what makes your work durable: `/home/eda-pcb-agent` is network storage
+      shared with the humans' desktop and survives a pod restart, while the container
+      filesystem is an ephemeral overlay that does not.
+    - **`HOME` is `/home/eda-pcb-agent`** — your real, persistent home, shared with the
+      humans' desktop. `~`, `$HOME` and `ls ~` all work and show your actual files.
+      (`terminal.home_mode: "real"` plus `HERMES_REAL_HOME` make this so; the default would
+      point your shell at an almost-empty `~/.hermes/home` sandbox instead.)
+    - **Build toolchain you HAVE:** `cmake`, `gcc`, `g++`, `make`, `git`, `python3`, `uv`.
+      ⚠ **`ninja` is NOT installed**, so configure with `cmake -G "Unix Makefiles"` (the
+      default) and build with `make -j4`, not `ninja`.
+    - **KiCad 10.0.6 is available, but NOT in your container** — it lives in the `desktop`
+      sidecar, which shares only `/home` with you. Run it through the `kicad` bridge, which
+      IS on your `PATH`:
+          kicad kicad-cli version        # -> 10.0.6
+      ⚠ Bare `kicad-cli` is NOT on your PATH and returns `command not found`. That is
+      expected, and it does NOT mean KiCad is missing or that you should install it — it
+      means you forgot the `kicad ` prefix. If the bridge itself is ever not found, call it
+      by absolute path: `/home/eda-pcb-agent/.local/bin/kicad ...`.
+      ⚠ **Do not build KiCad from source.** It would take 1-3 hours, needs development
+      headers that are not in this image and that you cannot install, and would produce an
+      older or equal version to the one you already have. If a DIFFERENT version is genuinely
+      needed, that is an image change (`Dockerfile` + its `IMAGE_TAG`) — say so and stop;
+      that is a complete answer, not a failure.
+    - ⚠ **Long installs must be backgrounded.** A foreground command is hard-capped at 600
+      seconds and a longer request is rejected before it runs. Use the terminal tool's
+      `background=true` with `notify_on_complete=true`, and redirect output to a file under
+      `$HOME` — the streamed buffer is lost when the gateway restarts, the file is not.
+    - Your task board is durable and lives at `~/.hermes/kanban.db`. Prefer it over holding
+      long-running plans in your head; it survives restarts and the humans can read it.
+
+    ## What you can and cannot do
+
+    - **NEVER hand-write a `.kicad_sch` file.** Authoring schematics as s-expression text
+      does not work and is the single most expensive failure this agent has had: on
+      2026-09-22 it spent 2.5 hours and ~360 tool calls emitting files that all died on
+      `Failed to load schematic`, cycling the `(version ...)` stamp through 20211014,
+      20231225, 20250114, 20250610, 20260206 and 20200310 as if the version were the
+      problem. **It is not the version.** A file written by the proper tooling loads at
+      version 20250114, and the format carries uuids, symbol instances and sheet
+      instances that are not reconstructable by hand.
+      ⚠ If you find yourself writing `(kicad_sch` into a file, or diffing version
+      numbers to make a loader happy, STOP — you are in that failure, and no number of
+      retries leaves it.
+    - **Schematics are authored through the `kicad` MCP server (`:3400`), which you
+      already have.** The loop is `sch_plan_from_spec` -> `sch_preview_plan` ->
+      `sch_apply_plan`, with `sch_rollback` if it goes wrong. These tools know the KiCad
+      10 format; you do not need to.
+      ⚠ `sch_apply_plan` returns `isError: false` for a write it never validated, so it
+      is NOT evidence the schematic is good.
+    - **Verify through the `kicad-review` server (`:3401`), always.** The `build` profile
+      on :3400 deliberately has NO `run_erc` — authoring cannot check its own work. After
+      every apply, call `run_erc` (and `validate_design` /
+      `validate_footprints_vs_schematic` where they fit) on :3401. An authoring run with
+      no verification once produced 6 symbols across 5 sheets with an EMPTY main sheet
+      and reported success.
+    - **If a schematic will not load, the tooling is not broken — your file is.** Check
+      that you wrote it with the `sch_*` tools before investigating file permissions,
+      bridges, or the CLI. In that same incident, PCB gerber export succeeded on the very
+      paths the agent had concluded were unreachable.
+    - **You drive the command line.** `kicad kicad-cli` (ERC, DRC, netlists, gerbers, plots) and
+      `pcbnew`/`kipy` Python scripting are ordinary subprocesses. This is your real path into
+      a board.
+      ⚠ `kicad-cli sch` READS and EXPORTS; it does not author. `kicad_sch_api` lives in the
+      desktop sidecar's `/opt/kicad-py` venv, NOT in your container, so
+      `import kicad_sch_api` in your Python cell fails by design and is not a fault to fix.
+      Reach it through the `kicad` bridge or the MCP tools.
+    - **You cannot see or drive the KiCad GUI.** You have no display, and your vision tool
+      analyses an image FILE — it cannot take a screenshot. The productive loop is: render
+      with `kicad kicad-cli` to PNG/SVG, then look at that file.
+    - **The humans drive the GUI.** When something genuinely needs the interactive editor, ask
+      them — they are watching this session.
+
+    ## Working style
+
+    - This is a shared account, so everything you do is attributed to `eda-pcb-agent` and is
+      visible to both humans. Say what you are about to do before doing something destructive.
+    - Keep work under `/home/eda-pcb-agent/work/<project>`, one directory per board.
+    - Commit early with git. There is no other undo for a board file.

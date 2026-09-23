@@ -1,0 +1,319 @@
+# ArgoCD core Helm values — managed via GitOps (self-managed ArgoCD pattern).
+#
+# This file covers only ArgoCD infrastructure: server, controller, redis, ingress.
+#
+# NOT included here (injected by Pulumi bootstrap only):
+#   global.domain          — resolved from Pulumi stack config
+#   configs.secret.*       — admin password hash + server secret key
+#
+# To upgrade ArgoCD: bump targetRevision in
+# deployment/argocd-infra/argocd-infra-self/argocd-infra-self.yaml, then manually sync the
+# argocd-infra-self Application.
+
+global:
+  domain: argocd-infra.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  env:
+    - name: TZ
+      value: "Europe/Berlin"
+
+configs:
+  cm:
+    timeout.reconciliation: "5m"
+    # Local account for the argocd-mcp server running in the devcontainer
+    # (.mcp.json). apiKey ONLY, deliberately no `login`: it mints API tokens and
+    # must never be able to open a UI session. Its grants are the four explicit
+    # `p, mcp-reader, ...` rules in configs.rbac below -- NOT role:readonly, which
+    # would also carry exec and repository read.
+    accounts.mcp-reader: apiKey
+    # HTTPRoute health: a route waiting for a backend from a LATER wave is Healthy.
+    #
+    # ArgoCD's built-in check reads ResolvedRefs and reports Degraded when a backendRef
+    # cannot be resolved. That is wrong for a wave-ordered bootstrap: the OIDC routes at
+    # wave 2 legitimately point at authentik-server (wave 6) and grafana's route at a
+    # Service from wave 14. The repo documents this as intended — see the "chicken/egg"
+    # note in kube-prometheus-stack/prometheus-oidc-ingress.yaml.
+    #
+    # Left at the default this deadlocks the cluster: kube-prometheus-stack and
+    # longhorn-config go Degraded with ZERO unhealthy resources of their own, the wave-3
+    # barrier never releases, and wave 6 can never run to create the Service that would
+    # have fixed them.
+    #
+    # WHY "Healthy" AND NOT "Progressing": ArgoCD BLOCKS a sync on a Progressing resource.
+    # Reporting Progressing here swaps a Degraded deadlock for a worse one: the routes
+    # apply fine but sit at hook=Running, the parent sync never completes, the app stays
+    # OutOfSync (so the barrier blocks on the SYNC condition instead), and the resources
+    # after them in the sync — prometheus-pushgateway — are never applied at all.
+    #
+    # An unresolved backendRef is not a defect of the route: the object is well-formed and
+    # the Gateway accepted it. Accepted=False IS a defect (bad hostname, listener conflict,
+    # wrong sectionName) and stays Degraded, so real misconfiguration still fails loudly.
+    resource.customizations.health.gateway.networking.k8s.io_HTTPRoute: |
+      local hs = {}
+      hs.status = "Progressing"
+      hs.message = "Waiting for route status"
+      if obj.status ~= nil and obj.status.parents ~= nil then
+        for _, parent in ipairs(obj.status.parents) do
+          if parent.conditions ~= nil then
+            for _, condition in ipairs(parent.conditions) do
+              -- A parent that refuses the route is a genuine misconfiguration.
+              if condition.type == "Accepted" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+              if condition.type == "Accepted" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = condition.message
+              end
+            end
+          end
+        end
+      end
+      return hs
+    # Authentik's ingress cert is Let's Encrypt STAGING (untrusted CA) while testing,
+    # so ArgoCD's OIDC client can't verify it. Skip verification for the OIDC provider.
+    # updateConfigFromProjectSettings.sh flips this to "false" when certIssuerType is
+    # letsencrypt-prod (real, trusted certs → verification must stay on).
+    oidc.tls.insecure.skip.verify: "false" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcSkipVerify}
+    oidc.config: |
+      name: Authentik
+      issuer: https://id.subdomain1.your-domain.tld/application/o/argocd-infra/ # automatically updated from project-settings:{general.subdomain,general.domain}
+      clientID: argocd-infra
+      clientSecret: $argocd-oidc-client-secret:oidc.clientSecret
+      requestedScopes:
+        - openid
+        - profile
+        - email
+        - groups
+
+  rbac:
+    # Authentik group → ArgoCD role:
+    #   argocd-admins / authentik-admins → full admin
+    #   employees-extended               → read-only (infra view-only)
+    # policy.default "" = no access for anyone not matched (employees/external).
+    # App access is also gated in Authentik (access-infra-view policy binding).
+    #
+    # mcp-reader is the local apiKey account for argocd-mcp (see configs.cm above).
+    # `logs` is its OWN resource, not an action on `applications` -- writing
+    # `p, mcp-reader, applications, logs, ...` is accepted and silently does nothing,
+    # and get_application_workload_logs then 403s.
+    policy.csv: |
+      g, argocd-admins, role:admin
+      g, authentik-admins, role:admin
+      g, employees-extended, role:readonly
+      p, mcp-reader, applications, get, */*, allow
+      p, mcp-reader, logs, get, */*, allow
+      p, mcp-reader, projects, get, *, allow
+      p, mcp-reader, clusters, get, *, allow
+    policy.default: ""
+
+  params:
+    # The Gateway handles TLS termination; ArgoCD serves plain HTTP internally
+    server.insecure: "true"
+
+server:
+  replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.argocdServer}
+  # Soft spread across nodes when HA scales replicas up. ScheduleAnyway so the single
+  # replica stays schedulable when HA is off. No-op at replicas:1.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: argocd-server
+  service:
+    type: ClusterIP
+  extraArgs:
+    - --insecure
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  # Native Gateway API support (argo-cd chart server.httproute). TLS terminates at
+  # the shared Gateway's wildcard listener, so no tls block and no ssl-redirect
+  # annotation — the redirect is handled once by argocd-infra/gateway.
+  ingress:
+    enabled: false
+  httproute:
+    enabled: true
+    annotations:
+      external-dns.alpha.kubernetes.io/exclude: "true"
+    parentRefs:
+      - name: main
+        namespace: argocd-infra
+        sectionName: https-wildcard
+    hostnames:
+      - argocd-infra.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+controller:
+  replicas: 2 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.argocdController}
+  # Soft spread the (already 2) controller shards across nodes.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: argocd-application-controller
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+applicationSet:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+notifications:
+  enabled: true
+  replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.argocdNotifications} (singleton controller; pinned 1)
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+      namespace: prometheus
+  # argocd-notifications-cm content. These ARE the chart's keys — `configs.notifications`
+  # is not one, so anything put there is silently dropped (which is what happened until
+  # 2026-09-04: the live ConfigMap held nothing but context.argocdUrl).
+  secret:
+    # Created by Pulumi from the stack's smtp* config (src/argocd.ts): SMTP credentials
+    # cannot live in git, and the wave-19 notify Job reads the same Secret. The controller
+    # is pointed at it by --secret-name, and `$key` below resolves against its data.
+    create: false
+    name: smtp-credentials
+  notifiers:
+    # $host/$username/$password come from that Secret. `port` does NOT: substitution
+    # rewrites every value as a QUOTED string, and the email service unmarshals port into an
+    # int, so `port: $port` fails to parse. It must match the stack's smtpPort.
+    service.email: |
+      host: $host
+      port: 587
+      username: $username
+      password: $password
+      from: no-reply@your-domain.tld # automatically updated from project-settings:mail.senderEmail
+  templates:
+    template.app-sync-succeeded: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} sync succeeded"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync Succeeded
+          Sync Time:   {{.app.status.operationState.finishedAt}}
+
+          {{if .app.status.operationState.syncResult}}
+          {{range .app.status.operationState.syncResult.resources}}
+          - {{.kind}}/{{.name}}: {{.status}}
+          {{end}}
+          {{end}}
+
+          {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+    template.app-sync-failed: |
+      email:
+        subject: "[ArgoCD] ⚠️  {{.app.metadata.name}} sync FAILED"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync Failed
+
+          {{if .app.status.operationState.syncResult}}
+          {{range .app.status.operationState.syncResult.resources}}
+          - {{.kind}}/{{.name}}: {{.status}} {{.message}}
+          {{end}}
+          {{end}}
+
+          Error: {{.app.status.operationState.phase}} — {{.app.status.operationState.message}}
+
+          {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+    template.app-health-degraded: |
+      email:
+        subject: "[ArgoCD] ⚠️  {{.app.metadata.name}} is DEGRADED"
+        body: |
+          Application: {{.app.metadata.name}}
+          Health:      {{.app.status.health.status}}
+          Message:     {{.app.status.health.message}}
+
+          Resources:
+          {{range .app.status.resources}}
+          - {{.kind}}/{{.name}}: {{.health.status}} — {{.health.message}}
+          {{end}}
+
+          {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+    template.app-sync-running: |
+      email:
+        subject: "[ArgoCD] {{.app.metadata.name}} sync started"
+        body: |
+          Application: {{.app.metadata.name}}
+          Status:      Sync In Progress
+
+          {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+    # Triggers
+  triggers:
+    trigger.on-sync-failed: |
+      - when: app.status.operationState != nil and app.status.operationState.phase in ['Error', 'Failed']
+        oncePer: app.status.operationState.finishedAt
+        send: [app-sync-failed]
+
+    trigger.on-sync-succeeded: |
+      - when: app.status.operationState != nil and app.status.operationState.phase == 'Succeeded'
+        oncePer: app.status.operationState.finishedAt
+        send: [app-sync-succeeded]
+
+    trigger.on-sync-running: |
+      - when: app.status.operationState != nil and app.status.operationState.phase in ['Running', 'Terminating']
+        send: [app-sync-running]
+
+    trigger.on-health-degraded: |
+      - when: app.status.health.status == 'Degraded'
+        oncePer: app.status.health.status
+        send: [app-health-degraded]
+
+    trigger.on-sync-operation-failed: |
+      - when: app.status.operationState != nil and app.status.operationState.phase in ['Error']
+        send: [app-sync-failed]
+
+    # Subscribe all apps by default — send critical alerts to ops
+    defaultTriggers: |
+      - on-sync-failed
+      - on-health-degraded
+  # Who gets the mail is a stack value (smtpNotifyRecipient), so the subscription is applied
+  # by Pulumi as an annotation on the `default` AppProject — which subscribes every
+  # Application in it. Nothing to declare here.
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+

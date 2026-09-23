@@ -1,0 +1,184 @@
+# Grafana dashboard (as-code) for mesh link health. Discovered by the
+# kube-prometheus-stack grafana sidecar via the grafana_dashboard label
+# (sidecar.dashboards.searchNamespace: ALL in prometheus.yaml). No community
+# dashboard fits this custom metric set (headscale's /metrics is control-plane
+# only, tailscale exposes no per-peer Prometheus metrics), so it is hand-built.
+# Data sources:
+#   - mesh_peer_* : mesh-gateway metrics exporter sidecar (continuous scrape)
+#   - mesh_peer_ping_* : mesh-ping-probe CronJob (via Pushgateway)
+#   - mesh_peer_iperf_* : mesh-iperf3-probe CronJob (via Pushgateway)
+#   - mesh_wan_*        : mesh-wan-speedtest DaemonSet (via Pushgateway) — raw
+#                         outbound WAN DL/UL per node, the hypothesis-3 baseline
+#   - container_cpu_/node_load1 : node-exporter + cAdvisor — mesh-mgmt CPU cost
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-network-dashboard
+  namespace: prometheus
+  labels:
+    grafana_dashboard: "1"
+data:
+  mesh-network.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "schemaVersion": 39,
+      "tags": ["mesh", "network", "tailscale"],
+      "title": "Mesh Network Health",
+      "uid": "mesh-network-health",
+      "time": { "from": "now-6h", "to": "now" },
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {
+            "name": "peer",
+            "type": "query",
+            "datasource": "Prometheus",
+            "query": "label_values(mesh_peer_online, peer)",
+            "includeAll": true,
+            "multi": true,
+            "current": { "text": "All", "value": "$__all" }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Peer online",
+          "type": "state-timeline",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 0 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "offline", "color": "red" }, "1": { "text": "online", "color": "green" } } }
+              ]
+            }
+          },
+          "targets": [
+            { "expr": "mesh_peer_online{peer=~\"$peer\"}", "legendFormat": "{{peer}}" }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Path type (1 = direct WireGuard, 0 = DERP relay)",
+          "type": "state-timeline",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "DERP", "color": "orange" }, "1": { "text": "direct", "color": "green" } } }
+              ]
+            }
+          },
+          "targets": [
+            { "expr": "mesh_peer_direct_connection{peer=~\"$peer\"}", "legendFormat": "{{peer}}" }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Ping RTT CP → mesh node (ms)",
+          "description": "tailscale-ping RTT from the control plane to each mesh node, every 5 min. CP vantage only (not peer↔peer). {{instance}} = mesh node. Source: mesh-ping-probe CronJob → Pushgateway (job mesh_ping).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "ms" } },
+          "targets": [
+            { "expr": "mesh_peer_ping_rtt_ms", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Last handshake age (s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 300, "color": "red" } ] }
+            }
+          },
+          "targets": [
+            { "expr": "mesh_peer_last_handshake_seconds{peer=~\"$peer\"}", "legendFormat": "{{peer}}" }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Passive throughput CP ↔ peer (tailscale counters)",
+          "description": "rate() of the CP tailscaled's per-peer rx/tx byte counters — REAL traffic between the CP gateway and each peer (not a probe). rx = peer→CP, tx = CP→peer. CP vantage only. Source: mesh-gateway metrics exporter sidecar (continuous scrape).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "Bps" } },
+          "targets": [
+            { "expr": "rate(mesh_peer_rx_bytes_total{peer=~\"$peer\"}[5m])", "legendFormat": "rx {{peer}}" },
+            { "expr": "rate(mesh_peer_tx_bytes_total{peer=~\"$peer\"}[5m])", "legendFormat": "tx {{peer}}" }
+          ]
+        },
+        {
+          "id": 6,
+          "title": "iperf3 throughput CP → mesh node over the mesh (Mbps)",
+          "description": "Active iperf3 probe from the control plane to each mesh node's :5201 listener, hourly, -t 3, over tailscale0 (WireGuard mesh). Value = receiver bits/s, i.e. throughput INTO the mesh node (CP→node / download direction). NOT peer↔peer; every sample originates at the CP. {{instance}} = destination mesh node. Source: mesh-iperf3-probe CronJob → Pushgateway (job mesh_iperf).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "Mbits" } },
+          "targets": [
+            { "expr": "mesh_peer_iperf_throughput_mbps", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 7,
+          "title": "WAN download (Mbps, per node — raw outbound, Cloudflare)",
+          "description": "Each node's OWN raw outbound WAN download (curl vs speed.cloudflare.com, ~10 MB, every 30 min). Measured on the node itself, NOT over the mesh — this is the per-site internet baseline to compare against the mesh iperf3 numbers. Runs on mesh nodes AND CPs (cloud egress baseline). {{instance}} = node. Source: mesh-wan-speedtest DaemonSet → Pushgateway (job mesh_wan).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "Mbits" } },
+          "targets": [
+            { "expr": "mesh_wan_download_mbps", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 8,
+          "title": "WAN upload (Mbps, per node — throttles replica rebuild / WAL ship-out)",
+          "description": "Each node's OWN raw outbound WAN upload (curl POST vs speed.cloudflare.com, ~10 MB, every 30 min). Measured on the node itself, NOT over the mesh. Upload is usually the asymmetric-link ceiling and gates Longhorn replica rebuild + CNPG WAL shipping OUT of a site. {{instance}} = node. Source: mesh-wan-speedtest DaemonSet → Pushgateway (job mesh_wan).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "Mbits" } },
+          "targets": [
+            { "expr": "mesh_wan_upload_mbps", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 9,
+          "title": "tailscaled CPU on CP gateway (userspace WireGuard cost)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "rate(container_cpu_usage_seconds_total{namespace=\"headscale\",pod=~\"mesh-gateway.*\",container=\"tailscale\"}[5m])", "legendFormat": "{{pod}}" }
+          ]
+        },
+        {
+          "id": 10,
+          "title": "Per-node loadavg / cores (>1.0 = CPU-saturated → flaps are CPU, not link)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 1, "color": "red" } ] }
+            }
+          },
+          "targets": [
+            { "expr": "node_load1 / on(instance) count(node_cpu_seconds_total{mode=\"idle\"}) by (instance)", "legendFormat": "{{instance}}" }
+          ]
+        }
+      ]
+    }

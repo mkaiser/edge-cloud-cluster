@@ -1,0 +1,30 @@
+# Scrape the Nextcloud exporter (metrics.enabled in values.yaml, which deploys the
+# nextcloud-metrics Service and its exporter sidecar Deployment).
+#
+# OURS, rather than the chart's or an additionalServiceMonitors entry in
+# kube-prometheus-stack's values — both of those existed and collided on this exact
+# name/namespace, and values.yaml records how that played out. The essential part: `port`
+# here is the name of the SERVICE port, not the container port. The metrics Service
+# publishes `name: http, port: 9100, targetPort: metrics`, so `port: http` is correct and
+# `port: metrics` matches nothing while looking entirely plausible.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nextcloud
+  namespace: nextcloud
+  labels:
+    # Kept for continuity with the other monitors; the Prometheus CR no longer requires it
+    # (serviceMonitorSelectorNilUsesHelmValues: false in the kube-prometheus-stack values).
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nextcloud
+      app.kubernetes.io/component: metrics
+  namespaceSelector:
+    matchNames:
+      - nextcloud
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 60s

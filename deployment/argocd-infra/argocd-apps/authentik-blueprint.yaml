@@ -1,0 +1,82 @@
+# Authentik tile + OIDC provider for the APPS ArgoCD instance.
+#
+# ⚠ IT LIVES HERE, NOT IN authentik/blueprint-apps.yaml, SO THE TILE FOLLOWS THE APP.
+# Authentik is wave 6; this instance is wave 19, behind the wave-18 barrier. Declaring the
+# tile centrally published it on every cluster from the moment Authentik booted — thirteen
+# waves before there was anything at argocd-apps.<tld> to log in to. A user who clicked it
+# during a bring-up got a connection error from a host that did not exist yet, which reads
+# as a broken deployment rather than one that has not happened.
+#
+# Shipping it from this app's own directory is the pattern the toggleable apps already use
+# (headscale, nextcloud, xwiki, zulip, gitlab): the ConfigMap is mounted OPTIONALLY into the
+# Authentik worker (authentik/values.yaml → worker.volumes, `optional: true`), so the worker
+# boots fine at wave 6 with the mount empty and the tile appears only once this app syncs.
+#
+# ⚠ The INFRA instance's provider stays central, and must. argocd-infra is wave 0 — it exists
+# before the authentik namespace does, so it has no folder Authentik could mount from at the
+# time it is needed.
+#
+# `!Env ARGOCD_APPS_OIDC_CLIENT_SECRET` still resolves: the value is injected into the worker
+# from authentik's own sealed bundle (authentik-secrets-sealed.yaml), not from this file, so
+# moving the declaration does not move the secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-argocd-apps
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+  annotations:
+    # Sync phase, not a hook: the worker re-reads mounted blueprints, and this must persist.
+    argocd.argoproj.io/sync-wave: "19"
+data:
+  argocd-apps.yaml: |
+    version: 1
+    metadata:
+      name: argocd-apps
+    entries:
+      - id: provider-argocd-apps
+        model: authentik_providers_oauth2.oauth2provider
+        identifiers:
+          name: argocd-apps
+        attrs:
+          client_type: confidential
+          client_id: argocd-apps
+          client_secret: !Env ARGOCD_APPS_OIDC_CLIENT_SECRET
+          signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+          grant_types:
+            - authorization_code
+            - refresh_token
+          authorization_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+          invalidation_flow:
+            !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+          redirect_uris:
+            - matching_mode: strict
+              url: https://argocd-apps.subdomain1.your-domain.tld/auth/callback # automatically updated from project-settings:{general.subdomain,general.domain}
+          property_mappings:
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+            # ⚠ !Find, not !KeyOf: the `groups` scope mapping is declared in
+            # authentik/blueprint-apps.yaml and referenced across blueprints by name.
+            # !KeyOf only resolves ids within the SAME blueprint.
+            - !Find [authentik_providers_oauth2.scopemapping, [scope_name, groups]]
+      - model: authentik_core.application
+        identifiers:
+          slug: argocd-apps
+        attrs:
+          name: ArgoCD (apps)
+          group: Infrastructure
+          provider: !KeyOf provider-argocd-apps
+          meta_launch_url: https://argocd-apps.subdomain1.your-domain.tld/auth/login?return_url=https%3A%2F%2Fargocd-apps.subdomain1.your-domain.tld%2Fapplications # automatically updated from project-settings:{general.subdomain,general.domain}
+          meta_icon: https://cdn.jsdelivr.net/gh/selfhst/icons/svg/argo-cd.svg
+      - model: authentik_policies.policybinding
+        identifiers:
+          target: !Find [authentik_core.application, [slug, argocd-apps]]
+          # Same central policy the other infra tiles bind — declared in
+          # authentik/blueprint-apps.yaml and found by name.
+          policy: !Find [authentik_policies_expression.expressionpolicy, [name, access-infra-view]]
+        attrs:
+          order: 0
+          enabled: true

@@ -1,0 +1,606 @@
+# ConfigMap carrying the pipeline config the PreSync hook seeds into GitLab.
+#
+# GENERATED — never hand-edit the embedded copy. Edit ci/osxcar-sdv-switch.yml and run:
+#   deployment/argocd-apps/osxcar-sdv-switch/sync-ci-config.sh
+# Verify with --check before committing; precommit runs it. The hook reads THIS ConfigMap,
+# not the file under ci/, so silent drift would ship a stale pipeline.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osxcar-sdv-switch-ci-config
+  namespace: osxcar-sdv-switch
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # -2: must exist before the project hook (weight 0) mounts it.
+    argocd.argoproj.io/sync-wave: "-2"
+data:
+  osxcar-sdv-switch.yml: |
+    # Pipeline for the MIRRORED osxcar/sdv-switch project: load the EDA toolchains and run
+    # ./deploy.sh (DEPLOY_ARGS selects the flow: "-hw" for the full hardware build, empty for
+    # PetaLinux only).
+    #
+    # ⚠ THIS FILE IS NOT IN THE MIRRORED REPOSITORY, AND CANNOT BE. mirror-cronjob.yaml
+    # FORCE-pushes the external repo over project 8's tree, so a .gitlab-ci.yml committed there
+    # is wiped on the next mirror run (and the external repo has none). It is therefore seeded
+    # into a SEPARATE project and selected with GitLab's external CI config:
+    #
+    #   project 8  ci_config_path = osxcar-sdv-switch.yml@deployments/eda/ci-configs:main
+    #
+    # Verified against the live API (PUT returns 200 and the value round-trips). The mirror only
+    # ever touches project 8, so this config is untouched by it.
+    #
+    # ⚠ RUNS ON [eda-run], NOT [eda]. `module load` needs the gVisor + podman posture; the [eda]
+    # runner is privileged and non-gVisor because rootless buildah does not work under
+    # k3s/containerd. See app-of-apps/gitlab-runner-eda-run.yaml.
+
+    stages:
+      - deploy
+
+    deploy-hw:
+      stage: deploy
+      tags: [eda-run]
+      # No `image:` — the runner's own default is the remote-desktop base, which carries
+      # `broker`, `module-podmand` and the /etc/profile.d module drop-in. Overriding it would
+      # remove the module runtime from the pod.
+      #
+      # A synthesis is hours. The [eda-run] runner is concurrent=1, so a second run queues
+      # rather than competing for the same cores.
+      timeout: 6h
+      resource_group: osxcar-sdv-switch-deploy
+      # ⚠ interruptible: false. A superseded pipeline must NOT be cancelled mid-synthesis: the
+      # run may already have programmed hardware, and a half-applied deploy is worse than a
+      # stale one.
+      interruptible: false
+      rules:
+        # The default branch builds automatically — the mirror moves it when the external repo
+        # does, which is the "build on git change" path. `sdv-switch-bring-up` was the build
+        # branch until it was merged into main (2026-09-08).
+        # ⚠ Change this in ONE place only (BUILD_BRANCH below). `pcie-bring-up` is a DIFFERENT
+        # board bring-up and must not be built by this pipeline.
+        - if: $CI_COMMIT_BRANCH == $BUILD_BRANCH
+          when: always
+        # Every other ref — main included — offers a Run button in the UI instead of starting
+        # hours of work by itself. `allow_failure: false` so a manual run that fails still
+        # fails the pipeline.
+        - when: manual
+          allow_failure: false
+      variables:
+        # The branch that builds without a human pressing Run. Kept as a variable so the
+        # rules: block above and any future job agree by construction.
+        BUILD_BRANCH: "main"
+        # The external host, for the submodule credential rewrite above. Not a secret.
+        EXT_HOST: "gitlab.ub.uni-bielefeld.de"
+        # ⚠ --recurse-submodules IS MANDATORY HERE. `deploy.sh` at the repo root is a SYMLINK
+        # into the `scripts/shared` submodule (fpga-scripts). A plain clone leaves it DANGLING:
+        # the clone succeeds and `./deploy.sh` fails "not found", which reads as a missing file
+        # rather than a missing submodule. Measured on ecc204.
+        GIT_SUBMODULE_STRATEGY: recursive
+        # ⚠ THE SUBMODULE IS ON THE EXTERNAL HOST, so nothing GitLab gives the job can fetch
+        # it: CI_JOB_TOKEN authenticates against THIS instance only, and the mirror copied a
+        # gitlink rather than the submodule's objects. Measured on ecc204 — the clone reached
+        # `Cloning into '.../scripts/shared'` and died with
+        #   fatal: could not read Username for 'https://gitlab.ub.uni-bielefeld.de'
+        # which then aborts the whole get_sources stage.
+        #
+        # The fix is a pre_get_sources_script that installs an insteadOf rewrite carrying the
+        # SAME sealed token the mirror uses. It has to be `pre_get_sources_script`, not
+        # `before_script`: submodules are fetched during get_sources, which runs BEFORE
+        # before_script.
+        #
+        # ⚠ EXT_TOKEN is a MASKED project CI variable, not a value in this file. Set it from
+        # the sealed external-git secret (osxcar-sdv-switch/sealSecrets.sh) — the PreSync hook
+        # publishes it.
+        GIT_SUBMODULE_FORCE_HTTPS: "true"
+        # ⚠ NO GIT_SUBMODULE_DEPTH. A depth-N submodule fetch only guarantees the tip of the
+        # submodule's DEFAULT BRANCH, and the parent pins an exact SHA — when the pinned commit
+        # is not inside that shallow window git silently leaves the OLD working tree in place.
+        # Measured on job 21 (2026-09-11): the trace said
+        #   Submodule path 'scripts/shared': checked out 'c9d82e9f…'
+        # yet petalinux-load-env.sh ran its PRE-FIX code path, taking the hardcoded
+        # /data/software/... route and aborting, so petalinux-config was never on PATH:
+        #   petalinux-build.sh: line 105: petalinux-config: command not found
+        # A full submodule fetch costs seconds here and makes the pinned SHA authoritative.
+        # (The old comment claimed this kept the token off disk — that is what
+        # GIT_SUBMODULE_FORCE_HTTPS plus the pre_get_sources_script env rewrite do; the depth
+        # had nothing to do with it.)
+        # Both toolchains, loaded into ONE shell. deploy.sh needs them simultaneously: it finds
+        # Vivado with a plain `which vivado` (scripts/shared/vivado-load-env.sh checkVivado())
+        # and petalinux-build.sh calls `petalinux-create` from PATH. Verified both resolve into
+        # their module shim dirs when loaded together.
+        # ⚠ MODULE NAMES, not tool names: there is no `vivado` module — the image ships Vitis,
+        # Model Composer and PDM besides Vivado, so the module is `xilinx`.
+        EDA_MODULES: "xilinx/2024.1 petalinux/2024.1"
+        # What to pass to ./deploy.sh. Overridable per run (GUI "Run pipeline" variable, or the
+        # API's `variables[]`), because the two halves of this build have very different costs:
+        #   -hw          full hardware flow — synthesis + impl + bitstream, ~3h35m, THEN PetaLinux
+        #   (no args)    PetaLinux only; Vivado is SKIPPED, so a PetaLinux change is minutes
+        #                to reach rather than hours
+        # ⚠ The no-args form still needs the xilinx module loaded: petalinux-config consumes
+        # the .xsa that the hardware flow produced, and a PetaLinux-only run reuses whatever
+        # is already in hw/vivado. It does NOT re-run Vivado.
+        DEPLOY_ARGS: "-hw"
+        # ── LICENSING: TWO INDEPENDENT MECHANISMS, do not conflate them ─────────────────────
+        # 1. A FLOATING licence server. Vivado reads XILINXD_LICENSE_FILE inside the module
+        #    container; the xilinx module maps it from MODULE_LICENSE_SERVER
+        #    (module.yaml set_from_secret). module-podmand forwards that var ONLY if it can see
+        #    it in this POD's environment, so it must be set as a project CI variable — the
+        #    value belongs to the `remote-desktop-secrets:license-server` sealed secret, so the
+        #    cluster keeps one licence value. NOT set here: a variable in this file would put
+        #    the value in git.
+        # 2. NODE-LOCKED .lic FILES, added by the repo itself: the branch carries
+        #    `hw/vivado/src/lic/` (see its README) and hw/vivado/src/vivado_user_scripts/
+        #    load_env.sh registers every .lic there with the Vivado licence manager. That path
+        #    needs nothing from CI — the files ride along in the clone.
+        # A run with NEITHER still LOADS both modules; only the tool's own licence checkout
+        # fails, which is the clearer failure mode.
+      # ⚠ RUNS BEFORE get_sources, which is when submodules are fetched — a before_script
+      # would be far too late. GIT_CONFIG_* scope the rewrite to this job's environment, so the
+      # token never lands in a .git/config on the shared runner.
+      # ⚠ NESTED UNDER `hooks:`, NOT a top-level job key. A bare
+      # `pre_get_sources_script:` is rejected outright by GitLab 19.3 —
+      #   jobs:deploy-hw config contains unknown keys: pre_get_sources_script
+      # and the whole config becomes invalid, so NO pipeline can even be created
+      # (POST /pipeline returns 400). Entry::Hooks declares
+      # ALLOWED_HOOKS = %i[pre_get_sources_script], i.e. it lives inside `hooks`.
+      hooks:
+        pre_get_sources_script:
+          - |
+            if [ -n "${EXT_TOKEN:-}" ]; then
+              echo "Installing the external-host credential for submodule fetches..."
+              git config --global "url.https://oauth2:${EXT_TOKEN}@${EXT_HOST}/.insteadOf" "https://${EXT_HOST}/"
+            else
+              echo "ERROR: EXT_TOKEN is not set — the scripts/shared submodule lives on" >&2
+              echo "       ${EXT_HOST} and cannot be fetched without it. deploy.sh is a" >&2
+              echo "       SYMLINK into that submodule, so the build cannot proceed." >&2
+              echo "       Set EXT_TOKEN as a masked project CI variable." >&2
+              exit 1
+            fi
+      script:
+        # ── 0. podman storage: strip the fuse-overlayfs mount_program ────────────────────────
+        - |
+          # ⚠ WITHOUT THIS EVERY MODULE CONTAINER DIES rc=126. Measured on job 62:
+          #   using mount program /usr/bin/fuse-overlayfs: unknown argument ignored: lazytime
+          #   fuse-overlayfs: cannot mount: Invalid argument
+          #   Error: mounting storage for container ...
+          # module-podmand reports only `container exited rc=126`, and the real message lands
+          # in the runlog — so the job looks like a tool failure rather than a storage one.
+          #
+          # The base image bakes `mount_program = /usr/bin/fuse-overlayfs` (Dockerfile.base)
+          # for a VM-based runtime, whose rootfs is virtiofs and cannot stack kernel overlay.
+          # UNDER gVisor IT IS NOT MERELY UNNECESSARY, IT BREAKS PODMAN OUTRIGHT: /dev/fuse
+          # arrives inside a runsc sandbox as a 9p FILESYSTEM (verified: major/minor 0/0) even
+          # when the pod spec says `type: CharDevice`, so fuse-overlayfs has no device to talk
+          # to. Kernel overlay, by contrast, works — verified with a raw `mount -t overlay`
+          # and then `podman run --network host` in a gVisor pod on an ecc/eda-builder node.
+          #
+          # ⚠ THIS IS EXACTLY WHAT THE DESKTOP ALREADY DOES, and the only reason the desktop
+          # path worked while CI did not: remote-desktop's startup script strips the same line
+          # on every boot. The CI pod never runs that script — the runner replaces the
+          # entrypoint with this job — so the correction has to be here too.
+          # Keep the two in step; see remote-desktop/startup-configmap.yaml for the long form.
+          if [ -f /etc/containers/storage.conf ]; then
+            sed -i -E '/^\s*mount_program\s*=/d' /etc/containers/storage.conf
+            echo "gVisor: removed fuse-overlayfs mount_program — using native overlay"
+          fi
+          # ⚠ AND THE STICKY MARKER, which is NOT optional. podman writes
+          # overlay/.has-mount-program the first time a store is used with a mount_program and
+          # thereafter keeps calling fuse-overlayfs whatever the config says — the identical
+          # error returns and reads as "the fix did not work". The shared per-node store
+          # (/var/lib/eda-module-podman) OUTLIVES the pod, so a store touched once by a
+          # mount_program build would poison every later job without this line.
+          rm -f /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null || true
+          echo "podman storage driver: $(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo unknown)"
+        # ── 1. the module runtime ────────────────────────────────────────────────────────────
+        # ⚠ THE BROKER RUNS IN THIS CONTAINER, not as a sidecar: the Kubernetes executor has no
+        # sidecar setting. `module load` blocks on /modules/.ready/<name>-<ver>, which ONLY the
+        # broker creates — without this the load hangs for its full hour rather than failing.
+        - |
+          # ⚠ EXPORTED FROM A FILE, because the Kubernetes executor has no env-from-secret
+          # setting. module-podmand forwards this into the module container only if it is in
+          # THIS pod's environment, so the export must happen before any `module load` —
+          # and `export` in one script step does carry to the next (one shell per job).
+          # ⚠ license-FLEXNET, not license-server. The mounted eda-secrets carries both: the
+          # FlexNet list (every port the site serves, ';'-separated) for Vivado, and a SINGLE
+          # port for HyperLynx/SALT which cannot parse a list. Reading the wrong one gives
+          # Vivado one port and licence checkout may fail under load.
+          if [ -s /run/license/license-flexnet ]; then
+            MODULE_LICENSE_SERVER="$(cat /run/license/license-flexnet)"
+            export MODULE_LICENSE_SERVER
+            # Print only the shape, never the value.
+            echo "Licence servers: $(printf '%s' "$MODULE_LICENSE_SERVER" | tr ';' '\n' | wc -l) FlexNet entry(ies)"
+          else
+            echo "NOTE: no licence server mounted — module load still works, but a tool's own"
+            echo "      licence checkout will fail unless the repo ships a node-locked .lic."
+          fi
+        - |
+          # ⚠ DIAGNOSTIC, and it earns its place: rc=125 from module-podmand names nothing,
+          # and the podman error lands in a runlog that a failed run does not always flush.
+          # CapEff tells you in one line whether the capabilities the runner config asks for
+          # actually reached this container — the thing that took three runs to establish.
+          # CAP_SYS_ADMIN is bit 21, CAP_MKNOD bit 27; nested podman needs mknod.
+          echo "container capabilities: $(grep CapEff /proc/self/status)"
+          python3 - <<'PY' || true
+          m = int(open("/proc/self/status").read().split("CapEff:")[1].split()[0], 16)
+          print(f"  CAP_SYS_ADMIN(21)={bool(m>>21 & 1)}  CAP_MKNOD(27)={bool(m>>27 & 1)}")
+          PY
+          echo "Starting the module broker..."
+          /usr/local/bin/broker &
+          BROKER_PID=$!
+          # Wait for it to publish its request dir; a broker that died on a missing env var
+          # must fail HERE, not as a mysterious hang inside `module load`.
+          for i in $(seq 1 30); do
+            [ -d /run/module-requests ] && break
+            kill -0 "$BROKER_PID" 2>/dev/null || { echo "ERROR: broker exited immediately — check REGISTRY_HOST/IMAGE_BASE" >&2; exit 1; }
+            sleep 1
+          done
+          [ -d /run/module-requests ] || { echo "ERROR: broker never created /run/module-requests" >&2; exit 1; }
+          echo "  broker is up (pid $BROKER_PID)."
+          # ⚠ module-podmand IS A SECOND DAEMON, and `module load` alone does not need it —
+          # which is why its absence only shows up when a tool is actually RUN. The generated
+          # shim drops a request into /run/module-pulls and waits; that directory is created by
+          # module-podmand, not by the broker. Without it every launcher dies with
+          #   vivado: line 23: /run/module-pulls/<id>: No such file or directory
+          #   ERROR: cannot reach the module helper (/run/module-pulls)
+          # AFTER the module loaded and reported ready. In the desktop pod it is started by
+          # startup-configmap.yaml; a CI pod has no startup script, so the job starts it.
+          # ⚠ EXPORT BEFORE module-podmand FORKS. The daemon forwards SKIP_BBPATH_SEARCH into
+          # the module container, but only if it is in ITS OWN environment — and a daemon
+          # inherits that once, at fork time. Exporting it later (in the runuser block, where
+          # the build runs) is far too late and silently forwards nothing: gen-machineconf then
+          # calls tinfoil, which hangs, and the job reports
+          #   ERROR: Unable to start bitbake server (None)
+          # exactly as if the variable had never been set. Measured on job 26 — the export sat
+          # ~100 lines below this point, in a different shell.
+          # Same "a new tool needs BOTH sides" rule as the licence variables above.
+          export SKIP_BBPATH_SEARCH=1
+          echo "Starting the module pull helper..."
+          /usr/local/bin/module-podmand &
+          PODMAND_PID=$!
+          for i in $(seq 1 30); do
+            [ -d /run/module-pulls ] && break
+            kill -0 "$PODMAND_PID" 2>/dev/null || { echo "ERROR: module-podmand exited immediately — check REGISTRY_HOST/MODULE_IMAGE_BASE" >&2; exit 1; }
+            sleep 1
+          done
+          [ -d /run/module-pulls ] || { echo "ERROR: module-podmand never created /run/module-pulls" >&2; exit 1; }
+          echo "  pull helper is up (pid $PODMAND_PID)."
+        # ── 2. load the toolchains and run the deploy ───────────────────────────────────────
+        # ⚠ `bash -lc`, NOT `bash -c`. /etc/profile.d is sourced by LOGIN shells only, and the
+        # base image's bashrc fallback is guarded `case $- in *i*)` — INTERACTIVE only. A CI
+        # shell is neither, so without -l `module` is simply "command not found".
+        - |
+          # ⚠ THE BUILD RUNS AS `headless` (uid 1001), NOT ROOT, AND PETALINUX FORCES THIS:
+          #   ERROR: The extensible sdk cannot be installed as root.
+          # petalinux-config refuses outright to unpack its Yocto eSDK as uid 0 (measured on
+          # job 68 — Vivado had already written the bitstream successfully, so only the
+          # PetaLinux half fails). module-podmand runs the module container as `--user <uid>`,
+          # taking the uid from the OWNER of the request file (stat -c %u, so a caller cannot
+          # claim someone else's), which means the CALLER's uid decides — and a root CI shell
+          # gets a root container.
+          #
+          # ⚠ module-podmand ITSELF STAYS ROOT (started above): it drives podman and pulls into
+          # the shared store. Only the module-load + deploy shell drops privileges.
+          #
+          # Three things have to line up for the ownership checks in module-podmand to pass:
+          #   - the WORKSPACE must be writable by 1001 (the runner checks out as root)
+          #   - $HOME must be OWNED by 1001 — module-podmand rejects a home owned by anyone
+          #     else, which is what stops one user mounting another's home
+          # ⚠ /run/module-requests is deliberately NOT chowned. It is mode drwx-wx-wx — a
+          # DROP-BOX: any user may write a request, nobody may enumerate other users' requests.
+          # That is the design (the request file's OWNER is what module-podmand trusts as the
+          # uid), so it already permits an unprivileged writer and chowning it would only
+          # weaken the isolation.
+          chown -R 1001:1001 "$CI_PROJECT_DIR" /home/headless 2>/dev/null || true
+          # ⚠ VERIFY, DO NOT ASSUME — AND FAIL LOUDLY. The chown above is `|| true` because a
+          # stray unwritable path must not kill the job, but that also makes a TOTAL failure
+          # silent, and an unwritable $HOME breaks the build much later in a way that names
+          # nothing useful: BitBake needs a writable HOME (it is where the cooker daemon puts
+          # its state), and without one petalinux-config prints
+          #   ERROR: Unable to start bitbake server (None)
+          # eight times with the real cause only in bitbake-cookerdaemon.log.
+          # ⚠ The check runs AS 1001, not as root: root can write anywhere, so testing as root
+          # proves nothing about the user that will actually run the build.
+          if ! runuser -u headless -- test -w /home/headless; then
+            echo "ERROR: /home/headless is not writable by uid 1001 after chown." >&2
+            echo "       BitBake needs a writable HOME; petalinux-config would fail with" >&2
+            echo "       'Unable to start bitbake server' and name nothing." >&2
+            ls -ld /home/headless >&2
+            exit 1
+          fi
+          echo "  \$HOME (/home/headless) is writable by uid 1001."
+          # ⚠ SINGLE-QUOTED BLOCK — NO APOSTROPHES BELOW, NOT EVEN IN COMMENTS.
+          # Every line until the closing quote is one shell argument. An apostrophe in a
+          # comment (a possessive, or quoting a name like 'BBPATH') CLOSES this string; a
+          # second one reopens it, so the block does not fail loudly — it silently continues
+          # in the OUTER shell, which is ROOT. That is exactly what happened: `module load`
+          # then ran as root, wrote the shims into /home/headless, and put them on ROOT's
+          # PATH, so the build shell had PATH module-bin entries: NONE while the shim files
+          # sat there perfectly, and petalinux-config died with "command not found".
+          # check-ci-quoting.sh enforces this.
+          runuser -u headless -- bash -lc '
+            set -euo pipefail
+            cd "$CI_PROJECT_DIR"
+            echo "building as $(id -un) (uid $(id -u))"
+            for m in $EDA_MODULES; do
+              echo "module load $m"
+              module load "$m"
+            done
+            # Prove the loads took effect. Container modules generate PATH shims rather than
+            # touching the env, so a silent failure would otherwise surface as deploy.sh not
+            # finding its tools — several steps later.
+            command -v vivado          >/dev/null || { echo "ERROR: vivado not on PATH after module load" >&2; exit 1; }
+            command -v petalinux-build >/dev/null || { echo "ERROR: petalinux-build not on PATH after module load" >&2; exit 1; }
+            echo "  vivado:          $(command -v vivado)"
+            echo "  petalinux-build: $(command -v petalinux-build)"
+
+            # ⚠ SKIP_BBPATH_SEARCH=1 — WITHOUT IT petalinux-config CANNOT COMPLETE.
+            # gen-machineconf calls common_utils.GetBitbakeVars BBPATH at startup, which
+            # goes through bb.tinfoil.Tinfoil().prepare(config_only=True) — the BitBake PYTHON
+            # API, not its CLI. In this sandbox that call HANGS: the tinfoil server starts,
+            # answers setFeatures and updateConfig, and then goes silent forever
+            # (reproduced 2026-09-10 in the module container — 41 min elapsed, 3 s CPU,
+            # state Sl, no child processes, bitbake.sock and bitbake.lock left behind and the
+            # server pid gone; the cookerdaemon log stops mid-session right after
+            # "Command Completed"). In CI the same defect surfaces as
+            #   ERROR: Unable to start bitbake server (None)
+            # because the parent gives up on the readiness pipe (EOFError -> None) rather than
+            # blocking, which is why it reads as a startup failure and why the cookerdaemon log
+            # is empty there.
+            #
+            # ⚠ THE BITBAKE CLI IS FINE — `bitbake -e` completes cleanly in the same container
+            # with a full server lifecycle in the daemon log. Only the tinfoil path hangs, which
+            # is why every environmental theory (gVisor fork/setsid, AF_UNIX on v9fs, /dev/shm,
+            # semaphores, fd limits, locale, $HOME, AF_UNIX path length) tested NEGATIVE.
+            #
+            # gen-machineconf documents this switch itself and only loses BBPATH-provided
+            # plugins, falling back to its own scripts_path — this build uses none.
+            # Also exported here for the BUILD shell itself. The copy before module-podmand
+            # is what reaches the module CONTAINER; this one covers anything gen-machineconf
+            # runs directly in this shell. Both are needed; neither is redundant.
+            export SKIP_BBPATH_SEARCH=1
+
+            # Unquoted ON PURPOSE: DEPLOY_ARGS must word-split into separate argv entries,
+            # and an EMPTY value must produce NO argument at all (a quoted "$DEPLOY_ARGS" would
+            # pass one empty string, which deploy.sh reads as a bad option).
+            # ⚠ DIAGNOSTIC — checkPetalinux() in scripts/shared runs `command -v petalinux-build`
+            # and it comes back EMPTY inside petalinux-load-env.sh, even though the same lookup
+            # resolves in THIS shell (the module-load banner prints the full shim path). Print
+            # what a CHILD bash actually sees, since deploy.sh invokes each step as
+            # `bash <script>` — that is the only place the difference can appear.
+            # ⚠ `command -v` EMPTY does not mean PATH is wrong — it also fails when the dir is
+            # on PATH but the SHIM FILE is missing. Distinguish the two explicitly.
+            echo "shell : command -v petalinux-build = $(command -v petalinux-build || echo EMPTY)"
+            echo "PATH module-bin entries:"; (echo "$PATH" | tr ":" "\n" | grep module-bin || echo "  NONE")
+            echo "shim dir listing:"; ls -la "$HOME/.local/module-bin/petalinux/2024.1" 2>&1 | head -6
+            echo "HOME=$HOME  whoami=$(id -un)"
+
+            echo "running ./deploy.sh ${DEPLOY_ARGS:-<no args>}"
+            # ⚠ ${DEPLOY_ARGS:-}, not $DEPLOY_ARGS: this shell runs under `set -u` (see the
+            # `set -euo pipefail` above), so a bare reference would abort with "unbound
+            # variable" if the CI variable were ever removed rather than merely emptied.
+            # shellcheck disable=SC2086
+            ./deploy.sh ${DEPLOY_ARGS:-}
+          '
+        # ── 3. publish the outputs LOCALLY ──────────────────────────────────────────────────
+        # ⚠ NOT through `artifacts:` for the bulk. gitlab/check-ci-artifacts.sh forbids it and
+        # records why: the runner PUTs to Workhorse, which runs in the CLOUD, so a lab-built
+        # output travels lab -> cloud -> back to an appliance 200 m from the runner (~1h45m for
+        # 30 GB against ~5.5 min direct). The .xsa plus the PetaLinux images are exactly that
+        # shape.
+        #
+        # ⚠ WRITE UNDER <project>/<branch>-<short-sha>/, never a fixed path: /builds-out is the
+        # SHARED datapool/eda/builds export, also mounted by every interactive machine, so two
+        # concurrent builds on one path silently interleave and the loser's bitstream ships.
+        - |
+          OUT="/builds-out/${CI_PROJECT_PATH##*/}/${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+          echo "Publishing build outputs to ${OUT}..."
+          mkdir -p "$OUT"
+          # Each is optional: -hw may be skipped, and a PetaLinux-only run has no .xsa.
+          # A run that produced NOTHING is a failure, though — asserted below.
+          for src in hw/vivado/system.xsa os/petalinux/images/linux deployment log; do
+            [ -e "$src" ] || { echo "  (absent: $src)"; continue; }
+            mkdir -p "$OUT/$(dirname "$src")"
+            cp -a "$src" "$OUT/$(dirname "$src")/" && echo "  copied $src"
+          done
+          [ -n "$(ls -A "$OUT" 2>/dev/null)" ] || { echo "ERROR: the build produced no outputs at all" >&2; exit 1; }
+          echo "Outputs are on the appliance at ${OUT#/builds-out/} (datapool/eda/builds)."
+      # ⚠ RUNS EVEN WHEN THE JOB FAILED — which is exactly when the logs matter, and why this
+      # is not left to `artifacts:`. Measured on ecc204: deploy.sh failed pointing at
+      # log/vivado-build.log, and the artifact upload then returned HTTP 400 three times
+      # ("upload failed with no response from coordinator"), so the ONE file naming the cause
+      # never left the pod. The job had also not reached its publish step, so it was not on the
+      # export either — the failure was undiagnosable.
+      #
+      # Copying to /builds-out here removes that dependency entirely: the NFS export is mounted
+      # by the runner, so this is a plain file copy with no coordinator, no S3 and no upload
+      # path to fail. `|| true` throughout — a diagnostics step must never itself fail a job or
+      # mask the real exit status.
+      after_script:
+        - |
+          OUT="/builds-out/${CI_PROJECT_PATH##*/}/${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}/logs-job-${CI_JOB_ID}"
+          mkdir -p "$OUT" 2>/dev/null || true
+          # log/ is deploy.sh's own directory; hw/vivado carries the Vivado run logs when a
+          # synthesis dies before deploy.sh writes its summary.
+          # ⚠ /var/log/module-run.*.log IS WHERE THE REAL ERROR LIVES when a module container
+          # fails to START. module-podman.sh redirects the whole `podman run` into
+          # /var/log/module-run.<uid>.<base>.log, so a container that exits rc=125 (podman could
+          # not start it at all) leaves NOTHING in the tool's own log — vivado-build.log simply
+          # stops after "Invoking vivado in batch mode". Measured on ecc204 job 22.
+          mkdir -p "$OUT/module-run" 2>/dev/null || true
+          cp -a /var/log/module-run.*.log "$OUT/module-run/" 2>/dev/null || true
+          # ⚠ SAVE THE HARDWARE ARTEFACTS EVEN ON FAILURE. Publishing (step 3 of `script`)
+          # only runs when the whole script succeeds, so a PetaLinux failure THREW AWAY a
+          # Vivado run that had already written its bitstream — 3h33m of synthesis discarded
+          # because a later, independent stage failed (job 68: "Bitgen Completed
+          # Successfully", then PetaLinux died and no .xsa was ever published). Keeping them
+          # also makes a PetaLinux-only re-run possible: DEPLOY_ARGS="" reuses hw/vivado.
+          for src in hw/vivado/system.xsa hw/vivado/design_1_wrapper.bit; do
+            [ -e "$src" ] || continue
+            mkdir -p "$OUT/$(dirname "$src")" 2>/dev/null || true
+            cp -a "$src" "$OUT/$(dirname "$src")/" 2>/dev/null \
+              && echo "  kept $src (build failed later, but this stage had finished)"
+          done
+          for src in log hw/vivado/vivado.log hw/vivado/vivado.jou os/petalinux/build/build.log; do
+            [ -e "$src" ] || continue
+            mkdir -p "$OUT/$(dirname "$src")" 2>/dev/null || true
+            cp -a "$src" "$OUT/$(dirname "$src")/" 2>/dev/null || true
+          done
+          # ⚠ bitbake-cookerdaemon.log IS COLLECTED BY SEARCH, not by a fixed path, and it is
+          # the file that actually explains a BitBake failure. When the server will not come up
+          # petalinux-config prints only
+          #   ERROR: Unable to start bitbake server (None)
+          #   ...(server startup failures would be in bitbake-cookerdaemon.log)
+          # eight times over and then a gen-machineconf summary — the real traceback is ONLY in
+          # that daemon log. Its location moves with the PetaLinux version and the project
+          # layout (build/, project-spec/, or the yocto eSDK dir), so a literal path in the list
+          # above silently collects nothing.
+          find . -name 'bitbake-cookerdaemon.log' -o -name 'bitbake-*.log' 2>/dev/null \
+            | head -20 | while read -r f; do
+                mkdir -p "$OUT/bitbake" 2>/dev/null || true
+                cp -a "$f" "$OUT/bitbake/$(echo "${f#./}" | tr '/' '_')" 2>/dev/null || true
+              done
+          # ⚠ AND RUN BITBAKE ONCE BY HAND TO CAPTURE ITS STDERR. petalinux-config swallows it:
+          # it reports only "Unable to start bitbake server (None)" — the literal None being the
+          # exception it failed to render — and the cookerdaemon log is EMPTY because the server
+          # dies before it opens it (measured on job 76). So the real message exists nowhere in
+          # the artefacts. Invoking bitbake directly is the only way to see it, and by here the
+          # eSDK is already extracted into the project, so bitbake exists.
+          # Best-effort throughout: this is a diagnostic on an already-failed job.
+          if [ "${CI_JOB_STATUS}" != "success" ]; then
+            # Absolute path: the invocation below runs from a different cwd.
+            BB=$(find "$CI_PROJECT_DIR/os/petalinux/components/yocto" -maxdepth 6 -type f \
+                   -name bitbake -perm -u+x 2>/dev/null | head -1)
+            if [ -n "$BB" ]; then
+              echo "─── direct bitbake --version (to surface the real error) ───"
+              mkdir -p "$OUT/bitbake" 2>/dev/null || true
+              ( cd "$CI_PROJECT_DIR/os/petalinux" && runuser -u headless -- \
+                  env HOME=/home/headless "$BB" --version ) 2>&1 | tail -40 \
+                | tee "$OUT/bitbake/direct-bitbake-version.txt" || true
+            else
+              echo "(no bitbake under os/petalinux/components/yocto — eSDK not extracted)"
+            fi
+            # ⚠ AND TEST AF_UNIX BINDING WHERE BITBAKE ACTUALLY BINDS IT. Its server creates a
+            # unix socket in the BUILD directory; /builds is the executor's default volume,
+            # which under gVisor arrives as a 9p/gofer filesystem, and AF_UNIX bind on 9p is a
+            # classic failure that would explain a server dying before it can log anything.
+            # /tmp (the container's own writable layer) is included so the result discriminates.
+            echo "─── AF_UNIX bind test, per filesystem ───"
+            PY_BIND='import socket,sys,os; d=sys.argv[1]; p=os.path.join(d,".sockprobe"); os.path.exists(p) and os.unlink(p); s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(p); s.listen(1); print("bind OK"); s.close(); os.unlink(p)'
+            for d in /tmp "$HOME" "$CI_PROJECT_DIR/os/petalinux/build" "$CI_PROJECT_DIR"; do
+              [ -d "$d" ] || continue
+              fs=$(stat -f -c %T "$d" 2>/dev/null || echo '?')
+              out=$(runuser -u headless -- python3 -c "$PY_BIND" "$d" 2>&1 | tail -2)
+              echo "  $d [$fs]: $out"
+            done | tee "$OUT/bitbake/af_unix-bind-test.txt" || true
+
+            # ⚠ RUN bitbake-layers FROM THE CI POD — a CONTROL, not the failing call.
+            # The build's real failure happens INSIDE the petalinux module container —
+            # module-podmand runs /usr/local/bin/petalinux-config there, and gen-machineconf
+            # plus bitbake-layers are its children. This probe runs in the CI POD instead, so
+            # it is a CONTROL against a different environment, not a reproduction.
+            #
+            # ⚠ ITS HOSTTOOLS ERROR IS AN ARTEFACT OF THE PROBE, NOT THE BUILD FAILURE:
+            #   ERROR: ... required tools ... unavailable in PATH: ar as gcc g++ make ...
+            # The base image carries no build toolchain; all 24 of those tools ARE present in
+            # the module image (verified). Do not chase it.
+            #
+            # What the control DOES establish, and it is the sharpest signal so far: run from
+            # this pod the server starts, writes a ~15 KB cookerdaemon log and exits cleanly,
+            # while the in-container run leaves that same log EMPTY across 8 retries — same
+            # builddir, same v9fs.
+            #
+            # The failing call is a SUBPROCESS, not tinfoil — update_buildconf.py runs
+            #   bitbake-layers -F add-layer <layer>
+            # from $BUILDDIR during "Adding user layers". Every tinfoil path is excluded:
+            # xsct_flow.py only reaches one in the branch that --xsct-tool skips, and
+            # check_tool('bitbake-layers') passes recipe=None so FindNativeSysroot never runs.
+            # That is why SKIP_BBPATH_SEARCH changed nothing (job 27).
+            #
+            # ⚠ THIS MUST RUN IN A CI POD. Reproducing it in the desktop pod is misleading —
+            # /home/headless is v9fs there but OVERLAYFS here, and a desktop builddir left over
+            # from an earlier successful config makes bitbake-layers succeed for the wrong
+            # reason. Both mistakes were made while chasing this.
+            #
+            # What we need is the exec failure: the cookerdaemon log is EMPTY across 8 retries,
+            # and daemonize.py redirects the child's stdout/stderr into that file BEFORE calling
+            # the function, so an empty log means the child dies at or before
+            #   os.execl(sys.executable, "bitbake-server", <bitbake>/bin/bitbake-server, ...)
+            # Run it directly and keep stderr.
+            echo "─── bitbake-layers in CI builddir (the command that actually fails) ───"
+            BBL=$(find "$CI_PROJECT_DIR/os/petalinux/components/yocto" -maxdepth 8 -type f \
+                    -name bitbake-layers -perm -u+x 2>/dev/null | head -1)
+            BBD="$CI_PROJECT_DIR/os/petalinux/build"
+            {
+              echo "bitbake-layers : ${BBL:-NOT FOUND}"
+              echo "builddir       : $BBD [$(stat -f -c %T "$BBD" 2>/dev/null || echo absent)]"
+              echo "server script  : $(ls -la "$(dirname "${BBL:-/nonexistent}")/bitbake-server" 2>&1)"
+              echo "python3        : $(command -v python3)"
+              if [ -n "$BBL" ] && [ -d "$BBD" ]; then
+                echo "--- show-layers stderr ---"
+                ( cd "$BBD" && runuser -u headless -- env HOME=/home/headless \
+                    BUILDDIR="$BBD" "$BBL" show-layers ) 2>&1 | tail -30
+              fi
+              # ⚠ DO NOT DUMP THE COOKERDAEMON LOG HERE. Its updateConfig line contains the
+              # job's FULL ENVIRONMENT, which includes CI_JOB_TOKEN, CI_REGISTRY_PASSWORD,
+              # CI_DEPENDENCY_PROXY_PASSWORD, CI_REPOSITORY_URL (token embedded) and EXT_TOKEN
+              # — and $OUT is the SHARED builds export every interactive machine mounts.
+              # Measured on job 28, which leaked all of them. The file is collected separately
+              # above by the bitbake/*.log search; that copy stays inside the job artefacts.
+              echo "--- cookerdaemon: $BBD/bitbake-cookerdaemon.log ---"
+              f="$BBD/bitbake-cookerdaemon.log"
+              if [ -f "$f" ]; then
+                echo "($(wc -c <"$f") bytes) — not echoed here, it embeds the job environment"
+                grep -aoE "^[0-9]+ [0-9:.]+ (Started bitbake server|Exiting|ERROR.*)" "$f" | tail -10
+              else
+                echo "(absent)"
+              fi
+            } 2>&1 | tee "$OUT/bitbake/bitbake-layers-direct.txt" || true
+          fi
+          # ⚠ REDACT CREDENTIALS BEFORE ANYTHING IS PUBLISHED OR PRINTED.
+          #
+          # BitBake echoes the FULL fetch command when a fetch fails, and the recipes in this
+          # project embed a GitLab token directly in SRC_URI:
+          #   git://<host>/osxcar/LVGL_Menu.git;protocol=https;user=<user>:<token>;name=menu
+          # so a parse failure puts a live credential into log/petalinux-build.log verbatim
+          # (measured 2026-09-18). $OUT lives on the NFS builds export, which is shared with
+          # every interactive machine, and the tails below go into the job trace — so without
+          # this the secret is broadcast twice over.
+          #
+          # ⚠ THIS TREATS A SYMPTOM. The real fix is upstream: the token is COMMITTED to the
+          # external repo (two recipes under project-spec/meta-user/recipes-user/), so it is in
+          # that repo's git history and must be ROTATED, then supplied via ~/.netrc or a git
+          # credential helper instead of inline in SRC_URI. Redacting here only stops us
+          # RE-publishing it; it cannot un-leak it. Do not let this line close that item.
+          #
+          # Patterns, deliberately broad — anything shaped like a credential in a URL, not one
+          # known token, so a rotated or added secret is still caught:
+          #   user=<something>       (the Yocto SRC_URI form)
+          #   scheme://user:pass@    (the expanded git/curl form)
+          # `-i` edits in place across every file already copied under $OUT; `|| true` because a
+          # diagnostics step must never fail the job or mask the real exit status.
+          find "$OUT" -type f 2>/dev/null | while read -r f; do
+            sed -i -E \
+              -e 's#(user=)[^;"[:space:]]+#\1<REDACTED>#g' \
+              -e 's#(://)[^/@:[:space:]]+:[^@[:space:]]+@#\1<REDACTED>@#g' \
+              "$f" 2>/dev/null || true
+          done
+          echo "job ${CI_JOB_ID} status=${CI_JOB_STATUS} logs -> ${OUT#/builds-out/}"
+          # Print the tail of the Vivado log into the TRACE as well, so a failure is
+          # diagnosable from the job page without mounting anything.
+          # ⚠ PIPED THROUGH THE SAME REDACTION as $OUT above — these tails come from the
+          # WORKING COPY, which this step never rewrites, so they still carry the raw token.
+          for f in log/vivado-build.log hw/vivado/vivado.log /var/log/module-run.*.log; do
+            [ -s "$f" ] || continue
+            echo "─── tail of $f ───"
+            tail -40 "$f" 2>/dev/null | sed -E \
+              -e 's#(user=)[^;"[:space:]]+#\1<REDACTED>#g' \
+              -e 's#(://)[^/@:[:space:]]+:[^@[:space:]]+@#\1<REDACTED>@#g' || true
+          done
+      # Only the SMALL things go through `artifacts:` — the log and a pointer to the bulk output.
+      # This is the shape check-ci-artifacts.sh explicitly permits ("let artifacts: carry the
+      # small things — logs, reports, manifests, the URL of the big object").
+      artifacts:  # ci-artifacts-ok: logs only; the bulk is on the NFS builds export
+        name: "$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA"
+        when: always
+        expire_in: 30 days
+        paths:
+          - log/

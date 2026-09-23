@@ -1,4 +1,0 @@
-# Placeholder for local overlays / additional manifests for system-upgrade-controller.
-# The controller itself is deployed from upstream:
-#   https://github.com/rancher/system-upgrade-controller (path: .)
-# Place any additional CRDs or ConfigMaps here for multi-source inclusion.

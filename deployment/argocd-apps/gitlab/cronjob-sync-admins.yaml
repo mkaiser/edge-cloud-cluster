@@ -1,0 +1,362 @@
+# CronJob: enforce GitLab SSO access policy from GitOps, every 5 min:
+#   - pre-create a GitLab account (+ openid_connect identity) for every member of
+#     AUTHENTIK_ADMIN_GROUPS ∪ AUTHENTIK_USER_GROUPS
+#   - sync AUTHENTIK_ADMIN_GROUPS members → GitLab admin flag (that set ONLY)
+#   - disable public self-registration (signup_enabled=false); SSO
+#     auto-provisioning is unaffected.
+#   - OIDC-only login: disable web password authentication (no local login form);
+#     root break-glass remains via `gitlab-rails console` in the webservice pod.
+#   - disable Web IDE single origin fallback (VS Code assets must come from the
+#     isolated extension host CDN, never same-origin with the GitLab session).
+#
+# WHY: GitLab's OmniAuth admin_groups / groups_attribute are a SAML-only feature
+# (lib/gitlab/auth/saml/config.rb). The openid_connect provider silently ignores
+# them, so an OIDC user is NEVER auto-promoted to admin no matter the group claim
+# (the dead admin_groups: [gitlab-admins] in gitlab-oidc-provider.yaml.template is
+# kept only as documentation of intent). This job is the actual mechanism: every
+# 5 min it makes AUTHENTIK_ADMIN_GROUPS the source of truth for the GitLab admin
+# flag — promoting members, demoting stale admins (never root/bots).
+#
+# Accounts are PRE-CREATED here (with their openid_connect identity) rather than
+# waiting for the member's first OIDC login, so the flag and any project membership
+# are in place before they ever log in — no empty first dashboard.
+#
+# ⚠ Pre-creation covers a WIDER set than the admin flag, and that is the point.
+# Anything that grants a member a project membership needs the GitLab User row to
+# already exist — a job that looks the user up can only warn and skip otherwise
+# (osxcar-sdv-switch/presync-gitlab-project.yaml granting testuser OWNER was
+# exactly this case). AUTHENTIK_USER_GROUPS therefore gets accounts WITHOUT any
+# privilege. Do not collapse the two sets back into one: putting an ordinary group
+# in the admin list makes every member a GitLab admin.
+#
+# Auth:
+#   Authentik: AUTHENTIK_BOOTSTRAP_TOKEN read from authentik-secrets (authentik ns)
+#   GitLab:    no token — runs `rails runner` directly in the webservice pod
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-sync-admins
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+# Read the Authentik bootstrap token (cluster-scoped: secret lives in authentik ns).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-sync-admins-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["authentik-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-sync-admins-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-sync-admins-authentik-secrets
+subjects:
+- kind: ServiceAccount
+  name: gitlab-sync-admins
+  namespace: gitlab
+---
+# Exec into the GitLab webservice pod to run rails runner.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-sync-admins
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+# cronjob-bootstrap-groups reuses this ServiceAccount and execs `deploy/gitlab-toolbox`
+# rather than a bare pod name. `kubectl exec deploy/...` first GETs the Deployment to
+# resolve it to a pod, so without this the group/project bootstrap dies on every run with
+#   deployments.apps "gitlab-toolbox" is forbidden
+# and GitLab comes up with NO groups and NO projects — which looks like a GitLab problem,
+# not an RBAC one, because every ArgoCD app still reports Healthy.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-sync-admins
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-sync-admins
+subjects:
+- kind: ServiceAccount
+  name: gitlab-sync-admins
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gitlab-sync-admins
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: gitlab-sync-admins
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: sync
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            # In-cluster API call → internal Service (no dependency on public DNS).
+            - name: AUTHENTIK_URL
+              value: "http://authentik-server.authentik.svc.cluster.local"
+            # Space-separated. TWO group sets, deliberately separate:
+            #   ADMIN_GROUPS -> GitLab ACCOUNT pre-created *and* the admin flag set.
+            #   USER_GROUPS  -> GitLab ACCOUNT pre-created, NO admin flag.
+            # Both sets are pre-created because account creation and privilege are
+            # different concerns: an ordinary member still needs a User row to exist
+            # before anything can grant them a project membership (see the
+            # pre-creation block below). Demotion considers ADMIN_GROUPS only, so
+            # adding a group here can never hand out admin.
+            - name: AUTHENTIK_ADMIN_GROUPS
+              value: "gitlab-admins employees-extended"
+            - name: AUTHENTIK_USER_GROUPS
+              value: "employees"
+            # Authentik ingress cert is LE STAGING (untrusted CA) while testing, so
+            # curl rejects it (exit 60). "-k" skips verification.
+            # updateConfigFromProjectSettings.sh clears this to "" (verify) when
+            # certIssuerType is letsencrypt-prod.
+            - name: CURL_INSECURE
+              value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+            command:
+            - /bin/sh
+            - -ec
+            - |
+              apk add --no-cache curl jq >/dev/null 2>&1
+
+              AUTHENTIK_TOKEN=$(kubectl get secret authentik-secrets -n authentik \
+                -o jsonpath='{.data.AUTHENTIK_BOOTSTRAP_TOKEN}' | base64 -d)
+              [ -z "$AUTHENTIK_TOKEN" ] && { echo "ERROR: could not read AUTHENTIK_BOOTSTRAP_TOKEN"; exit 1; }
+
+              # Collect "<username>\t<email>" for every internal, active member of the
+              # named groups. Called TWICE — once for the admin set, once for the
+              # account-only set — so the two policies cannot drift apart.
+              #
+              # NOTE the filter is `groups_by_name`, NOT `groups__name`. The latter is
+              # not a declared filter on authentik's UserViewSet (core/api/users.py), so
+              # DRF IGNORES it and returns EVERY user in the instance — a bogus group
+              # name returned all 11 users instead of none. `groups_by_name` is a real
+              # ModelMultipleChoiceFilter and fails CLOSED: an unknown group is a 400,
+              # which `curl -sf` turns into a non-zero exit rather than a silent
+              # everyone-is-an-admin. Do not "simplify" this back.
+              #
+              # type=internal drops service accounts (ak-outpost-*, ad-provisioner,
+              # oidc-provisioner) and is_active=true drops disabled ones (krbtgt,
+              # Guest) — neither should ever get a GitLab account.
+              #
+              # Both fields are needed downstream: the email identifies the account,
+              # the username is the OIDC extern_uid (provider uid_field:
+              # preferred_username).
+              fetch_members() {
+                _out=""
+                for GRP in $1; do
+                  PAGE=1
+                  while true; do
+                    RESP=$(curl -sf $CURL_INSECURE \
+                      -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+                      "$AUTHENTIK_URL/api/v3/core/users/?groups_by_name=${GRP}&type=internal&is_active=true&page_size=100&page=${PAGE}") \
+                      || { echo "ERROR: Authentik user query failed for group '$GRP' (unknown group?)" >&2; return 1; }
+                    BATCH=$(echo "$RESP" | jq -r '.results[] | select((.email // "") != "") | "\(.username)\t\(.email)"')
+                    [ -z "$BATCH" ] && break
+                    _out=$(printf '%s\n%s' "$_out" "$BATCH")
+                    NEXT=$(echo "$RESP" | jq -r '.pagination.next // 0')
+                    [ "$NEXT" = "0" ] || [ "$NEXT" = "null" ] && break
+                    PAGE=$((PAGE + 1))
+                  done
+                done
+                echo "$_out" | grep -v '^$' | sort -u || true
+              }
+
+              # to_json emits a JSON array of {username,email}; passed as ARGV so
+              # nothing is string-interpolated into the rails script. Email is
+              # lowercased here so the ruby side can compare directly.
+              to_json() {
+                printf '%s\n' "$1" \
+                  | jq -R 'select(length>0) | split("\t") | {username: .[0], email: (.[1] | ascii_downcase)}' \
+                  | jq -s -c '.'
+              }
+
+              echo "Fetching Authentik admin members (groups: $AUTHENTIK_ADMIN_GROUPS)..."
+              ADMIN_USERS=$(fetch_members "$AUTHENTIK_ADMIN_GROUPS") || exit 1
+              echo "  admin members: $(printf '%s\n' "$ADMIN_USERS" | grep -c . || true)"
+
+              echo "Fetching Authentik account-only members (groups: $AUTHENTIK_USER_GROUPS)..."
+              PLAIN_USERS=$(fetch_members "$AUTHENTIK_USER_GROUPS") || exit 1
+              echo "  account-only members: $(printf '%s\n' "$PLAIN_USERS" | grep -c . || true)"
+
+              # Pre-creation covers the UNION; only ADMIN_USERS drives the admin flag.
+              ALL_USERS=$(printf '%s\n%s' "$ADMIN_USERS" "$PLAIN_USERS" | grep -v '^$' | sort -u || true)
+
+              ADMINS_JSON=$(to_json "$ADMIN_USERS")
+              ALL_JSON=$(to_json "$ALL_USERS")
+
+              WEBSERVICE_POD=$(kubectl -n gitlab get pods -l app=webservice \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{.items[0].metadata.name}')
+              [ -n "$WEBSERVICE_POD" ] || { echo "ERROR: no running GitLab webservice pod"; exit 1; }
+              echo "Reconciling admin flags via rails ($WEBSERVICE_POD)..."
+
+              # rails runner reads the script from stdin ("-"); ARGV[0] is the
+              # accounts-to-exist JSON, ARGV[1] the admin subset. The admin groups are
+              # authoritative for the flag: promote members, demote stale human
+              # admins, never touch root or bot accounts.
+              kubectl -n gitlab exec -i "$WEBSERVICE_POD" -c webservice -- \
+                /srv/gitlab/bin/rails runner - "$ALL_JSON" "$ADMINS_JSON" <<'RUBY'
+              require 'json'
+              # Block public self-registration (the /users/sign_up form). SSO
+              # auto-provisioning is unaffected — omniauth allowSingleSignOn still
+              # creates accounts for Authentik-known users on first login. Enforced
+              # here every run so it self-heals if toggled in the admin UI.
+              s = ApplicationSetting.current_without_cache
+              if s && s.signup_enabled
+                s.update!(signup_enabled: false)
+                puts "  disabled public signup_enabled"
+              end
+              # OIDC-only: hide the local username/password login form (web + git).
+              # Authentik is the only interactive login path. Break-glass for root:
+              # `gitlab-rails console` in the webservice pod (re-enable from there).
+              if s && (s.password_authentication_enabled_for_web || s.password_authentication_enabled_for_git)
+                s.update!(password_authentication_enabled_for_web: false,
+                          password_authentication_enabled_for_git: false)
+                puts "  disabled password authentication (OIDC-only)"
+              end
+              # Web IDE: never serve VS Code assets same-origin with GitLab when the
+              # extension host CDN (*.cdn.web-ide.gitlab-static.net) is unreachable —
+              # same-origin editor code runs with the user's GitLab session (the
+              # admin-area "single origin fallback" security banner). Reachability is
+              # browser-side, so cluster egress posture is irrelevant. respond_to?
+              # guards older GitLab versions without the setting.
+              if s && s.respond_to?(:vscode_extension_marketplace_single_origin_fallback_enabled) &&
+                  s.vscode_extension_marketplace_single_origin_fallback_enabled
+                s.update!(vscode_extension_marketplace_single_origin_fallback_enabled: false)
+                puts "  disabled Web IDE single origin fallback"
+              end
+              # ARGV[0]: every member that should HAVE an account (admin set ∪
+              #           account-only set) -> drives pre-creation below.
+              # ARGV[1]: the admin subset -> drives promotion and demotion ONLY.
+              members = JSON.parse(ARGV[0])
+              emails  = JSON.parse(ARGV[1]).map { |m| m['email'].to_s.downcase }
+
+              # --- Pre-create GitLab accounts for Authentik members ---
+              #
+              # WHY: OIDC is a login protocol, not a provisioning one — GitLab only
+              # creates the local User row when the browser hits the callback. Until
+              # then the member has no account, so no admin flag and no group
+              # membership can be attached, and their first login lands on an empty
+              # dashboard (private projects are membership-scoped). Creating the row
+              # ahead of time closes that window entirely.
+              #
+              # The identity is what makes this safe. GitLab matches an OIDC callback
+              # on identity(provider, extern_uid) FIRST; only with no identity match
+              # does it fall back to email. A row created WITHOUT the identity would
+              # therefore not be recognised at login and GitLab would create a SECOND
+              # account (username suffixed) — so the identity is mandatory, not a
+              # nicety. extern_uid is the Authentik username because the provider sets
+              # uid_field: preferred_username (gitlab-oidc-provider.yaml.template).
+              members.each do |m|
+                uname = m['username'].to_s
+                email = m['email'].to_s.downcase
+                next if uname.empty? || email.empty?
+
+                ident = Identity.find_by(provider: 'openid_connect', extern_uid: uname)
+                next if ident&.user
+
+                u = User.find_by('lower(email) = ?', email)
+                if u
+                  # Account exists (created by an earlier login) but carries no
+                  # identity for this uid — attach one so the link is explicit.
+                  unless u.identities.exists?(provider: 'openid_connect')
+                    u.identities.create!(provider: 'openid_connect', extern_uid: uname)
+                    puts "  linked identity: #{u.username} -> #{uname}"
+                  end
+                  next
+                end
+
+                # Username collision with an unrelated local account: skip rather than
+                # inventing a suffixed name, so the OIDC login keeps its normal path.
+                if User.find_by(username: uname)
+                  puts "  skip (username taken by another account): #{uname}"
+                  next
+                end
+
+                nu = User.new(
+                  username: uname,
+                  email: email,
+                  name: (m['name'].to_s.empty? ? uname : m['name'].to_s),
+                  # Random unusable password: login is OIDC-only (password auth is
+                  # disabled above), and User requires one to be set.
+                  password: ::User.random_password,
+                  password_automatically_set: true,
+                  # Skip the confirmation mail — Authentik already owns the address,
+                  # and an unconfirmed user cannot sign in.
+                  skip_confirmation: true
+                )
+                nu.assign_personal_namespace(Organizations::Organization.default_organization) if nu.respond_to?(:assign_personal_namespace)
+                if nu.save
+                  nu.identities.create!(provider: 'openid_connect', extern_uid: uname)
+                  puts "  pre-created: #{nu.username} (#{email})"
+                else
+                  puts "  ERROR pre-creating #{uname}: #{nu.errors.full_messages.join(', ')}"
+                end
+              end
+
+              emails.each do |e|
+                u = User.find_by('lower(email) = ?', e)
+                if u.nil?
+                  puts "  skip (no account): #{e}"
+                elsif !u.admin
+                  u.admin = true
+                  u.save!
+                  puts "  promoted: #{u.username} (#{e})"
+                end
+              end
+              User.where(admin: true).where.not(username: 'root').find_each do |u|
+                next if u.bot?
+                unless emails.include?(u.email.to_s.downcase)
+                  u.admin = false
+                  u.save!
+                  puts "  demoted: #{u.username} (#{u.email})"
+                end
+              end
+              puts "Done."
+              RUBY
+
+              echo "Admin sync complete."

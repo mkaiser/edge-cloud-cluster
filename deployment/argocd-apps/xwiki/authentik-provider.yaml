@@ -1,0 +1,311 @@
+# Authentik OAuth2 provider + SCIM provider + application tiles for XWiki —
+# managed entirely from this folder via the Authentik API (Part B: self-contained
+# per-app OIDC), so nothing xwiki-specific lives in the authentik folder.
+#
+#   PostSync  job → create/update the "xwiki" OAuth2 provider + "XWiki"
+#                   application (tile, group "Office") + bind access-employee-apps;
+#                   AND create/update the "xwiki-scim" SCIM provider + "XWiki SCIM"
+#                   application (user/group provisioning into XWiki).
+#   PreDelete job → delete both applications + both providers on app removal.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace). OIDC client secret (key client-secret) from
+# xwiki-oidc-client-secret; SCIM bearer token (key scim-token) from
+# xwiki-scim-token — both in this namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xwiki-authentik
+  namespace: xwiki
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: xwiki-authentik-token-read
+  namespace: xwiki
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: xwiki-authentik-token-read
+  namespace: xwiki
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: xwiki-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: xwiki-authentik
+    namespace: xwiki
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xwiki-authentik-provider
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: xwiki-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PUBLIC_URL
+              value: "https://wiki.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xwiki-oidc-client-secret
+                  key: client-secret
+            - name: SCIM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xwiki-scim-token
+                  key: scim-token
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n xwiki \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # ---- the "xwiki-oidc-admins" group (idempotent) ----
+              # Owned HERE rather than in argocd-infra/authentik/blueprint-groups.yaml so
+              # that disabling this app creates no xwiki group. It is not an ACCESS group
+              # (access is the central access-employee-apps policy bound below) — XWiki
+              # itself maps it to XWiki.XWikiAdminGroup via oidc.groups.mapping in
+              # values.yaml, i.e. the group name travels in the groups claim. If it is
+              # missing nobody becomes an XWiki admin, silently.
+              #
+              # ecc/seed=admin-only: it grants ADMIN rights, so seed-user-group-sync.yaml
+              # puts only testadmin in it, never testuser.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              XWIKI_ADMINS_GRP_PK=$(first_pk "core/groups/?name=xwiki-oidc-admins")
+              if [ -z "$XWIKI_ADMINS_GRP_PK" ]; then
+                echo "Creating group 'xwiki-oidc-admins'..."
+                XWIKI_ADMINS_GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"xwiki-oidc-admins","is_superuser":false,"attributes":{"ecc/seed":"admin-only"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "xwiki-oidc-admins group pk=$XWIKI_ADMINS_GRP_PK"
+
+              MAP_PKS="[]"
+              for s in openid profile email groups; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" PUBLIC_URL="$PUBLIC_URL" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'xwiki',
+                'client_type': 'confidential',
+                'client_id': 'xwiki',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict',
+                                   'url': os.environ['PUBLIC_URL'] + '/oidc/authenticator/callback'}],
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=xwiki")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'xwiki'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'xwiki' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'XWiki',
+                'slug': 'xwiki',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'Office',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/xwiki.png',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app xwiki "XWiki" "$APP_PAYLOAD"
+
+              # Bind the central access-employee-apps expression policy.
+              APP_PK=$(first_pk "core/applications/?slug=xwiki")
+              POL_PK=$(first_pk "policies/expression/?name=access-employee-apps")
+              if [ -n "$APP_PK" ] && [ -n "$POL_PK" ]; then
+                BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                  echo "  binding access-employee-apps policy to XWiki"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              else
+                echo "  WARN: app or access-employee-apps policy not found — skipping access binding"
+              fi
+
+              # ---- SCIM provider (user/group provisioning into XWiki) ----
+              SCIM_USER_MAP=$(first_pk "propertymappings/provider/scim/?name=authentik%20default%20SCIM%20Mapping:%20User")
+              SCIM_GROUP_MAP=$(first_pk "propertymappings/provider/scim/?name=authentik%20default%20SCIM%20Mapping:%20Group")
+              EMPLOYEES_GRP=$(first_pk "core/groups/?name=employees")
+              echo "scim user_map=$SCIM_USER_MAP group_map=$SCIM_GROUP_MAP employees=$EMPLOYEES_GRP"
+
+              SCIM_PAYLOAD=$(PUBLIC_URL="$PUBLIC_URL" SCIM_TOKEN="$SCIM_TOKEN" \
+                SCIM_USER_MAP="$SCIM_USER_MAP" SCIM_GROUP_MAP="$SCIM_GROUP_MAP" \
+                EMPLOYEES_GRP="$EMPLOYEES_GRP" python3 -c "
+              import json, os
+              p = {
+                'name': 'xwiki-scim',
+                'url': os.environ['PUBLIC_URL'] + '/rest/scim/v2/',
+                'token': os.environ['SCIM_TOKEN'],
+              }
+              maps = [m for m in [os.environ.get('SCIM_USER_MAP')] if m]
+              gmaps = [m for m in [os.environ.get('SCIM_GROUP_MAP')] if m]
+              if maps:  p['property_mappings'] = maps
+              if gmaps: p['property_mappings_group'] = gmaps
+              if os.environ.get('EMPLOYEES_GRP'): p['filter_group'] = os.environ['EMPLOYEES_GRP']
+              print(json.dumps(p))
+              ")
+
+              SCIM_PK=$(first_pk "providers/scim/?name=xwiki-scim")
+              if [ -z "$SCIM_PK" ]; then
+                echo "Creating SCIM provider 'xwiki-scim'..."
+                SCIM_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$SCIM_PAYLOAD" "$API/providers/scim/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating SCIM provider 'xwiki-scim' (pk=$SCIM_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$SCIM_PAYLOAD" "$API/providers/scim/${SCIM_PK}/" >/dev/null
+              fi
+
+              SCIM_APP_PAYLOAD=$(SCIM_PK="$SCIM_PK" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'XWiki SCIM',
+                'slug': 'xwiki-scim',
+                'provider': int(os.environ['SCIM_PK']),
+              }))
+              ")
+              upsert_app xwiki-scim "XWiki SCIM" "$SCIM_APP_PAYLOAD"
+
+              echo "XWiki Authentik OIDC + SCIM providers + tiles + access binding configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xwiki-authentik-provider-cleanup
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: xwiki-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n xwiki \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              for slug in xwiki xwiki-scim; do
+                echo "Deleting application '$slug'..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/${slug}/" >/dev/null 2>&1 || true
+              done
+
+              OPK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=xwiki" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              [ -n "$OPK" ] && { echo "Deleting OAuth2 provider 'xwiki' (pk=$OPK)..."; curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${OPK}/" >/dev/null 2>&1 || true; }
+
+              SPK=$(curl -fsS -H "$AUTH" "$API/providers/scim/?name=xwiki-scim" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              [ -n "$SPK" ] && { echo "Deleting SCIM provider 'xwiki-scim' (pk=$SPK)..."; curl -fsS -X DELETE -H "$AUTH" "$API/providers/scim/${SPK}/" >/dev/null 2>&1 || true; }
+
+              echo "XWiki Authentik cleanup done."

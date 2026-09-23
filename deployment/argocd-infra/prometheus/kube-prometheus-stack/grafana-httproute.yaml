@@ -1,0 +1,32 @@
+# Hand-written HTTPRoute for Grafana.
+#
+# kube-prometheus-stack has NO Gateway API support — its templates/*/route.yaml
+# files are OpenShift Routes, not gateway.networking.k8s.io. So the grafana
+# subchart's ingress is disabled in prometheus.yaml and routing lives here.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once by argocd-infra/gateway.
+#
+# Backend: the grafana subchart Service is <release>-grafana. The Application has
+# no releaseName, so ArgoCD uses the Application name → kube-prometheus-stack-grafana.
+# grafana chart service.port defaults to 80 (targetPort 3000).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana
+  namespace: prometheus
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - grafana.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: kube-prometheus-stack-grafana
+          port: 80

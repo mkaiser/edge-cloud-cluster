@@ -1,0 +1,88 @@
+# RBAC so the "LLM Backend Switch" tool (tools/llm_backend_switch.py) can scale the GPU
+# serving Deployments from inside a chat.
+#
+# The Open WebUI pod already runs with the `default` ServiceAccount of its namespace and has
+# the SA token mounted at /var/run/secrets/kubernetes.io/serviceaccount, so a Tool can call
+# the Kubernetes API directly — no extra credential, no sidecar, no new host.
+# This grants that SA the NARROWEST rights that make the switch work.
+#
+# Scope, deliberately tight:
+#   * `get` + `patch` only. No create, no delete, no exec.
+#   * `resourceNames` pinned to the individual serving Deployment, so the token cannot touch
+#     anything else even inside the same namespace.
+#   * A namespaced Role per namespace (ollama / ollama-turing / vllm) rather than a
+#     ClusterRole — the Deployments live in different namespaces and nothing needs
+#     cluster scope.
+#
+# `patch` on a Deployment is exactly what `kubectl scale` does. Note it is NOT enough to
+# change which model vLLM serves: that is a startup CLI arg (--model /
+# --served-model-name), so a vLLM model switch needs a per-model Deployment, not a patch.
+# See the tool's docstring.
+#
+# A scale only STICKS because the Applications carry ignoreDifferences on /spec/replicas plus
+# RespectIgnoreDifferences. Without that, ArgoCD selfHeal reverts it within seconds — measured,
+# it evicted a test pod mid-download.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-backend-switch
+  namespace: ollama
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["ollama"]
+    verbs: ["get", "patch"]
+  # Listing pods is what lets the tool report "up / starting / down" instead of just echoing
+  # a replica count back at the user. Cannot be resourceName-scoped (list is collection-wide).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-backend-switch
+  namespace: ollama
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: open-webui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-backend-switch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-backend-switch
+  namespace: ollama-turing
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["ollama-turing"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-backend-switch
+  namespace: ollama-turing
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: open-webui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-backend-switch
+---
+# vllm namespace: deliberately NOT created here — the Role/RoleBinding for it lives in the
+# vllm app's OWN folder (deployment/argocd-apps/vllm/llm-backend-switch-rbac.yaml), because
+# creating an object in a namespace another Application owns makes the two fight over it.
+# Same reasoning for the Orin, but it needs no such Role: nothing competes for that node's
+# GPU, so its vLLM is never scaled by the switch tool.
+# The tool already handles a missing target: it reports "not deployed" rather than erroring.

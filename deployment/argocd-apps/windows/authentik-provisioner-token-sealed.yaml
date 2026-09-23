@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: windows
+spec:
+  encryptedData:
+    token: AgCFMOPuFq9UATMToGuouqx4OW6EoD87t5o8nP+1z2F2EJi2ysHiOltkzzuLpYfhm6Nd3fNrYPyw7Ejjtl4r9rpT674jbSISOEYg/EG/Bew9+gxijUHwHYCEOesaEUrE3Q6BHlTP3D1jQ3Y29DV1Abq8hVPW9zuULdyIWL6qTGqFZpWItZu3RtfKC1CHPTRwmrz+ARRnkZwO2eG1IvTUK29au4cWXz9RGY8rPakAA6uSPI8ESmJK7qU4kLctV7mnZca7AenxLNuBx+OiS5XZjViDox0QKAL23rp6ZNHGZEU9v+wITK7Ua6AvhS2rjN5kV5gf4PE1WXpPAAWa7rAbKVwuQNicYZAnIwKHJQzxxEM35mgKizx2TQwVEFeYT0a/Pv/fI/USWtZ3y75Bvf5D+Ngr3nm4nXQx4X9vd8D4k80WLspR1USdobr7GkPVlaSuNg7dd6SHv4/TFGWkGINWRgr92HvWSjp8RSzF7cnnvLv78O77Jo2EENaohSIy7SeHnNl3GELuWtzTZsSXGfszYFf5EcgFS2MhMeyuFRJDiLDZbldxDbdS4ERE20N5UEqbPWPltOcrqeS5Glxnl5EOfFqea8cwQ1vtFsMVqQQMBALHsySl6LOxK4kbjvKt/gpW4uU4lRYR/Km31UKKyxz7Yz848bNneHfC9BbHLg/dAg7W0DodzDc2QnOkJWhBj3z6SgNKIJ/ljNpPEG9iMptHbAedNViJPODZv6HjLE6F/TruN315VGYo4kVuZh0jDREd3ZebqEPceY1+8OpCu8XTZmt7ToS0yGPPnI4/sVjdg6PpRyj1retnXvXQITiKdnAmiuBmtcahr0zOlmfl7xgiiQ/BCraLnlZPxEc=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: windows

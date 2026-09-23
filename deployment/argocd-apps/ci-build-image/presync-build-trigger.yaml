@@ -1,0 +1,357 @@
+# PreSync on the ci-build-image app: seed + trigger the CI build-image pipeline.
+#
+# Same machinery as remote-desktop/presync-build-desktop.yaml (read there for the full
+# rationale: RBAC at wave -1, Job at wave 0, mirror-via-git-push not the Commits API):
+#   1. mints a root PAT (via gitlab-toolbox exec)
+#   2. ensures the group chain deployments/infrastructure/ci + the
+#      deployments/infrastructure/ci/build-image project exist
+#   3. OPENS THIS PROJECT TO OTHER PIPELINES' JOB TOKENS — see the block below; this is
+#      the one step with no counterpart in the other triggers, and every consumer's
+#      ability to PULL the image depends on it
+#   4. MIRRORS Dockerfile + .gitlab-ci.yml from the ci-build-image-build-files ConfigMap
+#      into that project on `main`
+#   5. TRIGGERS a pipeline only if the mirror pushed nothing (a git push auto-triggers; a
+#      second API pipeline would race on the [eda] runner)
+#
+# ⚠ IT DOES NOT WAIT FOR THE PIPELINE. Waiting would park this Job behind whatever the
+# [eda] runner is doing — a Vivado module build is hours — and the Job deadline would kill
+# it. The consumers wait instead, in their own triggers, which is where the dependency
+# actually is: each of them blocks until this image's tag is in the registry rather than
+# firing a pipeline that would die at image pull with nothing to re-trigger it.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-build-image-trigger
+  namespace: ci-build-image
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ci-build-image-trigger
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# exec into gitlab-toolbox: PAT minting and the rails membership/protection call
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ci-build-image-trigger
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ci-build-image-trigger
+subjects:
+- kind: ServiceAccount
+  name: ci-build-image-trigger
+  namespace: ci-build-image
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ci-build-image-trigger
+  namespace: ci-build-image
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ must exceed the in-container 30m GitLab wait, else the deadline kills the Job
+  # mid-wait and the retry budget is never spent.
+  activeDeadlineSeconds: 2400
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation, so a TTL buys nothing and COSTS the
+  # post-mortem: it deletes the pod, and with it the only copy of the logs. Alloy/Loki
+  # does not save you — its pod discovery is a poll, so a short-lived Job can finish and
+  # be deleted before it is ever scraped.
+  template:
+    spec:
+      serviceAccountName: ci-build-image-trigger
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: trigger
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        - name: GITLAB_API
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080/api/v4"
+        # git-http MUST go through gitlab-workhorse on :8181 — :8080 is Puma/Rails and
+        # rejects git requests with "Nil JSON web token".
+        - name: GITLAB_GIT_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+        # <group.../><project> path in GitLab (also the registry image repo).
+        # ⚠ Under .../ci/, NOT under .../eda/modules/: what lives under the modules group
+        # is pulled BY THE BROKER AND RUN AS ROOT, and the [eda] runner's one-build-per-node
+        # anti-affinity keys on that group's id. This is neither of those things.
+        - name: IMAGE_REPO
+          value: "deployments/infrastructure/ci/build-image"
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -eu
+            GROUP_PATH="${IMAGE_REPO%/*}"   # everything up to the last '/' = the group chain
+            PROJ_NAME="${IMAGE_REPO##*/}"    # last segment = the project
+            ENC_REPO=$(echo "$IMAGE_REPO" | sed 's#/#%2F#g')
+
+            # ⚠ MUST outlast GitLab's cold start on a cluster recreate, and MUST FAIL (not
+            # fall through) when it does not — a 10m wait once expired while GitLab was
+            # still starting and the old loop carried on, turning "GitLab never came up"
+            # into a misleading downstream error.
+            echo "Waiting for GitLab API (up to 30m)..."
+            i=1
+            ready=0
+            while [ "$i" -le 180 ]; do
+              # ⚠ `|| true`: this runs under `set -eu`, and curl exits non-zero when it cannot
+              # resolve or connect — exactly the case this loop is here to wait out. Without it the
+              # first probe against a GitLab that is still starting kills the Job outright and the
+              # wait never happens (measured on the ecc199 bring-up: four pods, one line each).
+              # `-w` still prints 000 on failure, so nothing else changes; do NOT add `|| echo 000`,
+              # which concatenates with curl's own 000 and yields 000000.
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness" || true)
+              if [ "$code" = "200" ]; then ready=1; break; fi
+              echo "Try ${i}/180: GitLab not ready (HTTP ${code}), retrying in 10s..."
+              i=$((i + 1)); sleep 10
+            done
+            if [ "$ready" != "1" ]; then
+              echo "ERROR: GitLab API not ready after 30m — refusing to continue." >&2
+              exit 1
+            fi
+
+            # --- Mint a root PAT via the toolbox ---
+            echo "Creating PAT via toolbox..."
+            PAT_NAME="ci-build-image-$(date +%s)"
+            PAT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner \
+              "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'${PAT_NAME}',scopes:['api'],expires_at:1.year.from_now); puts t.token" \
+              2>/dev/null | tail -1)
+            if [ -z "$PAT" ]; then
+              echo "ERROR: could not obtain PAT"; exit 1
+            fi
+            echo "PAT obtained."
+
+            # --- Ensure the group CHAIN exists (walk each ancestor segment) ---
+            echo "Ensuring GitLab group chain ${GROUP_PATH}..."
+            GROUP_ID=""
+            ACCUM=""
+            PARENT_ID=""
+            IFS='/'
+            for SEG in $GROUP_PATH; do
+              IFS=' '   # restore for the body
+              [ -z "$SEG" ] && continue
+              ACCUM="${ACCUM:+$ACCUM/}$SEG"
+              ENC_ACCUM=$(echo "$ACCUM" | sed 's#/#%2F#g')
+              GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/groups/${ENC_ACCUM}" || true)
+              GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -z "$GID" ]; then
+                echo "  creating group ${ACCUM}..."
+                GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/groups" \
+                  --data-urlencode "name=${SEG}" \
+                  --data-urlencode "path=${SEG}" \
+                  ${PARENT_ID:+--data "parent_id=${PARENT_ID}"} \
+                  --data "visibility=private" || true)
+                GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                # A concurrent create may have won the race — re-look-up by full path.
+                if [ -z "$GID" ]; then
+                  GID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                    "${GITLAB_API}/groups/${ENC_ACCUM}" \
+                    | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                fi
+              fi
+              if [ -z "$GID" ]; then
+                echo "  ERROR: could not ensure group ${ACCUM}"; exit 1
+              fi
+              PARENT_ID="$GID"
+              GROUP_ID="$GID"
+              IFS='/'   # for the next loop iteration
+            done
+            IFS=' '
+            echo "  leaf group ${GROUP_PATH} id=${GROUP_ID}."
+
+            # --- Ensure the project exists under that group ---
+            echo "Ensuring GitLab project ${IMAGE_REPO}..."
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/projects/${ENC_REPO}" || true)
+            if [ "$code" != "200" ]; then
+              echo "  creating project ${PROJ_NAME} in group ${GROUP_PATH} (HTTP ${code} on lookup)..."
+              curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/projects" \
+                --data-urlencode "name=${PROJ_NAME}" \
+                --data-urlencode "path=${PROJ_NAME}" \
+                --data "namespace_id=${GROUP_ID}&visibility=private&initialize_with_readme=true" \
+                | grep -qE '"id":|already been taken' \
+                && echo "  project ensured." || { echo "  ERROR creating project"; exit 1; }
+            else
+              echo "  project exists."
+            fi
+
+            # --- Who may pull this image ---------------------------------------------
+            # A consumer's build pod pulls this image with the credentials GitLab hands the
+            # runner: `gitlab-ci-token` plus the CONSUMER project's CI_JOB_TOKEN. Since
+            # GitLab 16 a project refuses job tokens from other projects unless they are on
+            # its INBOUND allowlist, and a refusal is not a message — the build pod never
+            # starts, the job dies at image pull, and nothing rebuilds anything.
+            #
+            # ⚠ THIS PROJECT CANNOT OPEN ITSELF. Measured on ecc193 (2026-09-02):
+            #   PATCH /projects/:id/job_token_scope enabled=false
+            #   -> 400 "Job token scope cannot be disabled for this project because it is
+            #      enforced for the instance."
+            # So the allowlist is the only route, and the entries are added from the OTHER
+            # side: each consumer's own build trigger POSTs itself into this project's
+            # allowlist (POST /projects/<this>/job_token_scope/allowlist
+            # target_project_id=<consumer>, 201 first time, 400 "already in the job token
+            # allowlist" after). Self-registration on purpose — a list kept here would have
+            # to be edited the day a seventh pipeline appears, and a missing entry fails
+            # exactly as described above.
+            #
+            # Reported, not enforced, here: this is the state a consumer depends on, and
+            # printing it turns "the build pod never started" into one line of diagnosis.
+            jt=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/projects/${ENC_REPO}/job_token_scope" || true)
+            echo "Inbound job-token scope of ${IMAGE_REPO}: ${jt:-<unreadable>}"
+            echo "  (consumers add themselves to the allowlist from their own triggers)"
+
+            # --- Build gate: are ALL the tags this pipeline builds already published? ---
+            # ⚠ SETS A FLAG, DOES NOT `exit 0`. Exiting here also skipped the MIRROR, so a
+            # change to the pipeline could not reach GitLab while the image existed — which
+            # is exactly how the arm64 job could not be delivered on 2026-09-03: the amd64
+            # tag was present, this trigger declared "no build needed", and the new job never
+            # arrived. The build files are mirrored either way now; only the pipeline TRIGGER
+            # is gated. (Same shape as every consumer's trigger, for the same reason.)
+            #
+            # ⚠ EVERY IMAGE_TAG IN THE FILE, not the first. The pipeline builds one image per
+            # architecture (amd64 on [eda], arm64 on [thor]), so a gate that reads only the
+            # first tag reports "nothing to do" while an arch is missing.
+            SKIP_BUILD=1
+            TARGET_TAGS=$(sed -n 's/.*IMAGE_TAG:[[:space:]]*\([^[:space:]#]*\).*/\1/p' /files/.gitlab-ci.yml)
+            if [ -z "$TARGET_TAGS" ]; then
+              echo "WARN: no IMAGE_TAG found in /files/.gitlab-ci.yml — will trigger a build."
+              SKIP_BUILD=0
+            else
+              REPO_ID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/projects/${ENC_REPO}/registry/repositories" \
+                | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -z "$REPO_ID" ]; then
+                echo "  no registry repository yet — a build is needed."
+                SKIP_BUILD=0
+              else
+                for t in $TARGET_TAGS; do
+                  TAG_CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -H "PRIVATE-TOKEN: ${PAT}" \
+                    "${GITLAB_API}/projects/${ENC_REPO}/registry/repositories/${REPO_ID}/tags/${t}" || true)
+                  if [ "$TAG_CODE" = "200" ]; then
+                    echo "  ${IMAGE_REPO}:${t} is published."
+                  else
+                    echo "  ${IMAGE_REPO}:${t} is MISSING (HTTP ${TAG_CODE}) — a build is needed."
+                    SKIP_BUILD=0
+                  fi
+                done
+              fi
+            fi
+
+            # --- Ensure root can push to main (via rails, NOT the REST protected-
+            # branches API) ---
+            # The REST `allowed_to_push[][user_id]` form-encoding is unreliable and,
+            # crucially, a GLOBAL ADMIN is NOT a project member — so pushing to a protected
+            # `main` is rejected ("not allowed to push to protected branches") even as root
+            # on any re-run where `main` already exists protected. Fix both durably in one
+            # rails call (idempotent, self-heals on rebuild):
+            #   1. add root as project OWNER (membership, not just global admin)
+            #   2. recreate main protection with allow_force_push + push at Maintainer
+            # ⚠ `main` must stay PROTECTED, not merely pushable: the [eda] runner is
+            # registered with access_level=ref_protected, so it refuses jobs on an
+            # unprotected ref and the pipeline would sit "stuck" with no runner.
+            echo "Ensuring root project membership + main protection (rails)..."
+            kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- gitlab-rails runner "
+              p = Project.find_by_full_path('${IMAGE_REPO}')
+              abort 'project missing' unless p
+              u = User.find_by(admin:true) || User.find_by(username:'root')
+              m = p.member(u)
+              if m.nil?
+                p.add_member(u, Gitlab::Access::OWNER); puts '  added root as OWNER'
+              elsif m.access_level < Gitlab::Access::OWNER
+                m.update!(access_level: Gitlab::Access::OWNER); puts '  raised root to OWNER'
+              else
+                puts '  root already OWNER'
+              end
+              p.protected_branches.where(name:'main').destroy_all
+              ProtectedBranches::CreateService.new(p, u, {
+                name: 'main', allow_force_push: true,
+                push_access_levels_attributes:  [{access_level: Gitlab::Access::MAINTAINER}],
+                merge_access_levels_attributes: [{access_level: Gitlab::Access::MAINTAINER}]
+              }).execute
+              puts '  main protection recreated (force_push=true, push=Maintainer)'
+            " 2>&1 | grep -v '^$' || { echo "  ERROR: could not set membership/protection"; exit 1; }
+
+            # --- Mirror build files via a git push (HTTPS + PAT, workhorse :8181) ---
+            echo "Mirroring build files into ${IMAGE_REPO}@main..."
+            export GIT_TERMINAL_PROMPT=0
+            GIT_URL="${GITLAB_GIT_URL#http://}"
+            GIT_URL="http://root:${PAT}@${GIT_URL}/${IMAGE_REPO}.git"
+            rm -rf /tmp/repo
+            git clone -q --depth 1 --branch main "$GIT_URL" /tmp/repo 2>/tmp/git.log \
+              || { sed "s#${PAT}#REDACTED#g" /tmp/git.log; exit 1; }
+            cp /files/Dockerfile /tmp/repo/Dockerfile
+            cp /files/.gitlab-ci.yml /tmp/repo/.gitlab-ci.yml
+            cd /tmp/repo
+            git config user.email "ci-build-image-trigger@cluster.local"
+            git config user.name "ci-build-image-trigger"
+            git add Dockerfile .gitlab-ci.yml
+            PUSHED=0
+            if git diff --cached --quiet; then
+              echo "  files already up to date."
+            else
+              git commit -q -m "chore: mirror ci-build-image build files from infra repo"
+              git push -q origin main 2>/tmp/git.log \
+                || { sed "s#${PAT}#REDACTED#g" /tmp/git.log; exit 1; }
+              echo "  files mirrored."
+              PUSHED=1
+            fi
+            cd /
+
+            # --- Trigger the pipeline on main (only if the mirror pushed nothing) ---
+            if [ "$SKIP_BUILD" = "1" ] && [ "$PUSHED" = "0" ]; then
+              echo "Every tag is already published and nothing was mirrored — no pipeline needed."
+            elif [ "$PUSHED" = "1" ]; then
+              echo "Pipeline auto-triggered by the git push (source=push); not firing a second one."
+            else
+              echo "No push happened — triggering pipeline via API on main..."
+              pcode=$(curl -sS -o /tmp/pipe.json -w '%{http_code}' \
+                -H "PRIVATE-TOKEN: ${PAT}" \
+                -X POST "${GITLAB_API}/projects/${ENC_REPO}/pipeline?ref=main" || true)
+              if [ "$pcode" = "201" ]; then
+                echo "  pipeline created: $(sed -n 's/.*\"web_url\":\"\([^\"]*\)\".*/\1/p' /tmp/pipe.json)"
+              else
+                echo "  WARN: pipeline trigger returned HTTP ${pcode}: $(cat /tmp/pipe.json)"
+              fi
+            fi
+            echo "ci-build-image trigger completed."
+        volumeMounts:
+          - name: files
+            mountPath: /files
+            readOnly: true
+      volumes:
+        - name: files
+          configMap:
+            name: ci-build-image-build-files

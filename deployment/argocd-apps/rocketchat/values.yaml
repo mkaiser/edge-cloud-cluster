@@ -1,0 +1,64 @@
+# Rocket.Chat (RocketChat/helm-charts) — team chat.
+# Accessible at https://rocketchat.<subdomain>.<domain>
+#
+# Auth: OIDC via Authentik as a Rocket.Chat "Custom OAuth" service named
+# "authentik". Rocket.Chat has no env-var path for custom-oauth settings (their
+# IDs contain dashes, invalid as k8s env names), so the provider is configured
+# through the Rocket.Chat REST API by a PostSync job (oauth-config.yaml) — same
+# API-driven pattern as the Authentik side (authentik-provider.yaml). Both, plus
+# all secrets, live in this folder.
+#
+# MongoDB: self-managed (mongodb.yaml) single-node replica set on the official
+# mongo image — not the chart's bundled bitnami subchart. Credentials come from
+# the sealed rocketchat-mongodb secret; Rocket.Chat reads the connection string
+# from the sealed rocketchat-mongodb-uri secret (existingMongodbSecret, mongo-uri).
+
+host: rocketchat.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+
+# Chart has no Gateway API support — routing is an HTTPRoute in httproute.yaml
+# beside this file. `host` above is still consumed by the app itself (site URL).
+ingress:
+  enabled: false
+
+# Admin user seeded on first boot from ADMIN_USERNAME/ADMIN_PASS in this secret;
+# ADMIN_EMAIL is supplied via extraEnv below.
+extraSecret: rocketchat-admin
+
+replicaCount: 1
+
+# Rocket.Chat performs the OAuth token + userinfo exchange with Authentik
+# server-side (Node.js 18+). Node 18 uses the native fetch API (undici), which
+# ignores NODE_TLS_REJECT_UNAUTHORIZED. Use NODE_EXTRA_CA_CERTS instead to add
+# the LE staging CA chain so undici can verify the staging cert. For production
+# this env var is harmless — Node's built-in store already trusts ISRG Root X1.
+extraEnv: |
+  - name: NODE_EXTRA_CA_CERTS
+    value: /etc/ssl/staging-ca/ca-bundle.pem
+  - name: ADMIN_EMAIL
+    value: "no-reply@your-domain.tld" # automatically updated from project-settings:mail.senderEmail
+
+extraVolumes: |
+  - name: staging-ca
+    configMap:
+      name: staging-ca-bundle
+
+extraVolumeMounts: |
+  - name: staging-ca
+    mountPath: /etc/ssl/staging-ca
+    readOnly: true
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Use our self-managed MongoDB (mongodb.yaml) instead of the chart's bundled
+# bitnami subchart (unmaintained, being removed from the chart). Rocket.Chat
+# reads the connection string from this sealed secret (key mongo-uri), so no
+# password ends up in git via values.
+mongodb:
+  enabled: false
+existingMongodbSecret: rocketchat-mongodb-uri

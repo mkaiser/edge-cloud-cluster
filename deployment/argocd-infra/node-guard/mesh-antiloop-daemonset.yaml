@@ -1,0 +1,108 @@
+# mesh-antiloop enforcement DaemonSet — applies the `inet mesh_antiloop` nftables
+# table on EVERY node (CPs + mesh; hostNetwork + NET_ADMIN, nft speaks netlink into
+# the host netns).
+#
+# WHY: tailscaled advertises the pod-overlay
+# addresses as WireGuard endpoint candidates; peers that pick them push WG
+# INTO the pod overlay that itself rides on tailscale0 → recursive encapsulation
+# flood (500+ GB/node in hours, 15-20 % loss on all mesh paths). The table drops
+# udp 41641 (project_settings.network.tailscalePort) on the overlay interfaces so
+# those endpoint candidates never carry traffic. Full story:
+# doc/network-firewall.md "The anti-recursion table".
+#
+# The interface set is Cilium's devices: cilium_vxlan, cilium_host, cilium_net and the
+# per-pod lxc* veths. nft matches iifname by string, so a name that does not exist never
+# matches and the ruleset still loads clean: that is what lets this run before the CNI
+# comes up, and equally why a stale name here fails OPEN and SILENTLY.
+#
+# ⚠ THE INTERFACE SET is the part that still needs hand-syncing with the two other copies
+# (src/nodes-k3s-common.ts, src/provisioning-scripts/10-install-prereqs.sh). The PORT does
+# not: all three now read project_settings.network.tailscalePort — this copy and the
+# provisioning script through an anchored `TS_PORT=` assignment that
+# updateConfigFromProjectSettings.sh rewrites, the TS copy by interpolation. Do not inline
+# the number back into a rule; the anchor pass can only rewrite a `KEY=value` position.
+#
+# Three delivery layers for the same table (all idempotent — atomic single-table
+# replace, identical content):
+#   - mesh join: 10-install-prereqs.sh writes /etc/mesh-antiloop.nft + oneshot unit
+#     (survives reboot without k8s);
+#   - robot/hcloud provisioning: publicGuardScript appends it to /etc/nftables.conf;
+#   - THIS DaemonSet: covers nodes provisioned BEFORE the rule existed and re-asserts
+#     it on every pod (re)start — no SSH access needed (home-site nodes are
+#     unreachable from the admin devcontainer).
+#
+# The pod applies the ruleset then sleeps; on node reboot the pod restarts and
+# re-applies. RAM-only here — boot-time persistence is the join/provisioning
+# scripts' job. Image: alpine + apk add nftables at start (same egress caveat as the
+# probe pods: restricted-egress edge sites may fail the apk — those nodes get the
+# table from their join script anyway; this DS is the retrofit/backstop layer).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-antiloop-guard
+  namespace: headscale
+  labels:
+    app: mesh-antiloop-guard
+spec:
+  selector:
+    matchLabels:
+      app: mesh-antiloop-guard
+  template:
+    metadata:
+      labels:
+        app: mesh-antiloop-guard
+    spec:
+      hostNetwork: true
+      # Every node: mesh taint + CP taints + whatever else — the guard is universal.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nft-apply
+          image: docker.io/library/alpine:3.24 # renovate: tracked by "Container image tags" regex (docker datasource)
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              apk add --no-cache nftables >/dev/null
+              # The port is tailscaled --port. It lives in ONE place per file so
+              # updateConfigFromProjectSettings.sh can rewrite it; the nft heredoc below is
+              # UNQUOTED so this expands. Hardcoding it in the rules instead is how the three
+              # copies of this table silently drift apart — and a wrong port here does not
+              # error, it just stops matching (see the fail-open note above).
+              TS_PORT="41641" # automatically updated from project-settings:network.tailscalePort
+              OVERLAY_IFACES="cilium_vxlan cilium_host cilium_net lxc*" # automatically updated from project-settings:network.cniOverlayInterfaces
+              # Build the nft anonymous set from the anchored space-separated list. An EMPTY set is an nft
+              # syntax error, and this table loads before the CNI exists — a broken ruleset means no
+              # anti-recursion guard at all, so fail loudly instead.
+              [ -n "$OVERLAY_IFACES" ] || { echo "ERROR: OVERLAY_IFACES is empty" >&2; exit 1; }
+              IF_SET=""; for _i in $OVERLAY_IFACES; do IF_SET="$IF_SET\"$_i\", "; done
+              IF_SET="{ ${IF_SET%, } }"
+              nft -f - <<NFT
+              table inet mesh_antiloop {}
+              delete table inet mesh_antiloop
+              table inet mesh_antiloop {
+                  chain input {
+                      type filter hook input priority filter; policy accept;
+                      iifname ${IF_SET} udp sport ${TS_PORT} counter drop
+                      iifname ${IF_SET} udp dport ${TS_PORT} counter drop
+                  }
+                  chain output {
+                      type filter hook output priority filter; policy accept;
+                      oifname ${IF_SET} udp sport ${TS_PORT} counter drop
+                      oifname ${IF_SET} udp dport ${TS_PORT} counter drop
+                  }
+              }
+              NFT
+              echo "mesh_antiloop applied on $(hostname); sleeping."
+              exec sleep infinity
+          resources:
+            requests:
+              cpu: "5m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

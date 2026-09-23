@@ -1,0 +1,182 @@
+# Mesh latency probe — CronJob (every 5 min) on the control plane.
+# `tailscale ping` is an active probe (not scrape material): it reports the RTT
+# and whether the path is direct WireGuard or DERP-relayed. Runs from the CP
+# (single vantage point that sees every peer), enumerates peers from the shared
+# tailscaled socket, pings each, and PUSHES the results to the Pushgateway,
+# which Prometheus then scrapes.
+#
+# Uses the tailscale image (has the tailscale CLI + python3) and the CP host's
+# tailscaled socket via hostPath — same socket the mesh-gateway daemon owns.
+# hostNetwork + CP nodeSelector so it lands on a gateway node whose tailscaled
+# is authenticated.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-ping-probe
+  namespace: headscale
+data:
+  ping.py: |
+    import json
+    import os
+    import re
+    import socket
+    import subprocess
+    import sys
+    import urllib.request
+
+    SOCKET = "/var/run/tailscale/tailscaled.sock"
+    PUSHGATEWAY = os.environ.get(
+        "PUSHGATEWAY", "http://prometheus-pushgateway.prometheus.svc:9091")
+    COUNT = 3
+
+
+    def ts(*args):
+        return subprocess.run(
+            ["tailscale", "--socket", SOCKET, *args],
+            capture_output=True, text=True, timeout=60)
+
+
+    def mesh_nodes():
+        # Enumerate CURRENT mesh nodes from the k8s API (node name, mesh IP,
+        # site) instead of tailscale peers — the tailscale HostName is non-unique
+        # and full of stale registrations. Mesh nodes = those carrying the
+        # node.kubernetes.io/mesh-worker label; their InternalIP is the mesh IP.
+        import ssl
+        token = open(
+            "/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+        ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        ctx = ssl.create_default_context(cafile=ca)
+        req = urllib.request.Request(
+            "https://kubernetes.default.svc/api/v1/nodes",
+            headers={"Authorization": f"Bearer {token}"})
+        data = json.loads(
+            urllib.request.urlopen(req, timeout=10, context=ctx).read())
+        result = []
+        for n in data.get("items", []):
+            labels = n["metadata"].get("labels") or {}
+            if labels.get("node.kubernetes.io/mesh-worker") != "true":
+                continue
+            name = n["metadata"]["name"]
+            site = labels.get("ecc/site", "")  # automatically updated from project-settings:applicationPlacements.labels.site
+            ip = next((a["address"] for a in n["status"].get("addresses", [])
+                       if a.get("type") == "InternalIP"), None)
+            if ip:
+                result.append((name, ip, site))
+        return result
+
+
+    def ping(ip):
+        # `tailscale ping` output lines look like:
+        #   "pong from host (10.0.10.x) via DERP(fra) in 23ms"
+        #   "pong from host (10.0.10.x) via 1.2.3.4:41641 in 8ms"
+        out = ts("ping", "--c", str(COUNT), "--timeout", "5s", ip).stdout
+        rtt_ms, direct = None, None
+        for line in out.splitlines():
+            m = re.search(r"via (\S+) in ([\d.]+)ms", line)
+            if m:
+                direct = 0 if m.group(1).startswith("DERP") else 1
+                rtt_ms = float(m.group(2))  # keep the last (steady-state) sample
+        return rtt_ms, direct
+
+
+    def push(node, site, rtt_ms, direct):
+        lines = []
+        lines.append("# TYPE mesh_peer_ping_up gauge")
+        up = 1 if rtt_ms is not None else 0
+        lines.append(f"mesh_peer_ping_up{{site=\"{site}\"}} {up}")
+        if rtt_ms is not None:
+            lines.append("# TYPE mesh_peer_ping_rtt_ms gauge")
+            lines.append(f"mesh_peer_ping_rtt_ms{{site=\"{site}\"}} {rtt_ms}")
+        if direct is not None:
+            lines.append("# TYPE mesh_peer_ping_direct gauge")
+            lines.append(f"mesh_peer_ping_direct{{site=\"{site}\"}} {direct}")
+        body = ("\n".join(lines) + "\n").encode()
+        # job label = mesh_ping, instance = k3s node name → one group per node
+        url = f"{PUSHGATEWAY}/metrics/job/mesh_ping/instance/{node}"
+        req = urllib.request.Request(url, data=body, method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+
+
+    def main():
+        failures = 0
+        for node, ip, site in mesh_nodes():
+            try:
+                rtt, direct = ping(ip)
+                push(node, site, rtt, direct)
+                print(f"{node} ({ip}): rtt={rtt}ms direct={direct}")
+            except Exception as exc:
+                failures += 1
+                print(f"{node} ({ip}): FAILED {exc}", file=sys.stderr)
+        if failures:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mesh-ping-probe
+  namespace: headscale
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Without this the default is 6, so ONE bad run leaves six Error pods behind
+      # (8 accumulated here over 8-14 days while the app still reported Healthy).
+      # This is a 5-minute probe: if a run fails, the next one is along shortly and
+      # is a better signal than a retry of the stale one.
+      backoffLimit: 1
+      activeDeadlineSeconds: 240
+      template:
+        spec:
+          serviceAccountName: mesh-probe
+          restartPolicy: Never
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - operator: Exists
+          volumes:
+            - name: script
+              configMap:
+                name: mesh-ping-probe
+            - name: tailscale-run
+              hostPath:
+                path: /var/run/tailscale
+                type: Directory
+          containers:
+            - name: ping
+              # Alpine + apk (tailscale CLI for `tailscale ping`, python3 for the
+              # script). Runs on the CP, which has full egress, so apk works here
+              # — unlike the edge nodes. The tailscale image can't be used: it
+              # ships no python3.
+              image: docker.io/library/alpine:3.24  # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  apk add --no-cache tailscale python3 >/dev/null
+                  exec python3 /script/ping.py
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                - name: tailscale-run
+                  mountPath: /var/run/tailscale
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "32Mi"
+                limits:
+                  cpu: "200m"
+                  # 64Mi OOMKilled this probe repeatedly (8 pods over 8-14 days).
+                  # It runs python3 out of the tailscale image and the footprint
+                  # scales with peer count, so the ceiling gets hit exactly when the
+                  # mesh is degraded — i.e. when the probe matters most.
+                  memory: "128Mi"

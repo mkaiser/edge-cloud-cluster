@@ -1,0 +1,295 @@
+# NodeLocal DNSCache — a CoreDNS cache on every node, in front of the cluster CoreDNS.
+#
+# WHY: CoreDNS is a small number of pods, and on this cluster they are not at every site.
+# Without a local cache every DNS query from a mesh node crosses WireGuard to reach them
+# (14 ms measured from unibi-hclab-pcie-tb-s vs sub-ms cloud-local). NodeLocal DNSCache is
+# GA upstream since Kubernetes 1.18 and exists for exactly this: off-node latency, UDP tail
+# latency (a dropped packet costs 3 retries x 10 s), conntrack races and conntrack-table
+# pressure from UDP DNS, and per-node DNS metrics.
+#
+# ⚠ THIS IS NOT THE STOCK UPSTREAM MANIFEST, and the differences are load-bearing.
+# Upstream's variant runs hostNetwork, binds the link-local 169.254.20.10 and installs its
+# own iptables NOTRACK rules to intercept the DNS VIP. That assumes a kube-proxy iptables
+# data path, which `kubeProxyReplacement: true` removes — there is no kube-proxy chain to
+# interpose on. The IPVS-style fallback is worse: it needs kubelet's --cluster-dns repointed
+# (k3s-managed) AND every pod restarted before anything uses the cache.
+#
+# Cilium documents this case and answers it with a CiliumLocalRedirectPolicy (see
+# local-redirect-policy.yaml), which redirects at the veth with no kubelet change and no pod
+# restarts. Per its "Manual Configuration" section the cache must then run as an ORDINARY
+# pod, which is every deviation below:
+#   - hostNetwork: false
+#   - -setupinterface=false -setupiptables=false -skipteardown=true
+#   - Corefile binds 0.0.0.0, not the link-local IP
+#   - `health` serves on the pod's own IP (no host IP argument)
+#   - the probe carries no `host:` field
+# Reverting any one of them re-enables the interface/iptables hacks this design removes.
+#
+# ⚠ The image must be >= 1.15.16 — that is the release that added -setupinterface, without
+# which the pod creates and tears down a dummy interface it has no business touching here.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  labels:
+    k8s-app: node-local-dns
+---
+# Upstream service for the cache's own upstream lookups (-upstreamsvc). It resolves the
+# cluster CoreDNS pods directly, so a cache miss does not depend on the kube-dns VIP that
+# the LocalRedirectPolicy is busy redirecting — which would otherwise loop straight back
+# into this cache.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns-upstream
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: KubeDNSUpstream
+spec:
+  ports:
+    - name: dns
+      port: 53
+      protocol: UDP
+      targetPort: 53
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53
+  selector:
+    k8s-app: kube-dns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  labels:
+    k8s-app: node-local-dns
+data:
+  # ⚠ `__PILLAR__CLUSTER__DNS__` and `__PILLAR__UPSTREAM__SERVERS__` are LEFT AS-IS on
+  # purpose — do NOT substitute them. The pod mounts this key as Corefile.base and the
+  # node-cache binary resolves those two at RUNTIME (cluster DNS from -upstreamsvc, upstream
+  # servers from the node's /etc/resolv.conf), writing the real /etc/Corefile that -conf
+  # points at. Upstream documents exactly these two as pod-populated. The other three
+  # pillars DO need substituting and already are: LOCAL__DNS -> 0.0.0.0 and the `health`
+  # host dropped (Cilium's non-hostNetwork variant), DNS__DOMAIN -> cluster.local, and
+  # DNS__SERVER removed from every bind, since nothing binds the VIP here.
+  #
+  # cluster.local / in-addr.arpa / ip6.arpa are answered from cache and forwarded to the
+  # cluster CoreDNS over TCP (force_tcp): a TCP conntrack entry is freed on close, where a
+  # UDP one lingers ~30 s — the conntrack-table pressure NodeLocal DNSCache exists to remove.
+  # The final `.` block forwards everything else to whatever the NODE resolves with
+  # (/etc/resolv.conf), since this pod runs with dnsPolicy: Default.
+  Corefile: |
+    cluster.local:53 {
+        errors
+        cache {
+                success 9984 30
+                denial 9984 5
+        }
+        reload
+        loop
+        bind 0.0.0.0
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        health
+        }
+    in-addr.arpa:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind 0.0.0.0
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        }
+    ip6.arpa:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind 0.0.0.0
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        }
+    # ⚠ THE AD ZONE NEEDS ITS OWN BLOCK, or the cache breaks it. Anything not matched above
+    # falls to the `.` block below, which forwards to __PILLAR__UPSTREAM__SERVERS__ — the CACHE
+    # POD's /etc/resolv.conf. That is NOT the node's resolver: k3s refuses to pass a loopback
+    # nameserver (the mesh nodes run dnsmasq on 127.0.0.2) through to pods and substitutes
+    # 8.8.8.8 in /var/lib/rancher/k3s/agent/etc/resolv.conf, which every dnsPolicy: Default pod
+    # inherits. So the AD realm went to Google DNS and NXDOMAINed.
+    #
+    # Measured on ecc213 2026-09-17: CoreDNS answered fs-1.ad.base.internal -> 192.168.1.237
+    # while this cache NXDOMAINed the same name, and truenas-configure died with
+    # "fs-1.ad.base.internal did not resolve within 300s" — leaving the appliance unjoined and
+    # tests/adChecks.sh check E failing, with all three DCs healthy. Before layer 2 existed
+    # pods asked CoreDNS directly and the zone worked, so this is a regression the cache
+    # introduced, not an AD fault.
+    #
+    # ⚠ Any FUTURE `<name>.server` key in coredns-custom needs the same treatment — a whole
+    # zone served only by CoreDNS is invisible to this cache. `.override` keys are fine: they
+    # extend CoreDNS's own `.:53` block and are reached through the cluster.local path.
+    # ⚠ The zone header is a LITERAL, like cluster.local:53 above — a Corefile zone name is a
+    # KEY, not a value, so it cannot carry an `automatically updated from project-settings`
+    # anchor (applyProjectSettings.py rewrites value positions only). If
+    # activeDirectory.adLabel ever changes, THIS LINE must be changed by hand, and
+    # tests/adChecks.sh check E is what catches it if you forget.
+    ad.base.internal:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind 0.0.0.0
+        forward . __PILLAR__CLUSTER__DNS__ {
+                force_tcp
+        }
+        prometheus :9253
+        }
+    .:53 {
+        errors
+        cache 30
+        reload
+        loop
+        bind 0.0.0.0
+        forward . __PILLAR__UPSTREAM__SERVERS__
+        prometheus :9253
+        }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  labels:
+    k8s-app: node-local-dns
+spec:
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 10%
+  selector:
+    matchLabels:
+      k8s-app: node-local-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: node-local-dns
+      annotations:
+        prometheus.io/port: "9253"
+        prometheus.io/scrape: "true"
+    spec:
+      priorityClassName: system-node-critical
+      serviceAccountName: node-local-dns
+      # ⚠ false, unlike upstream — see the header. The pod gets an ordinary pod IP and the
+      # CiliumLocalRedirectPolicy steers traffic to it.
+      hostNetwork: false
+      # Default, NOT ClusterFirst: this pod IS the DNS path, so it must not resolve through
+      # itself. Its `.` forward block then uses the node's own resolvers.
+      dnsPolicy: Default
+      # Every taint, so the cache actually lands on every node — mesh nodes carry
+      # ecc/mesh=true:NoSchedule and the GPU boxes add ecc/gpu. Matching on the effect
+      # rather than naming keys means a new taint cannot silently leave a node without DNS.
+      tolerations:
+        - key: "CriticalAddonsOnly"
+          operator: "Exists"
+        - effect: "NoExecute"
+          operator: "Exists"
+        - effect: "NoSchedule"
+          operator: "Exists"
+      containers:
+        - name: node-cache
+          # renovate: datasource=docker depName=registry.k8s.io/dns/k8s-dns-node-cache
+          image: registry.k8s.io/dns/k8s-dns-node-cache:1.26.8
+          resources:
+            requests:
+              cpu: 25m
+              memory: 5Mi
+          # ⚠ The three false/true flags are what make this safe as an ordinary pod:
+          # no dummy interface, no iptables rules, and no teardown of either on exit.
+          # -upstreamsvc points cache misses at kube-dns-upstream, not the kube-dns VIP.
+          args:
+            - "-localip"
+            - "0.0.0.0"
+            - "-conf"
+            - "/etc/Corefile"
+            - "-upstreamsvc"
+            - "kube-dns-upstream"
+            - "-setupinterface=false"
+            - "-setupiptables=false"
+            - "-skipteardown=true"
+          securityContext:
+            # No NET_ADMIN, unlike upstream: nothing here touches iptables or a link-local
+            # interface any more, so the capability would be unused privilege.
+            capabilities:
+              drop:
+                - ALL
+            allowPrivilegeEscalation: false
+          ports:
+            # ⚠ NAMED FOR THE CHART'S SERVICE PORTS, not upstream's dns/dns-tcp. Cilium maps
+            # an LRP's frontend ports to its backend ports BY NAME, so the kube-dns Service,
+            # this container and local-redirect-policy.yaml must all use the SAME three names
+            # or the policy binds nothing and reports no error. Upstream's example works
+            # because its Service is also named dns/dns-tcp; the coredns Helm chart hardcodes
+            # `<proto>-<port>` and offers no knob, so the backend is what has to move.
+            # Measured on ecc212 2026-09-16 — see local-redirect-policy.yaml.
+            - containerPort: 53
+              name: udp-53
+              protocol: UDP
+            - containerPort: 53
+              name: tcp-53
+              protocol: TCP
+            - containerPort: 9253
+              name: metrics
+              protocol: TCP
+          # No `host:` field — the probe hits the pod's own IP. Upstream points it at the
+          # link-local address, which does not exist in this variant.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/coredns
+      volumes:
+        - name: config-volume
+          configMap:
+            name: node-local-dns
+            items:
+              - key: Corefile
+                path: Corefile.base
+---
+# Headless service so Prometheus can scrape each cache instance.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+  annotations:
+    prometheus.io/port: "9253"
+    prometheus.io/scrape: "true"
+  labels:
+    k8s-app: node-local-dns
+spec:
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: 9253
+      targetPort: 9253
+  selector:
+    k8s-app: node-local-dns

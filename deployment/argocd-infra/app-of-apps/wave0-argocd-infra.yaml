@@ -1,0 +1,32 @@
+# App-of-apps entry for the self-managed INFRA ArgoCD.
+# Points to deployment/argocd-infra/argocd-infra-self/ which contains:
+#   - argocd-infra-self.yaml  (Application that reconciles the infra ArgoCD Helm release itself)
+#   - pvc.yaml          (argocd-helm-cache PVC)
+# Helm values for the infra ArgoCD release:
+#   deployment/argocd-infra/argocd-infra-self/values.yaml — ArgoCD core config
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-infra
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/argocd-infra-self
+    directory:
+      # Sealed secrets are owned by argocd-infra-self (source 3) — exclude here to
+      # avoid dual ownership and perpetual OutOfSync on the tracking-id annotation.
+      exclude: '{*-sealed.yaml,*.sh}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

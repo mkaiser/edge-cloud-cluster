@@ -1,0 +1,171 @@
+# PreSync: create the desktop registry PULL credential — NO sealed secret.
+# Same design as xilinx-2026-1/ and vllm/presync-registry-cred.yaml: a pull cred
+# must exist both as a k8s secret AND live in GitLab's DB, which is recreated
+# empty on every cluster rebuild — so it is minted at sync time from the live
+# GitLab (shared 'deployments'-group read_registry deploy token 'registry-pull'),
+# never sealed offline. The module images this desktop pulls
+# (deployments/infrastructure/eda/modules/*) are under that same group, so the
+# existing token covers them.
+#
+# PreSync (not PostSync): the desktop Deployment / broker can't pull without it.
+#
+# GROUP OWNERSHIP: the 'deployments/infrastructure/eda' group is created by THIS
+# app's own build-trigger (presync-build-desktop.yaml, PreSync wave 0), which runs
+# before this job's wave. So remote-desktop is self-contained — it does NOT depend
+# on xilinx/vllm having created the group. The 'registry-pull' deploy token on the
+# 'deployments' group is shared (find-or-create); whichever EDA app syncs first
+# mints it, the rest reuse it.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-bender-registry-cred
+  namespace: remote-desktop-bender
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: remote-desktop-bender-registry-cred
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# read the GitLab root password + exec the toolbox (in the gitlab ns)
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: remote-desktop-bender-registry-cred
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: remote-desktop-bender-registry-cred
+subjects:
+- kind: ServiceAccount
+  name: remote-desktop-bender-registry-cred
+  namespace: remote-desktop-bender
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-bender-registry-cred
+  namespace: remote-desktop-bender
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ must exceed the in-container 30m GitLab wait, else the deadline kills the
+  # Job mid-wait and the retry budget is never spent.
+  activeDeadlineSeconds: 2400
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: remote-desktop-bender-registry-cred
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: registry-cred
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        # Registry host (NOT secret) — plaintext, carries the subdomain anchor.
+        - name: REGISTRY_HOST
+          value: "registry.gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          # ⚠ MUST outlast GitLab's cold start on a cluster recreate, and MUST FAIL (not fall
+          # through) when it does not. Measured 2026-08-30 (ecc186→ecc187): a 10m wait expired
+          # while GitLab was still starting; the old loop then `break`ed and carried on, turning
+          # "GitLab never came up" into a misleading downstream error.
+          echo "Waiting for GitLab API (up to 30m)..."
+          i=1
+          ready=0
+          while [ "$i" -le 180 ]; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness")
+            if [ "$code" = "200" ]; then ready=1; break; fi
+            echo "Try ${i}/180: GitLab not ready (HTTP ${code}), retrying in 10s..."
+            i=$((i + 1)); sleep 10
+          done
+          if [ "$ready" != "1" ]; then
+            echo "ERROR: GitLab API not ready after 30m — refusing to continue." >&2
+            exit 1
+          fi
+
+          # Find-or-create the shared read_registry deploy token 'registry-pull'
+          # on the 'deployments' group (created by THIS app's build-trigger, wave 0).
+          echo "Ensuring 'deployments' group + registry-pull deploy token..."
+          j=1
+          while [ "$j" -le 30 ]; do
+            EXISTS=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner "puts(Group.find_by_full_path('deployments') ? 'yes' : 'no')" 2>/dev/null | tail -1 | tr -d ' \r\n')
+            [ "$EXISTS" = "yes" ] && break
+            echo "Try ${j}/30: 'deployments' group not present yet (this app's build-trigger creates it, wave 0), retrying in 10s..."
+            j=$((j + 1)); sleep 10
+          done
+
+          # rails: reuse or create the token; print "<username>\t<token>".
+          DT_OUT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- gitlab-rails runner '
+            g=Group.find_by_full_path("deployments")
+            if g.nil?; STDERR.puts "ERR: deployments group missing"; exit 1; end
+            u=User.find_by(admin:true)||User.find_by(username:"root")
+            t=g.deploy_tokens.active.find_by(name:"registry-pull")
+            if t.nil?
+              res=Groups::DeployTokens::CreateService.new(g,u,{name:"registry-pull",read_registry:true,expires_at:nil}).execute
+              t=res[:deploy_token]
+              (STDERR.puts "ERR: #{res[:message]}"; exit 1) unless t&.persisted?
+            end
+            puts "#{t.username}\t#{t.token}"
+          ' 2>/dev/null | tr -d "\r" | tail -1)
+          DT_USER="${DT_OUT%%	*}"
+          DT_TOKEN="${DT_OUT##*	}"
+          if [ -z "$DT_USER" ] || [ -z "$DT_TOKEN" ] || [ "$DT_USER" = "$DT_TOKEN" ]; then
+            echo "ERROR: could not obtain registry-pull deploy token: '${DT_OUT}'"
+            exit 1
+          fi
+          echo "Deploy token ready (user=${DT_USER})."
+
+          # Assemble the dockerconfigjson (plaintext host) and write the pull secret.
+          # The base64 `auth` field is REQUIRED by skopeo/podman --authfile: their parser
+          # ignores username/password and falls through to an anonymous request, which the
+          # registry rejects with a misleading 403 "Requesting bearer token" even for repos
+          # the token can read. kubelet is happy with either form.
+          echo "Writing remote-desktop-bender/remote-desktop-bender-registry-cred for ${REGISTRY_HOST}..."
+          DT_AUTH=$(printf '%s:%s' "${DT_USER}" "${DT_TOKEN}" | base64 | tr -d '\n')
+          DOCKERCFG="{\"auths\":{\"${REGISTRY_HOST}\":{\"username\":\"${DT_USER}\",\"password\":\"${DT_TOKEN}\",\"auth\":\"${DT_AUTH}\"}}}"
+          kubectl -n remote-desktop-bender create secret generic remote-desktop-bender-registry-cred \
+            --type=kubernetes.io/dockerconfigjson \
+            --from-literal=.dockerconfigjson="${DOCKERCFG}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "Desktop registry pull credential created."

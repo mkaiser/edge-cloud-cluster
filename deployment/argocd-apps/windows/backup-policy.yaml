@@ -1,0 +1,208 @@
+# Backup policy for windows-vm-storage — SEPARATE FROM THE APP so it can be turned off.
+#
+# WHAT: excludes windows/windows-vm-storage from every Longhorn S3 backup job, while
+# keeping local (node-local) snapshots.
+#
+# WHY: the volume is ~28GiB of raw block on a mesh node. Uploading it to Hetzner S3 over
+# that link runs at ~3.5 MB/s → ~2.5h, and it never finished inside one job run (best
+# observed 33% before the job ended). Snapshots are node-local and cost no upload
+# bandwidth, so they stay. Consequence, accepted deliberately: this volume has NO
+# off-site copy — if the mesh disk dies the VM is gone. It is a rebuildable
+# Windows install; if it ever holds state worth keeping, take a one-off manual backup
+# rather than re-enabling the daily job.
+#
+# WHY A JOB AND NOT PLAIN YAML: recurring-job membership is a LABEL on the Longhorn
+# Volume CR, and that CR is created imperatively by the CSI driver — it has no
+# ownerReference and no managedFields manager, so ArgoCD never manages it. The
+# StorageClass `recurringJobSelector` that seeds those labels is read at PROVISION TIME
+# ONLY (same freeze-at-creation as numberOfReplicas), so editing it does not reach an
+# existing volume. A PVC has no field or annotation for it either. Hence: a hook Job that
+# writes the labels, re-run on every sync. This also makes the policy survive a cluster
+# recreate, which the previous manual `kubectl label` did not.
+#
+# WHY NOT DROP THE SCOPE FROM THE RECURRINGJOB: that is node-scoped, not volume-scoped —
+# it would silently un-back-up any future volume landing on those nodes.
+#
+# HOW TO DEACTIVATE: add this filename to `directory.exclude` in
+# deployment/argocd-apps/app-of-apps/windows.yaml.disable, or rename it to
+# `backup-policy.yaml.disable`. The app runs `prune: true`, and ArgoCD DOES report these
+# hook objects as requiresPruning — so on deactivation it deletes the SA/ClusterRole/
+# ClusterRoleBinding/Job. That is the desired cleanup: they are policy, not app state.
+# Nothing the VM needs is affected — the PVC, Deployment and Service are ordinary tracked
+# resources in windows-vm.yaml and are never prune candidates. (This is also why the PVC
+# was deliberately NOT split into its own file: a deactivated PVC file WOULD be pruned,
+# deleting the claim and detaching the VM's disk.)
+#   NB: deactivating only stops the labels being RE-APPLIED. It does not put the volume
+#   back into a backup group. To actually re-enable backups, deactivate this file AND run:
+#     kubectl label volumes.longhorn.io -n longhorn-system <vol> \
+#       'recurring-job-group.longhorn.io/<scope>=enabled'   # the volume's storage scope
+#   ...then drop the windows-vm-storage exclusion from the LonghornVolumeNeverBackedUp
+#   alert in deployment/argocd-infra/prometheus/kube-prometheus-stack/prometheus.yaml, or the volume
+#   will be unmonitored.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windows-backup-policy
+  namespace: windows
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: windows-backup-policy
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+# Cluster-scoped because the Longhorn Volume CR lives in longhorn-system, not `windows`.
+# Deliberately narrow: only `volumes`, only these verbs (patch is what `kubectl label`
+# uses). Nothing else in this repo holds longhorn.io/volumes write access — keep it that
+# way rather than widening to a wildcard.
+- apiGroups: ["longhorn.io"]
+  resources: ["volumes"]
+  verbs: ["get", "list", "patch"]
+# Needed to resolve the PVC to its Longhorn volume name (.spec.volumeName). Omitting
+# this makes the first `kubectl get pvc` fail with Forbidden, which the Job's guard
+# cannot distinguish from an unbound PVC — it then exits 0 and silently applies no
+# policy, leaving the volume backed up. Read-only.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: windows-backup-policy
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: windows-backup-policy
+subjects:
+- kind: ServiceAccount
+  name: windows-backup-policy
+  namespace: windows
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: windows-backup-policy
+  namespace: windows
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: windows-backup-policy
+      restartPolicy: Never
+      # Only talks to the API server — keep it off the mesh nodes.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: backup-policy
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: PVC_NAMESPACE
+          value: "windows"
+        - name: PVC_NAME
+          value: "windows-vm-storage"
+        # The recurring job whose SNAPSHOTS we keep. Bound directly to the volume
+        # (recurring-job.longhorn.io/<job>, no `-group`) so the volume needs no group
+        # membership at all — which is the whole point, since every group it could join
+        # also carries a backup job.
+        - name: KEEP_SNAPSHOT_JOB
+          value: "mesh-snapshot-6hourly"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Distinguish "PVC absent" (fresh cluster, fine) from any OTHER kubectl error
+          # such as Forbidden. Collapsing the two — e.g. `|| true` on the get — makes an
+          # RBAC gap look like an unbound PVC, so the Job exits 0, applies no policy, and
+          # the volume stays BACKED UP while the sync reports success. That silent no-op
+          # is the worst outcome here, so a non-NotFound error must fail loudly.
+          ERR=$(kubectl get pvc -n "${PVC_NAMESPACE}" "${PVC_NAME}" -o jsonpath='{.spec.volumeName}' 2>&1 >/dev/null) || {
+            case "${ERR}" in
+              *NotFound*|*"not found"*)
+                echo "PVC ${PVC_NAMESPACE}/${PVC_NAME} does not exist yet — nothing to label. Exiting 0; the next sync will converge."
+                exit 0
+                ;;
+              *)
+                echo "FAILED: cannot read PVC ${PVC_NAMESPACE}/${PVC_NAME}: ${ERR}"
+                exit 1
+                ;;
+            esac
+          }
+
+          V=$(kubectl get pvc -n "${PVC_NAMESPACE}" "${PVC_NAME}" -o jsonpath='{.spec.volumeName}')
+
+          # PVC exists but is not yet Bound: no Longhorn Volume CR to label. Safe to skip —
+          # the volume stays in the `default` group (i.e. IS backed up) until the next sync
+          # applies this policy, and LonghornVolumeNeverBackedUp would surface a volume
+          # that somehow never converged.
+          if [ -z "${V}" ]; then
+            echo "PVC ${PVC_NAMESPACE}/${PVC_NAME} not bound yet — nothing to label. Exiting 0; the next sync will converge."
+            exit 0
+          fi
+          if ! kubectl get volumes.longhorn.io -n longhorn-system "${V}" >/dev/null 2>&1; then
+            echo "Longhorn Volume ${V} does not exist yet. Exiting 0; the next sync will converge."
+            exit 0
+          fi
+
+          echo "Applying no-S3-backup policy to Longhorn volume ${V} (${PVC_NAMESPACE}/${PVC_NAME})"
+
+          # Strip EVERY group label, then bind the snapshot job directly.
+          #
+          # The `default` removal is LOAD-BEARING: Longhorn auto-adds
+          # recurring-job-group.longhorn.io/default to any volume left with no group, and
+          # the `default` group contains backup-daily — so removing only the scope group
+          # silently re-enables the very backup this policy excludes. Strip it in the same
+          # call that adds the direct job binding, so the volume is never grouped.
+          #
+          # Removing an absent label is a kubectl no-op, so this is idempotent and safe to
+          # re-run on every sync.
+          # The scope group is read from the volume rather than hardcoded: which
+          # longhorn-<scope> StorageClass backs this PVC is a placement decision, and a
+          # stale literal here would strip a group that is not there while leaving the
+          # real one enabled. The assertion below is what catches that, but not stripping
+          # the wrong name in the first place is better than failing after the fact.
+          GROUPS=$(kubectl get volumes.longhorn.io -n longhorn-system "${V}" -o json \
+            | jq -r '[.metadata.labels // {} | keys[]
+                      | select(startswith("recurring-job-group.longhorn.io/"))
+                      | . + "-"] | join(" ")')
+          # shellcheck disable=SC2086 — word splitting is intended: one arg per label.
+          kubectl label volumes.longhorn.io -n longhorn-system "${V}" --overwrite \
+            ${GROUPS} \
+            'recurring-job-group.longhorn.io/default-' \
+            "recurring-job.longhorn.io/${KEEP_SNAPSHOT_JOB}=enabled"
+
+          # Verify rather than trust: assert no group label came back, since that is the
+          # exact failure mode (silent re-enable) this policy exists to prevent.
+          REMAINING=$(kubectl get volumes.longhorn.io -n longhorn-system "${V}" -o json \
+            | jq -r '[.metadata.labels // {} | keys[] | select(startswith("recurring-job-group.longhorn.io/"))] | join(",")')
+          if [ -n "${REMAINING}" ]; then
+            echo "FAILED: volume still carries group label(s): ${REMAINING}"
+            echo "A group may have been re-added by Longhorn; every group here also carries a backup job."
+            exit 1
+          fi
+
+          echo "OK. Final recurring-job labels:"
+          kubectl get volumes.longhorn.io -n longhorn-system "${V}" -o json \
+            | jq -r '.metadata.labels // {} | with_entries(select(.key | startswith("recurring-job"))) '

@@ -1,0 +1,35 @@
+# The `remote-desktop-bender` namespace as a PLAIN Sync-phase manifest.
+#
+# ⚠ IT MUST NOT BE A HOOK. Every hook-delete-policy deletes the object, and the DEFAULT
+# when the annotation is absent is `BeforeHookCreation` — "any existing hook resource is
+# deleted before the new one is created" (argo-cd docs, user-guide/sync-waves.md). There is
+# no policy meaning "keep". As a PreSync hook a namespace deletes ITSELF on every sync,
+# cascading away every namespaced PreSync hook inside it, failing the sync with
+# `Resource /Namespace/<ns> is missing, it might have been deleted`, and restarting under
+# `retry.limit: -1`. It converges after a retry or two, so it reads as a slow sync rather
+# than a fault.
+#
+# The lasting damage is to the static NFS PVs: deleting the namespace deletes the PVCs while
+# the `Retain` PVs survive holding a stale claimRef.uid, and Kubernetes NEVER re-binds a
+# Released PV. The Deployment then stays Pending forever — that half does not self-heal
+# (measured on remote-desktop 2026-09-04; recovered by removing /spec/claimRef from each PV).
+# This app has four such PVs, so the same trap applies unchanged.
+#
+# ⚠ THE NAMESPACE THE PRESYNC HOOKS NEED COMES FROM `CreateNamespace=true`, NOT FROM HERE.
+# That option is applied by the controller BEFORE the PreSync task list is built, so the
+# namespaced PreSync hooks already have their namespace.
+#
+# ⚠ SO WHY KEEP THE FILE AT ALL? For the OTHER APPS that write in here and cannot create it,
+# because CreateNamespace=true only ever creates an app's OWN destination namespace:
+# desktop-rollout (its desktop-rollout-read Role), image-registry (the broker's pull
+# credentials) and eda/secrets (the licence values). Without a manifest the namespace would
+# exist only once this app had synced, and those would fail until then.
+#
+# Wave -10 orders it ahead of everything else in the Sync phase so the PVCs, ConfigMaps and
+# workloads that live in it are applied after it exists.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: remote-desktop-bender
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"

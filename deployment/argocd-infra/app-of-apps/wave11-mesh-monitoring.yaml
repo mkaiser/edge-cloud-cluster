@@ -1,0 +1,33 @@
+# ArgoCD Application: mesh-monitoring
+# Active-probe workloads + dashboard for mesh link health:
+#   - iperf3-server DaemonSet on mesh nodes (throughput listener)
+#   - mesh-ping-probe CronJob (tailscale ping RTT / direct-vs-DERP → Pushgateway)
+#   - mesh-iperf3-probe CronJob (iperf3 throughput → Pushgateway)
+#   - Grafana dashboard ConfigMap (mesh link health)
+# The continuous status metrics come from the exporter sidecar in the wave-10
+# mesh-gateway DaemonSet; the Pushgateway + ServiceMonitors live with
+# kube-prometheus-stack (wave 2). Wave 11 = after mesh-gateway (wave 10) so the
+# tailscaled socket the probes mount already exists on the CP.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mesh-monitoring
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/mesh-monitoring
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

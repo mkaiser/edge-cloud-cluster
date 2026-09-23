@@ -4,8 +4,8 @@
 #
 # Usage:
 #   source ./scripts/pulumi/initPulumiStack.sh   # load stack once
-#   bash scripts/misc/printSealedSecrets.sh
-#   bash scripts/misc/printSealedSecrets.sh deployment/xwiki  # single dir
+#   bash scripts/secrets/printSealedSecrets.sh
+#   bash scripts/secrets/printSealedSecrets.sh deployment/argocd-apps/xwiki  # single dir
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

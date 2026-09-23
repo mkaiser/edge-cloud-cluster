@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: zulip
+spec:
+  encryptedData:
+    token: AgB1SOnmgKCJKb9B7TmbHEavwrmBa4kCAu/NpSoj8PlETngrnCdY+h/xIBIJ0vvFG4LUzuSc7nzW7Ksx4MD0HfzkIdziZOAH1wRg41/LnrPXdLVVztxdRF1oVUji6mb7+O7Q33NsNykjqo9EAQTPiIZnKlOr01LzSnN1gTMMiyzZMWSqJ9uW/9a+Mojh0YDnx/CQ9nUPgTBvxwXqEmctSWeZIMGvBxZ+lP56TOTfJ8rWwdl0G6n2e/FMaSk41S7EcAPFqk38cbVO6QW1aiaXnm5OLXC3TqNGyWu6NSZOqOWMcJMWKOXlNU9cB8IzNSehDtURLrJRH9tmgQsEQOultxP/i83MT2i9NZi2zhfP0FR779KHYFC3KZgAJJ2fxexo/O58myuG62PRy+AHFXo+DbRzo33Ldml2DVkWe469IGuQD2FwIpSlJpXgQhxQyn6koo7nXQaeovcTrYDyG2hn6reTR6Q19Yp9uHIoWyfwS9oLiCb0/0bwntNBBuJeymwZGG1fvTmaJ0vT6+gTl/8qWWHbOPjYy31ZG6OnzR/cuRMSF+1Vt4Gkh+aRx2pSUZ9sb5NGVF4KK3z+xsWpetiHeasDHIyCAuIV/uuVWlh4mX/KR+9y9ZYX3dVeCuKPf0VHWOGoZwy4gxoGRqzzy4tTtPmXbunFfhHQ/VObqf8M+GJ8yoVDM4C0Ysfm6IGin8JlZ23+/svN5riwDvu29Eys6+WtHE8OeuLFUikCS/YDcBVFaSHy5rvJcTjiPrvm0HlUQHSwOCWHnMthFr34bJJRxs0wDAZnCgSpjvd5KOOhRhvAfmp+LdAnrEV/ivckEK3UJqNy2X31McF1/xP97WBXA9T05xhMEqQ5XDw=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: zulip

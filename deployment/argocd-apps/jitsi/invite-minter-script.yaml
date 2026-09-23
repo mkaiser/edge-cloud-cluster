@@ -1,0 +1,252 @@
+# invite-minter: mints room-scoped GUEST invite links for Jitsi.
+#
+# Why this exists: enableGuests=false (values.yaml) means prosody rejects every
+# token-less client → a bare room URL forces OIDC login for ALL users. A "direct
+# link" guest is therefore NOT anonymous — the link carries a room-scoped JWT
+# (?jwt=<signed>) signed with the SAME JWT_APP_SECRET the OIDC adapter uses, so
+# prosody accepts it with no login and no host online. Guest tokens set
+# context.user.lobby_bypass=false (they still land in the lobby if a moderator is
+# present); OIDC-minted host tokens set true.
+#
+# Access control (chosen: "minter runs its own OIDC login"): before a host can
+# mint a link they complete the Authentik OIDC authorization-code flow against
+# the EXISTING "jitsi" OAuth2 provider (a second redirect URI /invite/callback is
+# added to it by authentik-provider.yaml). No proxy-provider/outpost needed, so
+# nothing in the authentik folder changes — same isolation as the rest of jitsi.
+#
+# Runtime: the stock denoland/deno image runs this .ts verbatim (mounted from
+# this ConfigMap) — no custom image build, no registry push. JWT signing reuses
+# the exact crypto the oidc-adapter uses (@emrahcom/jwt, HMAC-SHA256).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jitsi-invite-minter-script
+  namespace: jitsi
+  labels:
+    app.kubernetes.io/name: jitsi-invite-minter
+data:
+  minter.ts: |
+    // Jitsi invite-minter — OIDC-gated, room-scoped guest-link generator.
+    //
+    // Routes (all under /invite, the ingress path):
+    //   GET  /invite            → start OIDC login (redirect to Authentik)
+    //   GET  /invite/callback   → OIDC code→token→userinfo, set a signed session
+    //                             cookie proving the host authenticated, show form
+    //   POST /invite/mint       → (session required) mint a room-scoped guest JWT,
+    //                             return the shareable https://<host>/<room>?jwt=…
+    //   GET  /invite/healthz    → liveness
+    //
+    // The session cookie is itself a short-lived HS256 JWT signed with
+    // JWT_APP_SECRET (same key as everything else) carrying the host's identity —
+    // no server-side session store needed.
+    import { STATUS_CODE } from "jsr:@std/http@^1.0.25/status";
+    import { encodeBase64 } from "jsr:@std/encoding@^1.0.10/base64";
+    import { create, getNumericDate, verify } from "jsr:@emrahcom/jwt@^0.4.8";
+    import type { Algorithm } from "jsr:@emrahcom/jwt@^0.4.8/algorithm";
+
+    const OIDC_ISSUER_URL = Deno.env.get("OIDC_ISSUER_URL")!;
+    const OIDC_CLIENT_ID = Deno.env.get("OIDC_CLIENT_ID") || "jitsi";
+    const OIDC_CLIENT_SECRET = Deno.env.get("OIDC_CLIENT_SECRET") || "";
+    const OIDC_SCOPES = Deno.env.get("OIDC_SCOPES") || "openid profile email";
+    const JWT_APP_ID = Deno.env.get("JWT_APP_ID") || "jitsi";
+    const JWT_APP_SECRET = Deno.env.get("JWT_APP_SECRET")!;
+    const PUBLIC_URL = (Deno.env.get("PUBLIC_URL") || "").replace(/\/+$/, "");
+    const GUEST_EXP_DEFAULT = Number(Deno.env.get("GUEST_EXP_SECOND") || 10800);
+    const GUEST_EXP_MAX = Number(Deno.env.get("GUEST_EXP_MAX_SECOND") || 604800);
+    const SESSION_EXP = Number(Deno.env.get("SESSION_EXP_SECOND") || 3600);
+    const PORT = Number(Deno.env.get("PORT") || 9000);
+
+    const DISCOVERY_URL = `${OIDC_ISSUER_URL}/.well-known/openid-configuration`;
+    let AUTH_ENDPOINT = "", TOKEN_ENDPOINT = "", USERINFO_ENDPOINT = "";
+    let KEY: CryptoKey;
+
+    async function setKey() {
+      KEY = await crypto.subtle.importKey(
+        "raw", new TextEncoder().encode(JWT_APP_SECRET),
+        { name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"],
+      );
+    }
+
+    async function endpoints() {
+      if (AUTH_ENDPOINT) return;
+      const res = await fetch(DISCOVERY_URL);
+      if (!res.ok) throw new Error("OIDC discovery failed");
+      const c = await res.json();
+      AUTH_ENDPOINT = c.authorization_endpoint;
+      TOKEN_ENDPOINT = c.token_endpoint;
+      USERINFO_ENDPOINT = c.userinfo_endpoint;
+      if (!AUTH_ENDPOINT || !TOKEN_ENDPOINT || !USERINFO_ENDPOINT) {
+        throw new Error("OIDC discovery missing endpoints");
+      }
+    }
+
+    const redirectUri = (host: string) => `https://${host}/invite/callback`;
+
+    // ---- TTL parsing: "24h", "90m", "3600" (seconds) ---------------------------
+    function parseTtl(raw: string | null): number {
+      if (!raw) return GUEST_EXP_DEFAULT;
+      const m = raw.trim().match(/^(\d+)([smhd]?)$/);
+      if (!m) return GUEST_EXP_DEFAULT;
+      const n = Number(m[1]);
+      const mult = { s: 1, m: 60, h: 3600, d: 86400, "": 1 }[m[2]]!;
+      return Math.min(Math.max(n * mult, 60), GUEST_EXP_MAX);
+    }
+
+    // Jitsi room names are case-insensitive & lowercased by the client; normalise
+    // so the room claim matches what prosody sees. Allow only safe URL chars.
+    function normRoom(raw: string): string | null {
+      const r = decodeURIComponent(raw).trim().toLowerCase();
+      if (!r || r.length > 128 || !/^[a-z0-9._-]+$/.test(r)) return null;
+      return r;
+    }
+
+    async function signSession(sub: string, name: string): Promise<string> {
+      return await create(
+        { typ: "JWT", alg: "HS256" as Algorithm },
+        { iss: "invite-minter", aud: "invite-minter", sub, name,
+          iat: getNumericDate(0), exp: getNumericDate(SESSION_EXP) },
+        KEY,
+      );
+    }
+
+    async function readSession(cookie: string | null):
+      Promise<{ sub: string; name: string } | null> {
+      const t = cookie?.match(/(?:^|;\s*)inv_sess=([^;]+)/)?.[1];
+      if (!t) return null;
+      try {
+        const p = await verify(decodeURIComponent(t), KEY) as
+          { iss?: string; aud?: string; sub?: string; name?: string };
+        if (p.iss !== "invite-minter" || p.aud !== "invite-minter" || !p.sub) {
+          return null;
+        }
+        return { sub: p.sub, name: p.name || "" };
+      } catch { return null; }
+    }
+
+    // Guest token: room-scoped, lobby_bypass=false (guest, not moderator).
+    async function mintGuest(room: string, ttl: number, host: string):
+      Promise<string> {
+      return await create(
+        { typ: "JWT", alg: "HS256" as Algorithm },
+        { aud: JWT_APP_ID, iss: JWT_APP_ID, sub: host, room,
+          iat: getNumericDate(0), nbf: getNumericDate(0),
+          exp: getNumericDate(ttl),
+          context: { user: {
+            name: "Guest", lobby_bypass: false, security_bypass: false,
+          } } },
+        KEY,
+      );
+    }
+
+    async function accessToken(host: string, code: string): Promise<string> {
+      await endpoints();
+      const headers = new Headers({ "Accept": "application/json" });
+      const body = new URLSearchParams({
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri(host), code,
+      });
+      if (OIDC_CLIENT_SECRET) {
+        headers.append("Authorization",
+          "Basic " + encodeBase64(`${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}`));
+      } else { body.append("client_id", OIDC_CLIENT_ID); }
+      const res = await fetch(TOKEN_ENDPOINT, { method: "POST", headers, body });
+      const j = await res.json();
+      if (!j.access_token) throw new Error("token exchange failed");
+      return j.access_token;
+    }
+
+    async function userInfo(at: string): Promise<{ sub: string; name: string }> {
+      await endpoints();
+      const res = await fetch(USERINFO_ENDPOINT, {
+        headers: { "Accept": "application/json", "Authorization": `Bearer ${at}` },
+      });
+      const u = await res.json();
+      if (!u.sub) throw new Error("no userinfo");
+      return { sub: u.sub, name: (u.name || u.preferred_username || "").trim() };
+    }
+
+    const html = (b: string) =>
+      new Response(`<!doctype html><meta charset=utf-8>` +
+        `<meta name=viewport content="width=device-width,initial-scale=1">` +
+        `<style>body{font-family:system-ui;max-width:640px;margin:3rem auto;` +
+        `padding:0 1rem}input,button{font-size:1rem;padding:.5rem}` +
+        `label{display:block;margin:1rem 0 .25rem}code{word-break:break-all;` +
+        `background:#f4f4f4;padding:.5rem;display:block;border-radius:4px}` +
+        `</style>${b}`, { headers: { "content-type": "text/html; charset=utf-8" } });
+
+    async function handler(req: Request): Promise<Response> {
+      const url = new URL(req.url);
+      const host = req.headers.get("host") || new URL(PUBLIC_URL).host;
+      const path = url.pathname;
+
+      if (path === "/invite/healthz") return new Response("ok");
+
+      // Start OIDC login.
+      if (path === "/invite" && req.method === "GET") {
+        const sess = await readSession(req.headers.get("cookie"));
+        if (sess) return formPage(sess.name);
+        await endpoints();
+        const p = new URLSearchParams({
+          client_id: OIDC_CLIENT_ID, response_type: "code",
+          scope: OIDC_SCOPES, prompt: "consent",
+          redirect_uri: redirectUri(host), state: "invite",
+        });
+        return Response.redirect(`${AUTH_ENDPOINT}?${p}`, STATUS_CODE.Found);
+      }
+
+      // OIDC callback → session cookie → form.
+      if (path === "/invite/callback" && req.method === "GET") {
+        const code = url.searchParams.get("code");
+        if (!code) return new Response("missing code", { status: 400 });
+        try {
+          const info = await userInfo(await accessToken(host, code));
+          const sess = await signSession(info.sub, info.name);
+          const res = formPage(info.name);
+          res.headers.append("set-cookie",
+            `inv_sess=${encodeURIComponent(sess)}; Path=/invite; HttpOnly; ` +
+            `Secure; SameSite=Lax; Max-Age=${SESSION_EXP}`);
+          return res;
+        } catch (e) {
+          console.error(e);
+          return new Response("OIDC login failed", { status: 401 });
+        }
+      }
+
+      // Mint (session required).
+      if (path === "/invite/mint" && req.method === "POST") {
+        const sess = await readSession(req.headers.get("cookie"));
+        if (!sess) return new Response("login required", { status: 401 });
+        const form = await req.formData();
+        const room = normRoom(String(form.get("room") || ""));
+        if (!room) return html(`<p>Invalid room name.</p><a href=/invite>back</a>`);
+        const ttl = parseTtl(String(form.get("ttl") || ""));
+        const jwt = await mintGuest(room, ttl, new URL(PUBLIC_URL).host);
+        const link = `${PUBLIC_URL}/${room}?jwt=${jwt}`;
+        const hrs = (ttl / 3600).toFixed(ttl % 3600 ? 1 : 0);
+        return html(
+          `<h2>Guest link for room “${room}”</h2>` +
+          `<p>Valid ${hrs}h. Anyone with this link joins WITHOUT logging in ` +
+          `(guest, held in the lobby if a host is present):</p>` +
+          `<code>${link}</code>` +
+          `<p style=margin-top:2rem><a href=/invite>mint another</a></p>`);
+      }
+
+      return new Response(null, { status: 404 });
+    }
+
+    function formPage(name: string): Response {
+      return html(
+        `<h2>Jitsi guest-invite links</h2>` +
+        `<p>Signed in as <b>${name || "host"}</b>. Generate a link that lets a ` +
+        `guest join one room without an account.</p>` +
+        `<form method=post action=/invite/mint>` +
+        `<label>Room name</label>` +
+        `<input name=room required placeholder=my-meeting pattern="[A-Za-z0-9._-]+">` +
+        `<label>Valid for (e.g. 3h, 90m, 7d)</label>` +
+        `<input name=ttl value=3h>` +
+        `<p><button type=submit>Create guest link</button></p></form>`);
+    }
+
+    await setKey();
+    console.log(`invite-minter listening on :${PORT}`);
+    Deno.serve({ port: PORT, hostname: "0.0.0.0" }, handler);

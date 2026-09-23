@@ -1,0 +1,247 @@
+# The intended bound on the agent's shell tool. See the enforcement note below.
+#
+# This pod runs LLM-generated commands as ROOT with a working sudo. Without a policy it
+# could reach every ClusterIP in the cluster — GitLab, Authentik, the LiteLLM admin API,
+# every database — and every on-prem LAN reachable over the mesh. This policy is what keeps
+# the blast radius to "an internet-connected workstation that can also call the LLM gateway".
+#
+# ENFORCED. Cilium with policyEnforcementMode "default" (src/cni.ts) is what makes Kubernetes
+# NetworkPolicy real here: an allow-listed client reaches its target while a non-listed pod
+# in the SAME namespace is dropped with `Policy denied` in Hubble.
+#
+# The rules below are a real boundary, not a design record. Two consequences:
+#   • Editing them changes what the agent can reach. Do not relax a rule to "fix" a
+#     connectivity problem without deciding that the new reach is acceptable.
+#   • This is only ONE control. automountServiceAccountToken: false bounds what the agent can
+#     authenticate to; this bounds what it can dial. Both are needed.
+#
+# ⚠ Egress policy is rare here — most live policies in the cluster are ingress-only — so this
+# file is the one most likely to break its own workload: an over-tight egress rule fails as a
+# SILENT TIMEOUT, not a clear error. Verify with `hubble observe --verdict DROPPED` after any
+# change.
+#
+# TWO documents below, and both are needed. The NetworkPolicy carries the CIDR rules; the
+# CiliumNetworkPolicy at the end carries the one rule CIDRs cannot express (egress to a node
+# IP). Cilium unions them.
+#
+# Egress is DENY-BY-DEFAULT (an egress rule exists, so everything not listed is dropped),
+# with four holes:
+#   1. DNS to kube-dns.
+#   2. The LiteLLM gateway — how the agent reaches any model at all.
+#   3. The AD DC, so sssd can bind and the account can be authenticated.
+#   4. The public internet, MINUS every private range. ⚠ Hole 4 is not optional here: the
+#      agent's PURPOSE includes installing its own tools, so the Ubuntu archives, PyPI and
+#      git hosts must be reachable. Carving out RFC1918 + the pod/service CIDRs + link-local
+#      is what stops it turning around and talking to in-cluster or on-prem hosts.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eda-pcb-agent
+  namespace: eda-pcb-agent
+spec:
+  podSelector:
+    matchLabels:
+      app: eda-pcb-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ⚠ RDP comes from remote-desktop's Guacamole, NOT from the Gateway. This is the shared
+    # session's only inbound path, and it is why disabling remote-desktop takes the humans'
+    # access with it (the agent keeps working; nobody can watch).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: remote-desktop
+      ports:
+        - protocol: TCP
+          port: 3389
+    # The dashboard, reached through the shared Gateway's Envoy pods. Hermes gates it itself
+    # with this app's Authentik OIDC provider, so there is no forward-auth hop and the
+    # authentik namespace needs no access to this port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+      ports:
+        - protocol: TCP
+          port: 9119
+    # Kubelet probes come from the node itself, which NetworkPolicy does not filter
+    # (host-network source) — no rule needed for startup/readiness/liveness.
+  egress:
+    # --- DNS ---
+    # ⚠ BOTH selectors are required, and the second one is the one that is easy to miss.
+    # A pod resolves via the kube-dns ClusterIP, but Cilium's LocalRedirectPolicy
+    # (argocd-infra/node-local-dns/local-redirect-policy.yaml) rewrites that to the
+    # node-local-dns pod on the SAME node before NetworkPolicy is evaluated — so the peer
+    # that must be allowed is node-local-dns, whose label is `k8s-app: node-local-dns`,
+    # NOT `k8s-app: kube-dns`. Allowing only kube-dns drops every query.
+    #
+    # ⚠ This did not bite until the LRP actually started binding (ecc212 2026-09-16 — the
+    # port-name fix in that file's header). While it was inert, traffic really did reach
+    # CoreDNS and a kube-dns-only rule was correct, which is why this rule looks right and
+    # has history on its side. Measured on ecc214: DNS failed in-pod while an UNLABELLED
+    # pod on the same node in this same namespace resolved instantly.
+    #
+    # The failure is a silent timeout with no NetworkPolicy error anywhere: sssd cannot find
+    # a DC so the desktop exits `'eda-pcb-agent' does not resolve after 60s`, and tailscale
+    # reports `no DNS fallback candidates remain`. Both read as identity/VPN faults.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # --- The LLM gateway ---
+    # ⚠ Omitting this fails as a silent timeout, not an error: the agent simply never gets a
+    # response from any model.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: litellm
+          podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - protocol: TCP
+          port: 4000
+    # --- The Active Directory DC ---
+    # ⚠ WITHOUT THIS THE POD CANNOT START. sssd binds to the DC with GSSAPI at startup, and
+    # the startup script refuses to continue when the account does not resolve. LDAP(S) for
+    # the directory, Kerberos 88 for the ticket, and 464 for password operations.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: samba-ad
+      ports:
+        - protocol: TCP
+          port: 389
+        - protocol: TCP
+          port: 636
+        - protocol: TCP
+          port: 88
+        - protocol: UDP
+          port: 88
+        - protocol: TCP
+          port: 464
+        - protocol: UDP
+          port: 464
+    # --- SearXNG, the self-hosted web-search backend ---
+    # Without this the egress policy blocks it and web_search reports as unavailable with no
+    # obvious cause — the deny is silent and SEARXNG_URL looks correct.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: searxng
+          podSelector:
+            matchLabels:
+              app: searxng
+      ports:
+        - protocol: TCP
+          port: 8080
+    # --- The public internet, and nothing private ---
+    # ipBlock.except is what makes this safe: without those exclusions 0.0.0.0/0 would
+    # re-open every ClusterIP and every on-prem LAN reachable over the mesh, defeating the
+    # whole policy.
+    #
+    # ⚠ This rule does NOT carry the dashboard's OIDC gate, despite the issuer being a public
+    # https:// URL. id.<tld> resolves to a cluster NODE's public address, and Cilium gives
+    # node IPs the `host` identity, not `world` — an ipBlock rule only ever matches `world`,
+    # so those packets are dropped here no matter what the except list says. The OIDC hairpin
+    # is granted by the CiliumNetworkPolicy below. Keep both.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8        # the pod CIDR 10.42.0.0/16, the service CIDR
+                                  # 10.43.0.0/16, the hcloud private network and the mesh range
+              - 172.16.0.0/12     # RFC1918
+              - 192.168.0.0/16    # RFC1918 — the unibi-hclab / on-prem LANs, incl. the
+                                  # fileserver appliance and the lab registry
+              - 169.254.0.0/16    # link-local, incl. cloud metadata endpoints
+              - 100.64.0.0/10     # CGNAT — the tailscale/headscale overlay
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+---
+# The dashboard's OIDC gate, and nothing else.
+#
+# WHY A SECOND POLICY OBJECT: the issuer https://id.<tld> resolves to a cluster node's PUBLIC
+# address. Cilium labels every node IP `reserved:host`, and a NetworkPolicy ipBlock —
+# including 0.0.0.0/0 — only matches `reserved:world`. So the discovery, JWKS and code→token
+# calls are dropped by the rule above with `Policy denied ... identity <pod>->host`, the
+# dashboard's OIDC start endpoint returns 503, and nothing in a NetworkPolicy can fix it:
+# entity identity is expressible only in a CiliumNetworkPolicy.
+#
+# ⚠ PORT 443 ONLY, and that is load-bearing HERE MORE THAN ANYWHERE. The `host` identity on a
+# control-plane node also carries `reserved:kube-apiserver`, so a rule without this port
+# restriction would hand an agent that runs LLM-generated shell AS ROOT a path to the
+# Kubernetes API. The apiserver listens on 6443, so pinning to 443 grants the Gateway hairpin
+# and nothing else. Do NOT widen this to all ports, and do NOT add 6443.
+# (automountServiceAccountToken: false means the pod holds no API credential either —
+# defence in depth, not a substitute for this.)
+#
+# remote-node is included because the pod may be rescheduled onto a node other than the one
+# publishing the Gateway address; entity rules cannot be pinned to a single node IP.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: eda-pcb-agent-oidc-hairpin
+  namespace: eda-pcb-agent
+spec:
+  endpointSelector:
+    matchLabels:
+      app: eda-pcb-agent
+  # ── INGRESS FROM THE GATEWAY — REQUIRED, and a namespaceSelector CANNOT express it ──
+  # ⚠ THE ENVOY PROXY IS hostNetwork: true. Verified on ecc205: the forwarding pod
+  # (envoy-envoy-*, app.kubernetes.io/component=proxy) reports hostNetwork=true with
+  # podIP == hostIP, so Cilium gives it the NODE's identity — `reserved:host` on its own
+  # node and `reserved:remote-node` from anywhere else — NOT a pod identity in
+  # envoy-gateway-system.
+  #
+  # So the NetworkPolicy rule above that allows `namespaceSelector:
+  # kubernetes.io/metadata.name=envoy-gateway-system` on 9119 matches only the envoy-gateway
+  # CONTROLLER (an ordinary pod), never the proxy that actually carries the request. This
+  # pod runs on a mesh node while the proxy runs on a cloud node, so the traffic arrives as
+  # `remote-node` and is dropped.
+  #
+  # ⚠ THE FAILURE IS SILENT AND MISLEADING. Nothing appears in `hubble observe --verdict
+  # DROPPED` for this namespace, the HTTPRoute reports Accepted=True/ResolvedRefs=True, the
+  # Service has a ready endpoint, and the backend answers on loopback. The only symptom is
+  # Envoy's own reply to the browser:
+  #   upstream connect error or disconnect/reset before headers. reset reason: connection timeout
+  #
+  # ⚠ PORT 9119 ONLY. `host`/`remote-node` are broad identities — every node in the cluster —
+  # so this must never be widened to all ports. It grants the Gateway a path to the dashboard
+  # and nothing else. (3389 stays restricted to remote-desktop's Guacamole, which IS an
+  # ordinary pod and is matched correctly by the NetworkPolicy above.)
+  ingress:
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "9119"
+              protocol: TCP
+  egress:
+    - toEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

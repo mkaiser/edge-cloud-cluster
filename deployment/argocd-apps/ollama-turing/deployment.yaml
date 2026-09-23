@@ -1,0 +1,198 @@
+# Ollama on the discrete-GPU mesh node (smartmirror1: 2x RTX 2070, Turing sm_75).
+#
+# SEPARATE APP from `ollama` (which is Thor-only) on purpose: different CPU arch, different
+# image (upstream x86 vs a CI-built aarch64/L4T one), different GPU-injection story, and a
+# different replica model. Sharing one Deployment would need per-node overrides a Deployment
+# cannot express.
+#
+# ONE REPLICA, ONE CARD — the SECOND CARD IS DELIBERATELY LEFT FREE for Ryax, which runs
+# GPU actions on this node through a Node Pool (scripts/midterm-review/ryax-prov.sh, which
+# refuses a node with no free GPU). This halves serving capacity against the two-replica
+# arrangement and is a deliberate trade, not a default to "restore" — put it back to
+# replicas: 2 only when Ryax no longer needs a card here, and expect ryax-prov.sh to start
+# skipping this node the moment you do.
+#
+# The cards are NOT pooled (8 GiB apiece, and P2P is impossible on this hardware — BAR1 is
+# capped at 256 MB, see project_settings.ts), so a second replica would be an independent
+# server rather than extra VRAM: concurrency, not model size.
+# Exclusivity is SCHEDULER-ENFORCED (nvidia.com/gpu: 1 x 1 replica against 2 advertised
+# GPUs), unlike the Thor where it needs scripts/runtime/switchLLMBackend.sh. Verified: a pod
+# requesting more GPUs than remain stays Pending on "Insufficient nvidia.com/gpu".
+#
+# Model selection is USER-DRIVEN: Ollama keeps every pulled model on disk and loads/evicts on
+# demand (OLLAMA_MAX_LOADED_MODELS + OLLAMA_KEEP_ALIVE + LRU), so a user picking a model in
+# Open WebUI is what "deploys" it — no redeploy, no scaling, no switch script.
+# Adding a model to the OFFERED set needs NO change here or in LiteLLM: the `turing/*`
+# wildcard route (litellm/config.yaml) expands from a live GET /api/tags, so `ollama pull`
+# alone is enough and the model appears within ~5 min. The catalogue ConfigMap declares only
+# what a FRESH node should hold, it does not gate what can be served.
+# ⚠ The wildcard's provider must stay `ollama_chat/*`. An `openai/*` passthrough expands to
+# LiteLLM's entire built-in OpenAI catalogue (~374 phantom models in the picker) — that is
+# what was tried and rejected, not the wildcard itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-turing
+  namespace: ollama-turing
+  labels:
+    app: ollama-turing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-turing
+  strategy:
+    # maxSurge MUST be 0: a surge pod would need a card that the running pod (or Ryax) still
+    # holds, and the rollout deadlocks on Pending forever.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: ollama-turing
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        # ecc/gpu-model, not ecc/gpu=true: the label names the CUDA ARCH, and this image is
+        # x86_64 — it must never land on the aarch64 Thor.
+        ecc/gpu-model: nvidia-turing-sm75  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        # Mesh node.
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        # GPU nodes are tainted so they stay opt-in only; a GPU consumer must tolerate it.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+      # No anti-affinity: the GPU request alone caps how many pods this node can hold
+      # (nvidia.com/gpu: 1 each against 2 advertised cards, one of which Ryax uses).
+      containers:
+        - name: ollama
+          # Upstream x86_64 image — NO CI build needed, unlike the Thor (whose aarch64/L4T/
+          # sm_110 combination has no usable prebuilt).
+          image: docker.io/ollama/ollama:0.34.1 # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 11434
+              name: http
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: OLLAMA_MODELS
+              value: /mnt/models
+            # ── User-driven model selection knobs ──────────────────────────────────────
+            # Up to 2 models resident at once, WHEN THEY FIT. This does not raise VRAM; it
+            # only permits co-residency (e.g. qwen3.5:9b at 5.6 GB + nomic-embed-text at
+            # ~0.3 GB). Two big models will not fit and Ollama LRU-evicts rather than OOMing
+            # — the desired behaviour, and what makes user-driven model switching safe.
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "2"
+            # Unload after 10 min idle. Deliberately NOT the Thor's -1 (never unload): that
+            # is right for a single pinned model and wrong here, where an idle resident model
+            # is VRAM stolen from the next user's choice. Long enough that a live
+            # conversation never pays a reload.
+            - name: OLLAMA_KEEP_ALIVE
+              value: "10m"
+            # 2 concurrent requests per loaded model. Each parallel slot gets its own KV
+            # cache, so 4 slots would cost ~1 GiB of KV on top of the model — tight against
+            # the ~1.9 GiB spare. 2 is the honest number; raise it only with measurement.
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"
+            # Queue rather than 503 when both slots are busy.
+            - name: OLLAMA_MAX_QUEUE
+              value: "64"
+            # 8192, not the 256K the models advertise: KV scales with context and 256K would
+            # dwarf the card. MEASURED on this hardware with qwen3.5:9b @ 8192:
+            #   34/34 layers offloaded, model buffer 4717 MiB, KV only 256 MiB
+            #   -> `ollama ps` reports 5.6 GB / "100% GPU" against 7.5 GiB usable.
+            # ~1.9 GiB spare, so 8192 is comfortable and there is room to raise it later.
+            # (KV is unusually cheap here — the architecture is hybrid/recurrent, so only 8 of
+            # the 34 layers hold a KV cache. Do NOT assume that for a plain transformer.)
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "8192"
+          # ONE card per pod, scheduler-enforced. Deliberately NOT setting
+          # NVIDIA_VISIBLE_DEVICES: the device plugin injects the allocated card, and
+          # overriding it with "all" would let both pods double-book both GPUs.
+          #
+          # NOTE the container sees NVIDIA_VISIBLE_DEVICES=void — that is normal and working
+          # here (the node runs runtime mode=auto and the container toolkit auto-generates a
+          # CDI spec, so injection goes via CDI). Verified: ollama 0.32.15 detects
+          # "NVIDIA GeForce RTX 2070 compute=7.5 type=discrete total=7.6GiB" and does NOT hit
+          # the cudart_bootstrap stack-smash that forces the legacy env path on Tegra.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              nvidia.com/gpu: 1
+              # No CPU limit: llama.cpp uses all cores it can get for prompt processing and
+              # for any layer that does spill. The node's 16 cores are shared with whatever
+              # else runs here, Ryax actions included.
+              memory: 12Gi
+          volumeMounts:
+            - name: models
+              mountPath: /mnt/models
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              # Root returns 200 "Ollama is running". Models download lazily AFTER ready, so
+              # this needs no vLLM-style multi-minute budget.
+              path: /
+              port: 11434
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            # Generous timeout: a heavy model load can starve the HTTP handler briefly, and a
+            # 1s default would restart the pod mid-load.
+            timeoutSeconds: 10
+            failureThreshold: 6
+      volumes:
+        # hostPath, deliberately — it stays SHARED whenever this runs more than one
+        # replica. The alternatives are worse: a RWO local-path PVC cannot be mounted by
+        # two pods; a StatefulSet with per-pod
+        # PVCs downloads every model TWICE (~2x disk for no benefit); Longhorn RWX would
+        # replicate a large, disposable, re-downloadable cache over WireGuard.
+        # Ollama's store is content-addressed blobs + manifests, so concurrent readers are
+        # safe. Both pods therefore see the SAME catalogue, which is what makes the
+        # user-facing model list identical whichever replica a request lands on.
+        - name: models
+          hostPath:
+            path: /var/lib/ollama-models
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-turing
+  namespace: ollama-turing
+spec:
+  # ClusterIP only — no ingress. The sole client is the LiteLLM gateway, which is what
+  # provides auth, budgets and per-user attribution (the latter requires
+  # ENABLE_FORWARD_USER_INFO_HEADERS + user_header_name — see litellm/config.yaml).
+  # Round-robins across whatever replicas are up (one today).
+  #
+  # Known trade-off: each replica loads models independently, so a follow-up request may
+  # land on the replica that has not loaded that model yet and pay a second cold load (with
+  # the same model then resident on both cards). Acceptable at this user count.
+  # sessionAffinity would NOT help — LiteLLM is the only client, so all traffic shares one
+  # source IP and affinity would pin everything to one replica. If it becomes a problem the
+  # fix is two Services + two LiteLLM routes, making the choice explicit.
+  selector:
+    app: ollama-turing
+  ports:
+    - port: 11434
+      targetPort: 11434
+      name: http

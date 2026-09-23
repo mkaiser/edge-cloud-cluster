@@ -1,0 +1,35 @@
+# The Hermes admin dashboard (config, Kanban board, logs) at pcb-agent.<tld>.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway); the
+# HTTP→HTTPS redirect is handled once there. No per-host certificate — see
+# doc/tls-certificates.md.
+#
+# ⚠ The SHARED X SESSION IS NOT ON THIS ROUTE. RDP is not an HTTP protocol; the two humans
+# reach the desktop through remote-desktop's Guacamole tile (connection-seed.yaml). This
+# route only exposes the dashboard, which is gated by this app's own Authentik OIDC provider
+# (authentik-provider.yaml).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: eda-pcb-agent
+  namespace: eda-pcb-agent
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - pcb-agent.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # The dashboard streams agent output over a long-lived connection; the default
+      # backendRequest timeout would cut it.
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        - name: eda-pcb-agent
+          port: 9119

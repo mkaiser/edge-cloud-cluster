@@ -1,0 +1,70 @@
+# Stakater Reloader Helm values (chart 2.2.16).
+#
+# WHAT IT FIXES: ArgoCD updates a ConfigMap/Secret correctly and reports Synced/Healthy,
+# but never restarts the pods that mounted it. Every process that reads its config ONCE at
+# startup — LiteLLM, nginx (gitlab-s3-proxy), headscale — then keeps serving the old
+# content with the correct file already on disk. That failure is SILENT: nothing anywhere
+# is red. Reloader watches the ConfigMaps/Secrets a workload references and rolls it when
+# their content changes.
+#
+# Opt-in per workload, one annotation on the Deployment/StatefulSet/DaemonSet:
+#   reloader.stakater.com/auto: "true"      # every ConfigMap + Secret the pod references
+#   configmap.reloader.stakater.com/reload: "a,b"   # named ConfigMaps only
+#   secret.reloader.stakater.com/reload:    "c"     # named Secrets only
+# Nothing is rolled without one of these (autoReloadAll stays false).
+
+reloader:
+  # THE setting that makes this safe under ArgoCD. The chart default ("default" =
+  # `env-vars`) injects a STAKATER_<NAME>_CONFIGMAP env var into the container — i.e. it
+  # mutates `containers[].env`, a field ArgoCD declares and therefore owns, so ArgoCD and
+  # Reloader would fight over it. `annotations` writes only
+  # reloader.stakater.com/last-reloaded-from onto the pod template, which no manifest
+  # declares. Upstream README says the same ("preferred in GitOps environments").
+  #
+  # It is NOT sufficient on its own: the consuming Application must also carry
+  # ServerSideApply=true, so ArgoCD's diff is computed over the fields it manages instead
+  # of the whole object. Every app annotated for Reloader in this repo has it. Proof the
+  # combination holds: litellm's model-sync CronJob has patched that same annotation map
+  # (via `kubectl rollout restart`) every 5 minutes since 2026-08-22 with no sync churn.
+  # If a NON-SSA app is ever annotated, it needs
+  # `/spec/template/metadata/annotations` in its ignoreDifferences instead — that is
+  # exactly what wave8-headscale.yaml already does for its own checksum annotation.
+  reloadStrategy: annotations
+
+  # Cluster-wide. The alternative (watchGlobally: false + an explicit namespace list) would
+  # have to be extended by hand for every app that later opts in, and a missing entry fails
+  # SILENTLY — the same class of bug this component exists to remove.
+  # ⚠ The cost is a ClusterRole with get/list/watch on Secrets in every namespace. Reloader
+  # only hashes them; it never logs or forwards content.
+  watchGlobally: true
+
+  # Only workloads carrying an explicit reloader annotation are touched.
+  autoReloadAll: false
+
+  # Roll on CONTENT change only, not on creation: during a cluster recreate ArgoCD applies
+  # ConfigMaps before Deployments anyway, so reloadOnCreate would buy nothing and cost an
+  # extra roll of every annotated workload at bootstrap.
+  reloadOnCreate: false
+  reloadOnDelete: false
+
+  # Likewise on Reloader's own restart: true would roll every annotated workload each time
+  # this pod is rescheduled (node drain, k3s upgrade, chart bump).
+  syncAfterRestart: false
+
+  logLevel: info
+
+  deployment:
+    replicas: 1
+    # Platform-tier: it is a cluster-wide controller, and a config change that does not roll
+    # its pod is the silent failure described above.
+    priorityClassName: platform
+    # One informer over configmaps/secrets/workloads; small and flat.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+    # No mesh toleration on purpose — this belongs on the always-up cloud control plane,
+    # not on a lab node that can be offline.
+    tolerations: []

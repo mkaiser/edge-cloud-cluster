@@ -1,0 +1,485 @@
+# Cloud Samba AD domain controller — the FIRST DC, and the FSMO role holder.
+#
+# This is the DC Authentik talks to: the LDAPSource password write-back (Phase 2) binds
+# here over LDAPS, so a user's password change never traverses the mesh link and a lab
+# outage cannot block password changes cluster-wide.
+#
+# No hostNetwork: no LAN client authenticates against this DC. Only the lab DC needs it.
+#
+# --setup=provision,populate — NOT init-all. init-all includes `wait-domain`, which polls
+# _ldap._tcp.<realm> SRV forever; on the FIRST DC there is no domain yet, so init-all
+# deadlocks. (Observed during verification: the pod ran, logged "dns record for
+# AD.ECC.INTERNAL not found" once a second, and never provisioned.)
+#
+# The image bakes in `samba-tool domain provision --use-rfc2307 --server-role=dc`
+# (sambacc/addc.py), so uidNumber/gidNumber attributes exist without extra flags — that is
+# the attribute set TrueNAS's `idmap ad` backend reads, written with the uid 5000 / gid 6000
+# bases that postsync-provision-users.yaml applies.
+#
+# StatefulSet, not Deployment: a DC needs a stable hostname — its own SRV records point at
+# it — and a stable identity across restarts.
+#
+# ⚠ NEVER snapshot-restore this volume. Samba has no USN-rollback protection (no
+# invocation-ID reset like Windows AD), so restoring an older snapshot silently corrupts
+# replication state, with no clean recovery short of demote + rejoin. Keep this PVC out of
+# any recurring Longhorn snapshot job.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ad-cloud
+  namespace: samba-ad
+spec:
+  serviceName: ad-cloud
+  replicas: 1
+  selector:
+    matchLabels:
+      app: samba-ad
+      dc: cloud
+  template:
+    metadata:
+      labels:
+        app: samba-ad
+        dc: cloud
+    spec:
+      # Identity is a dependency of everything else: if this is evicted, Authentik password
+      # changes fail (the write-back raises rather than half-applying).
+      priorityClassName: platform
+      terminationGracePeriodSeconds: 30
+      # NO `hostname:` OVERRIDE — deliberate. A StatefulSet already gives each pod a stable
+      # hostname (<statefulset>-0), and setting `hostname:` here REPLACES it. That is what
+      # splits this DC's identity in two:
+      #
+      #   dccloud.<realm>     A 10.42.0.44    written at provision, never updated again
+      #   ad-cloud-0.<realm>  A 10.42.0.231   re-pointed by samba_dnsupdate every start
+      #
+      # samba_dnsupdate maintains records for the POD hostname. With `hostname: dccloud` the
+      # DC's AD name (instance_name) was NOT the pod hostname, so the name every peer looked
+      # up rotted while a second, correct record sat beside it. The lab DC's re-join then
+      # failed NT_STATUS_HOST_UNREACHABLE, and `samba_dnsupdate --verbose` said
+      # "No DNS updates needed" — truthfully; it was maintaining the other name.
+      #
+      # Letting the StatefulSet name the pod, and setting instance_name to match
+      # (sealSecrets.sh), leaves exactly one self-healing identity.
+      subdomain: ad-cloud
+      # DNS — LOAD-BEARING, do not simplify to ClusterFirst.
+      #
+      # A DC must resolve its OWN name and its peer's in the AD zone. On cluster DNS it
+      # cannot: `samba-tool drs showrepl` fails "The object name is not found" and the
+      # OUTBOUND replication connection fails WERR_FILE_NOT_FOUND — while everything else
+      # still looks healthy (join succeeds, both DCs listed, inbound replication works).
+      # One direction then silently never converges.
+      #
+      # 127.0.0.1 = this DC's own SAMBA_INTERNAL DNS, which is authoritative for the zone
+      # and carries both DCs' A records once the lab DC has joined.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - "127.0.0.1"
+        searches:
+          - "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+        options:
+          - { name: ndots, value: "2" }
+      # NO hostAliases FOR THE LAB DC — it does not work, and it looks like it should.
+      #
+      # The obvious design is: publish the lab DC's LAN address in DNS (what TrueNAS and the
+      # laptops want) and give THIS pod a /etc/hosts override pointing at the mesh address,
+      # so only replication takes the mesh path. That was implemented and it FAILS: samba's
+      # DRS resolves its peer through samba's own DNS and ignores /etc/hosts. `getent hosts`
+      # returned 10.0.10.8 from this pod while /proc/net/tcp showed DRS dialling
+      # 192.168.1.216 in SYN_SENT until it timed out (WERR_SEM_TIMEOUT).
+      #
+      # The lab DC therefore publishes its MESH address as its single A record — see the long
+      # note in sealSecrets.sh for why that is forced and what it costs lab clients.
+      securityContext:
+        fsGroup: 0
+      initContainers:
+        # Samba refuses to start if /var/lib/samba/private is group-accessible:
+        #   invalid permissions on directory '/var/lib/samba/private/msg.sock':
+        #   has 0770 should be 0700
+        #   exit_daemon: daemon failed to start: Samba failed to setup parent messaging
+        # and the pod then crashloops.
+        #
+        # This DC PROVISIONS rather than joins, so samba-tool mkdir's private/ as 2700
+        # after the kubelet has applied fsGroup, and it has not hit the failure the lab DC
+        # does. But the difference is incidental, not structural: `fsGroup` still applies
+        # g+w to this volume, and any path where private/ pre-exists (a restore, a
+        # re-provision onto an existing PVC) would inherit 2770 and crashloop the same way.
+        # Carried here so both DCs are guarded identically rather than one relying on luck.
+        #
+        # Fixing only msg.sock is NOT enough — it is recreated on every start and inherits
+        # the parent's mode. The PARENT is what has to be 0700.
+        #
+        # ORDERED FIRST, before fix-private-perms: refuse to provision from a stale Secret.
+        #
+        # Provisioning is a ONCE-EVER event per PVC pair — sambacc's "already provisioned"
+        # marker is /etc/samba/smb.conf itself (addc.py:44), which lives on the samba-config
+        # PVC. Whatever config.json is mounted at that instant is baked into the domain, and
+        # every later correction is silently ignored.
+        #
+        # That loses a whole re-provision when the pod starts with the PREVIOUS Secret
+        # still mounted (the SealedSecret unseals seconds after smb.conf is written): the
+        # domain comes up under the old name even though the committed config says
+        # otherwise. Nothing fails; the domain is simply, permanently wrong, and the only
+        # cure is deleting both PVCs and starting over.
+        #
+        # The window is real on every cluster recreate: the SealedSecret controller has to
+        # unseal before the kubelet can project the updated Secret, and the StatefulSet does
+        # not wait for that.
+        - name: verify-config-fresh
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Only meaningful before the domain exists. Once smb.conf is on the PVC the
+              # name is already committed, and blocking startup would strand a working DC.
+              if [ -f /etc/samba/smb.conf ]; then
+                echo "already provisioned as: $(grep -i 'netbios name' /etc/samba/smb.conf || true)"
+                exit 0
+              fi
+              # From the downward API, not `hostname`. Equivalent here (this pod is not
+              # hostNetwork), but the lab DC IS, where `hostname` returns the NODE name —
+              # keeping both guards identical avoids that trap being one edit away.
+              want="$POD_NAME"
+              got=$(python3 -c "import json;print(json.load(open('/etc/samba/container/config.json'))['configs']['cloud']['instance_name'])")
+              if [ "$got" != "$want" ]; then
+                echo "REFUSING TO PROVISION: mounted config is stale." >&2
+                echo "  instance_name in Secret : $got" >&2
+                echo "  this pod's hostname     : $want" >&2
+                echo >&2
+                echo "  Provisioning now would bake '$got' into the domain permanently" >&2
+                echo "  (the marker is smb.conf on the config PVC — see the header)." >&2
+                echo "  The SealedSecret has most likely not been unsealed yet; this pod" >&2
+                echo "  will retry and succeed once it is." >&2
+                exit 1
+              fi
+              echo "config is fresh: instance_name=$got matches pod name"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: samba-config, mountPath: /etc/samba }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+        # Re-apply the sambacc `globals` (cloud_bind) to smb.conf on every start.
+        #
+        # Same reason as the lab DC's copy of this container: sambacc merges global options
+        # into smb.conf exactly ONCE, on the join/provision path (addc.py `_prep_join` ->
+        # `_merge_config`), and returns early forever after. On an already-provisioned DC a
+        # changed `globals` block reaches the mounted Secret and is then SILENTLY IGNORED —
+        # green sync, Running pod, no effect.
+        #
+        # For the cloud DC this carries the `tls certfile/keyfile/cafile` settings that point
+        # LDAPS at the cert-manager-issued pair (tls-cert.yaml). Without this container those
+        # would never reach smb.conf and Samba would keep serving its untrusted autogenerated
+        # cert — which Authentik cannot verify, so password write-back would fail.
+        #
+        # ⚠ The config key is 'cloud', not 'lab' (SAMBA_CONTAINER_ID / the `configs` map in
+        # sealSecrets.sh). Copying the lab DC's container verbatim would merge the WRONG DC's
+        # options here.
+        #
+        # Ordered AFTER verify-config-fresh (which must see the pristine marker) and BEFORE
+        # fix-private-perms. Idempotent: _merge_config rewrites [global] from the current
+        # config each time, so a steady-state restart is a no-op.
+        # Copy the LDAPS cert out of the Secret mount to a path where it can be chmod 0600.
+        #
+        # WHY A COPY IS UNAVOIDABLE: Samba refuses to start the LDAP task unless the TLS
+        # private key is EXACTLY 0600 (CVE-2013-4476) —
+        #   invalid permissions on file '/etc/samba/tls/tls.key': has 0640 should be 0600
+        # and a Secret volume cannot deliver that here. `defaultMode: 0600` is necessary but
+        # NOT sufficient: the pod's `fsGroup: 0` re-adds the group bit to every file on a
+        # mounted volume, yielding 0640. Secret mounts are also read-only, so chmod on the
+        # mount itself fails. Dropping fsGroup is not an option — the DC's data PVC relies
+        # on it.
+        #
+        # So the Secret is mounted at /etc/samba/tls-src (read-only) and copied to
+        # /etc/samba/tls (an emptyDir) where the mode actually sticks.
+        - name: stage-ldaps-cert
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              cp /etc/samba/tls-src/tls.crt /etc/samba/tls-src/tls.key \
+                 /etc/samba/tls-src/ca.crt /etc/samba/tls/
+              # Samba checks the KEY strictly; the cert and CA are public.
+              chmod 0600 /etc/samba/tls/tls.key
+              chmod 0644 /etc/samba/tls/tls.crt /etc/samba/tls/ca.crt
+              ls -l /etc/samba/tls/
+          volumeMounts:
+            - { name: ldaps-tls-src, mountPath: /etc/samba/tls-src, readOnly: true }
+            - { name: ldaps-tls, mountPath: /etc/samba/tls }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+        - name: apply-global-options
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, sys
+              # Nothing to merge before provisioning: sambacc writes smb.conf itself then.
+              if not os.path.exists('/etc/samba/smb.conf'):
+                  print('not provisioned yet — sambacc will write smb.conf at provision time')
+                  sys.exit(0)
+              from sambacc import config as sconfig
+              from sambacc.commands.addc import _merge_config
+              cfg = sconfig.read_config_files(
+                  ['/etc/samba/container/config.json']).get('cloud')
+              opts = list(cfg.global_options())
+              if not opts:
+                  print('no global options for "cloud" — nothing to merge')
+                  sys.exit(0)
+              _merge_config('/etc/samba/smb.conf', opts)
+              # Print what actually landed, so a wrong value shows up here rather than only
+              # in an LDAPS handshake failure later.
+              from samba.param import LoadParm
+              lp = LoadParm(); lp.load('/etc/samba/smb.conf')
+              for k in ('tls enabled', 'tls certfile', 'tls keyfile', 'tls cafile'):
+                  print(f'{k:14s}:', lp.get(k))
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: samba-config, mountPath: /etc/samba }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+        - name: fix-private-perms
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Modes copied from a WORKING (provisioned) DC. Samba validates each of these
+              # at startup and refuses to run on any one that is group-accessible, so they
+              # must ALL be right — fixing them as each error appears just moves the failure
+              # to the next directory — private/msg.sock, then lock/msg.lock, then
+              # ntp_signd — so fix the whole set at once.
+              #
+              # lost+found and sysvol are deliberately absent: samba does not check them,
+              # and sysvol is 2770 on a healthy DC by design (group-writable for share ACLs).
+              for spec in \
+                "private:700" \
+                "private/msg.sock:700" \
+                "private/sam.ldb.d:700" \
+                "private/ldap_priv:750" \
+                "private/smbd.tmp:755" \
+                "private/tls:755" \
+                "lock:755" \
+                "lock/msg.lock:755" \
+                "ntp_signd:750" \
+                "bind-dns:750" \
+                "winbindd_privileged:750" \
+              ; do
+                d="/var/lib/samba/${spec%:*}"
+                m="${spec#*:}"
+                if [ -e "$d" ]; then
+                  cur=$(stat -c '%a' "$d")
+                  # Skip if already correct (with or without the setgid bit). Written as an
+                  # if, NOT `[ a ] || [ b ] && continue` — that chain's precedence is a trap
+                  # under `set -e`.
+                  if [ "$cur" != "2$m" ] && [ "$cur" != "$m" ]; then
+                    chmod "$m" "$d"
+                    echo "$d: $cur -> $(stat -c '%a' "$d")"
+                  fi
+                fi
+              done
+              # FILES matter too, not just directories. samba rejects a group-readable TLS
+              # key with
+              #   ldapsrv_task_init: ldapsrv failed tstream_tls_params_server
+              #   - NT_STATUS_CANT_ACCESS_DOMAIN_INFO
+              # and the same fsGroup+setgid inheritance leaves key.pem as rw-rw---- on a
+              # joined DC where a provisioned one has rw-------.
+              # `if`, NOT `[ -f x ] && chmod` — under set -e a false test ABORTS the whole
+              # initContainer, so on a first start (no tls/ yet) the sweep silently stopped
+              # here and never ran again. That is what left the CLOUD DC crashlooping on
+              #   invalid permissions on file '.../tls/key.pem': has 0660 should be 0600
+              #   ... This is known as CVE-2013-4476.
+              if [ -f /var/lib/samba/private/tls/key.pem ]; then
+                chmod 600 /var/lib/samba/private/tls/key.pem
+                echo "tls/key.pem -> 600"
+              fi
+              # Sweep private/ RECURSIVELY (-maxdepth 1 missed private/tls/ entirely) for
+              # anything group/other-writable. Done last so the explicit modes above win.
+              find /var/lib/samba/private -type f -perm /g+w,o+w \
+                -exec chmod g-w,o-w {} + 2>/dev/null || true
+              # The cert-manager LDAPS key gets the same treatment, and it must happen HERE
+              # rather than only in stage-ldaps-cert: this container runs LAST, so a mode set
+              # earlier can still be widened by fsGroup/setgid inheritance in between. Samba
+              # wants EXACTLY 0600 and rejects even group-READ (0640) — not just group-write,
+              # so the sweep above would not catch it.
+              if [ -f /etc/samba/tls/tls.key ]; then
+                chmod 600 /etc/samba/tls/tls.key
+                echo "ldaps tls.key -> $(stat -c '%a' /etc/samba/tls/tls.key)"
+              fi
+              echo "permission sweep done"
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - { name: samba-data, mountPath: /var/lib/samba }
+            - { name: ldaps-tls, mountPath: /etc/samba/tls }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+      containers:
+        # ── perm-guard ────────────────────────────────────────────────────────────
+        # Re-asserts the modes samba validates, FOR AS LONG AS SAMBA RUNS.
+        #
+        # fix-private-perms (initContainer) is not enough and cannot be: samba RE-CREATES
+        # these directories at runtime, after every initContainer has exited, and the
+        # kubelet's `fsGroup: 0` stamps g+w AND the setgid bit onto whatever it creates.
+        # Measured on a cloud DC with 8h uptime: the sweep logged "permission sweep done"
+        # with no chmod line — the modes were right when it ran — and samba then re-created
+        #   /var/lib/samba            2775   (mtime 20:46:17, initContainers ended ~20:44)
+        #   /var/lib/samba/lock       2775
+        #   /var/lib/samba/lock/msg.lock 2775   (re-created continuously)
+        #   /var/lib/samba/private    2770
+        #   /var/lib/samba/private/msg.sock 2770
+        #
+        # What that costs is NOT obvious, which is why it went undiagnosed for 8 hours:
+        #   invalid permissions on directory '/var/lib/samba/lock/msg.lock': has 0775 should be 0755
+        #   Unable to initialize messaging context!
+        # samba does NOT exit. task[ldap] binds TCP 389 and then drops EVERY session —
+        # anonymous, authenticated, LDAPS, and even the ldapi unix socket. Meanwhile
+        # task[cldap] (UDP 389) keeps serving normally, so `samba-tool domain info`,
+        # `nc -z 389` and the tcpSocket probes ALL PASS. The DC reports Ready and healthy
+        # while every real LDAP client fails, and the lab DC's `samba-tool domain join`
+        # CrashLooped 92 times on a bare `NT_STATUS_CONNECTION_RESET` that reads as a
+        # network fault. Fixing the modes on the live pod restored LDAP instantly and the
+        # join completed on the next retry.
+        #
+        # ⚠ `fsGroup: 0` cannot be dropped to fix this at the source — the DC's data PVC
+        # relies on it (see stage-ldaps-cert). So the mode has to be re-applied, not prevented.
+        #
+        # The setgid bit SURVIVES `chmod 0755` (it is inherited from the parent dir, not the
+        # mode argument), so the loop tolerates 2755/2700 exactly as the initContainer's
+        # table does — samba accepts those; it is the GROUP-WRITE bit it rejects.
+        - name: perm-guard
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              # No `set -e`: a transient failure (dir not created yet) must not kill the
+              # sidecar and take the pod's restart count with it.
+              while true; do
+                for spec in \
+                  ":755" \
+                  "lock:755" \
+                  "lock/msg.lock:755" \
+                  "private:700" \
+                  "private/msg.sock:700" \
+                  "private/sam.ldb.d:700" \
+                  "ntp_signd:750" \
+                  "bind-dns:750" \
+                  "winbindd_privileged:750" \
+                ; do
+                  d="/var/lib/samba/${spec%:*}"; m="${spec#*:}"
+                  [ -e "$d" ] || continue
+                  cur=$(stat -c '%a' "$d" 2>/dev/null) || continue
+                  # Accept the mode with or without the setgid bit; fix anything else.
+                  if [ "$cur" != "$m" ] && [ "$cur" != "2$m" ]; then
+                    chmod "$m" "$d" 2>/dev/null \
+                      && echo "perm-guard: $d $cur -> $(stat -c '%a' "$d" 2>/dev/null)"
+                  fi
+                done
+                sleep 15
+              done
+          volumeMounts:
+            - { name: samba-data, mountPath: /var/lib/samba }
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 64Mi }
+        - name: samba
+          # Upstream Samba project's own k8s image (samba-in-kubernetes), same org as
+          # samba-operator. Pinned to a release tag: `latest` is rebuilt daily.
+          image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--setup=provision", "--setup=populate"]
+          securityContext:
+            capabilities:
+              # Upstream's own example manifest asks for exactly this. Samba AD DC mounts
+              # its own private filesystems during provisioning.
+              add: ["SYS_ADMIN"]
+          env:
+            # Path the sealed sambacc config is mounted at (sambacc DEFAULT_CONFIG).
+            - name: SAMBACC_CONFIG
+              value: "/etc/samba/container/config.json"
+            # Selects which key under `configs` in that document this pod uses. The two DCs
+            # share `domain_settings` (same domain) but differ here (different netbios name).
+            - name: SAMBA_CONTAINER_ID
+              value: "cloud"
+          ports:
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+            - { name: dns-udp, containerPort: 53, protocol: UDP }
+            - { name: kerberos-tcp, containerPort: 88, protocol: TCP }
+            - { name: kerberos-udp, containerPort: 88, protocol: UDP }
+            - { name: ldap, containerPort: 389, protocol: TCP }
+            - { name: cldap, containerPort: 389, protocol: UDP }
+            - { name: smb, containerPort: 445, protocol: TCP }
+            - { name: kpasswd-tcp, containerPort: 464, protocol: TCP }
+            - { name: kpasswd-udp, containerPort: 464, protocol: UDP }
+            - { name: ldaps, containerPort: 636, protocol: TCP }
+            - { name: gc, containerPort: 3268, protocol: TCP }
+            - { name: gc-ssl, containerPort: 3269, protocol: TCP }
+          resources:
+            requests: { cpu: "200m", memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            tcpSocket: { port: 389 }
+            # Provisioning a fresh domain takes ~60-90s before LDAP answers.
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            tcpSocket: { port: 389 }
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            # Generous on purpose: a DC busy with replication can be slow to answer, and
+            # killing it mid-write is worse than a late restart.
+            timeoutSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - { name: config, mountPath: /etc/samba/container, readOnly: true }
+            - { name: samba-data, mountPath: /var/lib/samba }
+            - { name: samba-config, mountPath: /etc/samba }
+            # cert-manager-issued LDAPS cert (tls-cert.yaml). Mounted OUTSIDE
+            # /var/lib/samba/private/tls so it cannot be confused with — or overwritten
+            # by — Samba's autogenerated pair. The `tls certfile/keyfile/cafile` globals
+            # point here with ABSOLUTE paths; relative values are resolved against the
+            # private dir, which is not where this lives.
+            - { name: ldaps-tls, mountPath: /etc/samba/tls, readOnly: true }
+      volumes:
+        - name: config
+          secret:
+            secretName: samba-ad-config
+        # Source of the LDAPS cert, mounted read-only. NOT used directly by samba: the
+        # stage-ldaps-cert initContainer copies it to the `ldaps-tls` emptyDir below, where
+        # the key can actually be chmod 0600. See that container for why.
+        - name: ldaps-tls-src
+          secret:
+            # Written by the ad-cloud-tls Certificate. The pod will not start until
+            # cert-manager has issued it — that is intended: serving LDAPS with the
+            # untrusted autogenerated cert would let Phase 2 "work" over a channel
+            # Authentik cannot verify.
+            secretName: ad-cloud-tls
+            defaultMode: 0600
+        # Staging target for the cert. emptyDir, not the Secret mount, because Secret mounts
+        # are read-only and fsGroup:0 forces the group bit on them (0640) — and samba
+        # demands exactly 0600 on the private key.
+        - name: ldaps-tls
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: samba-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Real block storage. Samba's TDB/LDB need POSIX locking and xattrs — a network
+        # filesystem would corrupt them.
+        storageClassName: longhorn-cloud
+        resources: { requests: { storage: 8Gi } }
+    - metadata:
+        name: samba-config
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn-cloud
+        resources: { requests: { storage: 1Gi } }

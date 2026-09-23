@@ -1,0 +1,15 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  name: gitlab-s3-onprem-connection
+  namespace: gitlab
+spec:
+  encryptedData:
+    connection: AgCVzinXcvg7fjuk5nRb8fCVnxPqu0u3AgU8NapIxals7TJa/wtihidQmkyxFqK3+4dfRDkHfvlWMTqBsIWNOuc/BkOSrsfaMLxAdUfKq6obSgO5TLWPaSt1LiKf3S1TVTmuFcIiBbHWS/z2PUSMVX/am3mNjqakiPTpp+eu7Edqi7DHf9hS8xvJY1aVltBJqAX4z/THszaeAmvqqmEdbpbWPe9jZpd8jUzy8g8C+2PK0IpygESHdx+xwgRzP7piAaG4K1++yzX3ZnZ3Q8eGlh1yIkqlr4u23rTrOQBZtvFNlRggXr0K3pbkhhLZ6sm4W17q8msN6+MDaRuR6pDYLyOJ/i+8xnZCk6Gzld7SenKxK4GnngHpduubksC3wxN2mOyMP8e+bGrRIqJx1ZDULiYDHmZH7ITn71p2d7W0MYWuTN749dFVA6q1iMz9dVk0OO0mtxcb+JTlru3VLYVuKvg0Iig0Wf1RatQFYLTVwvXN3gRAJ8S4NYgoDOvUolwN5ZWviaz5lvFLpQmMYudKBwJQxqiqdwN78DXZ9QBaGCmuvWdDb6qiLVEB7/ThmqBfm5yWSeVuKg5pqhHqT65VtNz9DmogtIF4wrMa1XFuCG8Vfcn0QqXAjrEJaWW6j1CbccrAyl/Z/Zvf+7EX0K1JS/vR0cXt5qGPnGj4G2A+4kbaCG8wsby9RRK0iDiCsyNE+K3Py3LH3wVWB6VyAAd7aeHs7/GEs0ddI7KA78Cif1eACgLdUfJlEsmibZVI3uenSrhoGZOZEzUsLMzsWxm/TAZPMFh14luOrI5oaqFmlelrf5T1dhraF9WMnNRXp+sx9Ohe939k4qCgTLR4EbsHaJPqECxg/9ycZyZ6DN86bhDPkAi+USsED2PcGyb0yI5K2ZFWRrUWHOSAPr/GH6ggOG0EDjC7Z3UmFjeG3d4yl08otAyQJQV5rfxuEvNI3WXbbztVjyQO1LEzsrg6jpQMVR7GVscQn2m4hBJ56wh0hBzQn2cYjK0fiA==
+  template:
+    metadata:
+      name: gitlab-s3-onprem-connection
+      namespace: gitlab

@@ -1,0 +1,82 @@
+# KiCad 10.0.6 CONTAINER module manifest — baked into the runnable module image at
+# /module.yaml. Read by the remote-desktop broker (which publishes it) and the module CLI
+# (which generates `podman run` launchers from it).
+#
+# `runtime: container` marks it: the tool runs in ITS OWN container via podman inside the
+# sandboxed desktop pod, NOT natively on PATH.
+#
+# WHY THIS MODULE EXISTS AT ALL. The eda-pcb-agent generates KiCad projects into its NFS
+# home, and the remote-desktop humans log into has NO KiCad — so the boards were unopenable
+# in a GUI. The agent keeps its own baked-in KiCad and the `kicad` bridge; nothing about the
+# agent's path goes through this module. This is the human-facing GUI.
+#
+# NAMED `kicad`, version `10.0.6`, so the user-facing form matches the other modules:
+# `module load kicad/10.0.6`. The DASHED spelling (kicad-10) is only ever an identifier —
+# the app directory, the k8s namespace and the GitLab project — because those may not
+# contain a dot or a slash. It carries the MAJOR only, so 10.0.7 replaces 10.0.6 in place
+# rather than orphaning a project per patch release.
+#
+# ⚠ TWO MAJORS ARE EXPECTED TO COEXIST. A schematic written by 10 cannot be opened by 9, and
+# 9.0.9 cannot read libraries authored by a newer KiCad — this project has hit the
+# incompatibility in both directions. A second app (kicad-9) alongside this one is the
+# intended way to serve a board frozen on 9.x; that is precisely what modules are for, and it
+# is why KiCad is not simply baked into the desktop image.
+#
+# ⚠ NO `env:` BLOCK, and unlike hyperlynx no `set_from_secret`: KiCad is FOSS, so there is no
+# license server and no credential to inject. petalinux-2024-1 is the right template to copy
+# here, not hyperlynx.
+name: kicad
+version: "10.0.6"
+runtime: container
+# Publish/pull from THIS app's own GitLab project rather than the default
+# <IMAGE_BASE>/<name>. Keeps the image independently deletable and independently
+# rebuildable, and leaves room for a second KiCad major beside it.
+# Honoured by broker.sh module_image() + module-cli.sh (base-r14+).
+image: deployments/infrastructure/eda/modules/kicad-10
+# GUI tiles in the desktop's Applications menu — the point of the module. Each generates
+# $HOME/.local/bin/module-kicad-<exec>, which is ALWAYS on PATH (hence the `module-<name>-`
+# prefix: unprefixed, `pcbnew` would shadow a system binary in every shell, loaded or not).
+#
+# `kicad` (the project manager) is the usual entry point — it opens a .kicad_pro and launches
+# the editors itself. The other three are here because a user often wants to open a single
+# .kicad_sch / .kicad_pcb / gerber directly without going through a project.
+desktop_entries:
+  - name: "KiCad"
+    exec: kicad
+    command: /usr/bin/kicad
+    categories: "Development;Engineering;Electronics;"
+  - name: "KiCad Schematic Editor"
+    exec: eeschema
+    command: /usr/bin/eeschema
+    categories: "Development;Engineering;Electronics;"
+  - name: "KiCad PCB Editor"
+    exec: pcbnew
+    command: /usr/bin/pcbnew
+    categories: "Development;Engineering;Electronics;"
+  - name: "KiCad Gerber Viewer"
+    exec: gerbview
+    command: /usr/bin/gerbview
+    categories: "Development;Engineering;Electronics;"
+# CLI entries — for BATCH/scripted use. Each generates a wrapper named after the REAL binary
+# into a per-module shim dir ($HOME/.local/module-bin/kicad/10.0.6/) which `module load`
+# prepends to PATH, so an existing script runs unchanged:
+#   kicad-cli sch export pdf board.kicad_sch
+#
+# ⚠ `kicad-cli` is the only one of these that is genuinely non-interactive. The other five
+# are GUIs listed here for typing convenience while the module is loaded — they still need a
+# DISPLAY and will not work in a batch job. The launcher protocol has no stdin and no TTY.
+cli_entries:
+  - name: kicad-cli
+    command: /usr/bin/kicad-cli
+  - name: kicad
+    command: /usr/bin/kicad
+  - name: eeschema
+    command: /usr/bin/eeschema
+  - name: pcbnew
+    command: /usr/bin/pcbnew
+  - name: gerbview
+    command: /usr/bin/gerbview
+  - name: pcb_calculator
+    command: /usr/bin/pcb_calculator
+  - name: bitmap2component
+    command: /usr/bin/bitmap2component

@@ -1,0 +1,263 @@
+# Wrenix headscale chart v0.3.2 has three incompatibilities with headscale v0.28+:
+#   1. args: ["headscale","serve"] — but v0.28 images use ENTRYPOINT, so the actual
+#      command becomes "/ko-app/headscale headscale serve" → "unknown command" crash.
+#   2. No extraVolumes/extraVolumeMounts support → can't mount OIDC client secret.
+#   3. No ACL policy support at all (there is no `policy` key in the chart's
+#      values.yaml — only an unrelated service.ipFamilyPolicy) → the policy ConfigMap
+#      has to be mounted here too. See policy-configmap.yaml.
+#
+# This Sync-phase job patches both after every sync.
+# Sync hooks run before ArgoCD waits for app health, breaking the deadlock where
+# PostSync would never run (PostSync requires healthy state, but the pod can only
+# become healthy after the OIDC volume is mounted by this patch).
+# ignoreDifferences in the ArgoCD Application suppresses the resulting drift.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-args-patch
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-args-patch
+  namespace: headscale
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-args-patch
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-args-patch
+subjects:
+- kind: ServiceAccount
+  name: headscale-args-patch
+  namespace: headscale
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-args-patch
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: headscale-args-patch
+      restartPolicy: OnFailure
+      containers:
+      - name: patch
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          DEPLOY=headscale
+          NS=headscale
+
+          # 0. Force Recreate strategy. headscale's data PVC is ReadWriteOnce (Longhorn),
+          # but the chart's Deployment defaults to RollingUpdate — so any pod-template change
+          # (e.g. a config/extra_records edit) spins up a NEW pod that can't attach the PVC
+          # until the OLD one releases it → "Multi-Attach error" → rollout deadlocks forever
+          # (0/1 new replicas available) and the resync hangs. Recreate terminates the old
+          # pod first, so the new one attaches cleanly. /spec/strategy is in the Application's
+          # ignoreDifferences, so this patch doesn't fight ArgoCD.
+          STRATEGY=$(kubectl get deployment $DEPLOY -n $NS \
+            -o jsonpath='{.spec.strategy.type}' 2>/dev/null || true)
+          if [ "$STRATEGY" != "Recreate" ]; then
+            echo "Patching strategy: $STRATEGY -> Recreate (RWO PVC, avoid Multi-Attach)"
+            kubectl patch deployment $DEPLOY -n $NS --type=json -p \
+              '[{"op":"replace","path":"/spec/strategy","value":{"type":"Recreate"}}]'
+          else
+            echo "Strategy already Recreate."
+          fi
+
+          # 1. Fix args: chart hardcodes ["headscale","serve"] but v0.28 images use ENTRYPOINT
+          ARGS=$(kubectl get deployment $DEPLOY -n $NS \
+            -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null)
+          if echo "$ARGS" | grep -q '"headscale"'; then
+            echo "Patching args: $ARGS -> [serve]"
+            kubectl patch deployment $DEPLOY -n $NS --type=json \
+              -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["serve"]}]'
+          else
+            echo "Args already correct: $ARGS"
+          fi
+
+          # 2. Add OIDC client secret volume if missing (chart has no extraVolumes support)
+          VOLUMES=$(kubectl get deployment $DEPLOY -n $NS \
+            -o jsonpath='{.spec.template.spec.volumes[*].name}' 2>/dev/null)
+          if echo "$VOLUMES" | grep -q 'oidc-client-secret'; then
+            echo "OIDC volume already present."
+          else
+            echo "Adding OIDC client secret volume and mount..."
+            kubectl patch deployment $DEPLOY -n $NS --type=json -p '[
+              {
+                "op": "add",
+                "path": "/spec/template/spec/volumes/-",
+                "value": {
+                  "name": "oidc-client-secret",
+                  "secret": {
+                    "secretName": "headscale-oidc-client-secret",
+                    "items": [{"key": "client-secret", "path": "oidc_client_secret"}]
+                  }
+                }
+              },
+              {
+                "op": "add",
+                "path": "/spec/template/spec/containers/0/volumeMounts/-",
+                "value": {
+                  "name": "oidc-client-secret",
+                  "mountPath": "/etc/headscale/oidc",
+                  "readOnly": true
+                }
+              }
+            ]'
+            echo "OIDC volume patched."
+          fi
+
+          # 2a. Mount the LE staging CA bundle OVER the system trust store.
+          # headscale fetches the OIDC discovery document with Go's crypto/tls against
+          # /etc/ssl/certs/ca-certificates.crt and has NO insecure_skip_verify option. On
+          # letsencrypt-staging that fetch fails "x509: certificate signed by unknown
+          # authority", headscale falls back to CLI registration, and NO number of
+          # restarts fixes it — unlike the startup-race fallback, this one is permanent.
+          #
+          # subPath is deliberate: it replaces the single file rather than mounting over
+          # /etc/ssl/certs, which would hide every other root and break outbound TLS.
+          # The bundle is the full staging chain, so nothing else is needed. On
+          # letsencrypt-prod the file is inert (the prod chain is publicly trusted) —
+          # but it DOES shadow the system roots, so it must stay a complete bundle.
+          if echo "$VOLUMES" | grep -q 'staging-ca'; then
+            echo "Staging CA volume already present."
+          else
+            echo "Adding staging CA volume and mount..."
+            kubectl patch deployment $DEPLOY -n $NS --type=json -p '[
+              {
+                "op": "add",
+                "path": "/spec/template/spec/volumes/-",
+                "value": {
+                  "name": "staging-ca",
+                  "configMap": {"name": "staging-ca-bundle"}
+                }
+              },
+              {
+                "op": "add",
+                "path": "/spec/template/spec/containers/0/volumeMounts/-",
+                "value": {
+                  "name": "staging-ca",
+                  "mountPath": "/etc/ssl/certs/ca-certificates.crt",
+                  "subPath": "ca-bundle.pem",
+                  "readOnly": true
+                }
+              }
+            ]'
+            echo "Staging CA volume patched."
+          fi
+
+          # 2b. Mount the ACL policy ConfigMap (chart has no policy support).
+          # headscale reads it because headscale.config sets policy.mode/policy.path in
+          # app-of-apps/wave8-headscale.yaml.
+          if echo "$VOLUMES" | grep -q 'headscale-policy'; then
+            echo "Policy volume already present."
+          else
+            echo "Adding policy ConfigMap volume and mount..."
+            kubectl patch deployment $DEPLOY -n $NS --type=json -p '[
+              {
+                "op": "add",
+                "path": "/spec/template/spec/volumes/-",
+                "value": {
+                  "name": "headscale-policy",
+                  "configMap": {"name": "headscale-policy"}
+                }
+              },
+              {
+                "op": "add",
+                "path": "/spec/template/spec/containers/0/volumeMounts/-",
+                "value": {
+                  "name": "headscale-policy",
+                  "mountPath": "/etc/headscale/policy",
+                  "readOnly": true
+                }
+              }
+            ]'
+            echo "Policy volume patched."
+          fi
+
+          # 2c. Hand the "roll on config change" job to Reloader (argocd-infra/reloader).
+          # headscale does NOT hot-reload (docs/ref/policy.md: it needs a restart or
+          # SIGHUP), and a ConfigMap edit alone never changes the pod template, so ArgoCD
+          # would leave the old policy running indefinitely. This annotation makes Reloader
+          # watch every ConfigMap and Secret the LIVE pod spec references — the policy and
+          # staging-CA ConfigMaps and the OIDC/pg Secrets mounted by the steps above, not
+          # just the policy — and roll the Deployment when any of their content changes.
+          #
+          # It goes on the POD TEMPLATE, not the Deployment metadata: Reloader falls back to
+          # pod-template annotations (pkg/common/common.go ShouldReload), and
+          # /spec/template/metadata/annotations is the path this Application already lists in
+          # ignoreDifferences. That matters because this app has NO ServerSideApply — without
+          # the ignore, selfHeal strips anything written there each resync.
+          #
+          # The value is CONSTANT, so re-patching it on every sync is a genuine no-op. The
+          # checksum this replaces had to be recomputed and compared each run instead.
+          if [ "$(kubectl get deployment $DEPLOY -n $NS \
+                -o jsonpath='{.spec.template.metadata.annotations.reloader\.stakater\.com/auto}' \
+                2>/dev/null)" = "true" ]; then
+            echo "Reloader annotation already present."
+          else
+            echo "Adding reloader.stakater.com/auto to the pod template."
+            kubectl patch deployment $DEPLOY -n $NS --type=merge -p \
+              '{"spec":{"template":{"metadata":{"annotations":{"reloader.stakater.com/auto":"true"}}}}}'
+          fi
+
+          # Sanity check, unrelated to rolling: an empty policy.hujson means the ACL never
+          # reached the ConfigMap, which headscale will not report as an error.
+          if [ -z "$(kubectl get configmap headscale-policy -n $NS \
+                -o jsonpath='{.data.policy\.hujson}' 2>/dev/null || true)" ]; then
+            echo "WARNING: configmap/headscale-policy has no policy.hujson key."
+          fi
+
+          # 3. Inject HEADSCALE_DATABASE_POSTGRES_PASS from headscale-pg-user secret.
+          # headscale uses viper: HEADSCALE_DATABASE_POSTGRES_PASS overrides database.postgres.pass.
+          if kubectl get secret headscale-pg-user -n $NS >/dev/null 2>&1; then
+            ENV_NAMES=$(kubectl get deployment $DEPLOY -n $NS \
+              -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+            if echo "$ENV_NAMES" | grep -qx "HEADSCALE_DATABASE_POSTGRES_PASS"; then
+              echo "DB password env already present."
+            else
+              echo "Injecting HEADSCALE_DATABASE_POSTGRES_PASS from headscale-pg-user..."
+              PW='{"name":"HEADSCALE_DATABASE_POSTGRES_PASS","valueFrom":{"secretKeyRef":{"name":"headscale-pg-user","key":"password"}}}'
+              HAS_ENV=$(kubectl get deployment $DEPLOY -n $NS \
+                -o jsonpath='{.spec.template.spec.containers[0].env[0].name}' 2>/dev/null || true)
+              if [[ -n "$HAS_ENV" ]]; then
+                kubectl patch deployment $DEPLOY -n $NS --type=json \
+                  -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/env/-\",\"value\":$PW}]"
+              else
+                kubectl patch deployment $DEPLOY -n $NS --type=json \
+                  -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/env\",\"value\":[$PW]}]"
+              fi
+              echo "DB password injected."
+            fi
+          fi
+          echo "Done."

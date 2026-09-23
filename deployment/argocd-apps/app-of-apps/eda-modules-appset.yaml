@@ -1,0 +1,125 @@
+# ApplicationSet: the EDA module BUILD apps — one independent Application per module,
+# generated from one file.
+#
+# WHY AN ApplicationSet AND NOT ONE MERGED Application. The modules must stay INDEPENDENT:
+#   - they sync in parallel and each build takes 2-6 h. Merged into one Application, it is
+#     not Healthy until every hook finishes, so one 6 h xilinx build would gate hyperlynx's
+#     registration.
+#   - one failed hook Job wedges its whole Application and blocks later manifest changes
+#     (a Job's spec.template is immutable). Today that is CONTAINED to one module.
+#   - independent deletability/disableability is a stated goal.
+# A `list` generator keeps N separate Applications — separate sync, health, deletion and
+# failure containment — while collapsing four near-identical specs, which differed only in
+# name/path/namespace/exclude, into the `elements` below.
+#
+# ⚠ OWNERSHIP COLLISION — READ BEFORE ADDING A MODULE. `apps-root` renders every file in
+# this directory and prunes what it no longer renders; this ApplicationSet ALSO owns the
+# child Applications it generates. Two owners with prune: true on the same object names
+# would fight. The per-module app-of-apps files were therefore removed only AFTER this file
+# had synced and the ApplicationSet had adopted the children (verified:
+# ownerReferences on all three read ApplicationSet/eda-modules) — add first, adopt, then
+# remove, never in one commit. The same rule applies to any future migration here.
+#
+# ⚠ PER-MODULE PROSE BELONGS IN THAT MODULE'S OWN README.md (plus its module.yaml /
+# Dockerfile headers), not here — a `template` cannot hold it. That is where the 2026.1
+# "not one of a pair" note, the UG973 base pin and the deliberate
+# xilinx-vendor/hyperlynx-tool archive-path asymmetry live. README.md is in the exclude glob
+# below, so it never reaches the cluster as a manifest.
+#
+
+# ⚠ image-registry and eda-fileserver are NOT here either: they are not modules. They are
+# shared infrastructure for the whole EDA stack with their own lifecycles, and keep their
+# own app-of-apps files.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: eda-modules
+  namespace: argocd-apps
+spec:
+  # Orphaned children are deleted when an element is removed — the same prune semantics the
+  # individual Applications had.
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+  generators:
+    - list:
+        elements:
+          # `name` is BOTH the Application name and the namespace (one namespace per app,
+          # named after it — so pruning one can never delete a namespace another lives in).
+          # `dir` is the directory under deployment/argocd-apps/eda/.
+          - name: eda-xilinx-2024-1
+            dir: xilinx-2024-1
+          - name: eda-xilinx-2026-1
+            dir: xilinx-2026-1
+          - name: eda-petalinux-2024-1
+            dir: petalinux-2024-1
+          - name: eda-hyperlynx-2604
+            dir: hyperlynx-2604
+          # KiCad is the only FOSS module here: no installer media, no license server. It
+          # exists so humans on the remote-desktop can OPEN the boards the eda-pcb-agent
+          # generates — the desktop ships no KiCad of its own. See its README.
+          - name: eda-kicad-10
+            dir: kicad-10
+  template:
+    metadata:
+      name: "{{name}}"
+      annotations:
+        # mesh tier: the build runs on an [eda] builder node and the module is consumed by
+        # the mesh-only remote-desktop — skip on cloud restore.
+        placement.ecc/tier: mesh
+    spec:
+      project: default
+      source:
+        repoURL: git@github.com:YourProject/yourGit.git
+        targetRevision: main
+        path: "deployment/argocd-apps/eda/{{dir}}"
+        directory:
+          # Build inputs reach GitLab via the build-files ConfigMap, NOT as manifests —
+          # exclude the raw Dockerfile/CI/module.yaml/install_config.txt (module.yaml is
+          # .yaml and would otherwise be applied and fail) and the scripts. Everything else
+          # (namespace, build trigger, build-files CM, register Job) IS applied.
+          # ⚠ Uniform across modules on purpose: an app without install_config.txt simply
+          # matches nothing, so one glob covers all of them.
+          exclude: "{Dockerfile,.gitlab-ci.yml,module.yaml,install_config.txt,*.sh,README.md}"
+      destination:
+        server: https://kubernetes.default.svc
+        # Manifests carry their own namespace; this is the default for namespace-less ones.
+        namespace: "{{name}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+        # ⚠ RETRY LONG, BUT NOT FOREVER — 12 is a compromise between two failures that
+        # have both actually happened, and moving it in either direction re-opens one.
+        #
+        # TOO FEW: every module here has a PreSync build-trigger that polls GitLab
+        # /-/readiness, and on a cluster recreate GitLab is not up yet. On ecc183 all THREE
+        # modules failed identically at 13:46:58, each "Job has reached the specified
+        # backoff limit" after ArgoCD's default 5 retries, and stayed Failed with no image
+        # built until a human re-synced. GitLab was Healthy long before anyone noticed.
+        # With the backoff below, 12 attempts span well over an hour — a cold start fits.
+        #
+        # TOO MANY (`limit: -1`, which this was until 2026-09-04): an ArgoCD operation is
+        # PINNED to the revision it started with and IGNORES new sync requests while it
+        # runs, so an operation that retries forever can never pick up a fix. Measured on
+        # the first petalinux build: the build failed, the PostSync register hook then sat
+        # waiting 4.5 h for an image that would never appear, and each retry re-mirrored
+        # the SAME broken Dockerfile. Clearing it took a hand-patched Application. A finite
+        # limit ends the operation, which is what lets the next sync start at HEAD.
+        #
+        # Applied on the TEMPLATE so every current and future module inherits it — the
+        # per-module Applications are generated, so there is nowhere else to put it that
+        # does not drift.
+        #
+        # Do NOT enlarge the trigger's own budgets instead (activeDeadlineSeconds 900,
+        # backoffLimit 2): a pending PreSync hook holds the Application open, and the
+        # trigger deliberately fails fast rather than parking a pod against GitLab. The
+        # outer loop is the right lever.
+        retry:
+          limit: 12
+          backoff:
+            duration: 1m
+            factor: 2
+            maxDuration: 10m

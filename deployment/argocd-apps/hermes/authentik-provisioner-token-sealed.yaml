@@ -1,0 +1,19 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: hermes
+  annotations:
+    # Wave -1: the StatefulSet consumes this Secret, and ArgoCD health-gates a wave
+    # before starting the next one. In the same wave the sync parks on the
+    # StatefulSet ("waiting for healthy state"), which can never go healthy while
+    # the Secret it needs is still unapplied — a multi-hour deadlock.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    token: AgCRurSaCVKaUvD9c8K2733r2AY6SCQnYbq8P9Gfmr3l+RkPwj9oD4rplvaTo0ygoN70r0UftqmdkBmfkOhKFk6lEpl8hC5gKJxBYoq77UvNNS9N4TpXzcvTewV9lWpsBY68AY4GgKZtQwsRtaHldyJ/gzrh19ZmIurYkX8rgJdMJXW0Ox4ZrdDaEUspHx4PTbCWgKJBPlqipcOoFPBkH159tfZk7ahdnUHm1pqVDowb94C1oiiB5RlnQy4YVxY/3zM7gqmWrw0AexRq90wPN0HOXHcrL7snphsxPNNL7SxQ3KqI8Om7Y6RVDXqsInfcFS+0ps9ZiqfAv6qAdgis2ZvqvryDjDBhYoYoHSmN+6Y4MG0qncl6OaYNZXS3lLCXRSwGXyq0f0hpRuCUDY6SRdS/plKOBYujxhfpRr+X81pEcoGadoSFlMxgAaul9AJfDMhAX+CuxxxwcC10Mojl6KkQdLONQ+X0J0e7Jnd4nHX44fjdmZTJwJ20PBeXxTKOotgczVDlZbNU3gshDpiDvO7PFUZhjc8VKwp+XPZGs6rX3QcL6dlJbIL4MFigComyyQTzP5ynhCyfe6Eu2qWRvNHgGdjjZ58s0PBWsSCOcVHmAtoXa9MLb8gUO6R7DyW/Y7O2Pw3M8O2So8/B5U/cAoY0I9Qmk6/GiWgzZaPy6A3YynUbclEwVwTKlQ+Ip6dxLMwZcJSMDQ4bJj2zkXKLH2rCpFpFFi5BehzJyQleODYWSy3KGfIF8X6yuEEnKbVmSwPG7kzfh4YP5tkbdqee22Ao89Te+o3BpjjwjsjwH8RwmnyLOF8EhSVJFFG4TsZ9IhFOzIM8ur2HzRXIC3vxioIEHSKqsAr8vtI=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: hermes

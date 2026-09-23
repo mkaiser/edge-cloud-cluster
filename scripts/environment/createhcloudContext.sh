@@ -9,8 +9,12 @@
 # existing "default" context is a no-op). Returns non-zero if no token can be found.
 
 ensure_hcloud_token() {
-    # Already usable? (explicit token or a non-empty active context)
-    if [ -n "${HCLOUD_TOKEN:-}" ] || [ -n "$(hcloud context active 2>/dev/null)" ]; then
+    # Already have an explicit token in the env? Done.
+    # NB: a stored hcloud *context* is NOT sufficient on its own — the newer
+    # Hetzner zone/DNS API (`hcloud zone …`) authenticates only via HCLOUD_TOKEN
+    # in the env and returns "Zone not found" when relying on the context alone.
+    # So we always ensure HCLOUD_TOKEN itself is exported (derived below).
+    if [ -n "${HCLOUD_TOKEN:-}" ]; then
         return 0
     fi
 

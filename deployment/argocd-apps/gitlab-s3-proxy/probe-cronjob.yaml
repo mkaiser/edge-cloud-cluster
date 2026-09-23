@@ -1,0 +1,67 @@
+# Does a CLOUD pod still reach the on-prem artifacts endpoint — and is it still refusing
+# anonymous callers?
+#
+# WHY IT EXISTS: once GitLab's artifacts live on the appliance, a mesh outage fails the
+# artifact step of every CI job — cloud-run ones included, because Workhorse performs the
+# object-storage write and Workhorse is in the cloud. That failure is LATE (after a build has
+# already succeeded) and quiet on the GitLab side: trace archival just retries into the
+# Sidekiq queue. Without this probe the first symptom is red pipelines and a guess.
+#
+# ⚠ IT MUST RUN CLOUD-SIDE. A lab-pinned probe would pass throughout exactly the outage it
+# is meant to catch: the lab can always reach its own appliance.
+#
+# ⚠ IT EXPECTS 403, NOT 200 — and that is the interesting part. An unauthenticated GET
+# against the S3 endpoint proves reachability, TLS and that authentication is still being
+# enforced, in one request and with NO credential to store or rotate. seaweedfs decides
+# whether to authenticate at all with `isAuthEnabled = len(identities) > 0`, so losing the
+# identity does not fail closed — it serves anonymous read AND write. A 200 here means that
+# regression has happened and is strictly worse than an outage.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gitlab-s3-proxy-probe
+  namespace: gitlab-s3-proxy
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0        # one attempt: the alert is on the last SUCCESSFUL run
+      template:
+        spec:
+          restartPolicy: Never
+          # The whole point: exercise the same cloud→lab path GitLab uses.
+          nodeSelector:
+            ecc/site: hetzner-fsn1  # automatically updated from project-settings:applicationPlacements.cloudSite
+          priorityClassName: low
+          containers:
+            - name: probe
+              image: docker.io/curlimages/curl:8.22.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  URL="https://gitlab-s3-proxy.gitlab-s3-proxy.svc.cluster.local:30304/"
+                  # -k: TLS is terminated by the appliance with a certificate from its own
+                  # CA. Verifying it here would only re-test trust distribution, which is
+                  # GitLab's problem (global.certificates.customCAs), not reachability's.
+                  # ⚠ NO `|| echo 000` HERE. curl already prints %{http_code} — "000" when
+                  # it never got a response — AND exits non-zero, so the fallback APPENDED a
+                  # second value and the probe saw "000000", failing through to "unexpected
+                  # status" instead of reporting the connection failure it actually had.
+                  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 25 "$URL" || true)
+                  echo "GET $URL -> $code"
+                  case "$code" in
+                    403) echo "OK: reachable and refusing anonymous callers"; exit 0 ;;
+                    200) echo "CRITICAL: the endpoint served an ANONYMOUS request."
+                         echo "  seaweedfs enforces auth only while an identity exists; it does"
+                         echo "  not fail closed. Check seaweedfs.additional_envs on the app."
+                         exit 1 ;;
+                    000) echo "FAIL: no response — proxy pod, mesh link or appliance down."; exit 1 ;;
+                    *)   echo "FAIL: unexpected status $code"; exit 1 ;;
+                  esac
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { memory: 64Mi }

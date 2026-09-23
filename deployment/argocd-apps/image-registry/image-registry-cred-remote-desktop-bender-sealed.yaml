@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-cred
+  namespace: remote-desktop-bender
+spec:
+  encryptedData:
+    .dockerconfigjson: AgB1iwsNCsNdyjK5QWD0wSGOSnDcjT6CWe0WQSknG7m3mWPG88r1RJ6d6XQ+UkJjPbnlcN1AaBl7pziQH7ZDlpgdcqQ/cwENT+XClYMoSlAq2YFdCMOAEP7m3e9XFqqw7vDyr+5BTpPRlNz3HnkhAeRPmgW0mwke0oj0QwdE0knuDJxShDqZryJsQeuqeRjWP0yChjfoeV/k8bqUfDylSCC/GUuL1Sa4mcx2bFkALV8INlMlJixMq3N5P60i1G0+zwpj2uS5dUETMH7PXzsJ5UKQHXfCymyTaIUhDGJKVMa1h1AJbep5pCNqaiVxdh+TClSlEUwMsGKm88BMGYcWH3FPt7YyvBuTm3aYRDMbdMhxjqEbevReDxCTube5Z1fWkiQnI7QxPb8Oik2gf7fA6SG1Jv3aACAxa8iZIx39FDW84LcTmj74qn8fm0F9CZAAkQqM+oOAu6AF9u5XIfdLuMcMOZRvQzuwNAxvk+foSEKANgU31y3UoAtBaVGet4+bgXuEmCI3WSRujr70K+adQ/b1BbG/gqhP0sjJ1baX/XOrzQr3jEbGi8ZE1kMtGjQdQlhEIVYMum0j82jC6s1hbxQx1R0RWcz0a53NS7uV3ja3Zs+OT4o/a/9vkpfBqLzrFPpEz7qjDsNquO3aJK2QWoYh5zgZsoDOVEL/sbbhxHk+aE6fAvJPlMxxGo0W+o6n0f2tZndsHvf4oAJ4K+cVyVrfsdBw7TQUDPaJTydiW85iw/ZvsUC8wFoiLQPeNpOAL2XBXB/F8ucuxrsFgZ0/TZqBYlHK8ZEnuPWTlyI/WemhVymsrvUCe4Y5cfb2EgLr5bxfFHvTp+CXsLSkV/hj3rHVJc8hh9c1l9FJd52Wkbb6utawjMyqNTkNG2H9+uB+1f35VhqTsy8FmmIKTzGikeFPqYtzgcbuzLyFFpAOJt0NgkRnxEwl2kPPuMYE3RHcSDNGpxrRxuvyUX0owqjZbk0UCASGU9aKj8y8Dn5YzAq2EXk/vY+37xNZeM7a5rSbZ6B47RfToB2VJBl2d1D+77/W7zlmSaj2C8P8kv3Hhc+L2OfyqqJsI4IePO4QC2I=
+  template:
+    metadata:
+      name: image-registry-cred
+      namespace: remote-desktop-bender
+    type: kubernetes.io/dockerconfigjson

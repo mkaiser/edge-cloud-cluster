@@ -1,0 +1,645 @@
+# Hermes Agent — one pod, one PVC, two listeners.
+#
+#   8642  api  — OpenAI-compatible gateway ("api_server" platform). Public via
+#                hermes.<tld>, bearer-authenticated (API_SERVER_KEY).
+#   9119  dash — admin dashboard, supervised by s6. Public via hermes-admin.<tld>,
+#                gated by Hermes' own Authentik OIDC provider (created from this
+#                folder by authentik-provider.yaml), with basic-auth as the
+#                fallback for in-cluster callers.
+#
+# StatefulSet (not Deployment) for the stable per-replica PVC via
+# volumeClaimTemplates. replicas stays 1: multiplexing serves all profiles from
+# one process, and two replicas would both try to attach the same RWO volume.
+#
+# ── Why this runs as root (contradicting the usual hardening) ──────────────────
+# The image's PID 1 is s6-overlay's /init. Its stage2 hook (docker/stage2-hook.sh)
+# usermod's the baked `hermes` user to HERMES_UID/HERMES_GID, chowns the data
+# volume, seeds config, then each service drops to that user via s6-setuidgid.
+# All of that needs root. Starting the container as a non-root UID makes
+# main-wrapper.sh exit 1 with an explicit "not supported" error — this is exactly
+# what breaks the community Helm chart, whose runAsUser: 1000 default is applied
+# to the main container. So: runAsUser 0, allowPrivilegeEscalation true (s6 needs
+# to re-gain nothing, but the setuid drop path requires it not be blocked), and
+# only the four capabilities the chown/setuid dance actually uses.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hermes
+  namespace: hermes
+  annotations:
+    # Hermes reads config.yaml ONCE at process start — there is no hot reload, so an edit to
+    # bootstrap-configmap.yaml would otherwise sync green in ArgoCD and change nothing in the
+    # running agent. Reloader (argocd-infra/reloader) watches the ConfigMaps and Secrets this
+    # pod references and rolls the StatefulSet when their content changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  serviceName: hermes
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes
+  template:
+    metadata:
+      labels:
+        app: hermes
+    spec:
+      priorityClassName: standard
+      # The agent executes arbitrary shell. Deny it a Kubernetes API token —
+      # without this, its own kubectl-equivalent could talk to the apiserver as
+      # the namespace default ServiceAccount.
+      automountServiceAccountToken: false
+      # MESH tier since 2026-09-14 (was cloud). The desktop sidecar mounts the AD homes
+      # export and csi-driver-nfs's node DaemonSet is nodeSelector-pinned to
+      # ecc/fileserver-lan, so the pod only works on those nodes.
+      #
+      # ⚠ A LABEL, NOT A HOSTNAME PIN. Nothing in this pod is node-local: its state is the
+      # PVC and its homes are NFS, so any fileserver-LAN node will do and pinning one would
+      # only make a drained node an outage.
+      #
+      # ⚠ NO ecc/gpu TOLERATION, deliberately. The mesh toleration alone cannot land this on
+      # the GPU node, which carries a SECOND taint (ecc/gpu=true:NoSchedule) — that scarce
+      # single-GPU box stays opt-in, and an agent running arbitrary shell is not what should
+      # claim it.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # ⚠ EVICT FAST — the k8s default is 300s and that window IS the outage.
+        # The lab nodes go away for hours at a time. At the default the pod keeps its claim
+        # on a dead node for five minutes before eviction even begins, during which it still
+        # reports `1/1 Running` while its Service has zero endpoints — so the failure reads
+        # as an application fault rather than a node fault (measured twice on 2026-09-14).
+        # 30s is well clear of a transient kubelet hiccup and costs nothing while healthy:
+        # the taint is only applied once the node controller declares the node unreachable.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      # ⚠ NEEDED SINCE THE DESKTOP SIDECAR. The agent image comes from Docker Hub and needs
+      # no credential, but the desktop's base image is pulled from the lab registry through
+      # its NodePort (127.0.0.1:30500) — and a pull secret is matched by REGISTRY HOST
+      # STRING, so it must be keyed to that host. image-registry/sealSecrets.sh seals
+      # image-registry-cred-node into this namespace for exactly that. Without it the
+      # desktop container fails with `no basic auth credentials` and the WHOLE POD stays
+      # down, taking the agent with it.
+      imagePullSecrets:
+        - name: image-registry-cred-node
+      # ⚠ NO pod-level securityContext.fsGroup, AND THAT IS DELIBERATE — do not add one.
+      #
+      # fsGroup is POD-level and RECURSIVE across EVERY volume the pod mounts, including NFS.
+      # `fsGroupChangePolicy: OnRootMismatch` does not scope it to one volume: it only skips
+      # the walk when a volume's ROOT already carries the gid. The shared homes export root
+      # is gid 6000, so it did not skip — the moment the desktop sidecar added a /home mount,
+      # the kubelet began chgrp'ing every AD user's home directory. Measured 2026-09-14:
+      # 15327 files under eda-pcb-agent's home were relabelled to gid 10000 before the pod
+      # was scaled down, and had to be repaired by hand. It surfaces only as a slow start
+      # ("Setting volume ownership ... taking longer than expected"), never as damage.
+      #
+      # Dropping it costs nothing here. The data PVC's ownership is done by the image itself:
+      # s6-overlay's stage2 hook usermods `hermes` to HERMES_UID/HERMES_GID and chowns
+      # HERMES_HOME as root before any service drops privileges — which is why this pod runs
+      # as root at all (see the header). Verified against the pre-migration volume: every
+      # path under /opt/data was already hermes:hermes.
+      #
+      # If a volume ever genuinely needs group ownership applied, do it in an initContainer
+      # against THAT path — never with a pod-level fsGroup while an NFS export is mounted.
+      initContainers:
+        # ── Seed HERMES_HOME on the PVC ───────────────────────────────────────
+        # A ConfigMap cannot be mounted over a populated PVC directory, and a
+        # subPath mount would not track ConfigMap updates. So copy instead.
+        #
+        # This also writes the two .env files, and that is NOT optional: Hermes
+        # loads $HERMES_HOME/.env with override=True (hermes_cli/env_loader.py
+        # load_hermes_dotenv), so a value in .env BEATS the container env. If we
+        # left .env to the image, stage2-hook.sh would seed it from
+        # .env.example and append a RANDOM API_SERVER_KEY — which would then
+        # override the sealed key we set below and silently make every client
+        # 401. Writing .env here both pins our values and makes stage2's
+        # `grep -q '^API_SERVER_KEY=..*'` short-circuit its key generation.
+        #
+        # Per-profile credentials work the same way but are read ONLY from
+        # profiles/<name>/.env (agent/secret_scope.py build_profile_secret_scope),
+        # never from the process env — hence the second .env.
+        - name: seed-config
+          image: docker.io/nousresearch/hermes-agent:v2026.9.14  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-euc"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/opt/data
+
+              # config.yaml: git is the source of truth → overwrite every start.
+              # NOT a plain copy: the ConfigMap holds the literal placeholder
+              # ${LITELLM_KEY} for model.api_key (git must never hold the secret), so it is
+              # substituted here from the mounted env. `install` alone would ship the literal
+              # string and every completion would 401 — which is exactly the bug this fixes.
+              # Exactly the four placeholders below are substituted, each by name, so nothing
+              # else in the file can be mangled by an accidental $ in a comment or prompt.
+              sed -e "s|\${LITELLM_KEY}|${LITELLM_KEY}|g" \
+                  -e "s|\${DASHBOARD_USERNAME}|${DASHBOARD_USERNAME}|g" \
+                  -e "s|\${DASHBOARD_PASSWORD}|${DASHBOARD_PASSWORD}|g" \
+                  -e "s|\${PROFILE_API_SERVER_KEY}|${PROFILE_API_SERVER_KEY}|g" \
+                  /bootstrap/config.yaml > "$HOME_DIR/config.yaml"
+              chmod 0640 "$HOME_DIR/config.yaml"
+              # Fail loudly rather than serve a config that 401s on every request (api_key)
+              # or silently disables the dashboard password gate (basic_auth).
+              # The pattern must be built as '${' + $v + '}': inside double quotes "\${v}"
+              # is the LITERAL string ${v}, which never appears in the file, so the guard
+              # would never fire. -F keeps $ and { out of regex interpretation entirely.
+              for v in LITELLM_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD PROFILE_API_SERVER_KEY; do
+                if grep -qF '${'"$v"'}' "$HOME_DIR/config.yaml"; then
+                  echo "[seed] FATAL: \${$v} not substituted in config.yaml" >&2
+                  exit 1
+                fi
+              done
+
+              # SOUL.md: seed ONCE. The agent edits its own SOUL over time and
+              # overwriting it on every restart would erase that.
+              if [ ! -f "$HOME_DIR/SOUL.md" ]; then
+                install -m 0640 /bootstrap/SOUL.md "$HOME_DIR/SOUL.md"
+              fi
+
+              # Default profile .env — overwritten every start so a rotated
+              # sealed secret actually takes effect.
+              umask 077
+              # HERMES_DASHBOARD_OIDC_CLIENT_SECRET goes here and NOT into config.yaml:
+              # config.yaml is cleartext on the PVC. The plugin reads env first
+              # (_resolve_setting, env-wins-config), and .env is loaded with override=True.
+              cat > "$HOME_DIR/.env" <<EOF
+              API_SERVER_KEY=${API_SERVER_KEY}
+              OPENAI_API_KEY=${LITELLM_KEY}
+              SEARXNG_URL=${SEARXNG_URL}
+              HERMES_DASHBOARD_OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+              EOF
+
+              # Named profile. create_profile() raises FileExistsError, so we do
+              # NOT call it — profiles_to_serve() is only a directory scan plus a
+              # name validation, so a directory with its own .env is all it takes
+              # to make a profile servable.
+              PROF_DIR="$HOME_DIR/profiles/${HERMES_PROFILE_NAME}"
+              mkdir -p "$PROF_DIR"
+              cat > "$PROF_DIR/.env" <<EOF
+              API_SERVER_KEY=${PROFILE_API_SERVER_KEY}
+              OPENAI_API_KEY=${LITELLM_KEY}
+              SEARXNG_URL=${SEARXNG_URL}
+              EOF
+
+              # A secondary profile MUST NOT enable api_server: only the default
+              # profile owns the shared listener. If this profile bound its own
+              # port the multiplexer raises SecondaryPortBindingConfigError and
+              # skips the profile entirely (gateway/run.py).
+              cat > "$PROF_DIR/config.yaml" <<'EOF'
+              model:
+                provider: "custom"
+                base_url: "http://litellm.litellm.svc:4000/v1"
+                # Keep in sync with bootstrap-configmap.yaml, which carries the reasoning.
+                # The old note preferred ollama on speed; that route CANNOT CALL TOOLS
+                # (ollama/ollama#16686) and ollama-thor is now disabled, so speed was moot.
+                default: "thor/qwen3.6-35b-a3b-nvfp4"
+              terminal:
+                backend: "local"
+                cwd: "/opt/data/work"
+                home_mode: "profile"
+              platforms:
+                api_server:
+                  enabled: false
+              EOF
+
+              # The tool sandbox cwd from config.yaml must exist.
+              mkdir -p "$HOME_DIR/work"
+
+              # ── The DURABLE TOOL PREFIX ──────────────────────────────────────────────
+              # Everything the agent installs with a package manager lands in /usr, /etc and
+              # /var/lib/dpkg — all of which are CONTAINER-PRIVATE and EPHEMERAL. Only
+              # /opt/data survives a pod restart, and only /opt/data is shared with the
+              # desktop sidecar. So a tool that must LAST goes here, and both containers put
+              # it first on PATH.
+              #
+              # ⚠ THIS DOES NOT MAKE `apt install` PERSIST. apt writes outside this prefix;
+              # nothing here changes that. Durable means installing INTO the prefix:
+              #   pip install --target /opt/data/tools/lib
+              #   npm install -g --prefix /opt/data/tools
+              #   go install (with GOBIN set), or just a static binary dropped in bin/
+              # An apt package is fine for a one-off and will be gone after the next restart.
+              # ⚠ GROUP-OWNED BY THE DIRECTORY'S `domain users` (gid 6000), NOT by hermes.
+              # The whole point of the desktop sidecar is that a human can install a tool the
+              # AGENT then picks up. That only works if both can write here:
+              #   - the agent runs as uid 10000 (s6 drops the gateway to `hermes`; a
+              #     kubectl exec lands as root and will tell you otherwise — check the
+              #     GATEWAY, not your shell);
+              #   - a human logs into the desktop as their own AD account, whose primary
+              #     group IS 6000.
+              # So: owner 10000, group 6000, 2775. The SETGID bit is load-bearing — without
+              # it a file the human creates lands in their own group and the agent cannot
+              # read it, which fails as "the tool I installed is invisible".
+              # ⚠ 6000 is a NUMERIC gid on purpose. The agent container has no sssd and
+              # cannot resolve the NAME `domain users`; numeric ownership needs no resolver.
+              # It is the directory's primary group, so every AD user already has it — see
+              # the access table in doc/hermes-deployments.md before widening this.
+              mkdir -p "$HOME_DIR/tools/bin" "$HOME_DIR/tools/lib"
+              chown -R 10000:6000 "$HOME_DIR/tools" 2>/dev/null || true
+              chmod 2775 "$HOME_DIR/tools" "$HOME_DIR/tools/bin" "$HOME_DIR/tools/lib" 2>/dev/null || true
+
+              # ⚠ AND THE PARENT MUST BE TRAVERSABLE, or none of the above is reachable.
+              # HERMES_HOME is 0700 by default, so a human could not even `cd /opt/data`.
+              # 0710 (o+x, no read) lets them traverse INTO tools/ without listing the
+              # agent's memories, sessions or credentials alongside it.
+              chmod 0710 "$HOME_DIR" 2>/dev/null || true
+              chgrp 6000 "$HOME_DIR" 2>/dev/null || true
+
+              # stage2 fixes ownership at boot, but it only walks profiles/ when
+              # it finds a non-hermes owner — cheaper to be correct here.
+              chown -R 10000:10000 "$HOME_DIR/.env" "$HOME_DIR/config.yaml" \
+                "$HOME_DIR/profiles" "$HOME_DIR/work" 2>/dev/null || true
+              [ -f "$HOME_DIR/SOUL.md" ] && chown 10000:10000 "$HOME_DIR/SOUL.md" || true
+              echo "[seed] HERMES_HOME seeded"
+          env:
+            - name: HERMES_PROFILE_NAME
+              value: "martin"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: api-server-key
+            - name: PROFILE_API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: profile-api-server-key
+            - name: LITELLM_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: litellm-key
+            # Substituted into config.yaml's dashboard.basic_auth block. Env alone does NOT
+            # work — PID 1 does not inherit these, so the plugin sees a blank username and
+            # registers no password provider at all.
+            # Written into both .env files (see the main container's SEARXNG_URL comment).
+            - name: SEARXNG_URL
+              value: "http://searxng.searxng.svc:8080"
+            - name: DASHBOARD_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: dashboard-username
+            - name: DASHBOARD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: dashboard-password
+            # Confidential-client secret for the dashboard's Authentik OIDC gate. Same
+            # value the PostSync provider job puts on the Authentik side — a mismatch
+            # 401s the token exchange, not the login form, so it looks like an IDP fault.
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-oidc-client-secret
+                  key: client-secret
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+      containers:
+        - name: hermes
+          image: docker.io/nousresearch/hermes-agent:v2026.9.14  # renovate: tracked by "Container image tags" regex (docker datasource)
+          # ENTRYPOINT is docker/entrypoint-dispatch.sh → /init (s6) →
+          # main-wrapper.sh, which routes a non-executable first arg to
+          # `hermes <args>`. So this is `hermes gateway run` under supervision.
+          args: ["gateway", "run"]
+          ports:
+            - name: api
+              containerPort: 8642
+            - name: dashboard
+              containerPort: 9119
+          env:
+            # ── The durable tool prefix, FIRST on PATH ────────────────────────────────
+            # /opt/data is the only path that survives a restart and the only one shared
+            # with the desktop sidecar, so a tool installed under /opt/data/tools stays
+            # available to the agent across rolls AND is visible from the GUI. See the
+            # seed-config initContainer for what "durable" does and does not cover — an
+            # `apt install` still writes to /usr and is still lost.
+            # ⚠ THE REST OF THIS VALUE IS THE IMAGE'S OWN PATH, COPIED VERBATIM, and it
+            # must stay that way. A container `env: PATH` REPLACES the image's PATH rather
+            # than extending it — there is no append syntax — so dropping /opt/hermes/bin
+            # and /opt/hermes/.venv/bin would take the `hermes` CLI and its virtualenv off
+            # PATH and break the gateway at boot. Read from the running pod 2026-09-14:
+            #   /opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:
+            #   /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            # ⚠ If an image bump changes the baked PATH, this line must be re-read from the
+            # new image — it is a copy, and nothing detects the drift.
+            - name: PATH
+              value: "/opt/data/tools/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            # Bind the API server on all interfaces. The default is 127.0.0.1,
+            # which would make the Service endpoint refuse every connection.
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_PORT
+              value: "8642"
+            # API_SERVER_KEY / OPENAI_API_KEY are deliberately NOT set here:
+            # $HERMES_HOME/.env (written by the init container) is loaded with
+            # override=True and would win anyway. Keeping them in one place
+            # avoids two sources of truth that silently disagree.
+            #
+            # --- Dashboard ---
+            # The s6 dashboard service is a no-op unless HERMES_DASHBOARD is truthy.
+            - name: HERMES_DASHBOARD
+              value: "true"
+            - name: HERMES_DASHBOARD_HOST
+              value: "0.0.0.0"
+            - name: HERMES_DASHBOARD_PORT
+              value: "9119"
+            # MANDATORY, not defence-in-depth: since the June-2026 hardening the
+            # dashboard's auth gate engages on any non-loopback bind and FAILS
+            # CLOSED when no auth provider is registered. HERMES_DASHBOARD_INSECURE
+            # is accepted but ignored. Without these two the dashboard does not
+            # start at all. Authentik in front is the primary gate; this is the
+            # second factor that also covers in-cluster callers.
+            # Web search. Hermes' `searxng` provider needs ONLY this URL — no api key —
+            # and it is the one provider in its fallback chain (exa/brave/tavily/firecrawl/
+            # parallel) that does not require a paid external account.
+            #
+            # ⚠ Declared here for documentation only — the container env does NOT reach the
+            # agent. Measured: `tr \0 \n < /proc/<gateway pid>/environ` is EMPTY (s6 does not
+            # pass the container environment through to the supervised services). The channel
+            # that works is $HERMES_HOME/.env, which hermes_cli/env_loader.py loads with
+            # override=True — so the init container writes SEARXNG_URL there too, into both
+            # the default and the per-profile file. Same class of trap as model.api_key and
+            # the dashboard basic-auth vars.
+            - name: SEARXNG_URL
+              value: "http://searxng.searxng.svc:8080"
+            - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: dashboard-username
+            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-secrets
+                  key: dashboard-password
+            # Keep the s6 remap a no-op: the useradd in the image already uses 10000.
+            # (There is deliberately no pod-level fsGroup to match — see the note above the
+            # initContainers; stage2's own chown is what owns the data volume.)
+            - name: HERMES_UID
+              value: "10000"
+            - name: HERMES_GID
+              value: "10000"
+            # The dashboard's OIDC plugin verifies TLS with httpx, which offers
+            # no verify= override and no config knob — so on letsencrypt-staging
+            # the issuer's chain is untrusted and every discovery/JWKS/token call
+            # fails with CERTIFICATE_VERIFY_FAILED (dashboard 503, "Provider
+            # unreachable"). Python's ssl module honours SSL_CERT_FILE, so this
+            # is the only place the staging chain can be injected without
+            # rebuilding the image.
+            #
+            # ⚠ SSL_CERT_FILE REPLACES Python's trust store, it does not add to
+            # it. So this must point at the SYSTEM bundle on letsencrypt-prod —
+            # left at the staging-only bundle it would break TLS to every
+            # publicly-trusted host instead. The anchor below is what
+            # updateConfigFromProjectSettings.sh rewrites; do not drop it.
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}
+          securityContext:
+            # See the header block: the s6 bootstrap must start as root.
+            runAsUser: 0
+            # readOnlyRootFilesystem is NOT viable — s6-svscan writes /run/service
+            # before any of our config is even read. The emptyDirs below cover the
+            # writable paths instead.
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: true
+            capabilities:
+              # Exactly what the chown + s6-setuidgid drop needs, nothing more.
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+              drop: ["ALL"]
+          # Startup is slow: s6 stage2 chowns the volume, then the gateway loads
+          # the profile set and connects the adapter.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 30
+            # Generous: the agent's own tool loop can make the event loop
+            # briefly unresponsive, and a 1s default timeout would restart the
+            # pod mid-task.
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            # Starting point only — measure and revisit. Chromium (baked in for
+            # the browser toolset) is the memory wildcard.
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            # s6 needs a writable /run (service supervision dirs), and the agent
+            # writes scratch to /tmp.
+            - name: run
+              mountPath: /run
+            - name: tmp
+              mountPath: /tmp
+            - name: var-tmp
+              mountPath: /var/tmp
+            # Chromium shares memory through /dev/shm; the 64Mi default makes it
+            # crash on non-trivial pages.
+            - name: dshm
+              mountPath: /dev/shm
+            # SSL_CERT_FILE above points here. Mounted at a dedicated path
+            # rather than over /etc/ssl/certs, which would SHADOW the image's
+            # own trust store and break every other outbound TLS call.
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+        # ── THE DESKTOP SIDECAR ────────────────────────────────────────────────────────
+        # A human GUI onto THIS pod. It exists because the admin dashboard's chat cannot be
+        # a shared surface: hermes_cli/pty_session.py holds ONE websocket per session and
+        # closes the second viewer with code 4409 (the same constraint that made
+        # eda-pcb-agent a desktop rather than a dashboard).
+        #
+        # ⚠ WHY A SIDECAR AND NOT ITS OWN POD. The point is to see and fix the AGENT's
+        # environment, and /opt/data — its config, SOUL.md, memories, sessions and work dir
+        # — is on this pod's PVC. A separate pod could not mount it (RWO, and the agent
+        # holds it), so it could only talk to the agent, not repair it.
+        #
+        # ⚠ WHAT IT SHARES AND WHAT IT DOES NOT. /opt/data is shared. /usr is NOT: each
+        # container has its own root filesystem, so a package installed HERE is not visible
+        # to the agent and vice versa. The durable prefix (/opt/data/tools, on both PATHs)
+        # is the only crossing point — see the seed-config initContainer.
+        #
+        # ⚠ NO BROKER, NO /registry, NO MODULE MACHINERY, deliberately. Nothing here runs
+        # EDA modules, and mounting the module registry is root-execution authority — see
+        # the banner in remote-desktop-bender/nfs-eda-modulefiles-bender-pv.yaml. Do not add
+        # it "for symmetry" with the other desktops.
+        - name: desktop
+          # ⚠ The SAME archived base image as the two EDA desktops, so there is one image to
+          # build and one tag to bump. remote-desktop/check-image-invariants.sh lists this
+          # file in IMAGE_CONSUMERS and compares the tag against every other consumer —
+          # never bump it here alone.
+          image: 127.0.0.1:30500/image-archives/remote-desktop:base-r69
+          command: ["/bin/bash", "-c"]
+          args: ["/opt/desktop-startup/desktop-startup.sh"]
+          securityContext:
+            runAsUser: 0
+            # ⚠ MUST be true. false sets NoNewPrivs=1 in the kernel and sudo can then NEVER
+            # work, however correct the sudoers drop-in is (measured on eda-pcb-agent).
+            # Installing packages is the whole point of this container.
+            allowPrivilegeEscalation: true
+            capabilities:
+              # SETUID/SETGID: the su/sudo drop path xrdp needs per login.
+              # CHOWN/DAC_OVERRIDE/FOWNER: ownership fixes on the shared volume.
+              add: ["SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "FOWNER"]
+              drop: ["ALL"]
+          env:
+            # Same durable prefix as the agent, so a tool installed from the GUI is on the
+            # agent's PATH too. This container's own baked PATH is the desktop image's.
+            - name: PATH
+              value: "/opt/data/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            - name: RDP_PASSWORD
+              valueFrom: { secretKeyRef: { name: hermes-desktop-secrets, key: rdp-password } }
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            # ⚠ NOT ANCHORED: only the `.{adDomain}` SUFFIX is machine-managed — the leading
+            # `ad-cloud-0` is the DC pod's own name. See remote-desktop's copy of this note.
+            - name: AD_DC_FQDN
+              value: "ad-cloud-0.ad.base.internal"
+            # Its OWN machine account — must match MACHINE in keytab-job.yaml. Sharing one
+            # with another desktop would make each password rotation break the other.
+            - name: AD_MACHINE_ACCOUNT
+              value: "rdesk-hermes$"
+            # Per-user X sessions against AD, like the other desktops. The eda-pcb-agent
+            # shared-tmux model is NOT used: this desktop has two distinct audiences.
+            - name: SESSION_MODE
+              value: "per-user"
+          ports:
+            - { name: rdp, containerPort: 3389 }
+            - { name: dtssh, containerPort: 2222 }
+          volumeMounts:
+            # THE POINT: the agent's own state, read-write, same path as the agent sees it.
+            - name: data
+              mountPath: /opt/data
+            - name: homes
+              mountPath: /home
+            - name: staging-ca
+              mountPath: /run/staging-ca
+              readOnly: true
+            - name: krb5-keytab
+              mountPath: /etc/krb5.keytab
+              subPath: krb5.keytab
+              readOnly: true
+            # Mounted as a DIRECTORY, not subPath: a subPath mount is a one-time copy the
+            # kubelet never refreshes, so an edited script would never reach the pod.
+            - name: desktop-startup
+              mountPath: /opt/desktop-startup
+              readOnly: true
+            - name: desktop-dshm
+              mountPath: /dev/shm
+          resources:
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "4", memory: "8Gi" }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: hermes-bootstrap
+        - name: homes
+          persistentVolumeClaim: { claimName: nfs-homes-hermes }
+        - name: desktop-startup
+          configMap:
+            name: hermes-desktop-startup
+            defaultMode: 0755
+        # ⚠ 0600: krb5 refuses a group- or world-readable keytab. NOT `optional: true` —
+        # the keytab is minted by a PreSync hook, so it always exists before this pod is
+        # created, and `optional` would turn a missing Secret into a FATAL inside the
+        # container instead of a clear ContainerCreating.
+        - name: krb5-keytab
+          secret:
+            secretName: hermes-desktop-keytab
+            defaultMode: 0600
+        - name: desktop-dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: var-tmp
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # ⚠ CHANGING THIS IS NOT AN IN-PLACE EDIT. volumeClaimTemplates is IMMUTABLE on a
+        # StatefulSet, so moving between classes needs the StatefulSet and the PVC deleted
+        # and recreated — and the old class is Retain, so the released PV must be deleted by
+        # hand or it leaks. Done deliberately on 2026-09-14; the agent's prior state was
+        # discarded rather than migrated, by explicit decision.
+        storageClassName: longhorn-unibi-hclab # automatically updated from project-settings:applicationPlacements.meshStorageClass
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes
+  namespace: hermes
+spec:
+  selector:
+    app: hermes
+  ports:
+    - name: api
+      port: 8642
+      targetPort: api
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
+    # The desktop sidecar. RDP is what the Guacamole tile connects to.
+    - name: rdp
+      port: 3389
+      targetPort: rdp
+    # ⚠ The container listens on 2222 and the Service publishes 22, so no `-p` is needed.
+    # That split is deliberate: it keeps a grant for the DESKTOP's sshd from being confused
+    # with a grant to a NODE's sshd, which stays operator-only.
+    - name: ssh
+      port: 22
+      targetPort: dtssh

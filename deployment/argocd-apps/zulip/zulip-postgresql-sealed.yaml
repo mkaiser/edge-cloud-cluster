@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zulip-postgresql
+  namespace: zulip
+spec:
+  encryptedData:
+    password: ""
+  template:
+    metadata:
+      name: zulip-postgresql
+      namespace: zulip

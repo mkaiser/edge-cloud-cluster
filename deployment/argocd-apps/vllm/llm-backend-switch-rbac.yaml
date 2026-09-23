@@ -1,0 +1,46 @@
+# Lets the Open WebUI "LLM backend switch" tool scale THIS app's Deployment.
+#
+# WHY IT LIVES HERE AND NOT IN open-webui/: the Role is namespaced to `vllm`, and the
+# namespace belongs to this app. Creating it from the open-webui app would leave an object
+# in a namespace another Application owns, which the two would then fight over. The
+# open-webui side (deployment/argocd-apps/open-webui/llm-backend-switch-rbac.yaml) carries
+# the same pair for the ollama / ollama-turing namespaces and points here for this one.
+#
+# The subject is open-webui's `default` ServiceAccount — the tool runs inside that pod.
+#
+# ⚠ SCOPED AS TIGHTLY AS THE OTHERS: patch on ONE named Deployment, plus pod list so the
+# tool can report what is actually running. It cannot create, delete, or touch anything
+# else in the namespace.
+#
+# Without this the tool's vllm target fails at the scale call — `switchLLMBackend.sh vllm`
+# from the UI would report a permission error after having already scaled ollama-thor to 0,
+# i.e. it would leave the Thor serving NOTHING. The CLI path (a human with kubeconfig) was
+# unaffected, which is why the gap survived unnoticed.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-backend-switch
+  namespace: vllm
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["vllm"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-backend-switch
+  namespace: vllm
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: open-webui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-backend-switch

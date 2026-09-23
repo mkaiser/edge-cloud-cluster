@@ -1,0 +1,85 @@
+# node-feature-discovery — node labels discovered FROM the hardware.
+#
+# Every other node label in this cluster is declared in project_settings.ts and applied by
+# src/nodes-k3s-*.ts. This app is the one exception: it reports what a machine actually is,
+# which is the only way to catch a node whose capability differs from what its class implies.
+# See the README next to this file for the full rationale.
+#
+# What it is used for today: `feature.node.kubernetes.io/cpu-cpuid.X86_64_V2`, the x86-64
+# psABI microarchitecture level. Present on capable nodes and ABSENT on ones below it, so
+# consumers match positively (`operator: In`) and nothing has to remove a stale label.
+
+# ⚠ WITHOUT THESE TOLERATIONS THIS APP IS INERT. The chart default is `tolerations: []`, and
+# every mesh node is tainted ecc/mesh=true:NoSchedule (GPU nodes additionally
+# ecc/gpu=true:NoSchedule). Left at the default the worker DaemonSet runs on the cloud node
+# ALONE — it reports Healthy, emits labels for one node, and silently characterises none of
+# the mesh fleet, which is the entire reason this app exists.
+#
+# The failure mode is invisible: no error, no CrashLoop, just a DaemonSet whose DESIRED count
+# is 1. Check `kubectl -n node-feature-discovery get ds` against the node count after a chart
+# bump, since an upstream values rename would silently drop these back to the default.
+worker:
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    # GPU nodes are opt-in only (src/nodes-k3s-mesh.ts taints them so ordinary workloads stay
+    # off). A label collector is exactly the kind of pod that SHOULD still run there: it is a
+    # per-node agent, not a workload competing for the GPU, and a node nothing describes is a
+    # node nothing can schedule onto correctly.
+    - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  resources:
+    requests:
+      cpu: 5m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# The master merges what the workers report onto the Node objects. One replica, cloud — it
+# talks to the API server, not to hardware, so it needs no mesh placement.
+master:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 20m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+
+# Removes NodeFeature objects belonging to nodes that no longer exist. Load-bearing here
+# rather than cosmetic: this cluster is recreated regularly and mesh nodes join and leave, so
+# without it the API server accumulates objects for nodes that are long gone.
+gc:
+  enable: true
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 5m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# NUMA/resource topology for a topology-aware scheduler. Not deployed: this cluster runs the
+# stock k3s scheduler, which cannot consume it, so it would be a DaemonSet on every node
+# producing data nothing reads.
+topologyUpdater:
+  enable: false
+
+# kube-prometheus-stack is already at wave 2 and scrapes the infra namespaces.
+prometheus:
+  enable: true
+
+# NB `sources.cpu.cpuid` is deliberately NOT configured.
+#
+# The default attributeBlacklist (source/cpu/cpu.go, newDefaultConfig) hides SSE42, POPCNT,
+# CX16, SSE4 and SSSE3 — the individual x86-64-v2 features — so selecting on any of those
+# would match a label that is never emitted. The X86_64_V* level flags are NOT blacklisted,
+# and NFD derives them itself from the psABI level (source/cpu/cpuid_amd64.go calls
+# microarchLevelFlags(cpuid.CPU.X64Level())), which is why the level is what consumers match.
+#
+# Setting an attributeWhitelist instead would be worse than it looks: a whitelist REPLACES the
+# blacklist wholesale (initCpuidFilter), so it would suppress every flag not named in it.

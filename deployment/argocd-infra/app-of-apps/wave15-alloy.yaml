@@ -1,0 +1,25 @@
+# Alloy log collector DaemonSet. Wave 15, after Loki (wave 14) exists — Alloy
+# would retry a missing push endpoint anyway, but starting it second keeps the
+# logs clean.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: alloy-app
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/alloy
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

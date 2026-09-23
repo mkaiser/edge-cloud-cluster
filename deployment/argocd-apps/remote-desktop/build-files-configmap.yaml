@@ -1,0 +1,2429 @@
+# ConfigMap carrying the remote-desktop base build files for the build-trigger to
+# mirror. The embedded copies below are GENERATED from the source files in this
+# directory (Dockerfile.base, ci-base.yml, broker.sh, module-cli.sh, module-podman.sh)
+# — do NOT hand-edit them here; edit the source file and run
+#   deployment/argocd-apps/remote-desktop/sync-build-files.sh
+# This ConfigMap is what actually gets built, so a stale copy ships broken behaviour.
+# Verify before committing with `sync-build-files.sh --check`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remote-desktop-build-files
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  Dockerfile: |
+    # remote-desktop base image — a GENERIC Ubuntu/Xfce VNC desktop where EDA
+    # applications are loaded AT RUNTIME (HPC `module load` style, via Lmod + per-module OCI
+    # images run by the desktop's own podman) instead of being baked in. Built on
+    # unibi-hclab-pcie-tb-s via GitLab CI (ci-base.yml, tags:[eda]).
+    #
+    # NO application is baked in. This image provides only:
+    #   - the desktop (Xfce + TigerVNC + noVNC + xrdp + SSSD/Authentik-LDAP logins)
+    #   - the module broker's tools (skopeo) — the broker sidecar runs from THIS same image
+    #   - podman, to run module images inside the sandboxed desktop container
+    #   - Lmod, so `module load <app>/<ver>` works in login shells
+    #
+    # The apt set is the UNION of the xilinx and hyperlynx runtime library sets, so a
+    # module for either tool finds its system deps here — modules cannot apt-install at
+    # load time. This is where "generic desktop" leaks: it is generic only over apps
+    # whose system deps are anticipated here. Adding a tool with new deps = a base bump.
+
+    # renovate: tracked by "Container image tags" regex (docker datasource)
+    FROM docker.io/accetto/ubuntu-vnc-xfce-opengl-g3:latest
+    USER 0
+
+    # Native (on-PATH) modules: a loaded module's binary runs as a NATIVE
+    # process in THIS container and links against the system libs installed here — so
+    # each tool's system-lib deps must be present in the base. This is the one place
+    # "generic desktop" leaks: it is generic only over tools whose deps are anticipated
+    # here (a new tool with new deps = a base bump). Container-runtime modules avoid this:
+    # their libs live in the module image, not here.
+    #
+    # CURRENT SCOPE: Vivado only. HyperLynx's Motif/GTK2 libs are deliberately NOT here
+    # yet — add them (libxm4 libgtk2.0-0t64 libgl1 libglu1-mesa) when hyperlynx becomes
+    # a module.
+    RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        # --- desktop/runtime base (xrdp per-user sessions + SSSD/Authentik-LDAP) ---
+        locales file xz-utils x11-utils ca-certificates curl \
+        libtinfo6 libncurses6 libxext6 libxrender1 libxtst6 libxi6 \
+        libatomic1 libgomp1 libnss3 libasound2t64 \
+        libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+        libxcb-render-util0 libxcb-shape0 \
+        xrdp xorgxrdp dbus-x11 \
+        sssd-ldap libnss-sss libpam-sss ldap-utils \
+        #   sssd-ad sssd-krb5 adcli krb5-user — SSSD's ACTIVE DIRECTORY provider, so the
+        #                    desktop resolves identity from Samba AD directly instead of from
+        #                    the Authentik LDAP outpost. That closes the last structural gap in
+        #                    the identity chain: the outpost COMPUTES uid = 5000 + Authentik pk,
+        #                    while AD (and therefore the fileserver) STORES uidNumber — two
+        #                    sources that diverge the moment a pk changes — the desktop and the
+        #                    fileserver then report different uids for one user, who cannot read
+        #                    their own home. See doc/ad-identity-chain.md.
+        #                    ⚠ WITHOUT sssd-ad there is no libsss_ad.so, and because the
+        #                    startup script runs `sssd -D … || echo WARNING` the pod comes up
+        #                    LOOKING HEALTHY with no identity at all.
+        sssd-ad sssd-krb5 adcli krb5-user \
+        #   openssh-server — SSH/SFTP into the desktop for the same LDAP users that log in
+        #                    over RDP. Authenticates through the SAME PAM/SSSD stack (see
+        #                    the sshd block in startup-configmap.yaml), so there is no
+        #                    second credential store and no host keys baked into the image.
+        #   sssd-tools     — provides sss_ssh_authorizedkeys, which sshd's
+        #                    AuthorizedKeysCommand calls to fetch a user's public keys from
+        #                    the `sshPublicKey` LDAP attribute. This is what makes key auth
+        #                    work WITHOUT ~/.ssh/authorized_keys — load-bearing once /home
+        #                    moves to a network filesystem, because OpenSSH StrictModes
+        #                    refuses a key file whose mode/owner it cannot trust and a
+        #                    network mount presents uniform mode bits for every user.
+        #                    If this package name ever disappears, the build MUST fail here
+        #                    rather than silently produce an image where key auth degrades
+        #                    to a password prompt.
+        openssh-server sssd-tools \
+        # --- Vivado (Qt/GTK3) — the only module tool in scope now ---
+        libgtk-3-0t64 libglib2.0-0t64 \
+        # --- module tooling: Lmod + the broker's registry stack ---
+        #   lmod              — activation (module load)
+        #   skopeo            — read module manifests from the registry (no daemon)
+        #   python3-yaml      — parse module.yaml (broker + GUI launcher)
+        #   inotify-tools     — broker request-dir watch (falls back to poll)
+        #   util-linux        — flock (per-module serialization)
+        #   fuse3             — fusermount3, needed by fuse-overlayfs.
+        #                       Must be fuse3, not the legacy `fuse`: fuse-overlayfs pulls in
+        #                       fuse3, and `fuse3 Breaks: fuse`, so listing both fails the
+        #                       build with "held broken packages".
+        #   podman            — run container-runtime module images inside the desktop
+        #                       container (the sandbox runtime isolates it; see module-cli.sh)
+        #   fuse-overlayfs    — copy-on-write for podman on the FUSE rootfs. WITHOUT it podman
+        #                       falls back to vfs, which copies every layer per container:
+        #                       3m23s to start a 31 GB image vs 1.5s. See storage.conf below.
+        #   python3-pip       — the base ships a Python interpreter with NO pip and NO
+        #   python3-venv        ensurepip: both report "No module named ...", and
+        #                       `python3 -m venv` fails at "Failing command: .../bin/python3"
+        #                       trying to seed pip. An interpreter that cannot install anything
+        #                       is effectively broken for users.
+        #                       ⚠ python3-pip pulls a full build toolchain (binutils, gcc,
+        #                       libc6-dev) via python3-dev. apt --dry-run first: 76 new
+        #                       packages, 5 upgraded, 0 REMOVALS.
+        #                       ⚠ DELIBERATELY NOT uv: Hermes downloads and manages its OWN
+        #                       uv at $HERMES_HOME/bin/uv (hermes_cli/managed_uv.py) and
+        #                       `hermes update` resolves that
+        #                       managed path, never a system binary — so a distro uv would sit
+        #                       unused while drifting. It is also not in the Ubuntu 24.04
+        #                       repos, so baking it in would mean curl|sh or a third-party PPA.
+        #                       Per-user tooling belongs on /shared/tools, not in this image.
+        lmod skopeo umoci python3-yaml inotify-tools util-linux fuse3 \
+        python3-pip python3-venv \
+        podman fuse-overlayfs \
+        && locale-gen en_US.UTF-8 de_DE de_DE.UTF-8 \
+        && rm -rf /var/lib/apt/lists/*
+    ENV LANG=en_US.UTF-8
+
+    # podman storage: the desktop's rootfs is FUSE-backed (a sandbox runtime's gofer/virtiofs),
+    # and the kernel refuses to stack a NATIVE overlay mount on FUSE — `mount -t overlay` fails
+    # with "wrong fs type". That rules out the plain overlay driver.
+    #
+    # But vfs has NO copy-on-write: it materialises every layer as a full physical copy for
+    # EVERY container. On the 31 GB hyperlynx image that made `podman run … /bin/true` take
+    # 3m23s (only 36s of it CPU — the rest is pure copying) and grew the store to 118 GB for
+    # a single image. Users saw a ~4 min "startup" that was ~3m25s podman + ~40s application.
+    #
+    # fuse-overlayfs gives real copy-on-write on a FUSE rootfs, and the pod has /dev/fuse, so
+    # it works here. NOTE: in podman 4.x "fuse-overlayfs" is NOT a driver name — passing it as
+    # one fails with "driver not supported". It is the `overlay` driver plus a mount_program.
+    # Measured in-pod on the same image: 3m23s -> 1.5s, store 118 GB -> 30 GB.
+    RUN mkdir -p /etc/containers && printf '%s\n' \
+        '[storage]' \
+        'driver = "overlay"' \
+        'runroot = "/run/containers/storage"' \
+        'graphroot = "/var/lib/containers/storage"' \
+        '[storage.options.overlay]' \
+        'mount_program = "/usr/bin/fuse-overlayfs"' \
+        'mountopt = "nodev"' \
+        > /etc/containers/storage.conf
+
+    # Lmod: `module` available in every login shell. z10-module.sh WRAPS Lmod so
+    # `module load <name>/<ver>` asks the broker to fetch+prepare the module and then writes
+    # the podman-run launchers; a BARE name still delegates to real Lmod.
+    COPY module-cli.sh /etc/profile.d/z10-module.sh
+    COPY broker.sh /usr/local/bin/broker
+    # Root helper that pulls container-module images into the SHARED ROOT podman store for
+    # unprivileged LDAP users. Rootless podman cannot work for them (no /etc/subuid entry —
+    # LDAP users do not exist at build time — no uidmap package, and gVisor refuses the
+    # mapping), and sudo is not usable either since setuid is ineffective under gVisor.
+    COPY module-podman.sh /usr/local/bin/module-podmand
+    RUN chmod 0644 /etc/profile.d/z10-module.sh \
+        && chmod 0755 /usr/local/bin/broker \
+                      /usr/local/bin/module-podmand \
+        # /etc/profile.d is sourced by LOGIN shells only. The xfce terminal opens a
+        # NON-login interactive shell (xfce4-terminal defaults to CommandLoginShell=FALSE),
+        # which reads only the bashrc files — so on the desktop `module` was
+        # "command not found" while `su - user` had it. Source it for interactive
+        # non-login shells too.
+        #
+        # Guards, both load-bearing:
+        #   case $- in *i*)  — interactive ONLY. /etc/bash.bashrc is also read by any
+        #     non-interactive bash that has BASH_ENV set, and z10-module.sh itself
+        #     `unset BASH_ENV`s to stop Lmod's init clobbering the wrapper; sourcing it
+        #     from a non-interactive shell would re-enter that path.
+        #   ! declare -F _module_fetch — skip only when OUR WRAPPER is already installed.
+        #     Testing MODULEPATH here does NOT work: /etc/xrdp/startwm.sh runs under dash,
+        #     sources /etc/profile, and lmod.sh sets MODULEPATH + exports BASH_ENV while
+        #     z10-module.sh (bash-guarded) correctly bails. The whole xfce session then
+        #     INHERITS a non-empty MODULEPATH that contains only the system paths, so a
+        #     MODULEPATH test made every desktop terminal skip the wrapper and `module`
+        #     stayed command-not-found. _module_fetch is defined only by z10-module.sh.
+        # lmod.sh FIRST, exactly as the login path does it (profile.d runs alphabetically,
+        # so lmod.sh precedes z10-module.sh there). It sets the system MODULEPATH entries;
+        # z10-module.sh then appends the broker's tree and installs the wrapper. Sourcing
+        # only z10-module.sh here would silently drop the system paths.
+        && printf '%s\n' \
+             'case $- in *i*)' \
+             '  if ! declare -F _module_fetch >/dev/null 2>&1; then' \
+             '    [ -r /etc/profile.d/lmod.sh ] && . /etc/profile.d/lmod.sh' \
+             '    [ -r /etc/profile.d/z10-module.sh ] && . /etc/profile.d/z10-module.sh' \
+             '  fi' \
+             ';; esac' \
+           >> /etc/bash.bashrc
+
+    # Keep the accetto startup contract. The remote-desktop Deployment (desktop-gvisor.yaml)
+    # overrides the command per-container: the DESKTOP container wires SSSD + xrdp with
+    # pod-time secrets (like xilinx/hyperlynx); the BROKER sidecar runs `broker`.
+  .gitlab-ci.yml: |
+    # remote-desktop base image build — recover-or-rebuild.
+    #
+    # SOURCE OF TRUTH: this file lives in the infra repo
+    # (deployment/argocd-apps/remote-desktop/ci-base.yml). The build-trigger
+    # (presync-build-desktop.yaml) MIRRORS it (+ Dockerfile.base) into the in-cluster
+    # GitLab project deployments/infrastructure/eda/remote-desktop via a git push (as
+    # .gitlab-ci.yml + Dockerfile), then ArgoCD TRIGGERS this pipeline. Do NOT hand-edit
+    # it in GitLab — overwritten on the next mirror. Bump IMAGE_TAG to force a rebuild.
+    #
+    # Only the ConfigMap reaches GitLab — the source files in the infra repo do not — so the
+    # embedded/source drift check cannot run in this pipeline. Run
+    # `deployment/argocd-apps/remote-desktop/sync-build-files.sh --check` in the infra repo
+    # before committing; a stale ConfigMap silently builds the wrong scripts.
+    #
+    # Runs on the shared [eda] runner (tags:[eda] → unibi-hclab-pcie-tb-s, privileged
+    # buildah, /build-scratch hostPath for storage). Unlike the xilinx/vivado builds
+    # this needs NO /installer bind mount — no application is baked in.
+    stages: [build]
+
+    workflow:
+      auto_cancel:
+        on_new_commit: interruptible
+
+    build-remote-desktop-base:
+      stage: build
+      tags: [eda]
+      # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+      # for the registry gate below, which quay's image has never shipped. Built by
+      # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+      # ⚠ The tag must equal that app's IMAGE_TAG; remote-desktop/check-image-invariants.sh
+      # fails the commit if they drift. A consumer pinned to a tag that was never built simply
+      # never starts its build pod.
+      # ⚠ THE LAB-LOCAL REGISTRY, NOT $CI_REGISTRY. This job runs on a lab node, and under
+      # `targetState: production` the lab cannot reach the PUBLIC registry host at all — not
+      # over IPv6 (no route) and not over IPv4 (the host nftables guard resets TLS). The pull is
+      # done by the KUBELET, so it fails in prepare_script before any script line runs:
+      #   Failed to pull ... registry.gitlab.<tld>/...: dial tcp [2a01:...]:443:
+      #   network is unreachable
+      # Measured on ecc204; the same failure took out the base-image build for a whole day.
+      #
+      # ⚠ AND WHY AN IP RATHER THAN THE SERVICE DNS NAME — this is the one place a literal is
+      # correct. The kubelet resolves an image reference with the HOST's resolver, which knows
+      # nothing about cluster DNS, and it matches containerd's certs.d config by the EXACT host
+      # string. 127.0.0.1:30500 is not "an address somewhere": it is this registry's pinned
+      # NodePort on the node doing the pull, identical on every node, so one reference works
+      # fleet-wide and the bytes never leave the box. The registry's cert carries an
+      # `ipAddresses: [127.0.0.1]` SAN precisely for this path (image-registry/tls-cert.yaml).
+      # In-POD clients use the DNS name instead — REGISTRY_HOST is the FQDN. Both are right;
+      # the split is the design.
+      #
+      # ⚠ The image must EXIST in the lab registry. It is not built there — mirror it in from
+      # GitLab's registry (skopeo copy) when the tag changes, or this pull 404s.
+      image: 127.0.0.1:30500/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+      # Serialize on the single node: every ArgoCD (re)sync fires the PreSync trigger.
+      resource_group: remote-desktop-base-build
+      interruptible: true
+      timeout: 2h
+      variables:
+        IMAGE_TAG: base-r69                 # Bump on every base-image change: the tag IS the cache key.
+                                            # ⚠ A bump takes the desktop DOWN for the whole build
+                                            # (strategy: Recreate), so land a base bump on its own
+                                            # rather than bundling it with a config change — a failure
+                                            # is otherwise impossible to attribute.
+                                            # ⚠ Run `apt --dry-run` before adding a package and check
+                                            # the REMOVALS line: a packaging conflict that removes
+                                            # something strands the desktop for the whole build.
+                                            # What the base deliberately does NOT carry: uv (Hermes
+                                            # manages its own — see Dockerfile.base) and any per-user
+                                            # Python tooling, which belongs on /shared/tools.
+        IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+        # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+        # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+        # literally named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is
+        # fail-open, so that 404 reads as "not in the registry" and rebuilds from installer
+        # media every single time, silently. Measured on ecc188: the buggy form returned 404
+        # and this form returned 200 against the same tag.
+        # A `docker://` push destination is the opposite case — it MUST keep the tag, so those
+        # still use ${IMAGE#*/}.
+        IMAGE_REPO: $CI_PROJECT_PATH
+        # Registry TLS: prod cert is publicly trusted -> verify; staging CA is untrusted
+        # in the build pod -> false. Toggled by certIssuerType via the update script.
+        REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+        # overlay on the ext4 hostPath scratch (privileged pod) — vfs would copy the
+        # tree once per layer.
+        STORAGE_DRIVER: overlay
+        BUILDAH_ROOT: /build-scratch/buildah-storage
+        BUILDAH_RUNROOT: /build-scratch/buildah-run
+        # Push to the in-cluster registry Service directly, bypassing the public
+        # ingress (drops multi-GB blobs). PreferClose lands the push on the LAN-local
+        # (unibi-hclab) registry replica — NOT across WireGuard.
+        INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+        # ⚠ THE ONE COPY THAT SURVIVES A CLUSTER RECREATE.
+        # $IMAGE / $INTERNAL_REGISTRY above are GitLab's registry, which is IN-CLUSTER and is
+        # destroyed with the cluster — so after a recreate the desktop sits in
+        # ImagePullBackOff until a 10-20 min `buildah bud` re-runs. image-registry is backed by
+        # the TrueNAS export datapool/images (image-registry/nfs-images-pv.yaml, Retain), which
+        # does not go away: measured 2026-08-27, a 6h-old PVC holding 63.2 GB of
+        # module images built on EARLIER clusters.
+        #
+        # So the same image is pushed to BOTH, and the restore branch below pulls it back from
+        # here instead of rebuilding. This is the same store and the same credential the EDA
+        # module builds already use — not a new mechanism.
+        #
+        # ⚠ image-registry has NO GARBAGE COLLECTION (deliberate — see its README and
+        # project_settings.ts). Every IMAGE_TAG bump adds a few GB here PERMANENTLY; the old
+        # tag's blobs are orphaned and nothing reclaims them. Prune by hand.
+        IMAGE_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+        # ⚠ image-archives/, NOT deployments/... — this registry also holds the EDA module
+        # images under deployments/, and those are pulled BY THE BROKER AND RUN AS ROOT,
+        # authorised by <repo>:<tag> in broker.sh allowed(). A separate repository namespace
+        # means the desktop base image can never be confused for a module in either direction.
+        SURVIVING_IMAGE: $IMAGE_REGISTRY/image-archives/remote-desktop:$IMAGE_TAG
+        SURVIVING_IMAGE_REPO: image-archives/remote-desktop
+      script:
+        # Trust the image-registry CA before anything talks to it. It serves TLS from a PRIVATE
+        # in-cluster CA, so the build pod cannot verify it from the system trust store.
+        # containers/image reads /etc/containers/certs.d/<host>/ca.crt, so skopeo and buildah
+        # both pick this up. Writing the CA (rather than passing --tls-verify=false) means a
+        # wrong or missing CA fails loudly at the handshake instead of silently downgrading.
+        # Validated with python3 because this image has no openssl (memory: eda ci CA check).
+        - |
+          if [ -n "$IMAGE_REGISTRY_CA" ]; then
+            mkdir -p "/etc/containers/certs.d/${IMAGE_REGISTRY}"
+            printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${IMAGE_REGISTRY}/ca.crt"
+            # ⚠ THE PYTHON PROGRAM MUST NOT BE INDENTED, and that is harder here than it
+            # looks. This block is a YAML `- |` literal scalar, so every line must stay
+            # indented or the scalar ends and the file breaks — but python treats leading
+            # whitespace as an indent error on line 1. The previous version used
+            # <<'CACHECK' with an indented body (not <<-, which strips TABS only, never
+            # spaces), so python died with "IndentationError: unexpected indent" and the
+            # `||` branch reported the misleading "IMAGE_REGISTRY_CA is not a valid
+            # certificate" — the CA was always fine. Pipeline 20 failed exactly this way.
+            # Solution: a single-line program, so there is no second line to indent.
+            # Verified by running the extracted block against a real self-signed cert.
+            printf '%s' "$IMAGE_REGISTRY_CA" | python3 -c 'import base64,re,sys; raw=sys.stdin.read(); m=re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S); sys.exit("no PEM CERTIFICATE block") if not m else None; der=base64.b64decode("".join(m.group(1).split())); sys.exit("certificate body implausibly short") if len(der)<100 else None; print("image-registry CA OK (%d bytes DER)" % len(der))' \
+              || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+          else
+            echo "WARN: IMAGE_REGISTRY_CA is empty — the recreate-surviving copy is unavailable."
+            echo "      The build still works; it just cannot restore or archive."
+          fi
+        - |
+          # ── Recover-or-rebuild ────────────────────────────────────────────────────────
+          # Three outcomes, cheapest first:
+          #   1. already in GitLab's registry        -> nothing to do          (instant)
+          #   2. in the recreate-surviving registry  -> copy it back           (seconds)
+          #   3. neither                             -> buildah bud            (10-20 min)
+          # `skopeo inspect --raw` — NOT curl, and this is a REPAIR, not a refactor.
+          # ⚠ MEASURED ON ecc193 (2026-09-02): the curl form this replaces could never have
+          # worked. GitLab's registry answers /v2/ with `401 + WWW-Authenticate: Bearer
+          # realm="https://gitlab.<tld>/jwt/auth"`, so a BASIC-auth request returns 401 even
+          # for a tag that EXISTS — verified against remote-desktop:base-r40 (basic 401, bearer
+          # 200, same URL, same second). The gate is fail-open, so that 401 read as "absent"
+          # and this pipeline has never once skipped a build it could have skipped. skopeo
+          # performs the bearer token exchange and sends every manifest Accept header itself.
+          #
+          # --tls-verify=false replaces the old `-k`: under letsencrypt-staging the registry
+          # certificate is untrusted inside the build pod. This is a presence check, not a
+          # content fetch — bytes are digest-verified when they are actually pulled.
+          #
+          # Nor buildah: `inspect` only reads LOCAL storage and `pull` would fetch GB merely
+          # to test presence. skopeo is available because this job now runs on the CI build
+          # image (deployment/argocd-apps/ci-build-image).
+          set +e
+          _gate_out=$(skopeo inspect --raw --tls-verify=false \
+                   --creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" "docker://$IMAGE" 2>&1)
+          _gate_rc=$?
+          set -e
+          if [ "$_gate_rc" -eq 0 ]; then
+            echo "$IMAGE already exists — skipping build."
+            # ── Archive-on-skip ────────────────────────────────────────────────────────
+            # ⚠ "in GitLab's registry" does NOT imply "archived". base-r41 was built on
+            # ecc193 while the archive credential was broken (image-registry-auth's `password`
+            # key had been renamed to `push-password`), so it published fine and was never
+            # archived — and this gate then exits 0 on every later run, so nothing would ever
+            # notice until a recreate rebuilt it from scratch. Repair it here instead of
+            # waiting for the next tag bump.
+            # Cheap: registry-to-registry, and a no-op once the copy exists.
+            # ⚠ NEVER FATAL — the image is published and the app already works.
+            if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+              set +e
+              skopeo inspect --raw --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" >/dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                echo "  the recreate-surviving copy is MISSING — archiving it now..."
+                skopeo copy --retry-times 10 \
+                  --src-tls-verify=false --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                  --dest-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                  "docker://$IMAGE" "docker://$SURVIVING_IMAGE"
+                if [ $? -eq 0 ]; then
+                  echo "  archived $SURVIVING_IMAGE — this tag now survives a recreate."
+                else
+                  echo "  WARN: could not archive — the next recreate will rebuild this tag."
+                fi
+              else
+                echo "  recreate-surviving copy is present."
+              fi
+              set -e
+            else
+              echo "  WARN: no image-registry credential — cannot confirm the surviving copy."
+            fi
+            exit 0
+          fi
+          case "$_gate_out" in
+            *"manifest unknown"*|*"name unknown"*|*"was not found"*) : ;;
+            *) echo "registry gate: $IMAGE not readable (fail-open, continuing):"
+               echo "  skopeo: $_gate_out" ;;
+          esac
+          echo "$IMAGE not found in the cluster registry."
+
+          # ── 2. Restore from the surviving registry ───────────────────────────────────
+          # ⚠ NEVER FATAL. If anything here fails we fall through to the rebuild, which is
+          # slow but always correct. A backup path must not be able to redden a pipeline that
+          # would otherwise have produced a working image.
+          #
+          # No digest/completeness protocol is needed (unlike a tar archive on a filesystem):
+          # a registry is content-addressed, so a partial push never becomes a resolvable tag,
+          # and skopeo verifies each blob's digest as it goes.
+          #
+          # ⚠ ONE `skopeo copy`, REGISTRY TO REGISTRY. It replaces buildah pull + tag + push,
+          # and the difference is not stylistic:
+          #   - nothing is staged locally. `buildah pull` UNPACKED every layer into the node's
+          #     container store only to push the same bytes straight back out; skopeo streams
+          #     blob by blob and never materialises the image.
+          #   - ONE command carries BOTH credentials (--src-creds / --dest-creds). The
+          #     "credential missing on the second half" failure that cost ecc189 a full rebuild
+          #     of ollama AND remote-desktop cannot recur, because there is no second half —
+          #     and neither can the `#`-comment-inside-a-`\`-continued-`&&`-chain break that
+          #     silently dropped the `push` SUBCOMMAND and ran `push` as a command (rc=127).
+          # TLS: the SOURCE is verified against the image-registry CA in certs.d, written by the
+          # step above (which is why that step must stay first); the DESTINATION is the
+          # in-cluster registry Service on plain HTTP, hence --dest-tls-verify=false — exactly
+          # what the buildah push did.
+          if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+            echo "Checking the recreate-surviving registry for $SURVIVING_IMAGE ..."
+            set +e
+            _arc_out=$(skopeo inspect --raw \
+                     --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                     "docker://$SURVIVING_IMAGE" 2>&1)
+            _arc_rc=$?
+            set -e
+            if [ "$_arc_rc" -eq 0 ]; then
+              echo "[$(date -u +%F' '%T)] found it — copying it back instead of rebuilding..."
+              set +e
+              skopeo copy --retry-times 10 \
+                --src-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                --dest-tls-verify=false \
+                --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" "docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+              _restore_rc=$?
+              set -e
+              if [ "$_restore_rc" -eq 0 ]; then
+                echo "[$(date -u +%F' '%T)] restored $IMAGE from the surviving registry."
+                exit 0
+              fi
+              echo "WARN: restore failed (rc=$_restore_rc) — falling through to a full rebuild."
+            else
+              case "$_arc_out" in
+                *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+                  echo "  not there either — this tag has never been archived." ;;
+                *)
+                  echo "  archive not readable — rebuilding (fail-open):"
+                  echo "  skopeo: $_arc_out" ;;
+              esac
+            fi
+          fi
+
+          echo "$IMAGE not found — building on $(uname -m) at $(date -u +%F' '%T)..."
+        # CI_REGISTRY_* are injected by GitLab CI — no push secret needed. Log in to
+        # BOTH endpoints: the login credential (JWT) is scoped per registry host.
+        - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+        # image-registry has its OWN credential (htpasswd) — the GitLab JWT above is scoped to
+        # the GitLab host and is rejected here. Non-fatal: without it we simply do not write
+        # the surviving copy.
+        - |
+          if [ -n "$IMAGE_REGISTRY_USER" ]; then
+            buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$IMAGE_REGISTRY" \
+              || echo "WARN: image-registry login failed — the surviving copy will be skipped."
+          fi
+        - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+        - echo "[$(date -u +%F' '%T)] buildah bud (apt union + Lmod, ~10-20 min)..."
+        # NOTE: the build-trigger mirrors Dockerfile.base into the GitLab project as the
+        # canonical name `Dockerfile`, so inside the pipeline it is `Dockerfile` (the
+        # default) — do NOT use -f Dockerfile.base here (that name only exists in the
+        # infra repo, not in the mirrored project).
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+          bud --isolation chroot --format docker
+          -t "$IMAGE" .
+        - |
+          # ONE push implementation, one retry policy, two destinations. Defined as a function
+          # so the mandatory push and the best-effort archive push cannot drift apart in their
+          # timeout/retry behaviour.
+          #   $1 = destination ref (no docker:// prefix)   $2 = label for the log
+          # Returns the push's exit code; the CALLER decides whether that is fatal.
+          push_image() {
+            _dest="$1"; _what="$2"
+            _n=0
+            set +e
+            until [ "$_n" -ge 6 ]; do
+              echo "=== ${_what} push attempt $((_n+1)) START $(date -u +%H:%M:%S) ==="
+              timeout 3600 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+                push --tls-verify=false --retry 20 --retry-delay 10s \
+                "$IMAGE" "docker://${_dest}"
+              _rc=$?
+              echo "=== ${_what} push attempt $((_n+1)) END $(date -u +%H:%M:%S) rc=$_rc ==="
+              [ "$_rc" -eq 0 ] && break
+              _n=$((_n+1)); echo "${_what} push attempt $_n failed (rc=$_rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+            done
+            set -e
+            [ "$_n" -lt 6 ]
+          }
+
+          # Push under the SAME repository path as $IMAGE so the stored image == the
+          # canonical $IMAGE (pods pull via the ingress name). PreferClose keeps the
+          # bytes on the lab LAN; retries resume per-blob on transient resets.
+          push_image "${INTERNAL_REGISTRY}/${IMAGE#*/}" "cluster-registry" \
+            || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+        - |
+          # ── Archive to the recreate-surviving registry ───────────────────────────────
+          # ⚠ NEVER FATAL. The image is already pushed and the desktop already works; a
+          # failure here costs a rebuild after the NEXT recreate, which is exactly the status
+          # quo before this existed. Reddening the pipeline for it would be a regression.
+          if [ -n "$IMAGE_REGISTRY_USER" ] && [ -n "$IMAGE_REGISTRY_CA" ]; then
+            if push_image "$SURVIVING_IMAGE" "surviving-registry"; then
+              echo "Archived $SURVIVING_IMAGE — this tag now survives a cluster recreate."
+            else
+              echo "WARN: could not archive to the surviving registry. The build is still"
+              echo "      GOOD; the next recreate will just have to rebuild this tag."
+            fi
+          else
+            echo "WARN: no image-registry credential — skipping the recreate-surviving copy."
+          fi
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+        - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+  broker.sh: |
+    #!/bin/bash
+    # remote-desktop module broker — the privilege boundary.
+    #
+    # Runs as a PRIVILEGED sidecar in the desktop pod. The desktop container (where
+    # unprivileged LDAP users have shells) does NOT run privileged and cannot pull
+    # images or write the cache — it can only DROP A REQUEST (a filename under the
+    # shared request dir). Only a module NAME crosses the boundary; this loop validates its
+    # shape (regex) and that it is registered on the module share, then does the privileged
+    # work:
+    #   validate the name → confirm it is registered on the module share → publish its
+    #   module.yaml + the READY marker into the shared emptyDir.
+    #
+    # ⚠ The broker does NOT pull, unpack or run the image. Every module is
+    # `runtime: container`: the DESKTOP's podman pulls and runs it at launch (via
+    # module-podmand, the root helper there), because the image must land in that container's
+    # store to be runnable. What crosses the boundary from here is metadata only.
+    #
+    # Mounts (see desktop-gvisor.yaml):
+    #   /run/module-requests   emptyDir, shared, mode 0733 (users write, can't enumerate)
+    #   /modules               shared emptyDir — the broker publishes module.yaml and the
+    #                          READY marker here (plain FILES, which DO cross the sandbox
+    #                          boundary). No mounts land here.
+    #   /registry/modules/<name>/<version>/module.yaml  the module REGISTRY: a module exists
+    #                          and is permitted iff its manifest is here. No separate
+    #                          allowlist. Its own TrueNAS dataset+export, mounted ONLY here
+    #                          (never in the desktop container, never in the [eda] runner), so
+    #                          write access to it IS the security boundary — see allowed().
+    #   /var/run/registry-cred/.dockerconfigjson  skopeo --authfile (remote-desktop-registry-cred)
+    set -u
+
+    REQ_DIR=/run/module-requests
+    MOUNT_ROOT=/modules
+    # Node-local scratch: per-module flock files and the temp dirs used when a manifest has to
+    # be read out of an image. No module payload is stored here any more.
+    LOCAL_CACHE=/var/lib/modules
+    # The module registry lives on its own TrueNAS NFS export (see nfs-eda-modulefiles-pv.yaml).
+    # Overridable so a test pod can point at a scratch copy.
+    REGISTRY_ROOT="${MODULE_REGISTRY_ROOT:-/registry}"
+    MODULE_STORE="$REGISTRY_ROOT/modules"   # <name>/<version>/module.yaml == allowed
+    AUTHFILE=/var/run/registry-cred/.dockerconfigjson
+    REGISTRY="${REGISTRY_HOST:?REGISTRY_HOST must be set}"
+    IMAGE_BASE="${IMAGE_BASE:-deployments/infrastructure/eda/modules}"  # <registry>/<IMAGE_BASE>/<name>:<version>
+    TLS_VERIFY="${REGISTRY_TLS_VERIFY:-false}"
+    # image-registry serves TLS from a PRIVATE in-cluster CA, so verification needs that CA
+    # explicitly. --cert-dir takes a plain directory of *.crt (NOT an OpenSSL hash dir), which
+    # is what the image-registry-ca ConfigMap mount provides.
+    #
+    # ⚠ THE TEST IS "does it CONTAIN a .crt", NOT "does the directory exist". The ConfigMap
+    # volume is optional:true, so when the ConfigMap is missing the kubelet still creates an
+    # EMPTY directory — and a -d test passes on it. skopeo was then given --cert-dir pointing
+    # at nothing and failed every pull with `x509: certificate signed by unknown authority`,
+    # which reads as a trust problem in the CA rather than an absent one. Measured 2026-09-04
+    # on ecc196, where it stalled an EDA module registration for 45 minutes.
+    # Falling back to the system trust store here does NOT hide a real failure: it surfaces the
+    # honest error instead of a misleading one, and the desktop must still start before the CA
+    # has ever been distributed.
+    CERT_DIR="${REGISTRY_CERT_DIR:-}"
+    CERT_DIR_FLAG=""
+    if [ -n "$CERT_DIR" ] && ls "$CERT_DIR"/*.crt >/dev/null 2>&1; then
+      CERT_DIR_FLAG="--cert-dir=$CERT_DIR"
+    else
+      [ -n "$CERT_DIR" ] && log "WARNING: REGISTRY_CERT_DIR=$CERT_DIR holds no *.crt — TLS verification will use the system trust store only"
+    fi
+
+    mkdir -p "$REQ_DIR" "$MOUNT_ROOT" "$MOUNT_ROOT/.ready" "$LOCAL_CACHE" "$LOCAL_CACHE/.locks"
+    chmod 0733 "$REQ_DIR"
+
+    # ⚠ STDERR, NOT STDOUT. module_image() both LOGS (the tag-pinning warning) and RETURNS
+    # its value on stdout, and its callers capture that value with $(...). A log line on
+    # stdout is therefore captured AS the image reference: skopeo gets handed the warning
+    # text instead of a docker:// URL and fails. Measured 2026-09-04 on ecc196 — this made
+    # `broker digest` return "-" for a module whose image was present and pullable, which
+    # stalled an EDA register hook for an hour and read as a CA fault.
+    log() { echo "[broker $(date -u +%H:%M:%S)] $*" >&2; }
+
+    # module_image <name> <ver> — the registry ref for a module.
+    #
+    # Defaults to <IMAGE_BASE>/<name>:<ver>. An optional `image:` key in the REGISTERED manifest
+    # overrides the REPO PATH (the version is still appended), so two apps can publish the same
+    # module NAME from separate GitLab projects while both stay one `module load <name>/<ver>`
+    # for the user.
+    #
+    # Parsed with sed, not a YAML parser: this runs on the hot path and the key is a flat
+    # top-level scalar.
+    # module_repo <name> <ver> — the REPO PATH for a module, with no tag and no digest.
+    # Split out of module_image() so `broker digest` can build a TAG ref: that caller must be
+    # able to see a rebuild, which a digest-pinned ref can never show it (see the note there).
+    module_repo() {
+      local name="$1" ver="$2" repo
+      local man="$MODULE_STORE/${name}/${ver}/module.yaml"
+      repo=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$man" 2>/dev/null \
+             | tr -d '"'"'"' \r' | head -1)
+      case "$repo" in
+        ""|*..*|/*) repo="${IMAGE_BASE}/${name}" ;;
+      esac
+      printf '%s' "$repo"
+    }
+
+    module_image() {
+      local name="$1" ver="$2" repo dig
+      local man="$MODULE_STORE/${name}/${ver}/module.yaml"
+      repo=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$man" 2>/dev/null \
+             | tr -d '"'"'"' \r' | head -1)
+      # The manifest is operator-supplied, but it still builds a URL — refuse traversal and
+      # absolute paths rather than trusting it.
+      case "$repo" in
+        ""|*..*|/*) repo="${IMAGE_BASE}/${name}" ;;
+      esac
+
+      # ⚠ PIN BY DIGEST WHEN THE MANIFEST CARRIES ONE. Registering a module authorises the
+      # broker to run an image AS ROOT, and `allowed()` only asserts that
+      # <name>/<version>/module.yaml exists — it never looks at the image. With a tag ref, the
+      # thing that actually runs is whatever `:<version>` points at TODAY, so anyone able to
+      # overwrite that tag chooses what runs as root, without touching the module store at all.
+      # A digest ref removes that: the bytes are named, not the label.
+      #
+      # ⚠ STRICT FORMAT CHECK, NOT A TRIM. This value goes straight into a registry URL, and
+      # the manifest is operator-supplied like `image:` above. Anything that is not exactly
+      # sha256 + 64 hex is discarded rather than passed through.
+      dig=$(sed -n 's/^[[:space:]]*digest:[[:space:]]*//p' "$man" 2>/dev/null \
+            | tr -d '"'"'"' \r' | head -1)
+      # ⚠ EXACT LENGTH AND CHARSET, CHECKED SEPARATELY. A `case` glob spelling out 64
+      # [0-9a-f] groups is unreadable AND was written with the wrong repeat count on the first
+      # attempt — it silently rejected every valid digest and fell through to the tag, i.e. it
+      # disabled the pinning it was added to perform, while the warning made it look
+      # intentional. Length and charset as two explicit tests cannot go wrong that quietly.
+      local hex=""
+      case "$dig" in sha256:*) hex="${dig#sha256:}" ;; esac
+      if [ "${#hex}" -eq 64 ] && [ -z "$(printf '%s' "$hex" | tr -d '0-9a-f')" ]; then
+        printf 'docker://%s/%s@%s' "$REGISTRY" "$repo" "$dig"
+        return 0
+      fi
+
+      # No usable digest: fall back to the tag so an already-registered module keeps loading,
+      # but say so every time. This is a REAL gap, not a formality — re-register the module to
+      # close it (`broker register` records the digest).
+      log "WARNING: ${name}/${ver} is pinned by TAG, not digest — whoever can overwrite" \
+          "${repo}:${ver} controls what runs as root here. Re-register to pin it."
+      printf 'docker://%s/%s:%s' "$REGISTRY" "$repo" "$ver"
+    }
+
+    # NOTE: no /dev/fuse handling here. The broker mounts nothing (see the header).
+
+    # Only create the module store INSIDE a real mount. Creating it while $REGISTRY_ROOT is
+    # unmounted would leave an empty local dir that looks like a valid (but empty) registry.
+    if mountpoint -q "$REGISTRY_ROOT"; then
+      mkdir -p "$MODULE_STORE"
+    else
+      log "WARNING: $REGISTRY_ROOT is not mounted — no modules can be loaded until it is"
+    fi
+
+    # --- registry creds: parse "user:pass" from the dockerconfigjson for the registry
+    # host, and pass via skopeo --creds. (--authfile is unreliable here: our
+    # dockerconfigjson has username/password but no base64 `auth` field, which skopeo's
+    # authfile parser expects; --creds always works. Verified.)
+    CREDS=""
+    export AUTHFILE
+    if [ -f "$AUTHFILE" ]; then
+      CREDS=$(REG="$REGISTRY" python3 -c '
+    import json,os
+    d=json.load(open(os.environ["AUTHFILE"]))["auths"]
+    h=os.environ["REG"]
+    e=d.get(h) or (list(d.values())[0] if d else {})
+    u=e.get("username"); p=e.get("password")
+    if not (u and p) and e.get("auth"):
+        import base64; u,p=base64.b64decode(e["auth"]).decode().split(":",1)
+    print(f"{u}:{p}" if u and p else "")
+    ' 2>/dev/null)
+    fi
+    [ -n "$CREDS" ] || log "WARNING: no registry creds parsed from $AUTHFILE"
+
+    # --- status back to the user: a per-request status file the caller polls ---
+    status() {  # $1=reqfile $2=state $3=msg
+      echo "$2 $3" > "$REQ_DIR/.status.$(basename "$1")" 2>/dev/null || true
+    }
+
+    # allowed <name> <version> — the module REGISTRY is the authority.
+    #
+    # A module is permitted iff it is registered in the store the broker mounts at
+    # $MODULE_STORE, i.e. $MODULE_STORE/<name>/<version>/module.yaml exists. Registering a
+    # module = writing its manifest there; there is no separate allowlist to maintain.
+    #
+    # TRUST MODEL: whoever can write the registry can make this broker pull and run an image as
+    # root. The export is mounted ONLY into this privileged broker — never into the desktop
+    # container where unprivileged users have shells, and never into the [eda] GitLab runner —
+    # so a desktop user cannot register a module from inside the pod. WHICH PODS MOUNT IT is
+    # the security boundary: the export itself is rw to the lab LAN and cannot be narrower
+    # (broker and runner share a node, so NFS cannot tell them apart by source IP).
+    #
+    # FAIL-CLOSED: if the registry is missing/unmounted/unreadable, every load is rejected.
+    # An unreachable registry must never widen access.
+    allowed() {
+      local name="$1" ver="$2"
+      if [ ! -d "$MODULE_STORE" ]; then
+        log "DENY: module share $MODULE_STORE is not present — failing closed"
+        return 1
+      fi
+      # A mounted-but-empty dir is indistinguishable from an unmounted one by content
+      # alone; readability is what we can actually assert.
+      if [ ! -r "$MODULE_STORE" ] || [ ! -x "$MODULE_STORE" ]; then
+        log "DENY: module share $MODULE_STORE unreadable — failing closed"
+        return 1
+      fi
+      [ -f "$MODULE_STORE/${name}/${ver}/module.yaml" ]
+    }
+
+    # extract_module_yaml <ocidir>  — print the image's /module.yaml to stdout without a
+    # full rootfs unpack. Walks the layer tars newest-last (later layers win) and pulls the
+    # last-seen module.yaml.
+    #
+    # PERFORMANCE: module.yaml sits at the image ROOT, so it appears within the first few
+    # entries of the layer tar. A single `tar -xO` that STOPS at the first match is therefore
+    # near-instant, whereas scanning the whole member list is not: these layers are gzipped
+    # and Vivado's is ~30 GB, so a full pass costs many minutes of pure gzip -d per layer.
+    # The original version did that TWICE per layer (`tar -tf` to test, then `tar -xOf` to
+    # read) and wedged a vivado load for ~50 min at 91% CPU in gzip.
+    # `--occurrence=1` makes GNU tar exit after the first match instead of reading to EOF.
+    extract_module_yaml() {
+      local ocidir="$1" l out="" got=""
+      for l in $(skopeo inspect --authfile "$AUTHFILE" --raw "oci:${ocidir}:latest" 2>/dev/null \
+                 | python3 -c 'import sys,json;[print(x["digest"].split(":")[1]) for x in json.load(sys.stdin).get("layers",[])]' 2>/dev/null); do
+        local blob="$ocidir/blobs/sha256/$l"
+        [ -f "$blob" ] || continue
+        # Try both spellings; --occurrence=1 stops the read at the first hit.
+        got=$(tar -xO --occurrence=1 -f "$blob" ./module.yaml 2>/dev/null) \
+          || got=$(tar -xO --occurrence=1 -f "$blob" module.yaml 2>/dev/null) || got=""
+        [ -n "$got" ] && out="$got"
+      done
+      printf '%s' "$out"
+    }
+
+    # ── NO container-image archive, deliberately ────────────────────────────────────
+    # Do NOT re-introduce a `docker-archive` tar of each module image on the artifacts export.
+    # The lab-local registry's blob store is its own TrueNAS dataset (datapool/images) and
+    # survives a cluster recreate exactly as such a tar would — the tar is a SECOND copy of the
+    # same layers, ~190 GB for three modules. Its one claimed advantage is format independence
+    # (restores with no registry, CA or credential), but this sidecar cannot use it: it holds a
+    # PULL-ONLY deploy token, so every push back is rejected at the first blob.
+    #
+    # WHAT RESTORES: the registry blob store for a normal `module load`, and failing that the
+    # app's own CI pipeline, which rebuilds from the installer media that stays on the artifacts
+    # export. That is hours per module — accepted, and the reason the media is never deleted.
+    #
+    # ⚠ CONSEQUENCE: this sidecar does not mount /artifacts at all. Do not add it without a
+    # reason; it would also give the broker write access to the vendor media tree.
+
+
+    # ── MODULE DISCOVERY: two advisory candidate sources, one authoritative stat ────
+    # Nothing here decides what may run — allowed() does, by statting the share, and it is
+    # unchanged. This only decides what `module avail` LISTS.
+    #
+    # ⚠ DO NOT MAKE readdir THE ONLY SOURCE. It was, and the failure is measured: a network
+    # mount can serve a stale directory listing for minutes after a register/unregister/mv,
+    # so a module was registered, `allowed` said ALLOWED, and `module avail` did not list it
+    # until the pod restarted. Statting a path the listing hides does NOT repopulate it, so
+    # no amount of re-checking recovers from that.
+    #
+    # ⚠ AND DO NOT GO BACK TO A HARD-CODED LIST. That was the previous fix and it cost a
+    # module: every new module had to be added to a literal in this file, which lives in the
+    # desktop BASE IMAGE — so adding one module meant an IMAGE_TAG bump and a desktop restart,
+    # and forgetting it left the module loadable-but-undiscoverable with nothing to point at.
+    #
+    # So take the UNION of two sources that fail in opposite directions, and let the stat
+    # decide:
+    #   1. $CATALOG_FILE — written by `broker register` / `broker unregister` below, i.e. by
+    #      the only operations that can make a module loadable at all. Immune to the listing
+    #      cache (it is a file read, and this pod is the writer), and it survives a restart.
+    #   2. a readdir of the store — self-maintaining, and the fallback that makes a module
+    #      registered by some other route (or before the catalog file existed) visible. It may
+    #      LAG; it cannot invent an entry that the stat below then rejects.
+    # Neither source can hide what the other sees, and a phantom in either is dropped by the
+    # stat. A module still LOADS by exact name whether or not it is listed here.
+    CATALOG_FILE="$MODULE_STORE/.catalog"
+
+    # One `<name>/<version>` per line, validated to the same shape process() accepts so a
+    # hand-edited catalog line can never become a path traversal.
+    module_candidates() {
+      {
+        [ -f "$CATALOG_FILE" ] && cat "$CATALOG_FILE"
+        find "$MODULE_STORE" -mindepth 2 -maxdepth 2 -type d -printf '%P\n' 2>/dev/null
+      } | grep -E '^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9._-]+$' | sort -u
+    }
+
+    # catalog_add / catalog_del keep source 1 in step with reality. tmp+mv so a concurrent
+    # reader never sees a half-written file; failures are non-fatal because source 2 still
+    # covers discovery and the stat still covers correctness.
+    # ⚠ THE TEMP NAME CARRIES $$ AND MUST. With a fixed name, `mv` failed with
+    # "cannot stat '.../.catalog.tmp': No such file or directory" on a file the same function
+    # had just written (measured on the ecc199 register hook) — the same stale-lookup caching
+    # on this NFS mount that makes a plain readdir unusable for discovery. A name no lookup has
+    # seen before cannot have a cached negative entry.
+    catalog_add() {
+      local spec="$1" tmp="$MODULE_STORE/.catalog.$$.tmp"
+      { [ -f "$CATALOG_FILE" ] && cat "$CATALOG_FILE"; printf '%s\n' "$spec"; } \
+        | grep -E '^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9._-]+$' | sort -u > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$CATALOG_FILE" || rm -f "$tmp"
+    }
+    catalog_del() {
+      local spec="$1" tmp="$MODULE_STORE/.catalog.$$.tmp"
+      [ -f "$CATALOG_FILE" ] || return 0
+      grep -vxF "$spec" "$CATALOG_FILE" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$CATALOG_FILE" || rm -f "$tmp"
+    }
+
+    # registered_modules — print every candidate that is actually registered, one per line.
+    # The stat is the same cache-immune test allowed() uses, so this cannot report a module
+    # that would then refuse to load. Used by publish_index and list-modules so both agree.
+    registered_modules() {
+      local spec
+      module_candidates | while IFS= read -r spec; do
+        [ -f "$MODULE_STORE/$spec/module.yaml" ] && printf '%s\n' "$spec"
+      done
+    }
+
+
+    process() {  # $1 = request file holding a single "name/version" line
+      local reqf="$1" spec name ver img lockf
+      spec=$(head -1 "$reqf" 2>/dev/null | tr -d ' \r\n')
+      rm -f "$reqf"
+      # Validate shape: <name>/<version>. SECURITY: spec comes from an unprivileged user and
+      # is used to build filesystem paths below, so this must run BEFORE any path is formed.
+      # Neither component may contain "/", and "." / ".." are rejected outright — "foo/.."
+      # matches the character class but would resolve to the parent directory.
+      if ! printf '%s' "$spec" | grep -qE '^[a-z0-9][a-z0-9._-]*/[a-zA-Z0-9._-]+$'; then
+        log "REJECT bad spec: '$spec'"; status "$reqf" ERROR "invalid module spec"; return
+      fi
+      name="${spec%%/*}"; ver="${spec##*/}"
+      case "$name" in .|..) name="" ;; esac
+      case "$ver" in .|..) ver="" ;; esac
+      if [ -z "$name" ] || [ -z "$ver" ]; then
+        log "REJECT bad spec: '$spec'"; status "$reqf" ERROR "invalid module spec"; return
+      fi
+      if ! allowed "$name" "$ver"; then
+        log "REJECT not registered on the module share: '$spec'"
+        status "$reqf" ERROR "module not available"; return
+      fi
+      # Safe to consult the manifest here: allowed() above already required it to exist.
+      img=$(module_image "$name" "$ver")
+      lockf="$LOCAL_CACHE/.locks/${name}-${ver}"
+
+      # Already prepared? fast path — the .ready marker PLUS a manifest that still matches the
+      # share. Anything stricter (a `skopeo inspect`) would put a registry round-trip on every
+      # `module load`; `cmp` on two small local files costs nothing.
+      #
+      # ⚠ THE MANIFEST COMPARISON IS LOAD-BEARING, do not reduce this back to the marker alone.
+      # Re-registering a module (`broker register`, or the app's PostSync register Job after a
+      # rebuild) rewrites the manifest on the share — a new `digest:` pin, or new entries. The
+      # marker does not change, so a marker-only fast path serves the OLD published manifest
+      # forever and every desktop keeps launching the OLD digest. Measured 2026-09-15: hyperlynx
+      # was rebuilt and re-pinned to a fixed image, and both desktops went on running the broken
+      # one because they were already prepared. It reads as "the fix did not work" rather than as
+      # a staleness bug, because the registry, the tag and the share all look correct.
+      if [ -f "$MOUNT_ROOT/.ready/${name}-${ver}" ] \
+         && cmp -s "$MODULE_STORE/${name}/${ver}/module.yaml" "$MOUNT_ROOT/${name}/${ver}.module.yaml"; then
+        status "$reqf" READY "already prepared"; return
+      fi
+
+      # Serialize per module/version: two users requesting the same one → 2nd waits,
+      # then finds it ready.
+      exec 9>"$lockf"
+      if ! flock -w 3600 9; then log "lock timeout $spec"; status "$reqf" ERROR "busy"; return; fi
+
+      # Re-check after acquiring the lock (another holder may have finished).
+      # ⚠ SAME MANIFEST COMPARISON AS THE FAST PATH ABOVE, and for the same reason — this is a
+      # SECOND marker-only gate, and guarding only the first one fixes nothing: the first falls
+      # through on a stale manifest and then THIS one returns "prepared" anyway. Measured
+      # 2026-09-17: after a rebuild + re-register the broker answered READY prepared while still
+      # serving the previous digest, with `cmp` correctly reporting the two files as different.
+      if [ -f "$MOUNT_ROOT/.ready/${name}-${ver}" ] \
+         && cmp -s "$MODULE_STORE/${name}/${ver}/module.yaml" "$MOUNT_ROOT/${name}/${ver}.module.yaml"; then
+        status "$reqf" READY "prepared"; flock -u 9; return
+      fi
+
+      status "$reqf" WORKING "fetching ${spec}"
+      mkdir -p "$MODULE_STORE/${name}" "$LOCAL_CACHE/${name}" "$MOUNT_ROOT/${name}"
+
+      # Publish the manifest and mark the module ready. Nothing is unpacked or mounted here:
+      # the desktop's podman pulls and runs the image itself at launch, with the same
+      # registry credential. See doc/nested-container-runtime.md.
+      #
+      # The REGISTERED manifest on the share is the same file that is baked into the image
+      # (register-module.sh copies it out), so read it from there — no pull required. That
+      # matters: pulling a multi-GB image merely to read one small YAML would double the cost
+      # of every load. Fall back to reading it out of the image only if the share entry is
+      # missing or unreadable.
+      #
+      # ocidir MUST be initialised, not just declared: `local ocidir` leaves it UNSET, and the
+      # `[ -n "$ocidir" ]` cleanup below then aborts the whole broker under `set -u`
+      # ("ocidir: unbound variable") on the normal path where the share manifest exists and the
+      # fallback branch never runs. That killed the loop mid-prepare, so the module never got
+      # its .ready marker and `module load` failed with a bare Lmod "not found".
+      local ocidir="" myaml shared_yaml
+      shared_yaml="$MODULE_STORE/${name}/${ver}/module.yaml"
+      myaml=$(cat "$shared_yaml" 2>/dev/null)
+      if [ -z "$myaml" ]; then
+        ocidir=$(mktemp -d "$LOCAL_CACHE/.oci.XXXXXX")
+        if ! skopeo copy ${CERT_DIR_FLAG:+$CERT_DIR_FLAG} --src-tls-verify="$TLS_VERIFY" --src-creds "$CREDS" \
+             "$img" "oci:${ocidir}/oci:latest" >>/tmp/broker.log 2>&1; then
+          log "ERROR skopeo copy failed for $img"; status "$reqf" ERROR "pull failed"
+          rm -rf "$ocidir"; flock -u 9; return
+        fi
+        myaml=$(extract_module_yaml "$ocidir/oci")
+        rm -rf "$ocidir"; ocidir=""
+      fi
+      if [ -z "$myaml" ]; then
+        log "ERROR no module.yaml on the share or in the image for $spec"
+        status "$reqf" ERROR "manifest missing"; flock -u 9; return
+      fi
+
+      # FAIL CLOSED on anything but `runtime: container`. There is no other runtime: the
+      # native one (squashfuse-mounted .sqsh trees driven by Lmod) is gone, and gVisor — the
+      # only nested runtime — cannot serve a squashfs mount at all (reads return ENOSYS). A
+      # manifest asking for one must therefore say so HERE, where the request has a status
+      # file to fail into. Publishing it instead produced a module that prepared cleanly and
+      # then had no way to run: module-cli found no container image to launch and Lmod found
+      # no modulefile, so `module load` ended in a bare "not found".
+      if ! printf '%s\n' "$myaml" | grep -qE '^[[:space:]]*runtime:[[:space:]]*"?container"?[[:space:]]*$'; then
+        log "ERROR $spec: manifest is not 'runtime: container' — no other runtime is served"
+        status "$reqf" ERROR "unsupported runtime (only 'container' is served)"
+        flock -u 9; return
+      fi
+
+      # The manifest lives NEXT TO the module dir, not inside it, so the CLI has one lookup
+      # path. The dir itself is created (empty) because the CLI expects it to exist.
+      mkdir -p "$MOUNT_ROOT/${name}/${ver}"
+      printf '%s\n' "$myaml" > "$MOUNT_ROOT/${name}/${ver}.module.yaml"
+
+      # Verify the desktop's podman will actually be able to pull it — a cheap manifest
+      # inspect with the same credential, not a full pull, so a missing image fails here with
+      # a clear message instead of at first launch.
+      if ! skopeo inspect ${CERT_DIR_FLAG:+$CERT_DIR_FLAG} --tls-verify="$TLS_VERIFY" --creds "$CREDS" "$img" >>/tmp/broker.log 2>&1; then
+        # The registry has no copy, and there is no archive to fall back to (see the header):
+        # the ONLY repair is to run the app's CI pipeline, which rebuilds the image from the
+        # installer media on the artifacts export and pushes it.
+        log "ERROR $spec: image $img is not in the registry and there is no archive."
+        log "      Repair: run the app's GitLab pipeline to rebuild it from installer media."
+      fi
+
+      mkdir -p "$MOUNT_ROOT/.ready"; touch "$MOUNT_ROOT/.ready/${name}-${ver}"
+      status "$reqf" READY "loaded (container)"
+      log "READY $spec (container)"
+      flock -u 9
+    }
+
+    # ── Admin subcommands ───────────────────────────────────────────────────────────
+    # Registering a module = writing its manifest to the share (see allowed()). These run
+    # in THIS container because it is the only one that mounts the share. Driven from the
+    # devcontainer by register-module.sh; not reachable by desktop users.
+    case "${1:-}" in
+      archive|archive-async|restore)
+        # Retired together with the image archives (see the header). These copied a module
+        # image to/from a docker-archive tar on the artifacts export. `restore` could never
+        # work: this sidecar holds a pull-only deploy token, so every push is rejected at the
+        # first blob.
+        #
+        # The registry blob store is now the only copy, and it survives a recreate on its own
+        # dataset. If an image is genuinely missing, run the app's GitLab pipeline: it rebuilds
+        # from the installer media that stays on the artifacts export.
+        echo "broker: '$1' is retired — container images are not archived." >&2
+        echo "  The registry blob store (datapool/images) is the only copy and survives a" >&2
+        echo "  recreate. To recover a missing image, run that module's GitLab pipeline." >&2
+        exit 2
+        ;;
+      digest)
+        # broker digest <name> <version> — print "<share-digest> <registry-digest>".
+        # Either field is "-" when unknown. Exists so callers (the ArgoCD build trigger) can ask
+        # "does the share hold THIS image?" without needing the registry credential or reproducing
+        # the module_image/`image:` resolution — both live in here, and embedding a skopeo call
+        # with nested quoting inside a `kubectl exec … sh -c` is a reliable source of silent
+        # failures. Read-only and cheap.
+        dname="${2:?usage: broker digest <name> <version>}"
+        dver="${3:?usage: broker digest <name> <version>}"
+        case "$dname" in .|..|*/*) echo "invalid name" >&2; exit 2 ;; esac
+        case "$dver"  in .|..|*/*) echo "invalid version" >&2; exit 2 ;; esac
+        # ⚠ THE FIRST FIELD IS ALWAYS "-". It would carry the digest of the image's
+        # docker-archive on the artifacts export; there are no archives (see the header), so
+        # there is nothing to report. The field is KEPT rather than dropped because
+        # the ArgoCD build triggers parse two whitespace-separated values — emitting one would
+        # shift the registry digest into the wrong variable and silently misreport every module.
+        # ⚠ INSPECT THE TAG, NOT module_image(). module_image() returns the ref from the
+        # REGISTERED manifest, which is digest-pinned — so inspecting it asks the registry
+        # "what is the digest of <this exact digest>" and gets that same digest back. The
+        # answer is then true by construction and a REBUILD IS INVISIBLE: the tag can move
+        # and this still reports the old value forever.
+        #
+        # That is not theoretical. Measured 2026-09-21: after a successful rebuild moved the
+        # tag to bed4596c, this kept returning the pinned a6fdd82a, and the register hook —
+        # whose whole job is to notice the new image — accepted it and reported
+        # "Registered and verified ... (digest-pinned)" over an image built before the fix.
+        # Callers ask this to learn whether the registry has something NEW, so it must read
+        # the mutable tag; the pin is what they compare it against.
+        dreg=$(skopeo inspect ${CERT_DIR_FLAG:+$CERT_DIR_FLAG} --tls-verify="$TLS_VERIFY" --creds "$CREDS" --format '{{.Digest}}' \
+                 "docker://${REGISTRY}/$(module_repo "$dname" "$dver"):${dver}" 2>/dev/null | tr -d ' \r\n')
+        echo "- ${dreg:--}"
+        exit 0
+        ;;
+      list-modules)
+        # Stats every candidate (see module_candidates) instead of trusting a directory
+        # listing: a network mount can serve the PRE-CHANGE listing for minutes after a
+        # register/unregister/mv, so a readdir alone can hide a module that is ALLOWED and
+        # ready to load. The catalog file the register path maintains is the source that
+        # cannot be hidden that way; the stat is what makes either source safe to trust.
+        registered_modules
+        exit 0
+        ;;
+      # allowed <name> <version> — the AUTHORITATIVE "is this loadable?" check, and the one to
+      # trust when list-modules disagrees (see the cache note above). Same test the load path
+      # uses, so it cannot drift from it.
+      allowed)
+        aname="${2:?usage: broker allowed <name> <version>}"
+        aver="${3:?usage: broker allowed <name> <version>}"
+        if allowed "$aname" "$aver"; then
+          echo "ALLOWED $aname/$aver"; exit 0
+        fi
+        echo "NOT REGISTERED $aname/$aver" >&2; exit 1
+        ;;
+      register)
+        rname="${2:?usage: broker register <name> <version> [--from-stdin]}"
+        rver="${3:?usage: broker register <name> <version> [--from-stdin]}"
+        case "$rname" in .|..|*/*) echo "invalid name" >&2; exit 2 ;; esac
+        case "$rver"  in .|..|*/*) echo "invalid version" >&2; exit 2 ;; esac
+        mountpoint -q "$REGISTRY_ROOT" || { echo "ERROR: $REGISTRY_ROOT not mounted" >&2; exit 1; }
+        if [ "${4:-}" = "--from-stdin" ]; then
+          rman=$(cat)
+        else
+          # Default: take the manifest from the module image itself (source of truth).
+          #
+          # This deliberately does NOT use module_image(): that reads the `image:` key out of the
+          # REGISTERED manifest, which is precisely what we are about to create — a module whose
+          # image lives outside the default repo cannot be discovered by pulling it. Register
+          # those by passing the manifest explicitly instead:
+          #   register-module.sh add <name> <ver> path/to/module.yaml   (-> --from-stdin)
+          rtmp=$(mktemp -d "$LOCAL_CACHE/.reg.XXXXXX")
+          if ! skopeo copy ${CERT_DIR_FLAG:+$CERT_DIR_FLAG} --src-tls-verify="$TLS_VERIFY" --src-creds "$CREDS" \
+               "docker://${REGISTRY}/${IMAGE_BASE}/${rname}:${rver}" "oci:${rtmp}/oci:latest" >/dev/null 2>&1; then
+            echo "ERROR: cannot pull ${IMAGE_BASE}/${rname}:${rver} from the registry." >&2
+            echo "       If this module publishes to a non-default repo (an \`image:\` key in its" >&2
+            echo "       module.yaml), pass the manifest explicitly:" >&2
+            echo "         register-module.sh add ${rname} ${rver} <path/to/module.yaml>" >&2
+            rm -rf "$rtmp"; exit 1
+          fi
+          rman=$(extract_module_yaml "$rtmp/oci")
+          rm -rf "$rtmp"
+        fi
+        [ -n "$rman" ] || { echo "ERROR: no /module.yaml found in the image" >&2; exit 1; }
+
+        # ⚠ RECORD THE DIGEST AT REGISTRATION. This is what lets module_image() pin the image
+        # instead of trusting the tag, and registration is the only moment where "the image the
+        # operator meant" is unambiguous. Resolve it from the SAME ref that will be loaded,
+        # honouring an `image:` key in the manifest being registered — note module_image() reads
+        # the STORED manifest, which does not exist yet, so the repo is derived here.
+        rrepo=$(printf '%s\n' "$rman" | sed -n 's/^[[:space:]]*image:[[:space:]]*//p' \
+                | tr -d '"'"'"' \r' | head -1)
+        case "$rrepo" in ""|*..*|/*) rrepo="${IMAGE_BASE}/${rname}" ;; esac
+        rdig=$(skopeo inspect ${CERT_DIR_FLAG:+$CERT_DIR_FLAG} --tls-verify="$TLS_VERIFY" \
+                 --creds "$CREDS" --format '{{.Digest}}' \
+                 "docker://${REGISTRY}/${rrepo}:${rver}" 2>/dev/null | tr -d ' \r\n')
+
+        # Any pre-existing `digest:` is dropped before appending, so re-registering a rebuilt
+        # tag repins rather than leaving a stale digest that would fail every pull.
+        rman=$(printf '%s\n' "$rman" | sed '/^[[:space:]]*digest:[[:space:]]*/d')
+        case "$rdig" in
+          sha256:*)
+            rman=$(printf '%s\ndigest: %s\n' "$rman" "$rdig")
+            echo "Pinned ${rname}/${rver} to ${rdig}"
+            ;;
+          *)
+            # ⚠ REGISTRATION STILL SUCCEEDS, DELIBERATELY. A registry blip during a recreate
+            # must not leave modules unloadable — availability wins here, and the gap is made
+            # loud instead of silent: module_image() warns on EVERY load until a re-register
+            # pins it. Failing closed here would trade a visible warning for an outage.
+            echo "WARNING: could not resolve a digest for ${rrepo}:${rver} — registering" >&2
+            echo "         TAG-PINNED. Whoever can overwrite that tag controls what runs as" >&2
+            echo "         root. Re-run this registration once the registry is reachable." >&2
+            ;;
+        esac
+
+        mkdir -p "$MODULE_STORE/${rname}/${rver}"
+        printf '%s\n' "$rman" > "$MODULE_STORE/${rname}/${rver}/module.yaml"
+        # Record it for discovery. The manifest above is what makes the module LOADABLE; this
+        # is only what makes `module avail` list it without depending on a directory listing
+        # the mount may still be caching.
+        catalog_add "${rname}/${rver}"
+        echo "registered ${rname}/${rver}"
+        exit 0
+        ;;
+      unregister)
+        rname="${2:?usage: broker unregister <name> <version>}"
+        rver="${3:?usage: broker unregister <name> <version>}"
+        case "$rname" in .|..|*/*) echo "invalid name" >&2; exit 2 ;; esac
+        case "$rver"  in .|..|*/*) echo "invalid version" >&2; exit 2 ;; esac
+        rm -f "$MODULE_STORE/${rname}/${rver}/module.yaml"
+        rmdir "$MODULE_STORE/${rname}/${rver}" 2>/dev/null || true
+        catalog_del "${rname}/${rver}"
+        echo "unregistered ${rname}/${rver}"
+        exit 0
+        ;;
+    esac
+
+    log "broker starting; registry=$REGISTRY base=$IMAGE_BASE watching $REQ_DIR"
+    # Give the CSI mount a moment to expose its contents before counting. The mount itself is
+    # already there (mountpoint -q above), but on a fresh pod the entries can lag briefly, and
+    # reporting "0 module(s) registered" reads like a broken share. Only affects this log line
+    # — allowed() re-checks the share on every request.
+    for _ in $(seq 1 10); do
+      [ -n "$(ls -A "$MODULE_STORE" 2>/dev/null)" ] && break
+      sleep 1
+    done
+    log "module share $MODULE_STORE: $(registered_modules | wc -l) of $(module_candidates | wc -l) candidate module(s) registered"
+
+    # Publish the REGISTRY INDEX into the shared dir so the desktop's `module avail` can list
+    # every registered module, not just the ones already prepared. The share is mounted only
+    # here, and no module has an Lmod modulefile, so without this index a module is
+    # undiscoverable from a user shell — you would have to already know its name.
+    publish_index() {
+      local tmp="$MOUNT_ROOT/.registered.tmp"
+      if registered_modules > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$MOUNT_ROOT/.registered"
+      else
+        rm -f "$tmp"
+      fi
+    }
+    publish_index
+    # NB there is deliberately no cache-recovery pass at startup, and none is needed: a
+    # module's image lives in podman's own store, and a `module load` re-publishes the
+    # manifest from the share in milliseconds.
+
+    # Watch loop: inotify if available, else poll.
+    #
+    # process() runs in a SUBSHELL so a fatal error inside it (e.g. `set -u` on an unset var —
+    # this actually happened: an uninitialised `ocidir` aborted the broker mid-prepare) kills only
+    # that request, not the whole broker. A dead broker is silent and indistinguishable from a
+    # slow fetch: the module never gets its .ready marker and `module load` fails with a bare Lmod
+    # "not found". If the subshell dies without writing a status, say so and keep serving.
+    while true; do
+      for reqf in "$REQ_DIR"/req.*; do
+        [ -e "$reqf" ] || continue
+        rname=$(basename "$reqf")
+        ( process "$reqf" ) || true
+        if [ ! -f "$REQ_DIR/.status.$rname" ]; then
+          log "ERROR request $rname died without a status — reporting failure"
+          echo "ERROR broker failed internally" > "$REQ_DIR/.status.$rname" 2>/dev/null || true
+          rm -f "$reqf"
+        fi
+      done
+      # Refresh the registry index so a module registered while we run becomes visible to
+      # `module avail` without needing a pod restart.
+      publish_index
+      if command -v inotifywait >/dev/null 2>&1; then
+        inotifywait -q -t 30 -e create -e moved_to "$REQ_DIR" >/dev/null 2>&1 || true
+      else
+        sleep 3
+      fi
+    done
+  module-cli.sh: |
+    # /etc/profile.d/z10-module.sh — user-facing `module` command for the remote-desktop.
+    #
+    # Wraps real Lmod: for `module load <name>/<ver>`, first ask the privileged broker to
+    # PREPARE the module (drop a request, wait for it to become READY), which publishes its
+    # manifest. The tool itself lives in an OCI image that the desktop's podman runs, so the
+    # load then generates launchers rather than manipulating the env. Every other subcommand
+    # (avail/list/unload/…) is merged with Lmod's own view.
+    #
+    # Users are unprivileged; they can only WRITE a request file into the broker's 0733 request
+    # dir. They never touch the registry credential or the image store.
+
+    # ⚠ BASH ONLY — bail out under any other shell.
+    #
+    # This file lives in /etc/profile.d/, so EVERY POSIX-sh login sources it too, and its
+    # contents are bash-specific (`declare -f`, function syntax, `[[ ]]`). Under dash the
+    # `declare -f module` below fails ("declare: not found"), the surrounding `eval` then gets
+    # truncated input and dies with "Syntax error: end of file unexpected", and the sourcing
+    # script exits non-zero.
+    #
+    # That broke RDP logins outright: /etc/xrdp/startwm.sh is `#!/bin/sh`, sources /etc/profile
+    # (hence this file), and so exited 2 before ever reaching Xsession. xrdp-sesman logged only
+    # "Window manager exited with non-zero exit code 2 ... exited quickly (0 secs)" and tore the
+    # session down — the user saw an immediate disconnect right after a SUCCESSFUL login, with
+    # nothing in .xsession-errors (the failure happens before Xsession redirects into it).
+    #
+    # `${BASH_VERSION:-}` is the portable test: dash leaves it unset, bash always sets it.
+    if [ -z "${BASH_VERSION:-}" ]; then
+      return 0 2>/dev/null || exit 0
+    fi
+
+    # Source Lmod's init, then RENAME Lmod's own `module` function to `_lmod_module` so the
+    # wrapper below can
+    # delegate to it. This is required, not cosmetic: Lmod's `ml` is a function that runs
+    # `eval "$(ml_cmd "$@")"`, and ml_cmd emits literally `module load 'x'`. If the wrapper
+    # delegated via `ml`, every `module load` would re-enter the wrapper through ml_cmd's
+    # emitted `module` call and recurse forever — `module load` hangs with no output and no
+    # error (it looks exactly like a slow broker fetch). Delegate to the renamed function.
+    if [ -f /usr/share/lmod/lmod/init/bash ]; then
+      . /usr/share/lmod/lmod/init/bash
+      # capture Lmod's definition under a new name, before we shadow `module`
+      eval "_lmod_module() $(declare -f module | tail -n +2)"
+      # Lmod's own /etc/profile.d/lmod.sh exports BASH_ENV=<lmod init>, which bash sources for
+      # every NON-INTERACTIVE shell. That re-runs Lmod's init AFTER this file and silently
+      # restores the raw `module` function, so in a script the wrapper is gone and `module load`
+      # of a module (which has no Lmod modulefile by design) fails.
+      # Interactive shells are unaffected (bash ignores BASH_ENV there),
+      # which is why a terminal works and a script does not — a nasty asymmetry to debug.
+      # Drop it: the modulefile tree is registered above, so nothing here needs BASH_ENV.
+      unset BASH_ENV
+    fi
+
+    _REQ_DIR=/run/module-requests      # broker: fetch + prepare (privileged sidecar)
+
+    # Container-runtime modules are launched through generated wrappers in $HOME/.local/bin (they
+    # cannot put anything on PATH themselves — the tool lives in another container). That dir is
+    # NOT on the default PATH in this image, so the wrappers existed but "command not found".
+    # Add it. Also note $HOME is /home/headless for the image's built-in root session, so the
+    # wrappers follow $HOME rather than the account name — always use $HOME, never a literal path.
+    case ":$PATH:" in
+      *":$HOME/.local/bin:"*) : ;;
+      *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+    esac
+
+    # _module_request <reqdir> <spec> <tries> <what> → 0 on READY, 1 on error/timeout
+    # Both privileged helpers use the same protocol: drop "name/version" into a 0733 dir, poll
+    # for a .status.<reqfile> line of "READY|ERROR <msg>".
+    _module_request() {
+      local dir="$1" spec="$2" tries="$3" what="$4" id reqf statf i st msg
+      id="$$-$(date +%s%N)"
+      reqf="$dir/req.$id"
+      statf="$dir/.status.req.$id"
+      printf '%s\n' "$spec" > "$reqf" 2>/dev/null || { echo "module: cannot reach $what" >&2; return 1; }
+      for i in $(seq 1 "$tries"); do
+        if [ -f "$statf" ]; then
+          st=$(cut -d' ' -f1 "$statf"); msg=$(cut -d' ' -f2- "$statf")
+          case "$st" in
+            READY) rm -f "$statf"; return 0 ;;
+            ERROR) echo "module: $what error: $msg" >&2; rm -f "$statf"; return 1 ;;
+          esac
+        fi
+        sleep 5
+      done
+      echo "module: timed out waiting for $spec ($what)" >&2; return 1
+    }
+
+    _module_fetch() {  # $1 = name/version  → 0 when the broker has prepared it, 1 on error
+      # NOTE: separate `local` statements are required. In a single `local spec="$1"
+      # n="${spec%%/*}"`, bash expands n BEFORE spec is assigned, so n/v come out EMPTY and
+      # every fast-path test silently checks "/modules/.ready/-" (always missing) — which sends
+      # already-loaded modules back to the broker and makes `module load` look like a hang.
+      local spec="$1"
+      local n="${spec%%/*}" v="${spec##*/}"
+      # There is no mount step: every module is an OCI image the desktop's podman runs, so
+      # "ready" means the broker has published the manifest. The image itself is pulled later,
+      # by module-podmand, on first launch.
+      [ -f "/modules/.ready/$n-$v" ] && return 0
+      printf 'Loading %s (fetching from registry on first use, please wait)...\n' "$spec"
+      # up to ~1 h: generous because the broker may have to read the manifest out of the image.
+      _module_request "$_REQ_DIR" "$spec" 720 broker || return 1
+      return 0
+    }
+
+    # The broker publishes each module's manifest BESIDE its module dir, as
+    # /modules/<name>/<version>.module.yaml — not inside it, so the CLI has one lookup path.
+    _module_manifest() { printf '/modules/%s/%s.module.yaml' "${1%%/*}" "${1##*/}"; }
+
+    # Shim dir for a container module's cli_entries. Wrappers here are named after the REAL
+    # binary, so this dir goes on PATH only while the module is loaded.
+    _module_shim_dir() { printf '%s/.local/module-bin/%s/%s' "$HOME" "${1%%/*}" "${1##*/}"; }
+
+    # _module_shim_path add|remove <name/version> — put the module's CLI shims on PATH (or take
+    # them off again). Idempotent in both directions; same guard style as the .local/bin block
+    # near the top of this file.
+    _module_shim_path() {
+      local action="$1" dir
+      dir=$(_module_shim_dir "$2")
+      case "$action" in
+        add)
+          [ -d "$dir" ] || return 0
+          case ":$PATH:" in
+            *":$dir:"*) : ;;
+            *) PATH="$dir:$PATH"; export PATH ;;
+          esac ;;
+        remove)
+          # Rebuild PATH without this dir. Plain string surgery would also hit a longer path
+          # that merely has $dir as a prefix, so filter element-wise.
+          local out="" p
+          local IFS=:
+          for p in $PATH; do
+            [ "$p" = "$dir" ] && continue
+            out="${out:+$out:}$p"
+          done
+          PATH="$out"; export PATH ;;
+      esac
+    }
+
+    # _module_loaded_containers → the container modules loaded in THIS shell, one
+    # "<name>/<version>" per line.
+    #
+    # There is no Lmod record to consult: `module load` of a container module never calls Lmod
+    # (it has no modulefile), so $LOADEDMODULES stays empty and `module list` alone reports
+    # "No modules loaded" over a perfectly good module. PATH is the authority instead — it is
+    # what _module_shim_path add/remove maintains, so it tracks load AND unload in the current
+    # shell and cannot go stale the way a marker file under $HOME would (that is per-user, and
+    # would leak state into every other shell and survive a container restart).
+    #
+    # Derives name/version from the shim dir layout ($HOME/.local/module-bin/<name>/<version>)
+    # rather than parsing anything: _module_shim_dir builds those paths, so the two stay
+    # consistent by construction.
+    _module_loaded_containers() {
+      local shimroot="$HOME/.local/module-bin" p
+      local IFS=:
+      for p in $PATH; do
+        case "$p" in
+          "$shimroot"/*/*)
+            # strip the root, leaving "<name>/<version>"
+            printf '%s\n' "${p#"$shimroot"/}" ;;
+        esac
+      done
+    }
+
+    module() {
+      case "${1:-}" in
+        load|add)
+          shift
+          local rc=0 m
+          for m in "$@"; do
+            # ANY slashed spec is the broker's, and every module the broker serves is
+            # `runtime: container` (it refuses anything else), so there is no second branch to
+            # pick between: fetch it, then write the launchers. A container module gets no Lmod
+            # env — the tool runs in its own container via podman.
+            #
+            # An unslashed name goes to Lmod, which is what serves its own modulefiles. Note
+            # this means Lmod's HIERARCHICAL names (Core/lmod, Core/settarg) are not reachable
+            # through the wrapper — they look like module specs and are sent to the broker,
+            # which rejects them. Harmless: nothing on this desktop loads them.
+            if case "$m" in */*) true ;; *) false ;; esac; then
+              _module_fetch "$m" || { rc=1; continue; }
+              _module_gui_launcher "$m" || rc=1
+              _module_shim_path add "$m"
+              # Print the REAL command names, not a "<entry>" placeholder — a container module
+              # puts nothing on PATH, so these wrappers are the only way to launch it and the
+              # user has no other way to discover what they are called.
+              # One command per line: the names are long and near-identical, so a single
+              # space-separated run-on is hard to read and easy to mistype.
+              local _cmds _clis
+              # ⚠ THE `|| true` IS LOAD-BEARING UNDER `set -e`. A module with only
+              # `cli_entries` and no `desktop_entries` — petalinux is exactly that — has no
+              # module-<name>-* wrappers, so the glob matches nothing and `ls` exits non-zero.
+              # `2>/dev/null` hides the MESSAGE but not the STATUS, and a caller running
+              # `set -e` (any CI job) then dies right here, AFTER the module has actually
+              # loaded successfully: rc=0 standalone, exit 2 under set -e, with no error text
+              # anywhere. Measured on ecc204 — the second `module load` in a pipeline killed
+              # the job silently while both modules were READY.
+              _cmds=$(cd "$HOME/.local/bin" 2>/dev/null && ls module-"${m%%/*}"-* 2>/dev/null || true)
+              _clis=$(cd "$(_module_shim_dir "$m")" 2>/dev/null && ls 2>/dev/null || true)
+              if [ -n "$_cmds" ]; then
+                printf '%s ready — GUI launchers:\n' "$m"
+                printf '%s\n' "$_cmds" | sed 's/^/  - /'
+                printf '(or launch it from the Applications menu)\n'
+              else
+                printf '%s ready — launch it from the Applications menu\n' "$m"
+              fi
+              # CLI entries are on PATH under their REAL names, so a batch script can call them
+              # directly. Listed separately because the two naming schemes look nothing alike.
+              if [ -n "$_clis" ]; then
+                printf 'on PATH for scripts/batch:\n'
+                printf '%s\n' "$_clis" | tr '\n' ' ' | sed 's/^/  /; s/ $/\n/'
+              fi
+              continue
+            fi
+            _lmod_module load "$m" || rc=1
+          done
+          return $rc ;;
+        unload|rm)
+          # A container module has NO Lmod modulefile, so plain `_lmod_module unload` errors out
+          # ("Unable to locate a modulefile"). Take the CLI shims off PATH instead, and only
+          # forward to Lmod for the bare names it actually knows about.
+          shift
+          local rc=0 m
+          for m in "$@"; do
+            if case "$m" in */*) true ;; *) false ;; esac; then
+              _module_shim_path remove "$m"
+              continue
+            fi
+            _lmod_module unload "$m" || rc=1
+          done
+          return $rc ;;
+        list)
+          # Lmod knows only its OWN modulefiles. A container module is loaded by putting its
+          # CLI shims on PATH and writing GUI launchers — Lmod is never involved — so plain
+          # `module list` reports "No modules loaded" even when one is loaded and working.
+          # `module avail` already merges the container modules into Lmod's view for
+          # DISCOVERABILITY; this is the same treatment for what is currently LOADED, so the
+          # two commands agree and `unload` has something to correspond to.
+          #
+          # Lmod prints its own "No modules loaded" to stderr when it has nothing loaded.
+          # Suppress that ONLY when we have container modules to show instead, otherwise the
+          # user would see an empty response to `module list`.
+          local _loaded; _loaded=$(_module_loaded_containers)
+          if [ -n "$_loaded" ]; then
+            if [ -n "${LOADEDMODULES:-}" ]; then
+              _lmod_module "$@"
+            fi
+            printf '\nCurrently loaded container modules:\n'
+            printf '%s\n' "$_loaded" | sed 's/^/   /'
+            printf 'Unload with: module unload <name>/<version>\n'
+          else
+            _lmod_module "$@"
+          fi
+          return 0 ;;
+        avail|av)
+          # Lmod only lists modules that have a modulefile, and no container module ever gets
+          # one — so every module on the share is invisible to plain `module avail`. Without
+          # this, a user cannot discover what is loadable.
+          # The registry lives on the SMB share, which is mounted only in the broker, so read
+          # the index the broker publishes at /modules/.registered.
+          _lmod_module "$@"
+          if [ -s /modules/.registered ]; then
+            printf '\n--------------------------- registered on the share ----------------------------\n'
+            sed 's/^/   /' /modules/.registered
+            printf 'Any of these can be loaded with: module load <name>/<version>\n'
+            printf '(first load fetches the payload and can take a while).\n'
+          fi
+          return 0 ;;
+        *)
+          _lmod_module "$@" ;;   # spider / show / purge / … straight to Lmod
+      esac
+    }
+
+    # `ml` is Lmod's shorthand and normally expands to a `module ...` call via ml_cmd. Since
+    # `module` is now the wrapper, route ml through the wrapper deliberately (so `ml load x`
+    # gets the fetch+mount treatment too) instead of leaving it pointing at raw Lmod.
+    ml() {
+      case "${1:-}" in
+        load|add|unload|rm|list|avail|av|spider|show|purge|use|unuse|swap|help|"")
+          module "$@" ;;
+        -*) module "$@" ;;
+        *)  module load "$@" ;;   # bare `ml <name>/<ver>` means load, per Lmod
+      esac
+    }
+
+    # Registry base for container-runtime module images. The desktop container pulls it
+    # image itself (sandbox-isolated) with the read-only registry cred; the broker only
+    # published the manifest. Overridable via env (same values as the broker sidecar).
+    : "${REGISTRY_HOST:=registry.gitlab.subdomain1.your-domain.tld}" # automatically updated from project-settings:{general.subdomain,general.domain}
+    : "${MODULE_IMAGE_BASE:=deployments/infrastructure/eda/modules}"
+    _MODULE_AUTHFILE=/var/run/registry-cred/.dockerconfigjson
+
+    # Write ~/.local/share/applications/<name>.desktop whose Exec re-establishes the
+    # module env itself — a desktop ICON inherits no shell, so it must self-load. The wrapper
+    # runs the module image via `podman run` with the proven nested-container recipe
+    # (doc/nested-container-runtime.md).
+    _module_gui_launcher() {  # $1 = name/version
+      local spec="$1" name="${1%%/*}" ver="${1##*/}" appdir mf
+      appdir="$HOME/.local/share/applications"
+      mkdir -p "$appdir" "$HOME/.local/bin"
+      # read desktop_entries from the broker-published manifest (beside the mount dir)
+      mf=$(_module_manifest "$spec")
+      [ -f "$mf" ] || return 0
+      # ⚠ STDERR IS KEPT. This used to be `2>/dev/null || true`, which hid a REAL failure for
+      # six days: the generator died on os.chmod(EPERM) against a root-owned shim, rewrote only
+      # part of the entry list, and `module load` still printed "ready". The build then ran a
+      # superseded image digest with no indication anywhere. The `|| true` stays — a launcher
+      # that cannot be written must not abort the load, since the module itself is usable — but
+      # the reason now reaches the user instead of /dev/null.
+      #
+      # ⚠ NOTHING MAY COME BETWEEN THESE ENV ASSIGNMENTS AND THE `python3` THEY PREFIX. A
+      # comment inserted after a trailing `\` ENDS the continuation: the assignments then run as
+      # their own no-op command and the generator starts with an EMPTY environment, dying on
+      # `KeyError: 'MODULE_AUTHFILE'`. That is exactly what happened here on 2026-09-19 — and it
+      # was only visible because the stderr above is no longer swallowed.
+      REGISTRY_HOST="$REGISTRY_HOST" MODULE_IMAGE_BASE="$MODULE_IMAGE_BASE" \
+      MODULE_AUTHFILE="$_MODULE_AUTHFILE" \
+      python3 - "$mf" "$spec" "$appdir" "$HOME/.local/bin" "$HOME/.local/module-bin" <<'PY' || \
+        echo "WARNING: could not (re)generate launchers for $spec — see the error above; the shims on PATH may pin a STALE image digest" >&2
+    import sys,os,re,tempfile
+    try: import yaml; d=yaml.safe_load(open(sys.argv[1]))
+    except Exception: sys.exit(0)
+    spec, appdir, bindir, shimroot = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+
+    # ⚠ REPLACE THE FILE, DO NOT WRITE THROUGH IT. A shim left behind by an earlier
+    # `module load` that ran as a DIFFERENT uid (a root one, say) is not chmod-able by this
+    # user even when the directory is group-writable: open(w,'w') succeeds and os.chmod then
+    # raises EPERM, which used to abort the whole generator PART-WAY THROUGH the entry list.
+    # The result was a shim dir where some tools pinned the new image digest and the rest
+    # still pinned the old one — and because the caller swallows stderr, nothing said so.
+    # Measured 2026-09-18: petalinux shims from 2026-09-12 kept pinning a superseded digest
+    # across every subsequent `module load`, so the build ran a stale image.
+    # Writing to a temp file and os.replace()-ing it needs only directory permission, so it
+    # works regardless of who owns the old file, and it is atomic for concurrent loads.
+    def _write_shim(path, text):
+        d = os.path.dirname(path)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix='.shim-')
+        try:
+            with os.fdopen(fd, 'w') as fh:
+                fh.write(text)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, path)
+        except Exception:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+    name, ver = spec.split('/', 1)
+    reg  = os.environ['REGISTRY_HOST']; base = os.environ['MODULE_IMAGE_BASE']
+    authf = os.environ['MODULE_AUTHFILE']
+    # An optional `image:` key overrides the REPO PATH (version still appended), so two apps can
+    # publish the same module NAME from separate GitLab projects. Must match broker.sh's
+    # module_image() — if this drifts, the wrapper pulls a different image than the broker
+    # prepared. Traversal/absolute values fall back to the default, as in the broker.
+    repo = str(d.get('image') or '').strip().strip('"\'')
+    if not repo or '..' in repo or repo.startswith('/'):
+        repo = f'{base}/{name}'
+    # ⚠ PIN BY DIGEST WHEN THE MANIFEST CARRIES ONE — broker.sh's module_image() does, and this
+    # is the half that was missing. Two consequences of running on the tag, both measured on
+    # petalinux/2024.1 (2026-09-04/05):
+    #   - SECURITY: registration authorises the broker to run an image AS ROOT, and the digest
+    #     in the manifest is what names the approved bytes. A wrapper on `:<ver>` runs whatever
+    #     that tag points at today, so the pin the broker records protects nothing on the path
+    #     users actually take.
+    #   - STALE IMAGE: module-podmand skips the pull when `podman image exists <ref>` is true,
+    #     and a tag it already holds is always "true". A FORCE_REBUILD that republishes the same
+    #     tag therefore NEVER reaches the desktop — it kept running the old image, and the only
+    #     symptom was the bug you just fixed still reproducing. A digest ref changes with the
+    #     rebuild, so the pull happens by itself.
+    # Validation mirrors the broker's: exactly sha256 + 64 hex, else fall back to the tag.
+    dig = str(d.get('digest') or '').strip().strip('"\'')
+    hexpart = dig[7:] if dig.startswith('sha256:') else ''
+    if len(hexpart) == 64 and all(c in '0123456789abcdef' for c in hexpart):
+        image = f'{reg}/{repo}@{dig}'
+    else:
+        image = f'{reg}/{repo}:{ver}'
+
+    # NB container env is NOT decided here: the run-request protocol has five fixed fields
+    # plus argv and no env field, so module-podmand chooses what the container sees. Adding a
+    # license flag to the generated wrapper has no effect — fix the allow-list in
+    # module-podman.sh instead.
+
+    # The launcher body is identical for a GUI entry and a CLI entry — same two-phase
+    # pull/run protocol, same request layout. Only the FILENAME and whether a .desktop file is
+    # written differ. Built once here so the two loops below cannot drift apart.
+    def container_wrapper(spec, image, cmd, exe):
+            # Recipe: cgroups off (RO subtree_control), host net (inherits pod /etc/hosts
+            # hostAliases → FlexNet), X11 socket in. Storage driver is NOT passed here — it
+            # comes from /etc/containers/storage.conf (overlay + fuse-overlayfs). Passing
+            # --storage-driver on the CLI overrides the whole [storage.options.overlay] block,
+            # so the mount_program would be lost and podman would fall back to a native overlay
+            # mount that the FUSE rootfs rejects.
+            # $HOME is bound in at the SAME path (and is the working dir) so the tool can read
+            # project files and write results back: without it a container module is
+            # write-isolated from the user's files and only usable as a GUI scratchpad — no
+            # batch/CLI use at all. Same path inside and out means a path the tool prints is
+            # still valid in the desktop shell. $HOME is the per-user Longhorn homes PVC.
+            # ⚠ A NORMAL f-string, NOT raw: the template relies on python collapsing `\\` to a
+            # single `\` for every shell LINE-CONTINUATION below. Making it raw (tried once)
+            # leaves those as `\\` and every continuation becomes a syntax error
+            # (`syntax error near unexpected token '||'`). The consequence is that any escape
+            # meant for the SHELL must be doubled here — see the printf below.
+            return f'''#!/bin/bash
+    # Container launcher for {spec} ({exe}) — runs the module image via podman
+    # inside this sandboxed pod. Recipe: doc/nested-container-runtime.md.
+    set -e
+    # The image must live in the SHARED ROOT store (graphroot /var/lib/containers/storage —
+    # the hostPath these pods mount). An LDAP user cannot pull into it: bare `podman` as a
+    # non-root user opens a ROOTLESS store, which has no /etc/subuid entry for LDAP users
+    # (they do not exist at image build time), no newuidmap/newgidmap, and under gVisor the
+    # mapping is refused outright ("newuidmap: write to uid_map failed: Operation not
+    # permitted"). sudo is not an option either — setuid is not effective under gVisor.
+    #
+    # BOTH the pull AND the run go through module-podmand, the root helper, via a 0733
+    # request dir. The run cannot stay with the user either:
+    # the image lands in the ROOT store while the user's podman reads their own rootless
+    # graphroot (~/.local/share/containers/storage), so after a successful pull the user's
+    # `podman image exists` STILL returns false and `podman run` would try to re-pull into a
+    # store it cannot write. The helper passes the caller's uid/HOME/cwd/DISPLAY through, and
+    # runs the container as --user <caller>, so the GUI and file ownership are unchanged.
+    _PULL_REQ=/run/module-pulls
+    _rid="$(id -u).$$.$(date +%s)"
+
+    # 1. Ensure the image is in the root store. Only the helper can answer that.
+    echo "{image}" > "$_PULL_REQ/$_rid" 2>/dev/null \\
+      || {{ echo "ERROR: cannot reach the module helper ($_PULL_REQ)" >&2; exit 1; }}
+    _announced=0
+    # Poll FAST at first, then back off. The helper answers an already-present image in
+    # milliseconds, so a flat `sleep 3` charged every invocation ~3 s of pure waiting — invisible
+    # for a GUI launched once, but a batch script calls these tools dozens of times. Measured on
+    # the gVisor desktop: flat sleeps made a trivial `hw_server -version` take 8.4 s against 2.6 s
+    # for the same raw `podman run`. Back-off keeps a genuine cold pull (10-20 min) cheap to wait
+    # on without spinning.
+    #
+    # ⚠ BOUND THE WAIT FOR THE FIRST ACKNOWLEDGEMENT, not the whole request. A genuine cold
+    # pull is 10-20 min and must be waited out, but the helper writes a status file within
+    # milliseconds of picking the request up — so silence past ~60 s means module-podmand is
+    # not running at all, not that the pull is slow. Unbounded, that case spins in sleep
+    # FOREVER with no output: observed for real (7+ min wall, 0:01 CPU, no error) after the
+    # helper died. One line of diagnosis beats an infinite silent hang.
+    _n=0
+    _waited=0
+    while :; do
+      _st=$(cat "$_PULL_REQ/.status.$_rid" 2>/dev/null || true)
+      case "$_st" in
+        READY*) break ;;
+        ERROR*) echo "ERROR: could not pull {image} (${{_st#ERROR }})" >&2; exit 1 ;;
+        PULLING*)
+          if [ "$_announced" = "0" ]; then
+            echo "Fetching {spec} image (first run, this can take 10-20 min over the mesh)..." >&2
+            _announced=1
+          fi ;;
+        "") # No status file yet — the request has not been picked up.
+          # 56 iterations ≈ 60 s under the back-off below (20×0.1 + 20×0.5 + 16×3).
+          if [ "$_waited" -ge 56 ]; then
+            echo "ERROR: module helper not responding — no acknowledgement in ~60s." >&2
+            echo "       module-podmand is not running; see /var/log/module-podmand.log." >&2
+            rm -f "$_PULL_REQ/$_rid" 2>/dev/null
+            exit 1
+          fi
+          _waited=$((_waited+1)) ;;
+      esac
+      _n=$((_n+1))
+      if   [ "$_n" -le 20 ]; then sleep 0.1
+      elif [ "$_n" -le 40 ]; then sleep 0.5
+      else                        sleep 3
+      fi
+    done
+    rm -f "$_PULL_REQ/.status.$_rid" 2>/dev/null || true
+
+    # 2. Ask the helper to run it. One field per line; argv is passed through verbatim and is
+    # never re-split or eval'd on either side.
+    # ⚠ USE printf BELOW, NEVER `for _a in ...; do echo "$_a"; done`. echo EATS its own flags, so
+    # an argument that happens to be one is silently DELETED from argv: `-n` (and `-en`, `-nE`)
+    # vanish entirely, `-e`/`-E` emit only a newline. Measured 2026-09-10 —
+    # `petalinux-create -t project --template zynqMP -n p` arrived as
+    #   ... --template / zynqMP / p
+    # with the `-n` gone, so PetaLinux's argparse reported "unrecognized arguments: p" and the
+    # failure read as a CLI-syntax problem in the TOOL. The identical argv via a direct
+    # `podman run` worked, which is what isolated it. printf is immune and needs no `--`.
+    # ⚠ The format spec is written DOUBLED below because this whole block is a PYTHON format
+    # template (see the `python3 - <<'PY'` generator above): a single escape is expanded when
+    # the shim is GENERATED, which put a real newline inside the quotes and split this very
+    # comment across two lines — the second of which the shell then tried to EXECUTE. Same
+    # reason `{{`/`}}` and `\\` are doubled everywhere else in the template.
+    _rrid="run.$(id -u).$$.$(date +%s)"
+    {{
+      echo "{image}"
+      id -u
+      echo "$HOME"
+      echo "$PWD"
+      echo "${{DISPLAY:-:10}}"
+      printf '%s\\n' {cmd} "$@"
+    }} > "$_PULL_REQ/$_rrid" 2>/dev/null \\
+      || {{ echo "ERROR: cannot reach the module helper ($_PULL_REQ)" >&2; exit 1; }}
+
+    # Stream the container's output back to OUR stderr. Without this the tool's output only ever
+    # reaches /var/log/module-run.* and a batch script that parses tool output gets nothing.
+    # stderr, not stdout, so a script doing `vivado ... > out.txt` is not polluted by progress
+    # text; the helper merges the container's own stdout+stderr into this one file anyway.
+    # `tail -F` (not -f) because the file may not exist yet when we start — the helper creates it
+    # when the request is picked up, a second or two later.
+    _runlog="/var/log/module-run.$(id -u).$_rrid.log"
+    # ⚠ -s 0.1, NOT the 1 s default. `tail -F` re-stats the file on a POLL, and with the
+    # default 1 s poll a FAST command (vivado -version, a --help, any error path) finishes and
+    # is drained before tail's first read — so the tool ran, wrote its output, and the user saw
+    # NOTHING. Measured 2026-09-09: `vivado -version` in the desktop printed nothing at all
+    # while /var/log/module-run.*.log held the full version banner; reproduced 5/5 with 0 bytes
+    # captured. A long run (synthesis) always won the race, which is why this only ever showed
+    # up on quick commands.
+    tail -n +1 -F -s 0.1 "$_runlog" >&2 2>/dev/null &
+    _tailpid=$!
+    _cleanup() {{ kill "$_tailpid" 2>/dev/null || true; }}
+    trap _cleanup EXIT
+
+    # Same acknowledgement bound as the pull loop: the run itself may take hours (synthesis),
+    # but the helper writes RUNNING within milliseconds of picking the request up, so silence
+    # means it is dead rather than busy.
+    _n=0
+    _waited=0
+    while :; do
+      _st=$(cat "$_PULL_REQ/.status.$_rrid" 2>/dev/null || true)
+      case "$_st" in
+        # 64 iterations ≈ 60 s under this loop's back-off (20×0.1 + 20×0.5 + 24×2).
+        "") if [ "$_waited" -ge 64 ]; then
+              echo "ERROR: module helper not responding — no acknowledgement in ~60s." >&2
+              echo "       module-podmand is not running; see /var/log/module-podmand.log." >&2
+              rm -f "$_PULL_REQ/$_rrid" 2>/dev/null
+              _cleanup; trap - EXIT
+              exit 1
+            fi
+            _waited=$((_waited+1)) ;;
+        # The helper reports "DONE <rc>" — propagate that rc so `set -e` and `if` work in a
+        # batch script. A bare DONE (older helper) is treated as success.
+        DONE*)  _rc="${{_st#DONE }}"
+                case "$_rc" in ''|*[!0-9]*) _rc=0 ;; esac
+                # Let `tail -F` drain the rest of the log. It polls the file every second, so a
+                # flat `sleep 1` was a coin-flip on catching the last lines AND charged every run
+                # a full second. Wait for the tail to go quiet instead: stop when the log stops
+                # growing, capped so a pathological writer cannot hang the wrapper.
+                # ⚠ THE FLOOR IS WHAT MAKES THIS CORRECT, not the stability test. "Size stopped
+                # growing" is TRUE IMMEDIATELY for a command that already finished, so without a
+                # minimum wait the loop broke after ~200 ms — before `tail` had polled even once
+                # — and killed it with the output unread. Wait at least 3 tail polls (0.1 s each)
+                # before the stability test is allowed to end the loop.
+                _prev=-1; _same=0
+                for _i in $(seq 1 40); do
+                  _sz=$(stat -c %s "$_runlog" 2>/dev/null || echo 0)
+                  if [ "$_sz" = "$_prev" ] && [ "$_i" -ge 4 ]; then
+                    _same=$((_same+1)); [ "$_same" -ge 2 ] && break
+                  else
+                    [ "$_sz" = "$_prev" ] || _same=0
+                    _prev=$_sz
+                  fi
+                  sleep 0.1
+                done
+                _cleanup; trap - EXIT
+                # ⚠ `|| true` ON BOTH, AND IT IS THE EXIT CODE THAT DEPENDS ON IT. This wrapper
+                # runs under `set -e`, and $_runlog lives in /var/log, which is root-owned and
+                # NOT writable by a desktop user — so `rm -f` there fails with EACCES (rm -f
+                # ignores a missing file, never a permission error). The script then died on
+                # that line, one statement BEFORE `exit "$_rc"`, and exited 1 no matter what the
+                # tool returned. Measured 2026-09-05: podmand logged `container exited rc=0` and
+                # wrote `DONE 0`, `bash -x` showed `_rc=0`, and the wrapper still exited 1 —
+                # i.e. every batch run by a normal user reported failure on success. Root was
+                # unaffected (it can unlink in /var/log), which is why GUI use never showed it.
+                # The daemon deletes its own log anyway; this is best-effort tidying.
+                rm -f "$_PULL_REQ/.status.$_rrid" 2>/dev/null || true
+                rm -f "$_runlog" 2>/dev/null || true
+                exit "$_rc" ;;
+        ERROR*) echo "ERROR: could not start {spec} (${{_st#ERROR }})" >&2
+                _cleanup; trap - EXIT
+                rm -f "$_PULL_REQ/.status.$_rrid" 2>/dev/null
+                exit 1 ;;
+      esac
+      # Same fast-then-slow shape as the pull loop above: a short command returns almost
+      # immediately, a long synthesis run does not need sub-second polling.
+      _n=$((_n+1))
+      if   [ "$_n" -le 20 ]; then sleep 0.1
+      elif [ "$_n" -le 40 ]; then sleep 0.5
+      else                        sleep 2
+      fi
+    done
+    '''
+    # ── GUI entries → $HOME/.local/bin/module-<name>-<exec> + a .desktop file ─────────────
+    for e in (d.get('desktop_entries') or []):
+        exe=e.get('exec'); nm=e.get('name',exe); cats=e.get('categories','')
+        if not exe: continue
+        wrap=os.path.join(bindir, f'module-{name}-{exe}')
+        # `command` is the in-CONTAINER command for THIS entry (a full path/args is fine);
+        # `exec` is only the short wrapper/desktop-file name. Falls back to exec.
+        _write_shim(wrap, container_wrapper(spec, image, e.get('command') or exe, exe))
+        de=os.path.join(appdir, f'module-{name}-{exe}.desktop')
+        open(de,'w').write(f'''[Desktop Entry]
+    Type=Application
+    Name={nm}
+    Exec={wrap} %F
+    Terminal=false
+    Categories={cats}
+    ''')
+
+    # ── CLI entries → $HOME/.local/module-bin/<name>/<version>/<entry> (on PATH) ──────────
+    # Per-module/per-version dir, NOT .local/bin: these wrappers carry the tool's OWN name
+    # (`vivado`, not `module-vivado-vivado`) because a batch script calls them by that name.
+    # Dropping them in the shared .local/bin would collide across modules and across versions,
+    # and could shadow a system binary for every shell — not just while the module is loaded.
+    shimdir = os.path.join(shimroot, name, ver)
+    os.makedirs(shimdir, exist_ok=True)
+    for e in (d.get('cli_entries') or []):
+        en = str(e.get('name') or '').strip()
+        cmd = e.get('command') or en
+        # The manifest comes off the SMB share, which is writable by anyone who can register a
+        # module. Validate the entry name before it becomes a path component so a `../` cannot
+        # escape the shim dir and overwrite an arbitrary file in $HOME. Same posture as the
+        # image-ref checks in module-podman.sh.
+        if not en or not re.match(r'^[A-Za-z0-9._-]+$', en):
+            continue
+        w = os.path.join(shimdir, en)
+        _write_shim(w, container_wrapper(spec, image, cmd, en))
+    PY
+    }
+  module-podman.sh: |
+    #!/bin/bash
+    # /usr/local/bin/module-podmand — root helper that PULLS container-module images into
+    # the shared root podman store on behalf of unprivileged LDAP users.
+    #
+    # WHY THIS EXISTS: container modules must use the shared ROOT store (graphroot
+    # /var/lib/containers/storage — the hostPath these pods mount). An LDAP user running
+    # bare `podman` gets a ROOTLESS store instead, which cannot work here:
+    #   - no /etc/subuid entry: LDAP users do not exist at image build time, and the base
+    #     image only ships ranges for its static `ubuntu`/`desktop` users, so the pull dies
+    #     with "no subuid ranges found for user".
+    #   - newuidmap/newgidmap are absent (no uidmap package).
+    #   - and even with both fixed, gVisor refuses the mapping outright:
+    #     "newuidmap: write to uid_map failed: Operation not permitted".
+    #
+    # WHY NOT sudo: setuid is not effective under gVisor — `sudo -n podman` fails with
+    # "effective uid is not 0, is /usr/bin/sudo on a file system with the 'nosuid' option
+    # set?" even though the setuid bit is present and / is not nosuid. It DOES work under
+    # a VM-based runtime, but sudo is not usable under gVisor either.
+    #
+    # The pattern mirrors the broker's: a 0733 request dir that users can write into but not
+    # enumerate, a root loop that re-validates every request independently, and a status file
+    # the caller polls. Users never get a root shell and never name a path — only
+    # `<name>/<version>`, which is re-validated here before any path is built.
+    #
+    # RUNNING is delegated too, and it has to be: the image lands in the ROOT store
+    # (/var/lib/containers/storage) while an LDAP user's podman reads their own rootless
+    # graphroot (~/.local/share/containers/storage). A user therefore cannot even see the
+    # pulled image — `podman image exists` returns false and `podman run` would try to pull
+    # it again into the store it cannot write. Verified: after a successful root pull,
+    # `su testadmin -c 'podman image exists <img>'` still said no.
+    #
+    # The GUI still works because the run request carries the caller's DISPLAY, HOME and cwd,
+    # and the helper passes exactly those through to `podman run` (see do_run).
+    set -u
+
+    REQ_DIR=/run/module-pulls
+    AUTHFILE=/var/run/registry-cred/.dockerconfigjson
+
+    mkdir -p "$REQ_DIR"
+    chmod 0733 "$REQ_DIR"                  # users write requests, cannot enumerate
+
+    log() { echo "[module-podmand $(date -u +%H:%M:%S)] $*"; }
+
+    # su_xauth_ok <uid> <display> <outfile> — write a HOSTNAME-AGNOSTIC X cookie for <uid>.
+    #
+    # Runs `xauth` AS THE USER (their ~/.Xauthority is 0600 and only they can read it), extracts
+    # the entry for <display>, and rewrites its address family to the wildcard `ffff` so the
+    # cookie matches from inside a container, whose hostname differs from the pod's. Returns 1
+    # and writes nothing if the user has no entry for that display.
+    #
+    # ⚠ 0600 AND owned by the caller. This file is a bearer token for that user's whole X
+    # session; the desktop is multi-user, so a readable cookie in a shared dir would let any
+    # logged-in user take over another's display.
+    su_xauth_ok() {
+      local uid="$1" disp="$2" out="$3" uname_
+      uname_=$(getent passwd "$uid" | cut -d: -f1) || return 1
+      [ -n "$uname_" ] || return 1
+      rm -f "$out" 2>/dev/null || true
+      # ⚠ xauth TAKES A LOCK next to its output file (`<file>-c`/`<file>-l`), so it must write
+      # somewhere the USER can create files — not into our 0711 dir, where it fails with
+      # `xauth: timeout in locking authority file` and produces nothing. Build it in the user's
+      # own $HOME, then move it into place as root.
+      local tmp_="\$HOME/.module-xauth.$$"
+      # `sed 's/^..../ffff/'` swaps the 2-byte family field for the wildcard; nmerge writes it back.
+      su - "$uname_" -c "rm -f $tmp_; xauth nlist '$disp' 2>/dev/null | sed -e 's/^..../ffff/' | xauth -f $tmp_ nmerge - 2>/dev/null" || true
+      local real_
+      real_=$(su - "$uname_" -c "printf '%s' $tmp_" 2>/dev/null) || true
+      if [ -n "$real_" ] && [ -s "$real_" ]; then
+        mv -f "$real_" "$out" 2>/dev/null || cp -f "$real_" "$out" 2>/dev/null
+        rm -f "$real_" "$real_-c" "$real_-l" 2>/dev/null || true
+      fi
+      [ -s "$out" ] || { rm -f "$out" 2>/dev/null || true; return 1; }
+      chown "$uid" "$out" 2>/dev/null || true
+      chmod 0600 "$out" 2>/dev/null || true
+      return 0
+    }
+
+    status() {  # $1=reqbase $2=state $3=msg
+      echo "$2 $3" > "$REQ_DIR/.status.$1" 2>/dev/null || true
+      chmod 0644 "$REQ_DIR/.status.$1" 2>/dev/null || true
+    }
+
+    # Registry creds → a NORMALISED authfile, written once at startup.
+    #
+    # ⚠ NEVER `podman pull --creds user:password`. argv is world-readable in /proc, so on this
+    # multi-user LDAP desktop every logged-in user could read the image-registry password out of
+    # `ps` — a credential that is push-capable in CI and guards a store whose images the broker
+    # runs AS ROOT (see image-registry/README.md, which treats publish rights as root-execution
+    # rights). --authfile keeps it in a 0600 file owned by root instead.
+    #
+    # The mounted secret cannot be used directly: it carries username/password but no base64
+    # `auth` field, which podman's authfile parser requires — without it podman 403s even on
+    # readable repos (memory skopeo-authfile-needs-auth-field). So synthesise the field here.
+    RUNAUTH=/run/module-podmand-auth.json
+
+    write_authfile() {
+      ( umask 0077
+        python3 -c 'import base64,json,sys
+    d = json.load(open(sys.argv[1]))["auths"]
+    out = {}
+    for host, a in d.items():
+        u, p = a.get("username", ""), a.get("password", "")
+        e = dict(a)
+        # Only synthesise it; never overwrite an `auth` the secret already carries.
+        if "auth" not in e and u:
+            e["auth"] = base64.b64encode(f"{u}:{p}".encode()).decode()
+        out[host] = e
+    json.dump({"auths": out}, open(sys.argv[2], "w"))' "$AUTHFILE" "$RUNAUTH"
+      ) 2>/dev/null || return 1
+      chmod 0600 "$RUNAUTH" 2>/dev/null || true
+    }
+
+    do_pull() {  # $1 = request file holding a single image reference
+      local reqf="$1" base img
+      base=$(basename "$reqf")
+      img=$(head -1 "$reqf" 2>/dev/null | tr -d ' \r\n')
+      rm -f "$reqf"
+
+      # Validate BEFORE using it. Only our own module registry path is pullable, so a
+      # request cannot turn this into an arbitrary-image-pull primitive. Anchored, and no
+      # shell metacharacters or traversal.
+      case "$img" in
+        *..*|*' '*|*'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'>'*|*'<'*)
+          log "REJECT metachar/traversal: '$img'"; status "$base" ERROR "invalid image ref"; return ;;
+      esac
+      # NB the host part must allow a :PORT — the lab-local registry is reached as
+      # image-registry.image-registry.svc.cluster.local:5000. A host pattern without the optional
+      # (:[0-9]+) rejects every in-cluster registry ref as "invalid image ref", which reads
+      # like a malformed manifest rather than a too-strict validator.
+      # ⚠ EITHER FORM: `<repo>:<tag>` OR `<repo>@sha256:<64 hex>`. The generated launcher pins
+      # the digest whenever the registered manifest carries one (module-cli.sh, matching
+      # broker.sh's module_image()), so a tag-only pattern rejects every pinned module with
+      # "invalid image ref" — the pin would silently disable the very modules it protects.
+      if ! printf '%s' "$img" | grep -qE '^[a-z0-9.-]+(:[0-9]+)?/[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+|@sha256:[0-9a-f]{64})$'; then
+        log "REJECT bad ref: '$img'"; status "$base" ERROR "invalid image ref"; return
+      fi
+      # Must live under this cluster's module registry path — nothing else.
+      if ! printf '%s' "$img" | grep -qE "^${REGISTRY_HOST}/${MODULE_IMAGE_BASE}/"; then
+        log "REJECT out-of-scope repo: '$img'"; status "$base" ERROR "image not a registered module"; return
+      fi
+
+      if podman image exists "$img" 2>/dev/null; then
+        log "already present: $img"; status "$base" READY "already present"; return
+      fi
+
+      status "$base" PULLING "fetching image"
+      # Serialise per IMAGE, not globally: a cold pull is 10-20 min over the mesh, so a single
+      # in-line loop would block every other user's request behind it (observed while testing:
+      # a second request sat unprocessed for the whole pull). One flock per image also stops
+      # two users racing the same multi-GB fetch into the same store.
+      # ⚠ THE LOCK LIVES IN THE STORE, NOT IN $REQ_DIR. $REQ_DIR is a pod-local emptyDir, so a
+      # lock there serialises only the users of ONE pod — two pods sharing a graphroot (the
+      # desktop and an [eda-run] build pod on the same node) would each take their own lock and
+      # both start the same 42.8 GB fetch. Podman's own storage.lock protects the metadata but
+      # does NOT stop two concurrent pulls of one image wasting the bandwidth twice.
+      # Placing it beside the graphroot makes it node-wide, which is what a shared cache needs.
+      # ⚠ Test the GRAPHROOT ITSELF, not the concatenation: on a `podman info` failure the
+      # substitution is empty and a naive "$root/.module-pull-locks" becomes the absolute
+      # "/.module-pull-locks", which mkdir may happily CREATE at the filesystem root — giving
+      # each pod its own lock and silently losing the cross-pod serialisation this is for.
+      local graphroot lockdir lock
+      graphroot="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
+      if [ -d "$graphroot" ]; then
+        lockdir="$graphroot/.module-pull-locks"
+        mkdir -p "$lockdir" 2>/dev/null || lockdir=""
+      else
+        lockdir=""
+      fi
+      if [ -z "$lockdir" ]; then
+        # Degraded, and say so loudly: the pull still happens, it is just no longer serialised
+        # against other pods sharing this node's store.
+        log "WARN cannot resolve podman graphroot — pull lock falls back to the pod-local $REQ_DIR"
+        lockdir="$REQ_DIR"
+      fi
+      lock="$lockdir/.lock.$(printf '%s' "$img" | tr -c 'a-zA-Z0-9._-' '_')"
+      (
+        exec 9>"$lock"
+        flock 9
+        if podman image exists "$img" 2>/dev/null; then
+          log "already present after wait: $img"; status "$base" READY "already present"; exit 0
+        fi
+        # Same stale-marker guard as do_run: a PULL also re-stamps `.has-mount-program`, and it
+        # runs first, so clearing it only at run time would still leave the pull's mounts (and
+        # the run that follows) routed through fuse-overlayfs. See the long note in do_run.
+        if [ "$(cat /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null)" = "true" ] \
+           && ! grep -qE '^\s*mount_program\s*=' /etc/containers/storage.conf 2>/dev/null; then
+          log "clearing stale .has-mount-program marker before pull"
+          rm -f /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null || true
+        fi
+        log "pulling $img"
+        if podman pull --authfile "$RUNAUTH" --tls-verify=false "$img" >/dev/null 2>&1; then
+          log "pulled $img"
+          status "$base" READY "pulled"
+        else
+          log "FAILED to pull $img"
+          status "$base" ERROR "pull failed"
+        fi
+      ) &
+    }
+
+    # do_run: execute a container-module image as root, on behalf of the calling user.
+    #
+    # The request file is NUL-free, one field per line, written by the generated launcher:
+    #   line 1  image reference        (validated exactly as for a pull)
+    #   line 2  caller uid
+    #   line 3  caller HOME
+    #   line 4  caller cwd
+    #   line 5  caller DISPLAY
+    #   line 6+ the command and its arguments, one per line (never re-split, never eval'd)
+    #
+    # Argument handling is security-critical: the argv is read into a bash array and passed
+    # straight to `podman run`, so no shell ever re-parses it, and it cannot smuggle a flag to
+    # podman itself or name a different image. It CAN choose the command — the module images
+    # declare no ENTRYPOINT, so argv[0] is what runs. That is acceptable only because the
+    # container runs as the caller (see the uid handling below): a user picking their own
+    # command inside the module image gets nothing they do not already have in the desktop pod.
+    #
+    # ⚠ THE CALLER'S UID IS THE REQUEST FILE'S OWNER, NEVER A LINE INSIDE THE FILE. REQ_DIR is
+    # 0733 precisely so any desktop user can drop a request, so every byte of its CONTENT is
+    # attacker-chosen. Line 2 used to be taken on trust: writing `0` there yielded
+    # `podman run --user 0` in a `--cgroups=disabled --network=host` container, i.e. root on the
+    # node's container runtime from an unprivileged LDAP session. The creator's uid is recorded
+    # on the inode by the kernel and cannot be forged, so that is the only usable source. Line 2
+    # is still READ — it holds the protocol's 5-line header shape that `tail -n +6` depends on —
+    # but its value is discarded.
+    #
+    # uid 0 is NOT rejected: the image's built-in root session legitimately loads modules, and
+    # for it the file owner IS 0. Taking the owner is what makes that safe — root gets root
+    # because it already was root, not because it asked.
+    do_run() {  # $1 = request file
+      local reqf="$1" base img uid home cwd disp fuid hown
+      base=$(basename "$reqf")
+      fuid=$(stat -c %u "$reqf" 2>/dev/null || true)
+      { read -r img; read -r uid; read -r home; read -r cwd; read -r disp; } < "$reqf"
+      mapfile -t argv < <(tail -n +6 "$reqf")
+      rm -f "$reqf"
+
+      case "$fuid" in
+        ''|*[!0-9]*)
+          log "REJECT run: cannot determine the owner of '$base'"; status "$base" ERROR "unknown caller"; return ;;
+      esac
+      [ "$uid" = "$fuid" ] || log "NOTE: request '$base' claimed uid '$uid'; using its owner $fuid"
+      uid="$fuid"
+
+      case "$img" in
+        *..*|*' '*|*'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'>'*|*'<'*)
+          log "REJECT run metachar: '$img'"; status "$base" ERROR "invalid image ref"; return ;;
+      esac
+      # Same two accepted forms as the pull path above — a digest-pinned module must be
+      # runnable, not just pullable.
+      if ! printf '%s' "$img" | grep -qE "^${REGISTRY_HOST}/${MODULE_IMAGE_BASE}/[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+|@sha256:[0-9a-f]{64})$"; then
+        log "REJECT run out-of-scope: '$img'"; status "$base" ERROR "image not a registered module"; return
+      fi
+      # HOME/cwd must be real paths owned by the caller — never a way to bind-mount /etc, and
+      # never a way to mount a DIFFERENT user's home. The ownership test is what enforces the
+      # second half; the /home/ prefix alone does not, since every user's home lives there.
+      # A stat that fails (a home that is not there at all) is a rejection, not a pass.
+      #
+      # uid 0 is exempt, and must be: the image's built-in root session runs with
+      # HOME=/home/headless, a directory seeded from the base image and owned by ITS account,
+      # not by root. Root can read any home regardless, so the test would cost that session its
+      # modules and buy nothing.
+      case "$home" in /home/*) ;; *) log "REJECT run home: '$home'"; status "$base" ERROR "bad home"; return ;; esac
+      if [ "$uid" != "0" ]; then
+        hown=$(stat -c %u "$home" 2>/dev/null || true)
+        if [ "$hown" != "$uid" ]; then
+          log "REJECT run home: '$home' is owned by '${hown:-?}', caller is $uid"
+          status "$base" ERROR "home not owned by caller"; return
+        fi
+      fi
+      case "$disp" in :[0-9]*) ;; *) disp=":10" ;; esac
+      # cwd is only `-w`, not a mount, but it must still resolve INSIDE a directory that IS
+      # mounted — anything else names a path the container does not have and podman fails with
+      # a bare "chdir" error that reads like a broken image.
+      #
+      # ⚠ A BATCH CALLER WORKS OUTSIDE $HOME, AND ITS WORKSPACE MUST BE MOUNTED. A CI job runs
+      # in /builds/<group>/<project>, so clamping cwd to $home silently started the tool in the
+      # wrong directory: Vivado came up fine and then died with
+      #   couldn't read file "../_vivado_batch.tcl": no such file or directory
+      # for a file that exists — measured on job 65. The tool's own log names the missing file,
+      # never the wrong directory, so this reads as a repo/path bug rather than a mount gap.
+      # So mount the workspace ROOT (the first two path components, e.g. /builds/deployments)
+      # rather than the leaf: deploy.sh walks UP out of its own directory (`../`) and symlinks
+      # into a sibling submodule checkout, both of which break if only the leaf is present.
+      local _ws_args="" _ws_root="" _wown=""
+      case "$cwd" in
+        "$home"|"$home"/*) ;;                      # inside $HOME: already mounted below
+        /builds/*)
+          # ⚠ RESTRICTED TO /builds/ ON PURPOSE — THIS IS A MOUNT INTO A ROOT CONTAINER.
+          # $home above is guarded by BOTH a /home/* prefix and an ownership test, precisely so
+          # a caller cannot bind-mount /etc. This path needs the same discipline: without the
+          # prefix restriction an unprivileged desktop user could request cwd=/etc/anything and
+          # get /etc mounted into a container running as root. /builds is the Kubernetes
+          # executor's workspace root and exists only in a CI pod, so an interactive user has
+          # no /builds to point at.
+          # ⚠ Do NOT widen this to a general "first two components" rule.
+          #
+          # Take the first TWO components (/builds/<group>): deploy.sh walks UP out of its own
+          # directory (`../`) and symlinks into a sibling submodule checkout, so mounting only
+          # the leaf breaks both.
+          _ws_root=$(printf '%s' "$cwd" | cut -d/ -f1-3)
+          # No `..` anywhere in the request — cut() would otherwise hand back a prefix that
+          # resolves elsewhere.
+          case "$cwd" in *..*) log "REJECT run cwd: '$cwd' contains .."; status "$base" ERROR "bad cwd"; return ;; esac
+          if [ -n "$_ws_root" ] && [ -d "$_ws_root" ]; then
+            # ⚠ OWNERSHIP IS TESTED ON $cwd, NOT ON $_ws_root, AND THAT IS DELIBERATE.
+            # $_ws_root is the shared group directory (/builds/<group>) which the RUNNER creates
+            # as root and which holds every project's checkout; a caller legitimately owns only
+            # its OWN project subtree beneath it. Testing the root instead rejected the very
+            # case this branch exists for:
+            #   REJECT run cwd: '/builds/deployments' is owned by '0', caller is 1001
+            # (measured on job 70). Requiring the caller to own the shared root would mean
+            # chowning the whole tree to one build's user, which is worse than what is being
+            # prevented.
+            #
+            # What the test still guarantees is the thing that matters: the caller cannot name a
+            # directory it does not own, so it cannot use this to reach another user's files.
+            # The mount is wider than the cwd out of necessity (deploy.sh walks up and symlinks
+            # into a sibling submodule), which is why the /builds/ prefix restriction above is
+            # load-bearing rather than decorative — it is what keeps that widening inside the
+            # CI workspace and away from /etc.
+            # Root is exempt for the same reason as $home.
+            if [ "$uid" != "0" ]; then
+              _wown=$(stat -c %u "$cwd" 2>/dev/null || true)
+              if [ "$_wown" != "$uid" ]; then
+                log "REJECT run cwd: '$cwd' is owned by '${_wown:-?}', caller is $uid"
+                status "$base" ERROR "workspace not owned by caller"; return
+              fi
+            fi
+            _ws_args="-v $_ws_root:$_ws_root"
+            log "workspace outside \$HOME — mounting $_ws_root and running in $cwd"
+          else
+            log "cwd '$cwd' has no mountable root — falling back to \$HOME"
+            cwd="$home"
+          fi
+          ;;
+        /scratch/*)
+          # ⚠ SAME POSTURE AS /builds/ ABOVE — THIS IS A MOUNT INTO A ROOT CONTAINER — but
+          # with a STRICTER rule, because /scratch is reachable by every desktop user while
+          # /builds only exists in a CI pod.
+          #
+          # WHY IT IS NEEDED: $HOME is the nfs-homes NFS PV seen through gVisor's v9fs, and
+          # NFSv4 synthesises system.nfs4_acl / system.nfs4_dacl on every file. listxattr
+          # enumerates them, getxattr then fails, so Yocto's sstate_task_postfunc —
+          # `cp -afl --preserve=xattr` — dies on every task:
+          #   cp: getting attribute 'system.nfs4_dacl': Operation not supported
+          # A PetaLinux TMPDIR therefore CANNOT live under $HOME. /scratch is a node-local
+          # hostPath (see desktop-gvisor.yaml), carries no NFS xattrs and copies cleanly.
+          # /tmp is NOT an alternative: it is a RAM-backed tmpfs here and a Yocto TMPDIR is
+          # tens of GB. Point PetaLinux at it with CONFIG_TMP_DIR_LOCATION.
+          #
+          # ⚠ THE UID IS PART OF THE PATH, DELIBERATELY. The mount is /scratch/<uid>, never
+          # /scratch itself: /scratch is 1777 and shared by every user on the node, so mounting
+          # the whole thing into a root container would hand one user's build write access to
+          # every other user's scratch. Requiring the caller's own uid as the FIRST component
+          # is what keeps them apart, and it is checked against the CALLER's uid — not merely
+          # parsed out of the request — so it cannot be spoofed by naming someone else's dir.
+          #
+          # Unlike /builds this does NOT widen to a shared parent: there is no sibling-submodule
+          # case here, so the narrowest mount that works is the right one.
+          #
+          # ⚠ /scratch/<uid> IS NOT PRE-CREATED, AND THAT IS NOT AN OVERSIGHT. The desktop
+          # startup makes /scratch 1777+sticky rather than laying down per-user dirs, because
+          # these users are AD accounts with no local uid here — guessing would create dirs
+          # owned by the wrong id (see the comment in desktop-gvisor.yaml). Sticky means the
+          # user creates their own and nobody else can remove it; the ownership test below is
+          # what then proves it really is theirs. So a caller must `mkdir -p /scratch/$(id -u)`
+          # once — until they do, this branch falls back to $HOME with the log line below.
+          case "$cwd" in *..*) log "REJECT run cwd: '$cwd' contains .."; status "$base" ERROR "bad cwd"; return ;; esac
+          _ws_root="/scratch/$uid"
+          case "$cwd" in
+            "$_ws_root"|"$_ws_root"/*) ;;
+            *) log "REJECT run cwd: '$cwd' is not under /scratch/$uid (caller uid $uid)"
+               status "$base" ERROR "scratch dir not owned by caller"; return ;;
+          esac
+          if [ -d "$_ws_root" ]; then
+            # Ownership test as well as the path rule: the directory must actually BE the
+            # caller's, so a pre-existing /scratch/<uid> planted by someone else is refused.
+            # Root is exempt for the same reason as $home and /builds.
+            if [ "$uid" != "0" ]; then
+              _wown=$(stat -c %u "$_ws_root" 2>/dev/null || true)
+              if [ "$_wown" != "$uid" ]; then
+                log "REJECT run cwd: '$_ws_root' is owned by '${_wown:-?}', caller is $uid"
+                status "$base" ERROR "scratch dir not owned by caller"; return
+              fi
+            fi
+            _ws_args="-v $_ws_root:$_ws_root"
+            log "workspace on node-local scratch — mounting $_ws_root and running in $cwd"
+          else
+            log "cwd '$cwd' has no mountable root — falling back to \$HOME"
+            cwd="$home"
+          fi
+          ;;
+        *) cwd="$home" ;;
+      esac
+      [ -d "$cwd" ] || cwd="$home"
+
+      # ⚠ USER/LOGNAME MUST BE SET, and nothing else sets them here. A login shell exports
+      # them; the run-request protocol has no env field, so a container started this way gets
+      # neither. Measured inside the petalinux module container — the ENTIRE env is
+      #   HOME=... LANG=... PATH=... PWD=...
+      # with no USER, no LOGNAME and no LC_ALL. BitBake's server startup and Yocto's sanity
+      # checks read all three, and when the server cannot start petalinux-config reports only
+      #   ERROR: Unable to start bitbake server (None)
+      # — the literal None being the exception it failed to render — while
+      # bitbake-cookerdaemon.log stays EMPTY because the server dies before opening it. So the
+      # symptom names nothing at all. What isolated it: running the SAME bitbake by hand on the
+      # runner (where runuser sets USER) prints "BitBake Build Tool Core version 2.2.0" and
+      # works, so bitbake is fine on this host and only the container's env differs.
+      # Resolve the NAME from the uid rather than trusting the request: the uid is already the
+      # authenticated value (the request file's owner).
+      local _uname
+      _uname=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+      [ -n "$_uname" ] || _uname="$uid"
+
+      if ! podman image exists "$img" 2>/dev/null; then
+        log "run requested but image absent: $img"; status "$base" ERROR "image not present"; return
+      fi
+
+      log "running $img (uid=$uid) ${argv[*]}"
+      status "$base" RUNNING "starting container"
+      # PER-RUN log, not the shared /var/log/module-run.$uid.log. Two reasons, both required for
+      # batch use: concurrent runs by the same user interleave unreadably in one file, and the
+      # caller streams this file back to its own stderr — it must contain THIS run's output only.
+      # The name is derived from the request basename, which is generated by the launcher and
+      # already validated as a path component by the REQ_DIR scan (never user-supplied text).
+      local runlog="/var/log/module-run.$uid.$base.log"
+      : > "$runlog" 2>/dev/null || true
+      chown "$uid" "$runlog" 2>/dev/null || true
+      chmod 0644 "$runlog" 2>/dev/null || true
+      # ⚠ THE X11 MOUNT IS CONDITIONAL, and it must be. podman REFUSES TO START a container
+      # when a bind-mount SOURCE does not exist, exiting 125 before the command ever runs —
+      # and /tmp/.X11-unix exists only where an X server does. In the desktop pod it always
+      # does; in a HEADLESS consumer (the [eda-run] CI build pod, a batch job) it never does,
+      # so an unconditional `-v /tmp/.X11-unix:...` made EVERY module launch fail with a bare
+      # `container exited rc=125` and nothing in the tool's own log. Measured on ecc204: the
+      # 40 GB image pulled fine and then every binary in it reported "not found", because the
+      # container had not started at all.
+      # DISPLAY is passed only alongside it: without the socket it would name a display that
+      # cannot be reached, which turns a clean "no GUI here" into a confusing X error.
+      #
+      # ⚠ THE SOCKET IS NOT ENOUGH — THE X COOKIE HAS TO COME WITH IT. xrdp's per-user X server
+      # uses MIT-MAGIC-COOKIE-1 auth, and every entry in ~/.Xauthority is keyed by the POD
+      # HOSTNAME (`<pod>/unix:10`). A container gets a different hostname, so even bind-mounting
+      # the user's own .Xauthority does NOT match: the tool dies with
+      #   Authorization required, but no authorization protocol specified
+      #   HyperLynxDRC: line 72: 20 Aborted   ${HLD_HOME}/hldrcqt
+      # which reads like a crash, not an auth failure — and the process can linger with NO window
+      # while the log shows only harmless Qt/dbus noise, so it presents as "the GUI does not show".
+      # Measured 2026-09-17 on remote-desktop-bender.
+      #
+      # The fix is to re-key the cookie to the WILDCARD family (`ffff`), which matches regardless
+      # of hostname, and hand the container that file instead. `xauth nlist | sed | nmerge` is the
+      # documented way to do this. Written per-launch under the user's own runtime dir, 0600 and
+      # owned by the caller: the cookie grants full access to that user's X session, so it must
+      # never be world-readable or shared between users on this multi-session desktop.
+      # ⚠ MOUNT THE CALLER'S OWN SCRATCH REGARDLESS OF cwd. The branch above only fires when
+      # the caller RUNS FROM scratch, which is not how the case that motivated it works: a
+      # PetaLinux build runs from the project under $HOME and merely POINTS its TMPDIR at
+      # scratch (CONFIG_TMP_DIR_LOCATION). With a cwd-keyed mount only, the container never
+      # sees /scratch and the build dies on
+      #   PermissionError: [Errno 13] Permission denied: '/scratch'
+      # which reads as a permissions bug rather than a missing mount. Measured 2026-09-20.
+      #
+      # Same safety rule as that branch, and it is the rule that makes this safe to do
+      # unconditionally: ONLY /scratch/<caller uid>, never /scratch itself (1777, shared by
+      # every user on the node), with the uid taken from the CALLER and an ownership test on
+      # the directory. Absent or foreign-owned ⇒ simply not mounted, never an error, because
+      # most module launches have nothing to do with scratch.
+      local _scr_args="" _scr_dir="" _sown=""
+      _scr_dir="/scratch/$uid"
+      if [ -d "$_scr_dir" ]; then
+        _sown=$(stat -c %u "$_scr_dir" 2>/dev/null || true)
+        if [ "$uid" = "0" ] || [ "$_sown" = "$uid" ]; then
+          case "$_ws_args" in
+            *" $_scr_dir:$_scr_dir"*) ;;                 # already mounted by the cwd branch
+            *) _scr_args="-v $_scr_dir:$_scr_dir" ;;
+          esac
+        else
+          log "not mounting $_scr_dir — owned by '${_sown:-?}', caller is $uid"
+        fi
+      fi
+
+      local _x11_args="" _xauth=""
+      if [ -d /tmp/.X11-unix ]; then
+        _x11_args="-e DISPLAY=$disp -v /tmp/.X11-unix:/tmp/.X11-unix"
+        # Best-effort: a module that needs no GUI still runs if this fails.
+        _xauth="/run/module-xauth/xauth.$uid.$base"
+        mkdir -p /run/module-xauth 2>/dev/null || true
+        chmod 0711 /run/module-xauth 2>/dev/null || true
+        if su_xauth_ok "$uid" "$disp" "$_xauth"; then
+          _x11_args="$_x11_args -e XAUTHORITY=$_xauth -v $_xauth:$_xauth:ro"
+        else
+          log "could not build an X cookie for uid=$uid display=$disp — GUI modules may fail to open a window"
+          _xauth=""
+        fi
+      else
+        log "no /tmp/.X11-unix — running headless (no DISPLAY passed)"
+      fi
+      (
+        # --user: the process inside the container runs as the CALLER, not root, so files it
+        # writes into the bind-mounted $HOME stay owned by that user.
+        #
+        # ⚠ LICENSE VARS ARE AN EXPLICIT ALLOW-LIST, and it must cover every name a module's
+        # `env.set_from_secret` declares. HyperLynx reads SALT_LICENSE_SERVER (see
+        # eda-hyperlynx-2604/module.yaml) and it was MISSING here: `module load hyperlynx/2604`
+        # succeeds, the launcher runs, and the tool then dies with SIGABRT because it had no
+        # license server. Passing the var through only works if the DESKTOP pod exports it too
+        # (desktop-*.yaml maps the sealed license secret), so a new tool needs BOTH sides.
+        # ⚠ HyperLynx needs MGLS_LICENSE_FILE **as well as** SALT_LICENSE_SERVER — two Siemens
+        # vendor daemons on one host (`saltd` and `mgcld`), addressed by two different vars.
+        # Forwarding only SALT gets the GUI as far as "No licenses for HyperLynx's primary
+        # features were obtained ... License server is not defined", which reads like a missing
+        # entitlement but is a missing ADDRESS. See desktop-bender.yaml for the measurement.
+        # ⚠ --ipc=host IS A PERFORMANCE FLAG FOR GUI MODULES, and the reason is MIT-SHM. The
+        # X server runs in the DESKTOP container and hands clients shared-memory segments for
+        # every frame (rdpClientConAllocateSharedMemory in the Xorg log, ~12 MB a time). Without
+        # this flag the module lands in its OWN ipc namespace with podman's default 64 MB
+        # /dev/shm, so it cannot attach to them and every redraw is copied through the X socket
+        # instead. Measured 2026-09-22 on the gVisor desktop: module ipc:[31] + 63M against the
+        # desktop's ipc:[3] + 126G; with the flag the module joins ipc:[3] and sees the same
+        # 126G. A heavy OpenGL canvas like KiCad's feels laggier than the Xfce desktop around it
+        # precisely because Xfce redraws are cheap and its are not.
+        # ⚠ NO --shm-size NEEDED. Joining the host ipc namespace brings the desktop's /dev/shm
+        # with it; --shm-size would only size a PRIVATE one, which is what we are getting rid of.
+        # ⚠ Scope: this shares an IPC namespace with the desktop container, NOT with the node —
+        # "host" here means this pod. The module already shares that pod's network namespace and
+        # runs as the calling user, so it is not a new trust boundary.
+        # ⚠ The env a container sees is decided HERE: the run-request protocol has no env field,
+        # so a license flag added to the generated wrapper (module-cli.sh) has no effect.
+        # ⚠ SKIP_BBPATH_SEARCH is forwarded for PetaLinux: gen-machineconf otherwise calls
+        # bb.tinfoil.Tinfoil().prepare(), which HANGS in this sandbox (the server answers
+        # setFeatures/updateConfig then goes silent — see the CI job's own note). The variable
+        # only reaches the tool if it is BOTH exported by the caller AND listed here.
+        # ⚠ CLEAR THE STALE `.has-mount-program` MARKER BEFORE EVERY RUN, not just at startup.
+        # podman records whether the store was last used WITH a fuse-overlayfs mount_program in
+        # this file, and then trusts the marker over storage.conf. The startup script removes it
+        # once at boot (startup-configmap.yaml), but podman REWRITES it on every single run — so
+        # one run that observes a mount_program re-stamps it `true` and every later mount is
+        # routed back through fuse-overlayfs, which cannot work under gVisor.
+        #
+        # The failure does not look like a storage problem. The container starts with an EMPTY
+        # rootfs, so crun reports the ENTRYPOINT missing:
+        #   crun: executable file `/usr/local/bin/kicad-entry` not found in $PATH
+        # which reads as a broken IMAGE. Measured 2026-09-21 on unibi-hclab-pcie-tb-s: a stale
+        # `true` marker failed EVERY module — and `podman run alpine echo OK` failed identically
+        # with `echo` not found, which is what proved it was the node and not the image.
+        #
+        # Cheap: one unlink on a tmpfs-backed path per run, against a container launch.
+        if [ "$(cat /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null)" = "true" ] \
+           && ! grep -qE '^\s*mount_program\s*=' /etc/containers/storage.conf 2>/dev/null; then
+          log "clearing stale .has-mount-program marker (config has no mount_program)"
+          rm -f /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null || true
+        fi
+        podman run --rm \
+          --cgroups=disabled \
+          --network=host \
+          --ipc=host \
+          --user "$uid" \
+          ${_x11_args} \
+          -v "$home":"$home" ${_ws_args} ${_scr_args} -w "$cwd" -e HOME="$home" \
+          -e USER="$_uname" -e LOGNAME="$_uname" \
+          -e LC_ALL="${LC_ALL:-en_US.UTF-8}" \
+          ${MODULE_LICENSE_SERVER:+-e MODULE_LICENSE_SERVER="$MODULE_LICENSE_SERVER"} \
+          ${XILINXD_LICENSE_FILE:+-e XILINXD_LICENSE_FILE="$XILINXD_LICENSE_FILE"} \
+          ${LM_LICENSE_FILE:+-e LM_LICENSE_FILE="$LM_LICENSE_FILE"} \
+          ${SALT_LICENSE_SERVER:+-e SALT_LICENSE_SERVER="$SALT_LICENSE_SERVER"} \
+          ${MGLS_LICENSE_FILE:+-e MGLS_LICENSE_FILE="$MGLS_LICENSE_FILE"} \
+          ${SKIP_BBPATH_SEARCH:+-e SKIP_BBPATH_SEARCH="$SKIP_BBPATH_SEARCH"} \
+          "$img" "${argv[@]}" >>"$runlog" 2>&1
+        # Capture rc IMMEDIATELY — `log` below runs a command and would overwrite $?.
+        # Plain assignment, not `local`: this is a subshell, and although bash does accept
+        # `local` here (the subshell inherits the function context) that is a subtlety not worth
+        # depending on.
+        rc=$?
+        # The per-launch X cookie is a bearer token for the user's display — drop it as soon as
+        # the container that needed it is gone, rather than leaving one file per launch behind.
+        [ -n "$_xauth" ] && rm -f "$_xauth" 2>/dev/null
+        log "container exited rc=$rc for $img"
+        # The rc travels in the STATUS LINE so the caller can exit with it. Without this a batch
+        # script never sees a failure: the launcher used to exit 0 on any DONE, so `set -e` did
+        # not fire and a failed synthesis looked like success.
+        status "$base" DONE "$rc"
+      ) &
+    }
+
+    # ⚠ REQUIRED, deliberately NOT defaulted. Both are set on the desktop container by
+    # desktop-gvisor.yaml; the same pair is set on the broker sidecar, which aborts on them
+    # being unset (broker.sh) — this side must behave identically or the two disagree
+    # silently.
+    #
+    # A default here would have to name SOME registry, and the only plausible one is GitLab's
+    # — but EDA module images are published ONLY to the lab-local image-registry. Falling back
+    # produces a module that prepares fine (the broker has the right host) and then fails at
+    # first run with "could not pull … (pull failed)", which reads like a credential or
+    # network fault rather than a wrong registry. Failing here instead makes the startup
+    # supervisor log the reason on every restart attempt.
+    for _v in REGISTRY_HOST MODULE_IMAGE_BASE; do
+      eval "_val=\${$_v:-}"
+      [ -n "$_val" ] || { log "FATAL: $_v is not set — refusing to serve container modules"; exit 78; }
+    done
+
+    # Non-fatal: a pull from an unauthenticated registry still works, and failing the daemon
+    # outright would take out modules that do not need credentials at all. Log it, because the
+    # symptom otherwise is a 401 that reads like a wrong password.
+    write_authfile || log "WARN: could not build $RUNAUTH from $AUTHFILE — pulls will be unauthenticated"
+
+    log "started (req dir $REQ_DIR, registry ${REGISTRY_HOST}/${MODULE_IMAGE_BASE})"
+    while :; do
+      for f in "$REQ_DIR"/*; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in .status.*|.lock.*) continue ;; esac
+        # A pull request is a single line (the image). A run request has the 5-line header
+        # plus argv, so anything with more than one line is a run.
+        if [ "$(wc -l < "$f" 2>/dev/null || echo 1)" -gt 1 ]; then
+          do_run "$f"
+        else
+          do_pull "$f"
+        fi
+      done
+      # 0.1 s, not 2 s: this is the latency floor for EVERY request — a request dropped just
+      # after a scan waits the full interval before the helper even notices it. Batch scripts
+      # invoke these tools dozens of times, so 2 s of dispatch delay per call was the single
+      # largest avoidable cost (a trivial `hw_server -version` measured 8.4 s end-to-end against
+      # 2.6 s for the equivalent raw `podman run`). The loop is a directory stat on a tmpfs, so
+      # polling ten times a second is negligible next to the podman work it dispatches.
+      sleep 0.1
+    done

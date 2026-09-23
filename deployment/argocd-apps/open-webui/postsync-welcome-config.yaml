@@ -1,0 +1,262 @@
+# Publish the welcome banner and the empty-chat prompt suggestions into Open WebUI.
+#
+# WHY A JOB AND NOT ENV VARS
+# --------------------------
+# WEBUI_BANNERS and DEFAULT_PROMPT_SUGGESTIONS exist as env vars, and setting them here
+# would do NOTHING on this cluster. Both are PersistentConfig keys (`ui.banners`,
+# `ui.prompt_suggestions` in the backend's DEFAULT_CONFIG), and Config.seed_defaults writes
+# a key only `if key not in existing_keys` — it never updates one that is already there.
+# This DB is long-established (chat history lives in CNPG open-webui-pg), so both keys
+# exist and every later git edit to such an env var is silently ignored. Same trap already
+# recorded for TOOL_SERVER_CONNECTIONS in postsync-install-tools.yaml.
+#
+# ENABLE_PERSISTENT_CONFIG=false would make env authoritative again, but cluster-wide: it
+# would override every admin-UI setting, not just these two. So write the rows instead.
+#
+# WHY THE REST API AND NOT SQL
+# ----------------------------
+# `config` values are TEXT-backed JSONField, so a direct INSERT needs a JSON *string* and
+# the exact key names — the class of quiet breakage the API avoids (see this directory's
+# README). POST /api/v1/configs/banners and /api/v1/configs/suggestions upsert through the
+# app's own validation, so the row is always the shape the running image expects.
+#
+# ⚠ THIS IS AUTHORITATIVE, BY DESIGN. The Job upserts on EVERY sync, so an admin's
+# hand-edit in the UI is overwritten the next time the app syncs. That is the intended
+# GitOps behaviour — change the text HERE, not in the browser — but it is not a bug report.
+#
+# AUTH: the same short-lived WEBUI_SECRET_KEY JWT minted from the app's own image as
+# postsync-install-tools.yaml, and the same OIDC-only caveat — nobody exists until someone
+# logs in, so with no admin the Job exits 0 and a later sync publishes the text.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-welcome-config
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # BeforeHookCreation, not HookSucceeded: a FAILED Job left behind makes spec.template
+    # immutable, so later commits silently re-run the OLD pod spec.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished, for the reason spelled out in postsync-install-tools.yaml:
+  # BeforeHookCreation already cleans up, and a TTL would delete the pod and with it the
+  # only copy of the logs (Alloy's pod discovery is a poll and can miss a short Job).
+  template:
+    metadata:
+      name: open-webui-welcome-config
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: publish
+          # The app's own image: it already has open_webui on the path plus psycopg2.
+          image: ghcr.io/open-webui/open-webui:v0.11.3  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: OWUI_URL
+              value: "http://open-webui.open-webui.svc:8080"
+            - name: OWUI_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              value: "postgresql://open-webui:$(OWUI_DB_PASSWORD)@open-webui-pg-rw:5432/open-webui"
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: secret-key
+          command: ["python3", "/scripts/publish_welcome.py"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: scripts
+          configMap:
+            name: open-webui-welcome-config-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: open-webui-welcome-config-script
+  namespace: open-webui
+  # A PLAIN resource, like tools-configmap.yaml and for the same reason: hook resources are
+  # not drift-compared, so a hook ConfigMap can go stale while ArgoCD reports Synced.
+  # Negative wave keeps it ahead of the PostSync Job that mounts it.
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  publish_welcome.py: |
+    import datetime, json, os, sys, time, urllib.error, urllib.request
+
+    sys.path.insert(0, "/app/backend")
+    from open_webui.utils.auth import create_token  # noqa: E402
+
+    BASE = os.environ.get("OWUI_URL", "http://open-webui.open-webui.svc:8080")
+
+    # ONE banner, deliberately: banners stack at the top of every chat, so a second one
+    # costs more attention than it earns. Both facts users actually need fit in one.
+    # Keep it concrete rather than welcoming:
+    #   * models load ON DEMAND, and the picker shows NO loading indicator — upstream sets
+    #     that flag only via the Ollama connection, which this deployment does not use
+    #     (ENABLE_OLLAMA_API=false routes everything through LiteLLM for budgets/ACLs).
+    #     So a first message to a cold model just looks slow. Measured 2026-09-08:
+    #     ~4-7 s for most models, ~35 s for the multimodal qwen3.5:4b.
+    #   * a newly added model is not instantly selectable — the gateway re-reads the model
+    #     list on restart, and a CronJob reconciles that every 5 minutes.
+    BANNERS = [
+        {
+            "id": "ecc-model-basics",
+            "type": "info",
+            "title": "Models load when you first use them",
+            "content": (
+                "The **first** message to a model that is not already loaded takes a few "
+                "seconds to about half a minute, with no progress bar \u2014 after that it "
+                "is fast.\n"
+                "You can manage the library yourself: ask *\"list the available models\"*, "
+                "*\"what is loaded right now?\"*, *\"add qwen3.5:2b\"* or "
+                "*\"remove the model I just added\"*. A model you add appears in the "
+                "picker within about "
+                "5 minutes."
+            ),
+            "dismissible": True,
+            "timestamp": 0,
+        },
+    ]
+
+    # These render as clickable cards on the empty chat screen, which is where a new user
+    # actually looks — the tools are invoked conversationally, so without this there is
+    # nothing anywhere in the UI that tells anyone the commands exist.
+    # The model a new chat starts on. `coder-ollama` was the de-facto default (it sorts
+    # first alphabetically) and is the WORST choice for it: that model is `qwen35moe`, which
+    # llama.cpp cannot batch — the pod logs "model architecture does not currently support
+    # parallel requests" and falls back to n_slots=1, so concurrent requests SERIALIZE.
+    # Measured 2026-09-08: six sequential "ping"s returned in 6.0-57.3 s wall time while
+    # eval_duration stayed flat at ~6 s and load_duration at 1 ms — i.e. up to ~50 s of pure
+    # queueing, which reads to a user as a broken cluster.
+    #
+    # thor/qwen3.6-35b-a3b-nvfp4 is the vLLM route on the Thor, and since 2026-09-18 the
+    # only model that node serves — ollama-thor is disabled (its parser cannot return tool
+    # calls, ollama/ollama#16686). It is resident and always loaded, which is what this
+    # setting needs. ⚠ It is SLOWER than the old ollama route (~10 tok/s measured here
+    # against a claimed 57.7), so a long answer visibly streams rather than appearing.
+    DEFAULT_MODEL = "thor/qwen3.6-35b-a3b-nvfp4"
+
+    SUGGESTIONS = [
+        {"title": ["List the models", "that are available"],
+         "content": "list the available models"},
+        {"title": ["What is loaded", "in GPU memory now?"],
+         "content": "what is loaded in GPU memory right now?"},
+        {"title": ["Add a model", "to the library"],
+         "content": "add qwen3.5:2b to the library"},
+        {"title": ["Which model", "should I use for code?"],
+         "content": "which of the available models is best for writing code, and why?"},
+    ]
+
+
+    def wait_ready(tries=60, delay=5):
+        """A PostSync hook can start before the new pod serves; a fresh boot also migrates."""
+        for i in range(tries):
+            try:
+                with urllib.request.urlopen(f"{BASE}/health", timeout=5) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:
+                pass
+            print(f"waiting for open-webui ({i+1}/{tries})", flush=True)
+            time.sleep(delay)
+        return False
+
+
+    def admin_id():
+        """The oldest admin. Both endpoints are admin-gated, so this needs a REAL admin."""
+        import psycopg2
+        from urllib.parse import urlparse
+
+        u = urlparse(os.environ["DATABASE_URL"])
+        c = psycopg2.connect(
+            dbname=u.path[1:], user=u.username, password=u.password,
+            host=u.hostname, port=u.port or 5432,
+        )
+        cur = c.cursor()
+        cur.execute("select id from \"user\" where role='admin' order by created_at limit 1")
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+    def get(tok, path):
+        req = urllib.request.Request(
+            f"{BASE}{path}",
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+
+    def post(tok, path, body):
+        req = urllib.request.Request(
+            f"{BASE}{path}", data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+
+    def main():
+        if not wait_ready():
+            print("open-webui did not become ready", file=sys.stderr)
+            return 1
+
+        uid = admin_id()
+        if not uid:
+            # OIDC-only: nobody has logged in yet, so there is no admin to act as. Exit 0 —
+            # a normal state on a fresh cluster, not a failure. A later sync publishes it.
+            print("no admin user yet (nobody has logged in) — skipping, will publish on a later sync")
+            return 0
+
+        tok = create_token(data={"id": uid}, expires_delta=datetime.timedelta(minutes=15))
+
+        rc = 0
+        # ModelsConfigForm requires DEFAULT_PINNED_MODELS and MODEL_ORDER_LIST too, so GET
+        # the current config and change only DEFAULT_MODELS — posting a partial body would
+        # blank whatever an admin has set for the others.
+        models_body = None
+        try:
+            cur = get(tok, "/api/v1/configs/models")
+            cur["DEFAULT_MODELS"] = DEFAULT_MODEL
+            models_body = cur
+        except Exception as e:
+            print(f"WARNING: could not read the models config, leaving the default alone: {e}",
+                  file=sys.stderr)
+
+        targets = [
+            ("/api/v1/configs/banners", {"banners": BANNERS}, f"{len(BANNERS)} banner(s)"),
+            ("/api/v1/configs/suggestions", {"suggestions": SUGGESTIONS},
+             f"{len(SUGGESTIONS)} suggestion(s)"),
+        ]
+        if models_body is not None:
+            targets.append(("/api/v1/configs/models", models_body,
+                            f"default model {DEFAULT_MODEL}"))
+
+        for path, body, label in targets:
+            try:
+                post(tok, path, body)
+                print(f"published {label}")
+            except urllib.error.HTTPError as e:
+                print(f"FAILED {path}: HTTP {e.code} {e.read().decode()[:300]}",
+                      file=sys.stderr)
+                rc = 1
+            except Exception as e:
+                print(f"FAILED {path}: {e}", file=sys.stderr)
+                rc = 1
+        return rc
+
+
+    if __name__ == "__main__":
+        sys.exit(main())

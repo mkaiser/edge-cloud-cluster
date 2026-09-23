@@ -1,0 +1,344 @@
+# Authentik OAuth2 provider + application tile for Headscale VPN — managed entirely
+# from this folder via the Authentik API (Part B: self-contained per-app OIDC),
+# so nothing headscale-specific lives in the authentik folder.
+#
+#   PostSync  job → create/update the "headscale" OAuth2 provider + "Headscale VPN"
+#                   application (tile, group "Infrastructure") + bind the central
+#                   access-infra-view policy.
+#   PreDelete job → delete the application + provider on app removal.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace) — NOT the superuser bootstrap token. The OIDC client secret
+# (key client-secret) comes from headscale-oidc-client-secret in this namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-authentik
+  namespace: headscale
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-authentik-token-read
+  namespace: headscale
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+  # Roll the headscale Deployment once the Authentik app exists. headscale builds its
+  # OIDC provider ONCE at startup: this PostSync job necessarily runs AFTER headscale is
+  # already up, so on a fresh cluster headscale always fetches the discovery document
+  # before the app exists, logs "failed to set up OIDC provider, falling back to CLI
+  # based authentication", and serves the manual `headscale auth register` page forever.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["headscale"]
+    verbs: ["get", "patch"]
+  # Read headscale's startup log to detect the OIDC fallback. resourceNames cannot be
+  # used for pods here (names are generated), so this is namespace-scoped get/list.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-authentik-token-read
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: headscale-authentik
+    namespace: headscale
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-authentik-provider
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: headscale-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: headscale-oidc-client-secret
+                  key: client-secret
+            # The OIDC-readiness probe below hits the PUBLIC id.<tld> URL, because that is
+            # the issuer headscale itself resolves. On letsencrypt-staging that cert is
+            # signed by an untrusted CA, so plain curl fails to connect at all (exit 60,
+            # http_code 000) and the probe would conclude "discovery not ready" forever.
+            # updateConfigFromProjectSettings.sh clears this to "" on letsencrypt-prod.
+            - name: CURL_INSECURE
+              value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n headscale \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # The `groups` scope is REQUIRED, not cosmetic: headscale's oidc.allowed_groups
+              # filter reads the `groups` claim, and Authentik only emits a claim whose
+              # scope mapping is attached to the provider. Without it the claim is absent,
+              # every user fails the filter, and nobody can log in.
+              MAP_PKS="[]"
+              for s in openid profile email groups; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              # ---- vpn-users access group (idempotent). ----
+              # This group is the WHOLE access decision for the VPN: headscale's
+              # oidc.allowed_groups rejects anyone not in it, so adding a person to this
+              # group in Authentik is all it takes to give them a working VPN account —
+              # no admin CLI, no per-user headscale user, no policy edit.
+              # attributes.ecc/seed=all marks it a non-admin access group (see
+              # authentik/seed-user-group-sync.yaml). Set at create time only: the
+              # provisioner role has add_group but not change_group.
+              GRP_PK=$(first_pk "core/groups/?name=vpn-users")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'vpn-users'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"vpn-users","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "vpn-users group pk=$GRP_PK"
+
+              # access-vpn expression policy (idempotent). Gates the Authentik APPLICATION;
+              # headscale's allowed_groups gates the TOKEN. Both are needed: the app policy
+              # stops the login flow early with a clear "not authorised" page, the headscale
+              # filter is the enforcement that cannot be bypassed by a stale session.
+              POL_PK=$(first_pk "policies/expression/?name=access-vpn")
+              POL_EXPR='groups = set(request.user.groups.values_list("name", flat=True))
+              return bool(groups & {"vpn-users", "authentik-admins"})'
+              POL_PAYLOAD=$(POL_EXPR="$POL_EXPR" python3 -c "
+              import json, os
+              print(json.dumps({'name':'access-vpn','execution_logging':False,'expression':os.environ['POL_EXPR']}))
+              ")
+              if [ -z "$POL_PK" ]; then
+                echo "Creating expression policy 'access-vpn'..."
+                POL_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating expression policy 'access-vpn' (pk=$POL_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/${POL_PK}/" >/dev/null
+              fi
+              echo "access-vpn policy pk=$POL_PK"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'headscale',
+                'client_type': 'confidential',
+                'client_id': 'headscale',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict', 'url': 'https://vpn.subdomain1.your-domain.tld/oidc/callback'}, {'matching_mode': 'strict', 'url': 'https://headplane.subdomain1.your-domain.tld/admin/oidc/callback'}], # automatically updated from project-settings:{general.subdomain,general.domain}
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=headscale")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'headscale'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'headscale' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Headscale VPN',
+                'slug': 'headscale',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'Infrastructure',
+                'meta_launch_url': 'https://headplane.subdomain1.your-domain.tld/admin/oidc/start', # automatically updated from project-settings:{general.subdomain,general.domain}
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/headscale.svg',
+              }))
+              ")
+
+              # Existence check via the detail endpoint (slug is the lookup key),
+              # NOT the ?slug= list filter: under the scoped provisioner token that
+              # list filter is silently dropped (returns results:[] while the app
+              # exists), which sent us down the POST branch → 400 "slug already
+              # exists". The detail endpoint returns 200/404 reliably.
+              HTTP=$(curl -fsS -o /dev/null -w '%{http_code}' -H "$AUTH" \
+                "$API/core/applications/headscale/" || true)
+              if [ "$HTTP" = "404" ]; then
+                echo "Creating application 'Headscale VPN'..."
+                curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$APP_PAYLOAD" "$API/core/applications/" >/dev/null
+              else
+                echo "Updating application 'Headscale VPN'..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$APP_PAYLOAD" "$API/core/applications/headscale/" >/dev/null
+              fi
+
+              # Bind the access-vpn policy created above. Idempotent — skip if already bound.
+              # Detail endpoint, not ?slug= list filter (dropped under scoped token).
+              #
+              # NOT access-infra-view (employees-extended/argocd-admins/authentik-admins):
+              # that group set is "who may look at infrastructure dashboards", which is a
+              # much smaller set than "who may have a VPN account". The VPN is an access
+              # method for ordinary users (SMB share, remote desktop), so it gets its own
+              # group and anyone can be granted it without also being handed ArgoCD.
+              APP_PK=$(curl -fsS -H "$AUTH" "$API/core/applications/headscale/" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin).get('pk',''))" 2>/dev/null || true)
+              if [ -n "$APP_PK" ] && [ -n "$POL_PK" ]; then
+                BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                  echo "  binding access-vpn policy to Headscale VPN"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              else
+                echo "  WARN: app or access-vpn policy not found — skipping access binding"
+              fi
+
+              echo "Headscale VPN Authentik provider + tile + access binding configured."
+
+              # ---- Roll headscale so it actually PICKS UP the provider just created. ----
+              # headscale resolves oidc.issuer exactly once, at startup. This job is a
+              # PostSync hook, so on a fresh cluster headscale is already running by the
+              # time the Authentik application exists — its discovery fetch 404s and it
+              # falls back to CLI registration (`headscale auth register --auth-id ...`)
+              # with only_start_if_oidc_is_available:false. The fallback is silent from
+              # the user's side: the VPN works, but every human is asked to have an admin
+              # run a CLI command instead of logging in through Authentik.
+              #
+              # Gate on the discovery document rather than rolling unconditionally: the
+              # job re-runs on EVERY sync, and an unconditional restart would bounce the
+              # VPN control plane each time.
+              DISCOVERY="https://id.subdomain1.your-domain.tld/application/o/headscale/.well-known/openid-configuration" # automatically updated from project-settings:{general.subdomain,general.domain}
+              # Pre-initialise under `set -u`: a `local`-less assignment inside the loop
+              # is not guaranteed to happen ([[bash-local-unset-vs-empty]]).
+              CODE=""
+              # Default under `set -u`: the var is set by the manifest, but a hand-run of
+              # this script without it would otherwise abort here rather than probe.
+              CURL_INSECURE="${CURL_INSECURE:-}"
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                CODE=$(curl -fsS $CURL_INSECURE -o /dev/null -w '%{http_code}' "$DISCOVERY" 2>/dev/null || true)
+                [ "$CODE" = "200" ] && break
+                echo "  discovery not ready yet (HTTP ${CODE:-none}), retry $i/10"; sleep 6
+              done
+              if [ "$CODE" != "200" ]; then
+                echo "  WARN: OIDC discovery still not 200 — NOT rolling headscale."
+                exit 0
+              fi
+
+              # Only roll if the RUNNING headscale actually lacks OIDC. The startup
+              # warning is the authoritative signal — the config file always contains the
+              # oidc block, so reading the config tells us nothing about provider setup.
+              if kubectl logs -n headscale deploy/headscale --tail=-1 2>/dev/null \
+                   | grep -q "failed to set up OIDC provider"; then
+                echo "  headscale came up WITHOUT OIDC — restarting to pick up the provider."
+                kubectl patch deployment headscale -n headscale --type merge -p \
+                  "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"ecc/oidc-restarted-at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}}}}"
+                echo "  headscale rolled; OIDC login will work once the new pod is ready."
+              else
+                echo "  headscale already has OIDC configured — no restart needed."
+              fi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-authentik-provider-cleanup
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: headscale-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n headscale \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'headscale'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/headscale/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=headscale" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'headscale' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "Headscale VPN Authentik cleanup done."

@@ -1,0 +1,249 @@
+# PreSync (of the gitlab-runner-eda-run app): mint the [eda-run] GitLab runner token
+# into gitlab-runner/gitlab-runner-token-eda-run.
+#
+# ⚠ WHY A SECOND EDA RUNNER, rather than a tag on the existing one. The Kubernetes
+# executor's `runtime_class_name` and `privileged` are RUNNER-WIDE — the runner's own help
+# says "A Runtime Class to use for all created pods" — so ONE runner cannot serve both
+# postures, and the two EDA job kinds need opposite ones:
+#
+#   [eda]      privileged, NO gVisor   — BUILDS module images (rootless buildah does not
+#                                        work under k3s/containerd)
+#   [eda-run]  gVisor, unprivileged    — RUNS the toolchains via `module load`, because the
+#                                        gVisor sandbox is what makes podman-as-root
+#                                        acceptable (module-runtime/README.md)
+#
+# Adding gVisor to the [eda] runner would therefore break all six existing image builds.
+#
+# GENERAL PURPOSE, not one project's runner: any pipeline that needs Vivado, PetaLinux or
+# HyperLynx to DO WORK (synthesis, simulation, a PetaLinux build, an SI run) selects
+# `tags: [eda-run]` and gets the toolchains on PATH. Nothing project-specific is here.
+#
+# SELF-CONTAINED: a PreSync hook of the gitlab-runner-eda-run Application itself
+# (app-of-apps/gitlab-runner-eda-run.yaml, source [2]) — NOT of the gitlab app and NOT of
+# any consumer. Runner + token share one lifecycle. (The only runtime dependency is GitLab
+# being reachable: the token is minted through a GitLab API call.)
+#
+# PreSync, not PostSync: the chart's runner pod (source [1]) mounts this secret; minted
+# PostSync the pod sits ContainerCreating, the app never goes Healthy, PostSync never fires
+# — deadlock.
+#
+# GitLab 16+ binds a runner's TAGS at CREATION and the API has no upsert, so re-registering
+# makes a duplicate dead runner — hence idempotent: skip if the secret already carries a
+# runner-token.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-runner-eda-run-token
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-runner-eda-run-token
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-runner-eda-run-token
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-runner-eda-run-token
+subjects:
+- kind: ServiceAccount
+  name: gitlab-runner-eda-run-token
+  namespace: gitlab-runner
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-runner-eda-run-token
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ activeDeadlineSeconds bounds the WHOLE Job, retries included — it must exceed the
+  # in-container wait (30m) or the deadline kills the Job mid-wait and the retry budget is
+  # never spent. 2400s = 30m wait + headroom for the PAT/runner calls.
+  activeDeadlineSeconds: 2400
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation above (the next sync deletes this Job
+  # before recreating it), so a TTL buys nothing and COSTS the post-mortem: it
+  # deletes the pod, and with it the only copy of the logs.
+  #
+  # Alloy does not save you here. Its pod discovery is a poll, so a Job pod that
+  # lives ~60s can finish and be TTL-deleted before it is ever scraped — verified
+  #: this Job ran twice and Loki holds ZERO lines for it
+  # ({namespace="gitlab-runner"} has only the long-lived runner/build streams).
+  # A failed hook Job is exactly what you most need logs for after a recreate,
+  # so the Job must outlive itself until the next sync.
+  template:
+    spec:
+      serviceAccountName: gitlab-runner-eda-run-token
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: runner-token
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        - name: DST_NS
+          value: "gitlab-runner"
+        - name: SECRET_NAME
+          value: "gitlab-runner-token-eda-run"
+        - name: RUNNER_DESC
+          value: "k8s-eda-module-runner"
+        - name: RUNNER_TAGS
+          value: '"eda-run"'
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          echo "Ensuring namespace ${DST_NS} exists..."
+          kubectl get namespace "${DST_NS}" >/dev/null 2>&1 || kubectl create namespace "${DST_NS}"
+
+          # Idempotent: skip if the secret already holds a runner-token. The API
+          # has no upsert, so re-creating would register a duplicate dead runner.
+          EXISTING=$(kubectl -n "${DST_NS}" get secret "${SECRET_NAME}" \
+            -o jsonpath='{.data.runner-token}' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "${SECRET_NAME} already has a runner-token."
+            # ⚠ DO NOT just exit here. access_level is bound at REGISTRATION, and this job
+            # is idempotent — so a runner registered before this file said `not_protected`
+            # keeps the OLD value forever and the skip hides it. Measured on ecc204: the
+            # runner came up `ref_protected`, which silently accepts NO job on an
+            # unprotected ref (and the mirrored branches must stay unprotected for the
+            # mirror to force-push). The pipeline then sits pending with no runner and
+            # nothing anywhere says why.
+            #
+            # The API can change it after the fact, so re-assert it on every sync. Needs an
+            # admin token, minted the same way as below.
+            RT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner \
+              "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'eda-run-fix-'+Time.now.to_i.to_s,scopes:['api'],expires_at:1.year.from_now); puts t.token" \
+              2>/dev/null | tail -1)
+            if [ -n "$RT" ]; then
+              RID=$(curl -sS -H "PRIVATE-TOKEN: ${RT}" "${GITLAB_URL}/api/v4/runners/all?per_page=100" 2>/dev/null \
+                | tr '}' '\n' | grep -F "\"description\":\"${RUNNER_DESC}\"" \
+                | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -n "$RID" ]; then
+                curl -sS -o /dev/null -w "  runner ${RID} access_level=not_protected: HTTP %{http_code}\n" \
+                  -H "PRIVATE-TOKEN: ${RT}" -X PUT "${GITLAB_URL}/api/v4/runners/${RID}" \
+                  --data "access_level=not_protected" || true
+              else
+                echo "  NOTE: could not find runner '${RUNNER_DESC}' to re-assert access_level."
+              fi
+            fi
+            exit 0
+          fi
+
+          # ⚠ MUST outlast GitLab's own cold start on a cluster recreate. Measured on the
+          # ecc186→ecc187 recreate (2026-08-30): this Job exhausted its retries while GitLab
+          # was still starting, the app went Failed, and NO [eda] runner was ever registered.
+          # Everything tagged [eda] then queued forever — remote-desktop's base-image build
+          # sat `pending` holding its resource_group slot, so every later pipeline stacked up
+          # behind it in `waiting_for_resource` and the desktop stayed ImagePullBackOff for
+          # 7+ hours. One un-minted token silently stalls an entire build chain.
+          #
+          # ⚠ A TIMED-OUT WAIT MUST FAIL, NOT FALL THROUGH. This loop used to `break` out of
+          # the `while` on exhaustion and carry straight on to the PAT call, which then failed
+          # with a confusing "Could not obtain API token" instead of "GitLab never came up".
+          echo "Waiting for GitLab API (up to 30m)..."
+          i=1
+          ready=0
+          while [ "$i" -le 180 ]; do
+            # ⚠ `|| true`: this runs under `set -eu`, and curl exits non-zero when it cannot
+            # resolve or connect — exactly the case this loop is here to wait out. Without it the
+            # first probe against a GitLab that is still starting kills the Job outright and the
+            # wait never happens (measured on the ecc199 bring-up: four pods, one line each).
+            # `-w` still prints 000 on failure, so nothing else changes; do NOT add `|| echo 000`,
+            # which concatenates with curl's own 000 and yields 000000.
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness" || true)
+            if [ "$code" = "200" ]; then ready=1; break; fi
+            echo "Try ${i}/180: GitLab not ready (HTTP ${code}), retrying in 10s..."
+            i=$((i + 1)); sleep 10
+          done
+          if [ "$ready" != "1" ]; then
+            echo "ERROR: GitLab API not ready after 30m — refusing to continue." >&2
+            echo "  Without this token no [eda] runner registers and every [eda] job queues forever." >&2
+            exit 1
+          fi
+
+          # Mint a root PAT via the toolbox (same flow as the shared bootstrap job).
+          echo "Creating PAT via toolbox..."
+          PAT_NAME="eda-runner-$(date +%s)"
+          API_TOKEN=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+            gitlab-rails runner \
+            "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'${PAT_NAME}',scopes:['api'],expires_at:1.year.from_now); puts t.token" \
+            2>/dev/null | tail -1)
+          if [ -z "$API_TOKEN" ]; then
+            echo "ERROR: Could not obtain API token"; exit 1
+          fi
+          echo "API token obtained."
+
+          # ⚠ access_level = NOT_PROTECTED HERE, the OPPOSITE of the [eda] builder — and
+          # this is forced, not a preference.
+          #
+          # A `ref_protected` runner only picks up jobs on PROTECTED refs. The projects this
+          # runner serves are MIRRORS: mirror-cronjob.yaml FORCE-pushes the external repo
+          # over their trees, and a protected branch rejects a force push with
+          # `pre-receive hook declined` — so `main` there MUST stay unprotected. A
+          # ref_protected runner would therefore never accept the job at all, and the
+          # pipeline sits "stuck" with no runner and no error explaining why.
+          #
+          # The [eda] builder needs ref_protected for the opposite reason: it consumes
+          # PROTECTED CI VARIABLES (the registry push credential), and GitLab gates those on
+          # the runner being protected-capable as well as on the variable's own flag. This
+          # runner consumes NO protected variables — its pull credential is a runner-level
+          # mount, not a CI variable — so it gives up nothing by being not_protected.
+          #
+          # ⚠ Consequence to keep in mind: any secret a job here needs must NOT be delivered
+          # as a protected variable. Use an unprotected masked variable or a runner mount.
+          # Register the instance runner (tags bound at creation).
+          echo "Creating runner '${RUNNER_DESC}' (tags=[${RUNNER_TAGS}])..."
+          RESP=$(curl -sf -X POST "${GITLAB_URL}/api/v4/user/runners" \
+            -H "PRIVATE-TOKEN: ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"runner_type\":\"instance_type\",\"description\":\"${RUNNER_DESC}\",\"tag_list\":[${RUNNER_TAGS}],\"run_untagged\":false,\"access_level\":\"not_protected\"}" 2>/dev/null || true)
+          TOKEN=$(echo "$RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: could not create runner '${RUNNER_DESC}'. Response: $RESP"; exit 1
+          fi
+          echo "  token obtained (${TOKEN:0:10}...); writing ${DST_NS}/${SECRET_NAME}..."
+          kubectl -n "${DST_NS}" create secret generic "${SECRET_NAME}" \
+            --from-literal=runner-registration-token="" \
+            --from-literal=runner-token="${TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "EDA runner token created."

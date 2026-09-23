@@ -1,0 +1,108 @@
+# NVIDIA device plugin — DISCRETE PCIe GPU nodes (ecc/gpu-model=nvidia-turing-sm75).
+#
+# Sibling of device-plugin.yaml, which serves the Tegra/SoC nodes. Two manifests instead of
+# one because a DaemonSet has a SINGLE pod template: the two hardware classes need different
+# discovery/injection env, and per-node env is not expressible. Each carries a precise
+# ecc/gpu-model nodeSelector so exactly one lands on any given GPU node.
+#
+# Every env difference from the Tegra sibling is deliberate — see the comments below. The
+# short version: discrete GPUs take the UPSTREAM DEFAULT path (NVML discovery, envvar
+# injection, UUID naming) because it works; the Tegra manifest only deviates to route around
+# Jetson-specific bugs.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-discrete
+  namespace: kube-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app.kubernetes.io/name: nvidia-device-plugin-discrete
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-discrete-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-discrete-ds
+    spec:
+      runtimeClassName: nvidia
+      priorityClassName: "system-node-critical"
+      nodeSelector:
+        ecc/gpu-model: nvidia-turing-sm75  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        # GPU nodes are mesh nodes (tainted ecc/mesh=true:NoSchedule).
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        # GPU nodes are additionally tainted ecc/gpu=true:NoSchedule (dedicated resource).
+        # The plugin is what ADVERTISES nvidia.com/gpu, so it must be able to land there.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - image: nvcr.io/nvidia/k8s-device-plugin:v0.20.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          name: nvidia-device-plugin-ctr
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+            # NVML discovery — the upstream default, and correct on discrete GPUs where the
+            # NVML memory query works. (The Tegra sibling is forced to "tegra" because NVML's
+            # memory query is unsupported on the iGPU and crash-loops the plugin.)
+            - name: DEVICE_DISCOVERY_STRATEGY
+              value: "nvml"
+            # The plugin returns NVIDIA_VISIBLE_DEVICES=<uuid> and lets the nvidia container
+            # runtime resolve it — the upstream default, and all a discrete node needs. NOT
+            # cdi-cri: that makes the PLUGIN generate its own spec, which is only necessary on
+            # Tegra (where csv mode cannot resolve the L4T iGPU at all).
+            #
+            # HOW THE GPU ACTUALLY REACHES THE CONTAINER (verified on smartmirror1, and not
+            # what you would guess from the value above): the node runs mode=auto, and the
+            # container toolkit's own nvidia-cdi-refresh.path unit auto-generates
+            # /var/run/cdi/nvidia.yaml on driver/toolkit install — on x86 too, not just Jetson.
+            # mode=auto sees that spec and resolves to CDI, so the container ends up with
+            # NVIDIA_VISIBLE_DEVICES=void and the device injected via CDI. That is FINE and
+            # self-consistent: the generated spec carries both real per-card UUIDs, so the
+            # UUID the plugin allocates resolves exactly. Confirmed: two pods each requesting
+            # 1 GPU land on DIFFERENT cards (distinct UUIDs) and a third stays Pending.
+            #
+            # Consequence for ollama: it must NOT rely on reading NVIDIA_VISIBLE_DEVICES (it
+            # is "void" here, which is what stack-smashes its cudart_bootstrap on Tegra — see
+            # Unlike the Thor,
+            # though, the injection itself works, so a pod here SHOULD request nvidia.com/gpu
+            # normally and let the scheduler enforce one card per pod. Verify the ollama build
+            # on this node before assuming the Tegra workaround is unnecessary.
+            - name: DEVICE_LIST_STRATEGY
+              value: "envvar"
+            # UUID naming — the upstream default. NVML reports a real, reboot-stable UUID per
+            # card (verified: GPU-0ef2ac2b… / GPU-4a144952…), which PCI enumeration index is
+            # not guaranteed to be. The Tegra sibling is forced to "index" only because its
+            # RM hardcodes GetUUID() to the string "tegra".
+            - name: DEVICE_ID_STRATEGY
+              value: "uuid"
+            # Inject all GPUs into THIS pod so NVML can enumerate them. Note this is the
+            # PLUGIN's own view; workload pods get only the card the plugin allocates them.
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "all"
+          # NOT privileged, and no /driver-root or /var/run/cdi mounts — unlike the Tegra
+          # sibling, which needs them to GENERATE a CDI spec from the L4T CSV files. Nothing
+          # generates a spec here, so the plugin only needs the kubelet socket directory.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins

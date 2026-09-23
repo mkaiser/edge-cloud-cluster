@@ -1,0 +1,114 @@
+# ⚠⚠ SECURITY BOUNDARY — READ BEFORE COPYING THIS FILE ⚠⚠
+#
+# Mounting this export is ROOT-EXECUTION AUTHORITY. Writing a module.yaml under
+# /registry/modules/<name>/<version>/ is what authorises the privileged broker to pull an
+# OCI image and run it as root, and `allowed()` in broker.sh is fail-closed against exactly
+# this directory. No export rule can narrow that: the server sees one source IP for the
+# whole lab LAN and cannot tell the broker from the [eda] runner, which share a node.
+#
+# THE SET OF PODS THAT MOUNT IT IS THEREFORE THE ONLY BOUNDARY. It must stay mounted in the
+# BROKER SIDECAR ONLY — never in the desktop container, where unprivileged AD users have
+# interactive shells. module-runtime/check-module-runtime.sh invariant 3 asserts this for
+# every registered consumer; a consumer not in its CONSUMERS dict is unchecked, not safe.
+#
+# ⚠ THIS IS THE SECOND CLAIM ON THAT EXPORT, and it widened the boundary deliberately:
+#   • remote-desktop        — audience: the remote-desktop-users group
+#   • remote-desktop-bender — audience: `employees`, i.e. EVERY AD account
+# That was an explicit decision (a second desktop with full `module load`, open to
+# employees), taken in the knowledge that it grants a much broader group a shell on a pod
+# whose sidecar holds this authority, on unibi-hclab-bender — which is also the
+# 192.168.1.0/24 subnet router. Recorded here rather than left to be inferred.
+#
+# If the audience should be narrowed again, the change is one string in connection-seed.yaml
+# (the Guacamole tile's USER_GROUP) plus the door policy in
+# remote-desktop/authentik-provider.yaml — not a change to this file.
+#
+# ⚠ THE `server:` VALUE ONLY TAKES EFFECT ON A FRESH CLUSTER. A PersistentVolume's
+# `spec.persistentvolumesource` is IMMUTABLE after creation, so on a cluster whose PVs
+# already exist this change cannot be applied — ArgoCD reports the PV OutOfSync and keeps
+# serving the old value. That drift is EXPECTED and harmless: the existing PV still mounts
+# via the IP, and the next recreate builds it from scratch with the name. Do NOT "fix" it
+# by deleting a Bound PV to force the update — that detaches live data.
+# The EDA module REGISTRY on the TrueNAS fileserver — NFSv4, STATIC PV.
+#
+# WHAT IT HOLDS: <name>/<version>/module.yaml, and nothing else. A module exists and is
+# permitted iff its manifest is here — there is no separate allowlist (broker.sh allowed()).
+#
+# ⚠ THIS IS THE AUTHORISATION BOUNDARY. Whoever can write here can make the privileged
+# broker pull and run an image AS ROOT. It replaces the lab SMB share, which held the
+# registry until that share was retired.
+#
+# ⚠ MOUNTED ONLY IN THE BROKER SIDECAR — never in the desktop container, where unprivileged
+# users have shells, and never in the [eda] GitLab runner. That mount list IS the boundary:
+# the export itself is rw to the whole lab LAN, and it cannot be narrower. The obvious
+# tightening (rw for the broker, ro for the runner) is impossible because both run on
+# unibi-hclab-pcie-tb-s — the only gVisor node, which the desktop requires — so the server
+# sees one source IP for both. Adding this claim to any other pod silently widens the
+# boundary with nothing to warn you.
+#
+# ⚠ ITS OWN DATASET (datapool/eda/modulefiles), not a subdirectory of artifacts, because
+# the retention policy is the inverse: a few kilobytes, NOT regenerable, security-relevant,
+# so long retention and off-site replication. artifacts is huge and reproducible.
+#
+# ⚠ NOT datapool/images — that is the OCI BLOB store of the lab-local registry
+# (deployment/argocd-apps/image-registry, claimed by nfs-images-pv.yaml), mounted rw by
+# an ordinary registry Deployment. Putting the manifests there would place the broker's
+# authorisation boundary inside an export a non-privileged pod mounts rw — precisely the
+# boundary the warning above exists to protect. The two must stay separate datasets.
+# The names are deliberately close; read the DATASET, not the word "registry".
+#
+# ⚠ Retain + STATIC. Registrations must survive a cluster recreate, which they do only
+# because the server-side path is deterministic and the volume is never reclaimed — a
+# dynamic StorageClass would mint a fresh directory name and silently lose every
+# registration (doc/nested-container-runtime.md).
+#
+# ⚠ unibi-hclab only: the csi-driver-nfs node DaemonSet is pinned there and cloud nodes have
+# no route to 192.168.1.0/24.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-eda-modulefiles-bender
+  labels:
+    ecc/volume: nfs-eda-modulefiles-bender
+spec:
+  capacity:
+    # Nominal — an NFS "volume" is a directory; the real limit is the datapool. The actual
+    # content is a handful of small YAML files.
+    storage: 5Gi
+  accessModes:
+    # RWX for consistency with the other NFS claims; in practice only the broker mounts it.
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as the artifacts claim; see nfs-installers-pv.yaml (gitlab-runner-eda) for why each is pinned.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # Must be unique cluster-wide.
+    volumeHandle: fs-1-datapool-eda-modulefiles-bender
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/eda/modulefiles # automatically updated from project-settings:storage.fileserver.datasets.eda.moduleFiles
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-eda-modulefiles-bender
+  namespace: remote-desktop-bender
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 5Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-eda-modulefiles-bender

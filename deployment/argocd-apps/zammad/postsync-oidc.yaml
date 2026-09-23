@@ -1,0 +1,199 @@
+# PostSync Job: configure Zammad's OpenID Connect settings + FQDN.
+#
+# Zammad stores this configuration in its DATABASE, not in env vars, so without
+# this job a human would have to walk the admin UI after every cluster recreate.
+# `Setting.set` is an upsert, so re-running is harmless and idempotent.
+#
+# hook-weight 10 → runs AFTER zammad-authentik-provider (weight 0), which creates
+# the provider this points at. ArgoCD orders hooks by hook-weight, NOT sync-wave.
+#
+# Runs as its own Job on the Zammad image rather than `kubectl exec` into a
+# Deployment pod, whose name is not stable.
+#
+# The env below MIRRORS what the chart's "zammad.env" helper renders for the
+# railsserver. A plain manifest cannot `include` that Helm template, so it is
+# duplicated here. Postgres alone is NOT enough: without REDIS_URL and
+# MEMCACHE_SERVERS, `rails r` falls back to the file cache/websocket backend and
+# exits 1 with an EMPTY stderr, which reads as a hung "waiting for database"
+# loop rather than a config error. Keep this list in sync on chart bumps.
+#
+# NOTE: PostSync hooks only run on a sync that actually CHANGES something — a
+# no-op sync skips them. To force a re-run, edit this job or hard-refresh+sync.
+#
+# The provider is a PUBLIC client with PKCE and has no client secret; see
+# authentik-provider.yaml for why. Zammad also refuses OIDC against an untrusted
+# TLS chain, so this only works under letsencrypt-prod (see NOTES.md).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zammad-oidc-settings
+  namespace: zammad
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+      containers:
+        - name: oidc-settings
+          image: "ghcr.io/zammad/zammad:7.1.3-0004" # renovate: tracked by "Container image tags" regex (docker datasource)
+          workingDir: /opt/zammad
+          env:
+            - name: POSTGRESQL_HOST
+              value: zammad-pg-rw
+            - name: POSTGRESQL_PORT
+              value: "5432"
+            - name: POSTGRESQL_USER
+              value: zammad
+            - name: POSTGRESQL_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: zammad-db
+                  key: db-password
+            - name: POSTGRESQL_DB
+              value: zammad
+            - name: POSTGRESQL_OPTIONS
+              value: pool=50
+            # Redis + memcached: required for Rails to boot the same way the
+            # railsserver does (see the note above).
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zammad-redis-auth
+                  key: redis-password
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@zammad-redis:6379"
+            - name: MEMCACHE_SERVERS
+              value: "zammad-memcached:11211"
+            - name: PUBLIC_FQDN
+              value: "zammad.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_ISSUER
+              value: "https://id.subdomain1.your-domain.tld/application/o/zammad/" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # AutoWizard.enabled? resolves this RELATIVE to workingDir (/opt/zammad) and
+            # just tests that the file exists. Without it AutoWizard.enabled? is false and
+            # the wizard step below exits 1 — see the volume note at the bottom.
+            - name: AUTOWIZARD_RELATIVE_PATH
+              value: tmp/auto_wizard/auto_wizard.json
+            # AutoWizard.run does Service::Image.organization_suggest — it FETCHES the
+            # organization logo over the network and writes it through Store, which is S3
+            # here. Without S3_URL that write raises
+            #   Store::Provider::S3::Error: Simple Storage Service configuration not found
+            # (app/models/store/provider/s3/config.rb:57) and the wizard aborts AFTER
+            # creating the admin, leaving a half-initialised instance. Same root cause as
+            # the autowizard mount: the chart injects this into its own pods only.
+            - name: S3_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zammad-s3-url
+                  key: s3-url
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+
+              echo "Waiting for the Zammad database to be reachable..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                bundle exec rails r "true" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: database never became ready"; exit 1; }
+
+              # --- Complete the setup wizard -------------------------------
+              # The chart's init job does NOT run the autowizard. Its gate is
+              # `rails r 'puts User.any?'` (templates/configmap-init.yaml:15),
+              # and `db:seed` always creates the nicole.braun sample user, so
+              # that test is true on a FRESH database and the autowizard branch
+              # is never taken. Without this, Zammad serves the getting-started
+              # wizard instead of the login page and SSO is unreachable — even
+              # though auth_openid_connect is already true.
+              #
+              # AutoWizard.setup consumes /opt/zammad/tmp/auto_wizard/auto_wizard.json
+              # (mounted from the sealed zammad-autowizard secret; the chart
+              # points AUTOWIZARD_RELATIVE_PATH at it). Idempotent: it is
+              # skipped once an Admin exists, so re-syncs are safe.
+              echo "Checking setup wizard state..."
+              bundle exec rails r "
+                if Setting.get('system_init_done')
+                  puts 'system_init_done already true — skipping autowizard.'
+                elsif !AutoWizard.enabled?
+                  warn 'ERROR: autowizard file missing; cannot bootstrap admin.'
+                  exit 1
+                else
+                  admin = AutoWizard.setup
+                  abort 'ERROR: AutoWizard.setup created no user' if admin.nil?
+                  puts 'autowizard created: ' + admin.login + ' roles=' + admin.roles.map(&:name).join(',')
+                  Setting.set('system_init_done', true)
+                  puts 'system_init_done = ' + Setting.get('system_init_done').to_s
+                end
+              "
+
+              echo "Applying OIDC + FQDN settings..."
+              bundle exec rails r "
+                Setting.set('fqdn', ENV.fetch('PUBLIC_FQDN'))
+                Setting.set('http_type', 'https')
+
+                Setting.set('auth_openid_connect', true)
+                Setting.set('auth_openid_connect_credentials', {
+                  'display_name' => 'Authentik',
+                  'identifier'   => 'zammad',
+                  'issuer'       => ENV.fetch('OIDC_ISSUER'),
+                  'uid_field'    => '',
+                  'scope'        => 'openid email profile',
+                  'pkce'         => true,
+                })
+
+                # Link an SSO login to an existing local account with the same
+                # email instead of erroring out on first login.
+                Setting.set('auth_third_party_auto_link_at_inital_login', true)
+
+                # OIDC-only login page: hide the username/password form and the
+                # self-registration link, so Authentik is the single front door.
+                #
+                # This is NOT a lockout risk. The login view computes
+                #   user_show_password_login = @C('user_show_password_login') || _.isEmpty(@auth_providers)
+                # (app/assets/javascripts/app/views/login.jst.eco:13), so if OIDC
+                # is ever unregistered the password form REAPPEARS by itself.
+                # Break-glass while it is hidden: /#admin_password_auth mails an
+                # admin a one-time login link (the login page links to it).
+                Setting.set('user_show_password_login', false)
+
+                # Only effective while password login is shown, but set it
+                # explicitly: this is a staff helpdesk, not open registration.
+                Setting.set('user_create_account', false)
+
+                puts 'auth_openid_connect            = ' + Setting.get('auth_openid_connect').to_s
+                puts 'auth_openid_connect_credentials = ' + Setting.get('auth_openid_connect_credentials').inspect
+                puts 'fqdn                           = ' + Setting.get('fqdn').to_s
+                puts 'user_show_password_login       = ' + Setting.get('user_show_password_login').to_s
+                puts 'user_create_account            = ' + Setting.get('user_create_account').to_s
+              "
+
+              echo "Zammad OIDC settings applied."
+          # AutoWizard.setup reads /opt/zammad/tmp/auto_wizard/auto_wizard.json. The chart
+          # mounts this into ITS OWN pods only (railsserver/scheduler/websocket/nginx, gated
+          # by autoWizard.enabled in values.yaml) — a custom Job like this one is invisible to
+          # that template, so the mount has to be repeated here. Without it AutoWizard.enabled?
+          # is false, the wizard step exits 1, and Zammad keeps serving the getting-started
+          # wizard with the SSO button hidden while every chart pod looks healthy.
+          # Key/path/mode mirror the chart (templates/deployment.yaml) so both see one file.
+          volumeMounts:
+            - name: autowizard
+              mountPath: /opt/zammad/tmp/auto_wizard
+      volumes:
+        - name: autowizard
+          secret:
+            secretName: zammad-autowizard
+            defaultMode: 420
+            items:
+              - key: autowizard
+                path: auto_wizard.json

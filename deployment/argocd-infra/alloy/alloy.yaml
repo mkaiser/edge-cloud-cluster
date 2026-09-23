@@ -1,0 +1,190 @@
+# Grafana Alloy — per-node log collector, ships pod logs to Loki.
+#
+# Alloy rather than Promtail: Promtail is deprecated upstream (its chart is
+# frozen at appVersion 3.5.1) and Alloy is its supported replacement. Starting a
+# new deployment on Promtail would mean migrating immediately.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: alloy
+  namespace: argocd-infra
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: alloy
+    targetRevision: "1.12.1" # renovate: datasource=helm depName=alloy registryUrl=https://grafana.github.io/helm-charts
+    helm:
+      values: |
+        controller:
+          type: daemonset
+          # Collect from EVERY node, including the tainted mesh nodes and the
+          # control-plane. A bare `operator: Exists` tolerates every taint; do not
+          # add a nodeSelector here or the DaemonSet stops being cluster-wide
+          # (same idiom as node-guard/mesh-antiloop-daemonset.yaml).
+          tolerations:
+            - operator: Exists
+
+        alloy:
+          # Off by default in the chart, and REQUIRED here: loki.source.file tails
+          # the kubelet's on-disk logs under /var/log/pods. Turning this off makes
+          # the collector silently stop finding any log file at all.
+          mounts:
+            varlog: true
+          clustering:
+            enabled: false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          configMap:
+            create: true
+            content: |
+              // LOG TRANSPORT: on-disk CRI files, NOT the kubelet API.
+              //
+              // loki.source.kubernetes streams a pod's logs THROUGH THE API, off a
+              // discovery poll, and both steps race pod deletion — so a short-lived
+              // pod can finish and be deleted before it is ever read. It fails
+              // SILENTLY: no error, Loki is simply empty for that pod. Measured on
+              // ecc181 (2026-08-27): the gitlab-runner-eda-token hook Job ran twice
+              // and Loki held ZERO lines for it, which is precisely the thing you
+              // need after a recreate.
+              //
+              // The kubelet writes /var/log/pods/<ns>_<pod>_<uid>/<container>/N.log
+              // AS THE CONTAINER RUNS and the file outlives the pod object, so
+              // tailing the file does not race deletion. `mounts.varlog: true` above
+              // is what makes this possible — keep it.
+              //
+              // discovery.kubernetes is still needed, for METADATA only: `app` comes
+              // from a pod label that the file path does not carry. It no longer
+              // transports any log line.
+              //
+              // Only this node's pods — the DaemonSet peer on every other node
+              // handles theirs. Without the field selector each Alloy would tail all
+              // pods and ship N copies of every line.
+              //
+              // K8S_NODE_NAME is injected by the chart (spec.nodeName). Do NOT fall
+              // back to constants.hostname: in a pod that is the POD name, so the
+              // field selector matches no pods at all and Loki stays silently empty
+              // — no error anywhere, just zero labels.
+              discovery.kubernetes "pods" {
+                role = "pod"
+                selectors {
+                  role  = "pod"
+                  field = "spec.nodeName=" + sys.env("K8S_NODE_NAME")
+                }
+              }
+
+              discovery.relabel "pod_logs" {
+                targets = discovery.kubernetes.pods.targets
+                rule {
+                  source_labels = ["__meta_kubernetes_namespace"]
+                  target_label  = "namespace"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_container_name"]
+                  target_label  = "container"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+                  target_label  = "app"
+                }
+                // Deliberately NO `pod` label. Every pod restart would mint a new
+                // stream (one chunk each), which is the classic Loki cardinality
+                // blowup and eats max_global_streams_per_user. The pod name is
+                // still carried on each log line.
+                //
+                // NO `node` label either, for the same reason measured directly:
+                // it has only 5 values but MULTIPLIES every other combination, and
+                // stream count sets the floor on S3 object count (one chunk per
+                // stream per flush). Measured 2026-08-14 over a 2h window:
+                // 307 series with node -> 75 without, a 76% cut. That matters
+                // because 82% of flushes were reason="idle" on sparse streams, so
+                // chunk_target_size never binds and object count tracks streams.
+                // Which node a pod ran on is still answerable — the k8s API knows.
+                //
+                // ⚠ FILE TAILING MAKES THIS EASY TO UNDO BY ACCIDENT. The path
+                // carries pod uid/name and the node is implicit per-DaemonSet-pod,
+                // so adding either as a target_label is a one-line change that
+                // silently reverts the 76% reduction above. Do not.
+
+                // Map pod uid + container name onto the kubelet's on-disk path.
+                // The `*` before $1 absorbs the "<ns>_<pod>_" prefix of the dir
+                // name; the trailing *.log picks up the rotated-current file.
+                // Upstream idiom — docs/sources/collect/logs-in-kubernetes.md.
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+                  separator     = "/"
+                  replacement   = "/var/log/pods/*$1/*.log"
+                  target_label  = "__path__"
+                }
+              }
+
+              local.file_match "pod_logs" {
+                path_targets = discovery.relabel.pod_logs.output
+              }
+
+              loki.source.file "pods" {
+                targets    = local.file_match.pod_logs.targets
+                forward_to = [loki.process.cri.receiver]
+              }
+
+              // ⚠ REQUIRED, and upstream's own local.file_match example OMITS it.
+              // The raw file line is "<ts> <stream> <flags> <msg>"; without
+              // stage.cri that whole prefix is ingested as part of the message and
+              // the entry is stamped at INGEST time instead of event time.
+              loki.process "cri" {
+                stage.cri {}
+
+                // ⚠ MANDATORY, NOT TIDYING — this is what keeps the stream count sane.
+                //
+                // loki.source.file attaches `filename` (the full __path__) to every
+                // entry automatically, and stage.cri attaches `stream`
+                // (stdout/stderr). `filename` embeds the POD NAME and UID, so it is a
+                // per-pod label by another name: it re-introduces exactly the
+                // cardinality blowup the relabel block above refuses, and `stream`
+                // then doubles whatever is left.
+                //
+                // MEASURED on ecc181 right after the file-tailing switch, before this
+                // stage existed: 644 active series over 30m against a ~75 baseline
+                // (172 distinct `filename` values vs 128 for namespace/container/app).
+                //
+                // label_keep, NOT label_drop: a whitelist also excludes whatever a
+                // future component or Alloy version decides to attach. The pod name is
+                // still on the line body, so `|= "<pod>"` keeps working.
+                stage.label_keep {
+                  values = ["cluster", "namespace", "container", "app"]
+                }
+
+                forward_to = [loki.write.default.receiver]
+              }
+
+              loki.write "default" {
+                endpoint {
+                  url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+                  // Batch hard: fewer, larger pushes downstream mean fewer chunks
+                  // and fewer S3 PutObjects, which is what keeps Hetzner RGW from
+                  // returning 503 SlowDown.
+                  batch_size = "1MiB"
+                  batch_wait = "5s"
+                }
+                external_labels = {
+                  cluster = "edgecloudinfra", // automatically updated from project-settings:general.name
+                }
+              }
+
+        # The chart's own ServiceMonitor needs the Prometheus operator CRDs; the
+        # stack is at wave 2 and this is wave 15, so they exist by now.
+        serviceMonitor:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: alloy
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

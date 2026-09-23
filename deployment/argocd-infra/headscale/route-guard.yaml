@@ -1,0 +1,274 @@
+# CronJob: approve advertised mesh subnet routes, every 5 minutes.
+#
+# WHY THIS EXISTS AND AN ARGOCD HOOK CANNOT REPLACE IT.
+# post-deploy-job.yaml already approves advertised routes — but it is a PostSync hook, and
+# hooks fire only on a sync. headscale is wave 8, while mesh nodes join ~15 min AFTER Pulumi
+# finishes, so at hook time the node has not advertised anything yet and the hook correctly
+# finds nothing to do. Nothing then re-triggers it.
+#
+# Left alone, a node advertises its LAN CIDR with Approved EMPTY and Serving EMPTY
+# indefinitely. `tailscale status` looks healthy, the headscale app reports Synced/Healthy,
+# and the LAN is simply not served — SMB/NFS from any tailscale client to that site is dead
+# with nothing anywhere reporting a problem.
+#
+# ⚠ A no-op ArgoCD sync SKIPS hooks entirely, so "just re-sync headscale" is not a fix
+# either. Drift that appears BETWEEN syncs needs something that runs between syncs.
+#
+# 5 minutes, not 15: a freshly joined or re-adopted node should not wait a quarter of an
+# hour for its LAN to become reachable. A healthy pass is one `headscale nodes list-routes`
+# and exits without mutating anything.
+#
+# ⚠ IT ONLY AUTO-APPROVES CLUSTER-MEMBER NODES. A subnet route lets its advertiser pull
+# traffic for an entire CIDR to itself, so auto-approving anything that merely joined the
+# VPN would let a transient laptop or a hand-carried box silently hijack the lab LAN — and
+# transient nodes are exactly the ones that join with a human-approved registration (the
+# keyless carry-script prints a URL/QR that an admin approves in Headplane). Extending that
+# 2nd factor only to registration, and then auto-approving whatever the node claims to route,
+# would defeat the point of having it.
+#
+# The discriminator is the node's MESH IP, matched EXACTLY against the InternalIP of a
+# Kubernetes node. A k3s mesh node's InternalIP *is* its tailscale address, so the two sets
+# line up with no string guessing at all:
+#     k8s  <site>-pcie-tb-s     InternalIP 10.0.10.9
+#     hs   id 9  pcie-tb-s      10.0.10.9        -> member, auto-approve
+#     hs   id 4  pcie-tb-s      10.0.10.4        -> stale, HELD
+#
+# Two discriminators were rejected:
+#   - headscale USER is useless: BOTH join paths default to on-premise-resident
+#     (src/nodes-k3s-mesh.ts sets it explicitly; generateProvisioningScripts.sh defaults to
+#     it), so it does not separate pulumi-provisioned from carried-in.
+#   - HOSTNAME matching is fragile AND was an outright bypass. headscale records the box
+#     hostname (`pcie-tb-s`) while k8s uses the long id (`<site>-pcie-tb-s`), so equality
+#     fails and something looser is needed — and anything looser leaks: a bare substring test
+#     let a rogue node calling itself `thor` inherit the member `<site>-thor-eval`'s
+#     approval. An IP is an identity the node cannot choose for itself; a hostname is a
+#     string it announces.
+#
+# A node holding a mesh IP that Kubernetes recognises came through the reviewed path — Pulumi
+# SSH, or an adoption an admin ran. Anything else waits for a human to approve its route in
+# Headplane, and this Job says so in its log rather than silently skipping.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-route-guard
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-route-guard
+  namespace: headscale
+rules:
+  # Find the headscale pod, then run the CLI inside it. There is no route-approval REST
+  # endpoint; the CLI against the local socket is the supported path (same as
+  # post-deploy-job.yaml).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+# Cluster membership is the auto-approve discriminator (see the header), so this needs to
+# LIST NODES — which is cluster-scoped and cannot come from a namespaced Role. Read-only on
+# nodes and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headscale-route-guard
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headscale-route-guard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headscale-route-guard
+subjects:
+  - kind: ServiceAccount
+    name: headscale-route-guard
+    namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-route-guard
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-route-guard
+subjects:
+  - kind: ServiceAccount
+    name: headscale-route-guard
+    namespace: headscale
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: headscale-route-guard
+  namespace: headscale
+spec:
+  schedule: "*/5 * * * *"
+  # Forbid so a slow run never overlaps itself — approving the same route twice is harmless,
+  # but two concurrent runs make the log impossible to read.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 200
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: headscale-route-guard
+          containers:
+            - name: guard
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+
+                  POD=$(kubectl get pods -n headscale \
+                          -l app.kubernetes.io/name=headscale \
+                          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                  if [ -z "$POD" ]; then
+                    # Fall back to the name pattern: the chart's labels have moved before,
+                    # and a guard that silently does nothing is worse than one that is loud.
+                    POD=$(kubectl get pods -n headscale --no-headers 2>/dev/null \
+                          | awk '$1 ~ /^headscale-[0-9a-f]{8,}/ && $3=="Running" {print $1; exit}')
+                  fi
+                  if [ -z "$POD" ]; then
+                    echo "no running headscale pod found — nothing to do (it may be starting)"
+                    exit 0
+                  fi
+
+                  # ⚠ Approve whatever is ADVERTISED but not yet APPROVED, rather than a
+                  # hardcoded list. Adding a site, re-adopting a node, or changing
+                  # nodes.mesh[].advertiseRoutes then needs no change here.
+                  #
+                  # ⚠ INCLUDING the cloud CP's own subnet range. post-deploy-job.yaml
+                  # deliberately handles that one separately, but from this guard's point of
+                  # view an unapproved advertised route is an unapproved advertised route —
+                  # excluding it would leave exactly one class of drift uncovered.
+                  # ⚠ The python is built with printf, not written inline. This is a YAML
+                  # block scalar, so inline python inherits the manifest indentation and dies
+                  # with IndentationError; dedenting it to column 0 ends the block scalar and
+                  # breaks the YAML itself. printf hands python column-0 source while the
+                  # manifest stays indented.
+                  PARSE=$(printf '%s\n' \
+                    "import sys, json" \
+                    "try:" \
+                    "    d = json.load(sys.stdin)" \
+                    "except Exception:" \
+                    "    sys.exit(0)" \
+                    "d = d if isinstance(d, list) else d.get('nodes', [])" \
+                    "for n in d:" \
+                    "    avail = n.get('available_routes') or n.get('availableRoutes') or []" \
+                    "    appr = n.get('approved_routes') or n.get('approvedRoutes') or []" \
+                    "    ips = n.get('ipAddresses') or n.get('ip_addresses') or []" \
+                    "    v4 = next((i for i in ips if ':' not in i), '')" \
+                    "    nm = n.get('givenName') or n.get('given_name') or n.get('name') or '?'" \
+                    "    for r in avail:" \
+                    "        if r not in appr:" \
+                    "            print('%s|%s|%s|%s' % (n['id'], r, v4, nm))")
+                  PENDING=$(kubectl exec -n headscale "$POD" -- \
+                      headscale nodes list-routes --output json 2>/dev/null \
+                    | python3 -c "$PARSE" 2>/dev/null || true)
+
+                  if [ -z "$PENDING" ]; then
+                    echo "all advertised routes are approved — nothing to do"
+                    exit 0
+                  fi
+
+                  # The allow-list: hostnames of nodes that are part of THIS cluster. See the
+                  # header for why membership rather than headscale user or name matching.
+                  # The allow-list is a set of IPs, not names — see the header.
+                  MEMBERS=$(kubectl get nodes \
+                    -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+                    2>/dev/null | sed '/^$/d' || true)
+                  if [ -z "$MEMBERS" ]; then
+                    echo "ERROR: could not list cluster nodes — refusing to approve anything." >&2
+                    echo "  Failing CLOSED on purpose: approving a subnet route lets its" >&2
+                    echo "  advertiser pull an entire CIDR to itself, so an unavailable" >&2
+                    echo "  allow-list must never widen access." >&2
+                    exit 1
+                  fi
+                  echo "cluster members: $MEMBERS"
+
+                  # EXACT match on the mesh IP. No prefixes, no suffixes, no substrings —
+                  # an IP is assigned by headscale and cannot be chosen by the node, so there
+                  # is nothing here for a hostile name to exploit. An empty candidate IP never
+                  # matches, which is the safe direction.
+                  is_member() {
+                    _ip="$1"
+                    [ -n "$_ip" ] || return 1
+                    for _m in $MEMBERS; do
+                      [ "$_m" = "$_ip" ] && return 0
+                    done
+                    return 1
+                  }
+
+                  # ⚠ A STALE NODE OBJECT SURVIVES RE-ADOPTION, still advertising the same
+                  # subnet under its OLD mesh IP — a dead entry sits alongside the live one
+                  # under the same hostname. IP matching HOLDS the stale one automatically,
+                  # because only the live IP is a k8s InternalIP; matching on hostname would
+                  # approve both. Cleaning up dead node objects is prune-orphaned-mesh-nodes'
+                  # job, not this guard's.
+                  RC=0
+                  HELD=""
+                  for ENTRY in $PENDING; do
+                    ID=$(printf '%s' "$ENTRY" | cut -d'|' -f1)
+                    ROUTE=$(printf '%s' "$ENTRY" | cut -d'|' -f2)
+                    NODEIP=$(printf '%s' "$ENTRY" | cut -d'|' -f3)
+                    NAME=$(printf '%s' "$ENTRY" | cut -d'|' -f4)
+                    if ! is_member "$NODEIP"; then
+                      # NOT an error: this is the designed outcome for a transient node, and
+                      # for the stale headscale object a re-adoption leaves behind (which
+                      # keeps advertising the same subnet under its OLD mesh IP).
+                      echo "HELD  $ROUTE from $NAME (node $ID, mesh ${NODEIP:-<none>}) — no matching cluster node."
+                      HELD="$HELD ${NAME}/${NODEIP:-noip}"
+                      continue
+                    fi
+                    if kubectl exec -n headscale "$POD" -- \
+                         headscale nodes approve-routes --identifier "$ID" --routes "$ROUTE" \
+                         >/dev/null 2>&1; then
+                      echo "approved $ROUTE for node $ID ($NAME)"
+                    else
+                      echo "ERROR: could not approve $ROUTE for node $ID ($NAME)" >&2
+                      RC=1
+                    fi
+                  done
+
+                  if [ -n "$HELD" ]; then
+                    echo
+                    echo "The following advertised routes were NOT approved and need an admin:"
+                    for h in $HELD; do echo "  - $h"; done
+                    echo "  Approve deliberately in Headplane (Nodes -> the node -> routes),"
+                    echo "  or from the headscale pod:"
+                    echo "    headscale nodes approve-routes --identifier <id> --routes <cidr>"
+                    echo "  A subnet route lets that node pull the whole CIDR to itself, so"
+                    echo "  this is intentionally a human decision for non-cluster nodes."
+                  fi
+
+                  # Report what is actually SERVING afterwards, not just what was approved:
+                  # approved-but-not-serving is its own failure mode (the node has to accept
+                  # the route too), and it is invisible if we only log the approval.
+                  echo
+                  echo "routes now:"
+                  kubectl exec -n headscale "$POD" -- headscale nodes list-routes 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' || true
+
+                  exit $RC
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { memory: 192Mi }

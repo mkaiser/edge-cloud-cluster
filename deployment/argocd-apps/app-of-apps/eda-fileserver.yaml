@@ -1,0 +1,82 @@
+# ArgoCD Application: EDA fileserver provisioning — the TrueNAS datasets, exports and
+# per-module subdirectories the EDA stack owns.
+#
+# WHY IT IS ITS OWN APP: disabling the EDA stack should stop provisioning EDA storage.
+# argocd-infra/truenas/configure-job.yaml keeps everything genuinely infra — homes, the SMB
+# userhomes share, identity, network and the AD join; this owns exactly the EDA slice. The
+# general rule: a dataset name lives with the app that MOUNTS it.
+#
+# ⚠ THE OTHER WRITER IS IN argocd-INFRA: deployment/argocd-infra/truenas/configure-job.yaml
+# owns datapool/{homes,shared/*,gitlab/mirror} plus identity, network and the AD join. This
+# app owns datapool/{eda/*,images}. Two ArgoCD instances therefore write to ONE appliance,
+# which is safe only while those sets stay DISJOINT — and the 20-per-60s auth budget is per
+# APPLIANCE, so both instances share it.
+#
+# ⚠ ONE app for the WHOLE EDA stack, not one per EDA module app. The appliance rate-limits
+# authentication at 20 per 60s and then locks out for TEN MINUTES cluster-wide, /home
+# included — and the EDA apps carry no sync-waves, so they sync concurrently. N per-app
+# provisioning jobs would be a real path to taking the fileserver down. One job = one auth.
+# It also keeps the appliance credential in ONE namespace, and keeps exactly one writer per
+# export path (nfs_export converges by path and takes rows[0], so two managers flap).
+#
+# ⚠ FORWARD-ONLY. Nothing here deletes a dataset, an export or a file. "Disabling this app
+# removes EDA provisioning" means it stops RE-ASSERTING — the data stays. See the manifest
+# header for what a teardown path would destroy.
+#
+# BEFORE FIRST DEPLOY:
+#   deployment/argocd-apps/eda/fileserver/sealSecrets.sh   (seal the scoped TrueNAS API key)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eda-fileserver
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: the appliance is on the lab LAN and unreachable from cloud — there is
+    # nothing to provision on a cloud-only restore.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/eda/fileserver
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: eda-fileserver
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # ⚠ RETRY FOREVER — this app CANNOT sync until a mesh node exists. The provisioning
+    # Job pins `nodeSelector ecc/fileserver-lan` (the appliance is only reachable from its
+    # own LAN), so on a recreate the pod is UNSCHEDULABLE until the lab nodes join. That is
+    # not a flake and it is not fast: the sync began 13:46 and the nodes joined
+    # 14:13 — 27 minutes later. ArgoCD's default 5 retries were spent by then, so the app
+    # sat Failed with an EMPTY namespace while reporting Healthy, and image-registry plus
+    # gitlab-runner-eda stayed blocked behind the failed PreSync hook until a human
+    # re-synced by hand. Assume up to an hour before the first mesh node appears.
+    #
+    # This is the same fix ollama/vllm/open-webui carry for the same class of bug (a PreSync
+    # hook racing bring-up on recreate). Costs nothing in steady state — only a FAILED sync
+    # retries.
+    #
+    # ⚠ THE OUTER LOOP IS THE RIGHT LEVER, not the Job's own budgets. Do not raise the Job's
+    # activeDeadlineSeconds (900s) to cover the wait: a pending PreSync hook holds the whole
+    # Application open and blocks the apps behind it. Do not raise its backoffLimit (1)
+    # either — that is deliberately low because a retry storm against the appliance's
+    # 20-auth/60s limit locks it out for TEN MINUTES cluster-wide, /home included.
+    #
+    # duration is 1m rather than the 30s those apps use, for that same lockout: an
+    # unschedulable pod never authenticates, so this particular race retries for free, but
+    # the same loop also covers failures that DO reach the appliance.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

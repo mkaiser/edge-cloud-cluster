@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: rallly
+spec:
+  encryptedData:
+    token: AgCEPBr/RIRxiepdUIF96NozUWIRGMhJ2iguCXCZiLBR/l3wm6rjqNWHFrDc0XixPaWDN0vsv12jAgK/yBCNupf+TjydlE2nmuBfvLD/QDJXCgueCJlWZKcbH0KJKCPylmg8zMHhjPuVimyT52Q5yjLbPGZgSht6O0TRmDAzMS5wWBQi5Qb4eP4Xw6/UU5Gr/mX+m2xeFRE/mttBW/YEffPvpZ4gVDq1xmQSX1OdglcSNm6gNGi8qwBsvFOL67oD3dk4BjOuaSAgawgP+rR/TVfx5CM3TX/yYXPym+b2UBKJT5DXQD71fJq51HXxhVqdZR0LTmnZhNT2vucdHuq8wy4e0kCxMnaD9zs2oMQ7ZkAE5bnAHmvdPMcXJ322h8ZlUPUPFtsoujMCpJWYEha0vDznwtfAMRTbq+J+oS3Wm8BXFpx+RBFOBBP59/sCNQX5l+tWNpKEMY8DEVdK7UCOZZKysPXSOweo12h+BsFjlJhyy93dBH6tKv4GsqiVO4E/j1UpZ5DESv28x8FluiS01hSo2mgixPfmnNwPnOxGaJR38a0a2w+ZJxRDkHtThRItuRB+3MWFo96S5gvCLI8dSXwvwP48S0hMW7oZ+83oYCjQoirq9kr4KYNgAePw80lPH/xTvLn0Tlda2CsFh9Dk3ML8P5DmkvIY9Je5ENOeHwsIqceJMEAESmgJpyuipeFgZq5jYlS0n7vcCAi4pW8D+OTsR987SMdXb0LC4YvnewhWEBojtK8jxdljm6utH9P0Dtgy0UJTPr18NqkKmWNx3VWZg87kQ2qzujrDbyWWb2Q8PwRQJnwzP4Fa/B4Tdzrx7Yh3BWO76DdTI1HvBXh1OQjTYmTcU1+N2bk=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: rallly

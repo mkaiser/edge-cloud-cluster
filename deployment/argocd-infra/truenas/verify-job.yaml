@@ -1,0 +1,350 @@
+# ArgoCD Sync hook: ASSERT the fileserver is in the intended state, and FAIL if it is not.
+#
+# WHY THIS EXISTS SEPARATELY FROM configure-job.yaml. The appliance is not a Kubernetes
+# resource, so ArgoCD diffs the Job and reports Synced regardless of what the box actually
+# looks like. configure-job converges it and exits 0; that is not evidence. Without a
+# separate assertion, appliance drift — someone changing a share in the GUI, a failed AD
+# rejoin, an idmap that stopped resolving — is SILENT, with every app green.
+#
+# This Job turns that into a visible Degraded application, and it is deliberately runnable
+# on its own: it is the thing to run to answer "is the box in the state we think it is?".
+#
+# ⚠ IT ASSERTS, IT NEVER FIXES. Repair belongs in configure-job, where it is idempotent and
+# ordered. A verifier that quietly repairs hides the very drift it exists to surface.
+#
+# Runs at sync-wave 2, i.e. AFTER configure-job (wave 1), so a fresh bring-up converges and
+# then checks. Same lab placement and mesh toleration — the appliance is only reachable from
+# there, and without the toleration this would sit Pending forever rather than failing.
+#
+# ⚠ ONE websocket, ONE auth, same as configure-job: 20 auth attempts per 60s trips a
+# TEN-MINUTE lockout, so a verifier that reconnected per check could lock out the appliance
+# it is verifying. backoffLimit 1 for the same reason.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truenas-verify-src
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+data:
+  verify.py: |
+    """Assert the fileserver gates. Exits non-zero on the first failed one."""
+    import os, sys
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    HOST      = os.environ["TN_HOST"]
+    USER      = os.environ["TN_USER"]
+    PASSWORD  = os.environ["TN_PASS"]
+    HOSTNAME  = os.environ["FS_HOSTNAME"]
+    AD_DOMAIN = os.environ["AD_DOMAIN"]
+    AD_REALM  = os.environ["AD_REALM"]
+    NETBIOS   = os.environ["AD_NETBIOS"]
+    ENDPOINT  = os.environ["FS_ENDPOINT"]
+    LAB_CIDR  = os.environ["LAB_CIDR"]
+    HOMES     = os.environ["DS_HOMES"]
+    SHARED_PARENT = os.environ["DS_SHARED_PARENT"]  # grouping only — asserted NOT exported
+    SHARED    = os.environ["DS_SHARED"]
+    SHARED_TMP = os.environ["DS_SHARED_TMP"]
+    # ⚠ The EDA datasets are NOT verified here — they moved to
+    # deployment/argocd-apps/eda/fileserver along with their provisioning, and are
+    # verified by that app's own gates. This job covers infra-owned storage only.
+    UID_BASE  = int(os.environ["UID_START"])
+    # ⚠ DERIVED, not declared — same source as configure-job.yaml's step_homes. A hardcoded
+    # list here silently stops verifying any user it does not name: eda-pcb-agent had a real
+    # home on the appliance (uid 5021) that this gate never looked at, so a wrong mode or
+    # owner on it would have passed. HOME_USERS stays supported as a manual override.
+    USERS     = [u for u in os.environ.get("HOME_USERS", "").replace(",", " ").split() if u]
+    if not USERS:
+        _listed = os.environ.get("HOME_USERS_FILE", "")
+        if _listed and os.path.exists(_listed):
+            with open(_listed) as _fh:
+                USERS = [u for u in _fh.read().replace(",", " ").split() if u]
+
+    failures = []
+
+    def check(label, ok, detail=""):
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f" — {detail}" if detail else ""))
+        if not ok:
+            failures.append(label)
+        return ok
+
+    def main():
+        with TrueNAS(HOST, USER, PASSWORD) as tn:
+            print("gate 1: identity")
+            net = tn.rpc("network.configuration.config")
+            smb = tn.rpc("smb.config")
+            check("hostname is " + HOSTNAME, net.get("hostname") == HOSTNAME,
+                  f"got {net.get('hostname')!r}")
+            # ⚠ The NetBIOS name and the Network hostname MUST be the same string: SMB
+            # clients strictly validate Kerberos SPNs, so a mismatch does not fail at join,
+            # it fails later at mount time as a Kerberos error that reads like permissions.
+            check("smb netbiosname matches hostname",
+                  smb.get("netbiosname") == HOSTNAME, f"got {smb.get('netbiosname')!r}")
+            check("smb workgroup is " + NETBIOS.upper(),
+                  (smb.get("workgroup") or "").upper() == NETBIOS.upper(),
+                  f"got {smb.get('workgroup')!r}")
+
+            # ⚠ THE COMMITTED LITERALS vs THE LIVE BOX. fileserver.endpoint and
+            # fileserver.labCidr are hand-maintained in project_settings.ts and baked into
+            # manifests at commit time, so nothing would otherwise notice if the appliance's
+            # address changed under them. They CANNOT be derived instead:
+            #   - endpoint is what CREATES the fs-1 A record (samba-ad/replication-job.yaml
+            #     FS_IP), so deriving it from DNS is circular; it is also the escape hatch
+            #     from split-horizon, since the AD zone publishes the DC's mesh address and
+            #     this appliance has no tailscale.
+            #   - labCidr is an export ALLOW-LIST, not an address. It matches endpoint's /24
+            #     today by coincidence — the box's own address does not say which subnet
+            #     ought to be permitted to mount it.
+            # And they are needed BEFORE any of this exists: the manifest generator runs
+            # offline, before `make bootstrap`, when neither the cluster nor DNS is up.
+            # So: keep them literal, and check them HERE, where a cluster does exist.
+            ifaces = tn.rpc("interface.query") or []
+            addrs = {}
+            for i in ifaces:
+                for a in (i.get("state") or {}).get("aliases") or []:
+                    if a.get("type") == "INET" and a.get("address"):
+                        addrs[a["address"]] = a.get("netmask")
+            check(f"appliance still has {ENDPOINT}", ENDPOINT in addrs,
+                  f"live INET addresses: {sorted(addrs) or 'none'} — update "
+                  f"project_settings fileserver.endpoint, or the fs-1 A record will be wrong")
+            if ENDPOINT in addrs and addrs[ENDPOINT] is not None:
+                import ipaddress
+                live_net = str(ipaddress.ip_network(f"{ENDPOINT}/{addrs[ENDPOINT]}",
+                                                    strict=False))
+                # A WARNING, not a failure: labCidr is an allow-list and MAY legitimately be
+                # narrower or wider than the interface's own subnet. Divergence is worth
+                # seeing, but it is not by itself wrong.
+                if live_net != LAB_CIDR:
+                    print(f"  NOTE   labCidr is {LAB_CIDR} while {ENDPOINT} sits on "
+                          f"{live_net} — intended only if the export allow-list is "
+                          f"deliberately not the interface subnet")
+                else:
+                    print(f"  PASS  labCidr {LAB_CIDR} matches the {ENDPOINT} subnet")
+
+            print("gate 2: active directory")
+            st = tn.rpc("directoryservices.status") or {}
+            check("directory service is ACTIVEDIRECTORY",
+                  st.get("type") == "ACTIVEDIRECTORY", f"got {st.get('type')!r}")
+            check("directory status HEALTHY", st.get("status") == "HEALTHY",
+                  f"got {st.get('status')!r} {st.get('status_msg') or ''}")
+            cfg = tn.rpc("directoryservices.config") or {}
+            c = cfg.get("configuration") or {}
+            check("joined domain is " + AD_REALM,
+                  (c.get("domain") or "").upper() == AD_REALM.upper(),
+                  f"got {c.get('domain')!r}")
+            # ⚠ idmap backend AD, NOT the 25.10 default RID. RID hashes SIDs into a range
+            # and would hand out uids unrelated to what AD carries, so every file would land
+            # owned by the wrong user. This gate is the one that catches a silent re-join
+            # having reverted it.
+            idm = (c.get("idmap") or {}).get("idmap_domain") or {}
+            check("idmap backend is AD", idm.get("idmap_backend") == "AD",
+                  f"got {idm.get('idmap_backend')!r}")
+            check("idmap schema_mode is RFC2307", idm.get("schema_mode") == "RFC2307",
+                  f"got {idm.get('schema_mode')!r}")
+
+            print("gate 3: uid coherence (THE gate that guards user data)")
+            # ⚠ This is the gate the plan insists on before any data moves: the appliance and
+            # the pods must agree on a user's uid. It is checked through NSS, not the cache,
+            # because NSS is what the filesystem actually uses.
+            #
+            # ⚠ Domain-qualified (AD\user): with use_default_domain False — the default, and
+            # correct for a single-domain member — NSS answers only that form.
+            #
+            # ⚠ Also note what a FAILURE here usually means, because the symptom points
+            # elsewhere: if EVERY user fails to resolve while the join is HEALTHY, the likely
+            # cause is Domain Users missing a gidNumber. idmap_ad requires the user's PRIMARY
+            # group to be mapped too, and samba's provision does not set it. See
+            # samba-ad/postsync-provision-users.yaml step 2b.
+            for user in USERS:
+                q = f"{NETBIOS.upper()}\\{user}"
+                try:
+                    obj = tn.rpc("user.get_user_obj", [{"username": q}])
+                except Exception as exc:
+                    check(f"{q} resolves via NSS", False, str(exc)[:80])
+                    continue
+                uid = obj.get("pw_uid")
+                check(f"{q} resolves via NSS", True, f"uid={uid} gid={obj.get('pw_gid')}")
+                # A uid below the idmap floor means it came from somewhere else entirely
+                # (a local account, or RID mapping) — not the directory.
+                check(f"{q} uid >= {UID_BASE} (came from the directory)",
+                      isinstance(uid, int) and uid >= UID_BASE, f"uid={uid}")
+
+            print("gate 4: export and shares")
+            path = "/mnt/" + HOMES
+            # This job owns homes + the two shared children — the three EDA exports are
+            # verified by eda/fileserver.
+            for label, dataset in (("nfs-homes", HOMES),
+                                   ("nfs-shared-data", SHARED),
+                                   ("nfs-shared-tmp", SHARED_TMP)):
+                p = "/mnt/" + dataset
+                nfs = tn.rpc("sharing.nfs.query", [[["path", "=", p]]])
+                check(f"NFS export exists on {p}", bool(nfs))
+                if not nfs:
+                    continue
+                e = nfs[0]
+                check(f"NFS export {label} enabled", bool(e.get("enabled")))
+                # ⚠ read-write matters for artifacts too — the media copy Job and the
+                # container-archive write both go through this export.
+                check(f"NFS export {label} is read-write", not e.get("ro"))
+                # ⚠ Without maproot the csi-driver-nfs provisioner cannot mkdir a
+                # subdirectory and EVERY PVC stays Pending with a message that reads like a
+                # node-side filesystem error.
+                check(f"NFS {label} maproot_user is root", e.get("maproot_user") == "root",
+                      f"got {e.get('maproot_user')!r}")
+                # An export open to the world would be a real exposure, since maproot is on.
+                check(f"NFS export {label} is network-restricted", bool(e.get("networks")),
+                      f"networks={e.get('networks')}")
+            # ⚠ The grouping parent must NOT be exported. Exporting datapool/shared would
+            # serve both children through one path, and an NFS export covers ONE dataset
+            # and not its children — so /shared/tmp would read EMPTY on the client while
+            # looking mounted. Mirrors the datapool/eda check in eda/fileserver.
+            parent_nfs = tn.rpc("sharing.nfs.query", [[["path", "=", "/mnt/" + SHARED_PARENT]]])
+            check(f"parent {SHARED_PARENT} is NOT exported", not parent_nfs,
+                  f"found export id={parent_nfs[0].get('id') if parent_nfs else None}")
+            nfscfg = tn.rpc("nfs.config") or {}
+            check("NFSv4 enabled", "NFSV4" in (nfscfg.get("protocols") or []),
+                  f"protocols={nfscfg.get('protocols')}")
+            # ⚠ A mismatched NFSv4 domain maps every uid to nobody, which presents as a
+            # permissions bug rather than a configuration one.
+            check("NFSv4 domain is " + AD_DOMAIN, nfscfg.get("v4_domain") == AD_DOMAIN,
+                  f"got {nfscfg.get('v4_domain')!r}")
+            for svc in ("nfs", "cifs"):
+                rows = tn.rpc("service.query", [[["service", "=", svc]]])
+                cur = rows[0] if rows else {}
+                check(f"service {svc} enabled", bool(cur.get("enable")))
+                check(f"service {svc} running", cur.get("state") == "RUNNING",
+                      f"state={cur.get('state')}")
+
+            print("gate 5: dataset and homes")
+            for dataset in (HOMES, SHARED_PARENT, SHARED, SHARED_TMP):
+                ds = tn.rpc("pool.dataset.query", [[["name", "=", dataset]]])
+                if not check("dataset " + dataset + " exists", bool(ds)):
+                    continue
+                # ⚠ acltype is CREATE-TIME. If this ever reads POSIX the dataset was made
+                # wrong and must be recreated — POSIX ACLs break SMB semantics on TrueNAS.
+                check(f"dataset {dataset} acltype is NFSV4",
+                      (ds[0].get("acltype") or {}).get("value") == "NFSV4",
+                      f"got {(ds[0].get('acltype') or {}).get('value')!r}")
+            listing = {e.get("name") for e in (tn.rpc("filesystem.listdir", [path]) or [])}
+            for user in USERS:
+                if not check(f"home for {user} exists", user in listing):
+                    continue
+                stt = tn.rpc("filesystem.stat", [f"{path}/{user}"])
+                # 0o700 == 448; stat mode carries the file type bits too.
+                mode = stt.get("mode", 0) & 0o777
+                check(f"home for {user} is mode 0700", mode == 0o700, f"got {oct(mode)}")
+                check(f"home for {user} is not root-owned", stt.get("uid") != 0,
+                      f"uid={stt.get('uid')}")
+
+        print()
+        if failures:
+            print(f"VERIFY FAILED — {len(failures)} gate(s):", file=sys.stderr)
+            for f in failures:
+                print(f"  - {f}", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("The appliance is NOT in the state this repo declares. ArgoCD would "
+                  "otherwise report Synced regardless — that is why this Job exists.",
+                  file=sys.stderr)
+            sys.exit(1)
+        print("ALL GATES PASSED — the fileserver is in the declared state")
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: truenas-verify
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # ⚠ 1, not 5. A retry spends auth attempts against the 20-per-60s limit that triggers a
+  # ten-minute lockout — a verifier must never be the thing that takes the appliance out.
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      # The appliance is reachable only from the lab LAN; see configure-job.yaml's header.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: verify
+          image: docker.io/library/python:3.14-slim # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "/verify/verify.py"]
+          env:
+            - name: TN_HOST
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: FS_HOSTNAME
+              value: "fs-1" # automatically updated from project-settings:storage.fileserver.hostname
+            # Checked against the live box by gate 1 — see the note there for why these
+            # stay literal instead of being derived.
+            - name: FS_ENDPOINT
+              value: "192.168.1.237" # automatically updated from project-settings:storage.fileserver.endpoint
+            - name: LAB_CIDR
+              value: "192.168.1.0/24" # automatically updated from project-settings:storage.fileserver.labCidr
+            - name: DS_HOMES
+              value: "datapool/homes" # automatically updated from project-settings:storage.fileserver.datasets.homes.dataset
+            - name: DS_SHARED_PARENT
+              value: "datapool/shared" # automatically updated from project-settings:storage.fileserver.datasets.shared.parent
+            - name: DS_SHARED
+              value: "datapool/shared/data" # automatically updated from project-settings:storage.fileserver.datasets.shared.dataset
+            - name: DS_SHARED_TMP
+              value: "datapool/shared/tmp" # automatically updated from project-settings:storage.fileserver.datasets.shared.tmpDataset
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            - name: AD_NETBIOS
+              value: "ad"
+            - name: UID_START
+              value: "5000" # automatically updated from project-settings:activeDirectory.uidStartNumber
+            # ⚠ EMPTY BY DESIGN, exactly like configure-job.yaml's HOME_USERS: the list is
+            # DERIVED from the mounted truenas-home-users ConfigMap below, so this gate
+            # verifies every home that Job actually creates. Set this only to override the
+            # derived list for a one-off manual run.
+            - name: HOME_USERS
+              value: ""
+            - name: HOME_USERS_FILE
+              value: /home-users/users
+            - name: TN_USER
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER }
+            - name: TN_PASS
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD }
+          volumeMounts:
+            - { name: verify, mountPath: /verify }
+            # The websocket client lives in configure-job's ConfigMap; both Jobs use it, so
+            # it is not duplicated here.
+            - { name: src, mountPath: /src }
+            - { name: home-users, mountPath: /home-users, readOnly: true }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: verify
+          configMap: { name: truenas-verify-src }
+        - name: src
+          configMap: { name: truenas-configure-src }
+        # Republished on every sync by samba-ad/postsync-provision-users.yaml. `optional`
+        # matches configure-job.yaml: on a first bring-up it may not exist yet, and the
+        # code below falls back to verifying no homes rather than failing on a mount.
+        - name: home-users
+          configMap:
+            name: truenas-home-users
+            optional: true

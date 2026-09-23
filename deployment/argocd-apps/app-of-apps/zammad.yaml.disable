@@ -1,0 +1,82 @@
+# ArgoCD Application: Zammad (official zammad Helm chart).
+# Accessible at https://zammad.subdomain.domain.tld
+# OIDC via Authentik — a PUBLIC client with PKCE (no client secret), which is a
+# deliberate deviation from the other apps here; see zammad/NOTES.md.
+#
+# Every chart subchart is DISABLED. Backing services are ours:
+#   postgres      -> zammad/postgres.yaml (CNPG, barman S3 PITR)
+#   redis/memcached/elasticsearch -> zammad/datastores.yaml
+#   minio         -> not used; attachments go to Hetzner S3
+# Upstream's minio subchart is still on bitnamilegacy images
+# (https://github.com/zammad/zammad-helm/issues/353), which is exactly what this
+# avoids.
+#
+# ⚠ CHART 18 REPLACED the bundled elasticsearch subchart with `eck-elasticsearch`,
+# which REQUIRES the ECK operator + its CRDs installed cluster-wide as a
+# prerequisite. This cluster has NO elastic CRDs. That does not block us — every
+# subchart is disabled here and Elasticsearch comes from zammad/datastores.yaml —
+# but verify `zammadConfig.elasticsearch.enabled: false` still wins before
+# re-enabling this app, and do not turn the bundled one on without the operator.
+#
+# Multi-source:
+#   1. Helm chart (zammad)
+#   2. ref source for $values
+#   3. Git directory for our postgres/datastores/route/jobs + sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: zammad
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://zammad.github.io/zammad-helm
+      chart: zammad
+      targetRevision: "18.2.1" # renovate: datasource=helm depName=zammad registryUrl=https://zammad.github.io/zammad-helm
+      helm:
+        releaseName: zammad
+        valueFiles:
+          - $values/deployment/argocd-apps/zammad/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/zammad
+      directory:
+        exclude: "{values.yaml,*.sh,*.md}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: zammad
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    # The chart itself ships only Deployments, but our redis + elasticsearch in
+    # datastores.yaml are StatefulSets: k8s mutates immutable volumeClaimTemplates
+    # with defaults ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

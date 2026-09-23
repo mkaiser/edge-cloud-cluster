@@ -1,0 +1,52 @@
+# ArgoCD Application: Stakater Reloader.
+#
+# Closes the one gap ArgoCD leaves open by design: it reconciles a ConfigMap/Secret but
+# does NOT restart the pods mounting it. Anything that reads its config only at startup
+# then serves stale content while the app shows Synced/Healthy — measured on litellm
+# (a new model route absent until a manual `rollout restart`) and documented as a
+# "you must run this by hand" note on gitlab-s3-proxy.
+#
+# Before this app the repo carried three separate hand-rolled substitutes: a committed
+# sha256 of config.yaml stamped into litellm's pod template (plus a pre-commit staleness
+# check), a shell checksum block in headscale's args-patch Job, and a comment telling
+# humans to run kubectl. Reloader replaces all of them with one annotation per workload:
+#   reloader.stakater.com/auto: "true"
+#
+# Values (incl. WHY reloadStrategy must be `annotations` under ArgoCD):
+# deployment/argocd-infra/reloader/values.yaml
+#
+# Wave 2 — a cluster-generic controller with no dependencies beyond the API server,
+# alongside the other wave-2 platform controllers. Gated by the wave-3 barrier like every
+# wave-2 app. It needs no ordering relative to the workloads that opt in: an annotation on
+# a workload Reloader has not seen yet is simply inert until it starts watching.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: reloader
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  sources:
+    - repoURL: https://stakater.github.io/stakater-charts
+      chart: reloader
+      targetRevision: "2.2.17"  # renovate: tracked by "ArgoCD Helm Application targetRevision" regex (helm datasource)
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/reloader/values.yaml
+
+    # ref source so valueFiles ($values) resolve from the git repo
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: reloader
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

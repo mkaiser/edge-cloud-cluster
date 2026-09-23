@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: rallly-pg-user
+  namespace: rallly
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: AgCG7I83JHapMlRD9nJfMdXWnKh/XJRVDsaLNclkHrW9RoNPnU8k8T1JZP4/dIFdT5XQIo5bHP9DMqw/d6I4YWmnnHZVXgRNQw/kOZm6fTtaqiDalQSj/4E+f/xRiaNWk0xzw1+YLJegAVu8TZ9Is+d0kOxIN+6VFa/17cTXvrhMKKY+uwAEW2ciN0CdOnAfBGZ/iCwN5Lu2FP5v8snEYXEJwvzTXlul4+PvZOr3UGhH02XGS8Tv+DfQulNM5rAeBRiwlONemJ0s6Q/P7cVtGpX5on/LOv1D2MH5HMk3JNuGf2X7J9g+ARe+uCdyhNV8Qby4t9YS7Lwx2vEVdMQmsuS9ZTUJjfU6yxs4UiXtO/uada2XYeg5hfSqEJRitDJ67vUpnKOQLiGwDF6Er7Jq/FtLRrQ1ehAWWaMyDzC5Y0h++JshAOc/QvwEDVNuwuN7BYoyDhCHM6i56E03b6njvO6WgaE+vcbAqb5YbJmHRMD1bishkVLPB+pGYApePPBj2VVRbjfe1nwZ9viq6sjtaAy/OGXYtGvhkXqLZL/Fhv/TpOrNFNx0OPtbI/qzXZ+/uP5Zlln8OLyWXjOZgMTaToTX3A97w86BCHrDkMx3WZW9OKr8ldPExspV+R1kJPCqv1gTnDB7briBQPmvn2rPoox4q8Z2Sb0EfsJhQ1SosN2J8+pQ9gvLm2l7W3tiRZXxOG0ii9yOhQQrW/AJA1u8O1Cnj6Y/b1XcjzApvbZ7gVyW2r2pOt0s3WHY5JOEWFiQNLI=
+    username: ""
+  template:
+    metadata:
+      name: rallly-pg-user
+      namespace: rallly

@@ -23,42 +23,51 @@ const BACKUP_REGION = longhornBucket.location;
 const LONGHORN_PORT = 8091;
 
 // Namespaces whose volumes are NOT restored at cloud-cluster creation: only apps
-// tagged placement.ecc/tier: edge (e.g. windows) — their data lives on edge
-// disks (longhorn-edge), so there's nothing to restore onto the cloud plane.
+// tagged placement.ecc/tier: mesh — their data lives on mesh-node disks
+// (longhorn-<scope>), so there's nothing to restore onto the cloud plane.
 //
 // IMPORTANT: `flex`-tier apps are deliberately NOT skipped here. They are still
 // cloud-resident on longhorn-cloud (their SeaweedFS/CNPG mobility migration is
 // deferred), so their data MUST be restored to cloud. Once a `flex` app actually
 // moves off cloud, its data lives in SeaweedFS/CNPG and it has no cloud Longhorn
-// backup to restore anyway, so this stays correct.
+// backup to restore anyway, so this stays correct. (The windows VM is `flex` now —
+// KVM-anywhere — so it is restored to cloud while pinned to longhorn-cloud.)
 //
 // Scanned from git manifests because the apps aren't synced yet when restore runs.
 function deferredNamespacesFromManifests(): string[] {
-    const dir = path.join(__dirname, "..", "deployment", "argocd-sync-waves");
+    // Mesh-tier apps now live under argocd-apps/app-of-apps/ (managed by the apps ArgoCD);
+    // infra Applications stay under argocd-infra/app-of-apps/. Scan both so
+    // any mesh-tier manifest in either tree is picked up.
+    const dirs = [
+        path.join(__dirname, "..", "deployment", "argocd-infra", "app-of-apps"),
+        path.join(__dirname, "..", "deployment", "argocd-apps", "app-of-apps"),
+    ];
     const out = new Set<string>();
-    let files: string[];
-    try {
-        files = fs.readdirSync(dir).filter((f) => f.endsWith(".yaml"));
-    } catch {
-        return [];
-    }
-    for (const f of files) {
-        const txt = fs.readFileSync(path.join(dir, f), "utf8");
-        const tierM = txt.match(/placement\.cape\.io\/tier:\s*["']?(\w+)["']?/);
-        // Only edge-tier apps are off-cloud; flex/cloud volumes restore to cloud.
-        if (!tierM || tierM[1] !== "edge") continue;
-        // destination.namespace = the namespace value that isn't the ArgoCD ns
-        const nsAll = [...txt.matchAll(/^\s*namespace:\s*["']?([\w-]+)["']?\s*$/gm)].map(
-            (m) => m[1],
-        );
-        const ns = nsAll.find((n) => n !== "argocd");
-        if (ns) out.add(ns);
+    for (const dir of dirs) {
+        let files: string[];
+        try {
+            files = fs.readdirSync(dir).filter((f) => f.endsWith(".yaml"));
+        } catch {
+            continue;
+        }
+        for (const f of files) {
+            const txt = fs.readFileSync(path.join(dir, f), "utf8");
+            const tierM = txt.match(/placement\.ecc\/tier:\s*["']?(\w+)["']?/);
+            // Only mesh-tier apps are off-cloud; flex/cloud volumes restore to cloud.
+            if (!tierM || tierM[1] !== "mesh") continue;
+            // destination.namespace = the namespace value that isn't an ArgoCD ns
+            const nsAll = [...txt.matchAll(/^\s*namespace:\s*["']?([\w-]+)["']?\s*$/gm)].map(
+                (m) => m[1],
+            );
+            const ns = nsAll.find((n) => n !== "argocd-infra" && n !== "argocd-apps");
+            if (ns) out.add(ns);
+        }
     }
     return [...out];
 }
 const DEFERRED_NAMESPACES = deferredNamespacesFromManifests();
 
-// Runs during `pulumi up` when restoreClusterFromS3Backup=true.
+// Runs during `pulumi up` when general.targetState is "restore".
 // Port-forwards the Longhorn API, waits for the backup target, then restores
 // every volume that has a backup in S3 but no healthy replicas on the new cluster.
 export interface LonghornRestoreArgs {
@@ -128,7 +137,7 @@ export class LonghornRestoreComponent extends pulumi.ComponentResource {
                     ``,
                     `port, bucket, region = sys.argv[1], sys.argv[2], sys.argv[3]`,
                     `base = f"http://localhost:{port}/v1"`,
-                    `# Namespaces tagged tier flex|edge — their volumes are NOT restored to cloud.`,
+                    `# Namespaces tagged tier mesh — their volumes are NOT restored to cloud.`,
                     `deferred = set(json.loads(os.environ.get("DEFERRED_NAMESPACES", "[]")))`,
                     `print(f"Deferred (non-cloud) namespaces: {sorted(deferred) or 'none'}")`,
                     ``,

@@ -1,0 +1,115 @@
+# The desktop's COMMON area: /shared (curated tooling) and /shared/tmp (scratch).
+#
+# Two PV/PVC pairs, not one, because these are two TrueNAS datasets — the children of
+# datapool/shared, see project_settings.ts `shared`. An NFS export covers ONE dataset and
+# not its children, so a single export of the parent would show an EMPTY /shared/tmp on the
+# client: the mountpoint would render the parent's directory entry, not the child dataset
+# behind it. That is also why datapool/shared itself is NOT exported — it is a grouping
+# parent only, exactly like datapool/eda. The split carries their differing policies too
+# (tmp is world-writable, capped by a 1T ZFS quota, and must not accumulate snapshots).
+#
+# ⚠ THE SAME STATIC-PV RULES AS homes-pv.yaml APPLY HERE, for the same reasons:
+#   • storageClassName is EMPTY STRING — naming a class would make the provisioner carve
+#     a per-PVC subdirectory (defeating "mount the export root"), and omitting the field
+#     lets the default class claim it.
+#   • mountOptions are REPEATED, not inherited — a static PV does not pick up a class's
+#     options, and nfsvers matters most: the export still offers NFSv3, and a client left
+#     to negotiate could land on v3, which has no real id mapping and squashes every uid
+#     to nobody.
+#   • reclaimPolicy Retain — Delete would let the CSI driver remove shared data when a
+#     claim goes away.
+#   • `server:` only takes effect on a FRESH cluster (a PV's source is immutable), which
+#     is why it carries the project-settings marker but changes there are not retroactive.
+#
+# Permissions are set on the APPLIANCE, not here (truenas/configure-job.yaml step 5):
+# /shared 0755 root, /shared/tools 0755 root, /shared/tmp 1777 root (sticky).
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-shared-data
+  labels:
+    ecc/volume: nfs-shared-data
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size. Real limits are ZFS-side.
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: fs-1-datapool-shared-data
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/shared/data # automatically updated from project-settings:storage.fileserver.datasets.shared.dataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-shared-data
+  namespace: remote-desktop
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 100Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-shared-data
+---
+# Scratch. Capacity below is NOMINAL and enforces nothing — the real cap is the 1T ZFS
+# quota on datapool/shared/tmp (project_settings.ts shared.tmpQuota). Kubernetes cannot
+# enforce a size on a static NFS PV; do not treat this number as a limit.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-shared-tmp
+  labels:
+    ecc/volume: nfs-shared-tmp
+spec:
+  capacity:
+    storage: 1Ti
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: fs-1-datapool-shared-tmp
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/shared/tmp # automatically updated from project-settings:storage.fileserver.datasets.shared.tmpDataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-shared-tmp
+  namespace: remote-desktop
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 1Ti
+  selector:
+    matchLabels:
+      ecc/volume: nfs-shared-tmp

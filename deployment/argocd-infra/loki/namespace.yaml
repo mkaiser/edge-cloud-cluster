@@ -1,0 +1,16 @@
+# The `loki` namespace has to be created by THIS app, explicitly.
+#
+# CreateNamespace=true on the parent (wave14-loki.yaml) creates that app's OWN
+# destination namespace, which is argocd-infra — not `loki`. And the child
+# Application's CreateNamespace=true fires only when the child itself syncs,
+# which is too late: the sealed secret and the S3 bucket Job in this same
+# directory are applied by the parent and land in `loki` first, failing with
+# `namespaces "loki" not found`.
+#
+# Sync-wave -2 so it precedes the sealed secret and the bucket Job (wave -1).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: loki
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"

@@ -1,0 +1,95 @@
+# descheduler Helm values (chart 0.36.0).
+#
+# Runs as a CronJob that periodically EVICTS pods violating their PREFERRED node
+# affinity, so the default scheduler can reschedule them onto a now-available
+# preferred node. This is what makes the GitLab registry's soft "prefer the lab site"
+# affinity actually MIGRATE a cloud-bootstrapped replica to a mesh node after the
+# mesh nodes join (k8s never moves a running pod on its own). See
+# deployment/argocd-apps/gitlab/values.yaml `registry:`.
+
+# CronJob (not a always-on Deployment) — a periodic sweep is enough for the
+# "migrate to mesh once available" use case and costs nothing between runs.
+kind: CronJob
+# Every 15 min: fast enough that a freshly-joined mesh node reclaims a registry
+# replica within a quarter hour of a cluster rebuild, without churning the cluster.
+schedule: "*/15 * * * *"
+# Don't stack runs if one is slow.
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+
+deschedulerPolicy:
+  profiles:
+    - name: default
+      pluginConfig:
+        # THE plugin we need: evict pods whose node no longer matches (or never
+        # matched) their PREFERRED node affinity, so they move toward a preferred node.
+        - name: RemovePodsViolatingNodeAffinity
+          args:
+            nodeAffinityType:
+              # Only the SOFT kind — this is exactly the registry's "prefer the lab site"
+              # case. (requiredDuringScheduling would already keep pods off wrong nodes.)
+              - preferredDuringSchedulingIgnoredDuringExecution
+        # Relieves CPU/memory pressure on an over-utilized node by evicting pods off
+        # it so the scheduler can place them on an under-utilized one. NOT the same
+        # problem as RemovePodsViolatingNodeAffinity above: that plugin only moves a
+        # pod that already DECLARES a preference; this one reacts to actual load and
+        # needs no affinity on the pod at all. This is what would have relieved
+        # edgecloudinfra-dedicated0 automatically during the 2026-09-01 Ryax bootstrap
+        # instead of a manual `kubectl patch` — action-builder sat FailedScheduling at
+        # 94% node CPU requests until pinned to a lab node by hand.
+        #
+        # ⚠ Named the OPPOSITE of what it sounds like: LowNodeUtilization is the plugin
+        # that empties an OVER-utilized (i.e. "high") node by targeting nodes BELOW
+        # thresholds as eviction destinations — read it as "spread load toward the low
+        # nodes", not "act on low nodes". HighNodeUtilization does the reverse
+        # (consolidate onto fewer, fuller nodes for cluster-autoscaler scale-down) and
+        # is the wrong plugin for this cluster, which never scales node count down.
+        - name: LowNodeUtilization
+          args:
+            # Only the single control-plane/cloud node can be "over-utilized" here in
+            # practice — mesh nodes have their own separate capacity and this is not
+            # meant to shuffle pods AMONG mesh nodes. thresholds/targetThresholds apply
+            # cluster-wide, so keep both bands wide: a node under 30% requested is a
+            # valid eviction target, a node over 80% is over-utilized and sheds pods.
+            thresholds:
+              cpu: 30
+              memory: 30
+            targetThresholds:
+              cpu: 80
+              memory: 80
+        # Safety rails so eviction can't cause an outage:
+        - name: DefaultEvictor
+          args:
+            # Never evict the last replica / violate PDBs / evict system-critical pods.
+            evictSystemCriticalPods: false
+            evictLocalStoragePods: false
+            ignorePvcPods: false
+            # Respect PodDisruptionBudgets (the registry has 2 replicas; the evictor
+            # will not take both down at once).
+            nodeFit: true   # only evict if the pod can actually be rescheduled somewhere better
+      plugins:
+        # RemovePodsViolatingNodeAffinity is a DESCHEDULE plugin (evaluates each pod
+        # independently against a rule) — must be enabled here or the CronJob no-ops.
+        deschedule:
+          enabled:
+            - RemovePodsViolatingNodeAffinity
+        # LowNodeUtilization is a BALANCE plugin (considers the whole cluster's
+        # utilization distribution, not a single pod's rule) — enabling it under
+        # `deschedule` instead silently no-ops. Confirmed against the chart's own
+        # `helm show values` example, which lists it under `balance`.
+        balance:
+          enabled:
+            - LowNodeUtilization
+        # DefaultEvictor is wired via pluginConfig above; it is the default filter.
+
+# Modest footprint — a short-lived CronJob pod.
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+# The descheduler itself should run on the cloud control-plane (stable, always up),
+# not chase mesh nodes.
+priorityClassName: ""

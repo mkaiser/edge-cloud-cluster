@@ -1,0 +1,32 @@
+# Serve config for the agent workstation's tailscale sidecar (deployment.yaml).
+#
+# This is the USERSPACE equivalent of TS_DEST_IP. The sidecar runs TS_USERSPACE=true, and
+# containerboot hard-errors "TS_DEST_IP is not supported with TS_USERSPACE"
+# (cmd/containerboot/settings.go), so inbound forwarding is expressed here instead.
+#
+# TCPForward targets localhost because the sidecar shares the pod's network namespace with
+# the desktop container — no Service is involved.
+#
+#   3389 -> localhost:3389   RDP (xrdp, the ONE shared agent session)
+#
+# ⚠ ONLY 3389, unlike remote-desktop which also forwards 22. This image runs no sshd, and
+# adding a port here that nothing listens on would present a mesh client with a connection
+# that opens and then dies — worse than a refused one.
+#
+# ⚠ THIS IS A SECOND DOOR TO A SHARED, ROOT-CAPABLE ACCOUNT. Guacamole (the other door) is
+# gated by Authentik SSO; this one is gated by the mesh ACL plus the AD password, which is
+# NOT the same thing. It is deliberate — a native RDP client is the point — but if the
+# exposure ever needs narrowing, do it in headscale's policy with a tag of this app's own
+# rather than by deleting this file: see the sidecar comment in deployment.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-pcb-agent-tailscale-serve
+  namespace: eda-pcb-agent
+data:
+  serve.json: |
+    {
+      "TCP": {
+        "3389": { "TCPForward": "localhost:3389" }
+      }
+    }

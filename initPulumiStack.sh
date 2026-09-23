@@ -1,1 +1,0 @@
-scripts/pulumi/initPulumiStack.sh

@@ -1,0 +1,118 @@
+# The lab-pinned half of GitLab's on-prem artifact storage. See README.md.
+#
+# nginx reads its config ONCE, at startup, and ArgoCD does not restart pods when a
+# ConfigMap changes — so the Deployment carries reloader.stakater.com/auto and an edit to
+# configmap.yaml rolls the pod by itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab-s3-proxy
+  namespace: gitlab-s3-proxy
+  annotations:
+    # nginx reads its config ONCE at startup. Reloader (argocd-infra/reloader) rolls this
+    # Deployment when configmap.yaml's content changes, so an edit takes effect instead of
+    # sitting Synced/Healthy with the old config still serving.
+    reloader.stakater.com/auto: "true"
+spec:
+  # One is enough: the pod is stateless, and the backend is a single appliance. A second
+  # replica would not add availability to anything downstream of it.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab-s3-proxy
+  template:
+    metadata:
+      labels:
+        app: gitlab-s3-proxy
+    spec:
+      # Above best-effort, below the workloads it serves: CI blocked on a missing artifact
+      # endpoint wastes far more than this pod's footprint, but it must never win an
+      # eviction race against GitLab itself.
+      priorityClassName: standard
+      # ⚠ HARD pin to the appliance LAN, and this is the entire point of the component: cloud nodes
+      # have no route to 192.168.1.0/24 (measured — a cloud pod's packets leave via the
+      # public gateway and die in Hetzner's backbone). Only a pod at this site can reach the
+      # appliance. Removing this nodeSelector does not degrade the proxy, it breaks it.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101 # the `nginx` user in the upstream image
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # ⚠ NGINX RESOLVES ITS UPSTREAM ONCE, AT CONFIG LOAD, AND EXITS IF THE NAME DOES
+        # NOT RESOLVE: "[emerg] host not found in upstream". On a fresh cluster the
+        # appliance's name is served by samba-ad, which comes up later — so the proxy
+        # crash-looped 15 times on the ecc193 bring-up before AD DNS was ready. It did
+        # self-heal, but the app reads Degraded throughout and the restart count invites
+        # exactly the wrong diagnosis.
+        #
+        # Waiting here instead means nginx starts once, when it can succeed.
+        - name: wait-for-dns
+          image: docker.io/library/busybox:1.38.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["sh", "-c"]
+          args:
+            - |
+              until nslookup fs-1.ad.base.internal >/dev/null 2>&1; do
+                echo "waiting for fs-1.ad.base.internal to resolve (AD DNS)..."
+                sleep 5
+              done
+              echo "resolved."
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+      containers:
+        - name: nginx
+          image: docker.io/library/nginx:1.31.6-alpine # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
+          ports:
+            - name: s3
+              containerPort: 30304
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            # nginx writes its pid here; the root filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
+          # ⚠ THIS PROVES ONLY THAT NGINX IS LISTENING. It does not touch the appliance, so
+          # an absent or dead backend still reports Ready and fails per-connection instead.
+          # That is deliberate — this pod should not be the thing that declares the appliance
+          # down — but it means "app Healthy" says nothing about artifacts working. The
+          # endpoint alert is what covers that.
+          readinessProbe:
+            tcpSocket: { port: 30304 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 30304 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            # ⚠ NO CPU LIMIT ON PURPOSE. This is a byte pump on the critical path of
+            # multi-GB uploads; throttling it converts a slow transfer into a timed-out one.
+            # The memory limit is a real bound — nginx streams rather than buffering whole
+            # objects, so anything approaching it is a bug, not a big artifact.
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: gitlab-s3-proxy
+        - name: tmp
+          emptyDir: {}

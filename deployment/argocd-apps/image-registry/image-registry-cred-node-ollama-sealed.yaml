@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-cred-node
+  namespace: ollama
+spec:
+  encryptedData:
+    .dockerconfigjson: AgCJHFAkKV731DroQdpZVLuEDBWTHbKIuODmSZtK6O6zG3j0ktjVw1wVlW8H41gjXGPYfh0nfuuVSwnUd+Yc0bLxWQImoOczTESLEIzeV3MFtW50uXa9QU1HCMwDKcMdB2blofBDwCmuWXAJ8oPxUYKBNe+2kd074xplpf17lRlVycV54Aypo82mYsP4hMMoqPvOA/MkyCLqVlZIA43YHEQsPB76c1z9lTQ7ha8ms1IHfV2/8g4fCjlrcH0ubMCE08vCWhBL/LxQ1RlEb62VXRm0NvWxtrIls/wxTW6Wr/AivZ6FBHD+PF4z3YTE7bDL1HRC94yxvS6THfZcv6n3B6bJepQlyIYDr/3xu/lhG9SRdkKtN+o8YApSbMPC4/M4d880LEPCmm4xgiXav9HlTa1v5yvQ4A4HZdU6p37yTHnK/d78QTl7C7L6k/uNBY9xhqb5DjToFjWxQeiTJiO8yEwXNFYpucmZwCEabK+P+SJXWldcWyf18jOuYQlnRKvsyjgMmy0pN98S5FiMxLu9SJYPHKpID26i3CUlYV8snXgg/v3HgXFj5KxWpo+mtHfk0+2CLsQ4lEXmpZI5UlOgq7cLaQ+2PZlS21wa4etURobwyqrz7Yjlf6YQYMEugg7ezynIErIU7VIHMis/5N3+duphtw2dp8fRhHsdI9/onTFsKwhgivH0LM+A4toQnfA/PgLvqwVhvPbUKshYdsniI8PzuUDQb4EE1UuQH998eJWG1yh4ZJWFU0raxoe/SzJgZYw8x5iRfcCW7gurz8UzSKlF8IKVGwz6MZUdqRz0HxUtszpbHbcHMsmQtF+JlRDeGJ0myTf59uY8lqne1QaYrW7b00PxHllX5RUVRuODDOzcjr+ULBCiiokIWWNicggXb0B/r+hzGhkckbALVGkLD6BzgX42X77Kazijw0rlNqL19sqVzuD9bvnhUU3uQwOgsumBK+fBMPIJsrWWxUnO1ybm5WZ3rdFfqnN7tPrngxjsh0XnFdYOccgJcdb+HnyBV+I2SwVY2pdzbQ==
+  template:
+    metadata:
+      name: image-registry-cred-node
+      namespace: ollama
+    type: kubernetes.io/dockerconfigjson

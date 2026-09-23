@@ -1,0 +1,38 @@
+# Public route for the Prometheus UI, protected by Authentik OIDC.
+# Prometheus has no native auth, so instead of routing straight to the prometheus
+# server this routes to the Authentik embedded outpost (proxy provider
+# "prometheus", see authentik/blueprint-apps.yaml), which enforces login then
+# proxies to the prometheus server via the provider's internal_host.
+# The chart's own ingress is disabled (prometheus.ingress.enabled=false).
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once, cluster-wide, by
+# argocd-infra/gateway/redirect-to-https.yaml.
+#
+# Chicken/egg: kube-prometheus-stack is sync-wave 2, authentik is wave 6 — until
+# Authentik is up this backend returns 503, then self-heals.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: prometheus-oidc
+  namespace: prometheus
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - prometheus.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # Cross-namespace backend, permitted by the ReferenceGrant in
+        # authentik/outpost-referencegrant.yaml. Do NOT replace it with an
+        # ExternalName alias in this namespace: Envoy Gateway silently refuses to
+        # route to those (HTTP 500, "direct_response", no upstream cluster).
+        - name: authentik-server
+          namespace: authentik
+          port: 80

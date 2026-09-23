@@ -1,0 +1,59 @@
+# Cluster-wide Gateway. TLS is terminated once, at the wildcard listener below,
+# and HTTPRoutes carry no certificate config at all.
+#
+# Lives in argocd-infra because that is where the wildcard-tls secret is issued
+# (see argocd-infra-self/wildcard-certs.yaml). A listener can only reference a
+# Secret in its own namespace, so the Gateway must live beside the cert.
+#
+# Deliberately app-agnostic: it carries ONLY the generic http + wildcard-HTTPS
+# listeners. An app whose hostnames the single-label wildcard cannot cover (a
+# multi-level host like registry.gitlab.<tld>) does NOT get a listener bolted on
+# here — it renders its own Gateway in its own namespace, beside its own
+# certificate, and the shared EnvoyProxy's `mergeGateways: true`
+# (src/ingress.ts) puts every such Gateway on this same Envoy data plane.
+# deployment/argocd-apps/gitlab is the worked example.
+#
+# Consequence to respect when adding listeners: under merging the
+# (port, protocol, hostname) tuple must be unique across ALL Gateways in the
+# cluster, not just this file. The `http` listener below is hostname-less, so
+# no other Gateway may define a hostname-less :80 listener — the newer one is
+# silently rejected with Accepted=False.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  # ⚠ Do NOT switch this to Cilium's gateway controller (gatewayClassName: cilium) on a
+  # live cluster. headscale is served THROUGH this Gateway, so an ingress outage CASCADES
+  # INTO THE MESH: mesh nodes lose their control server, tailscale logs out, kubelet loses
+  # the API and the nodes go NotReady — self-reinforcing, because the mesh cannot recover
+  # while ingress is down. Attempt it only on a FRESH cluster, where the bootstrap ordering
+  # is exercised from scratch.
+  gatewayClassName: envoy
+  listeners:
+    # Plain HTTP exists only to redirect. The redirect itself is an HTTPRoute
+    # (redirect-to-https.yaml), so app routes never have to think about it.
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+
+    # Default HTTPS listener: the single-label wildcard covers every app host
+    # (llm.<tld>, longhorn.<tld>, …).
+    - name: https-wildcard
+      protocol: HTTPS
+      port: 443
+      hostname: "*.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: All

@@ -1,0 +1,147 @@
+# PreSync: mint the desktop's headscale pre-auth key — NO sealed secret.
+#
+# Same reasoning as presync-registry-cred.yaml: headscale's DB is recreated empty on every
+# cluster rebuild, so a key sealed offline would be dead on arrival. It is minted at sync
+# time against the live headscale instead.
+#
+# WHY THIS LIVES HERE AND NOT IN THE HEADSCALE APP: the headscale post-deploy job holds a
+# namespace-scoped Role in `headscale` and cannot write a Secret into `remote-desktop`.
+# Rather than widen an infra app's RBAC into an app namespace, the app that CONSUMES the
+# key owns its creation — the convention already used for the registry pull credential.
+#
+# --tags tag:desktop is the load-bearing part. policy-configmap.yaml already declares
+# tag:desktop in tagOwners and grants autogroup:member -> tag:desktop on ["22","3389"]; that grant
+# matches nothing until a node actually carries the tag. Tagging at MINT time (rather than
+# with `headscale nodes tag` afterwards) means the tag is re-asserted every time the
+# sidecar re-registers — which is every pod roll, since its state is an emptyDir.
+#
+# The key is minted under the k3s-cloud user because tagOwners lists it as an owner of
+# tag:desktop. Ownership transfers to the special user `tagged-devices` on first use.
+#
+# PreSync: the Deployment's tailscale sidecar cannot start without the secret.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-bender-tailscale-key
+  namespace: remote-desktop-bender
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: remote-desktop-bender-tailscale-key
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# exec into the headscale pod (in the headscale ns) + write the secret locally
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: remote-desktop-bender-tailscale-key
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: remote-desktop-bender-tailscale-key
+subjects:
+- kind: ServiceAccount
+  name: remote-desktop-bender-tailscale-key
+  namespace: remote-desktop-bender
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-bender-tailscale-key
+  namespace: remote-desktop-bender
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: remote-desktop-bender-tailscale-key
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: tailscale-key
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: HS_NAMESPACE
+          value: headscale
+        - name: SECRET_NAME
+          value: headscale-preauthkey-desktop-bender
+        - name: TS_TAG
+          value: tag:desktop
+        # Owner of tag:desktop per policy-configmap.yaml tagOwners.
+        - name: TS_USER
+          value: k3s-cloud
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Idempotent: a valid key already in place is left alone, so a resync does not
+          # churn the tailnet identity on every sync.
+          if kubectl -n "$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" \
+               get secret "$SECRET_NAME" -o jsonpath='{.data.key}' 2>/dev/null | grep -q .; then
+            echo "$SECRET_NAME already exists — leaving it alone."
+            exit 0
+          fi
+
+          echo "Waiting for the headscale pod..."
+          i=1
+          while [ "$i" -le 60 ]; do
+            HS_POD=$(kubectl get pods -n "$HS_NAMESPACE" -l app.kubernetes.io/name=headscale \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [ -n "$HS_POD" ] && break
+            echo "Try ${i}/60: headscale pod not present yet, retrying in 10s..."
+            i=$((i + 1)); sleep 10
+          done
+          [ -n "${HS_POD:-}" ] || { echo "ERROR: headscale pod never appeared"; exit 1; }
+
+          # v0.28+ wants a NUMERIC user id. Same awk idiom as the headscale post-deploy job.
+          TIER_UID=$(kubectl exec -n "$HS_NAMESPACE" "$HS_POD" -- headscale users list -o json 2>/dev/null \
+            | awk -v n="$TS_USER" '/"id":/{id=$2} $0 ~ "\"name\": \""n"\""{gsub(/[^0-9]/,"",id); print id; exit}')
+          [ -n "$TIER_UID" ] || { echo "ERROR: headscale user '$TS_USER' not found"; exit 1; }
+
+          # Reusable: the sidecar's state is an emptyDir, so it re-registers on every pod
+          # roll and a single-use key would strand it after the first restart.
+          echo "Minting pre-auth key for $TS_USER with $TS_TAG..."
+          KEY=$(kubectl exec -n "$HS_NAMESPACE" "$HS_POD" -- \
+            headscale preauthkeys create --user "$TIER_UID" --reusable --expiration 8760h \
+            --tags "$TS_TAG" 2>/dev/null | tail -n1)
+          [ -n "$KEY" ] || { echo "ERROR: failed to mint pre-auth key"; exit 1; }
+
+          kubectl -n "$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" \
+            create secret generic "$SECRET_NAME" --from-literal=key="$KEY" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "$SECRET_NAME created."

@@ -1,0 +1,52 @@
+# ArgoCD Application: the shared CI build image (buildah + skopeo).
+#
+# WHY ITS OWN APP. Six pipelines build images (three EDA modules, remote-desktop's base,
+# ollama, vllm) and all six need buildah to build and skopeo to ask a registry whether a
+# tag already exists. No upstream image ships both, so the image is derived here. Hanging
+# that off one consumer's pipeline (remote-desktop's was the obvious candidate) would make
+# five unrelated builds depend on that app's project and schedule, and a failure there
+# would surface as "EDA module build blocked" one indirection away. A shared build
+# dependency gets its own app, its own project and its own visible pipeline.
+#
+# BUILD-ONLY: this app deploys no workload. It carries a build-files ConfigMap and a
+# PreSync trigger, exactly like the EDA module apps.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ci-build-image
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: the pipeline runs on the [eda] runner, which is pinned to the
+    # ecc/eda-builder nodes at a mesh site — and so is every consumer of the image ([eda] or
+    # [thor]). There is nothing for it to do on a cloud-only cluster.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/ci-build-image
+    directory:
+      # Build inputs reach GitLab via the build-files ConfigMap, NOT as manifests.
+      exclude: "{Dockerfile,.gitlab-ci.yml,*.sh,README.md}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ci-build-image
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # ⚠ RETRY FOREVER — the PreSync trigger polls GitLab /-/readiness and fails (rather
+    # than falling through) when GitLab is not up within 30m, which on a cluster recreate
+    # is normal. With ArgoCD's default 5 retries the app parks Failed and NOTHING rebuilds
+    # the image, so every consumer then blocks on an image that is never built. Same
+    # setting, same reason, as every other GitLab-dependent app here.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

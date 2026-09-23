@@ -1,0 +1,257 @@
+# vLLM — OpenAI-compatible LLM server on the Jetson-Orin GPU node.
+# IN-CLUSTER ONLY: no Ingress. The only client is the LiteLLM gateway
+# (deployment/argocd-apps/litellm), which authenticates with the upstream key
+# (vllm-orin-upstream secret, key api-key — same random token both sides share).
+#
+# WHY A SECOND APP AND NOT A PARAMETER OF deployment/argocd-apps/vllm: serving is
+# per-hardware. The Thor is Blackwell sm_110 with 122 GiB unified memory and serves a
+# 35B NVFP4 MoE; this box is Ampere sm_87 with 29 GiB and serves a 4B INT4 dense model.
+# Sizing, quantization and the MoE/MTP flags all differ; only the image is shared.
+#
+# THE IMAGE IS SHARED WITH THE THOR — one build serves both Jetsons. The Dockerfile
+# compiles nothing arch-specific (it installs the released PyPI abi3 aarch64 wheel plus
+# the official cu130 torch), and that wheel's fatbins carry sm_80/87/89/90/100/110/120 —
+# verified by reading .nv_fatbin out of vllm-0.29.0-cp38-abi3-manylinux_2_28_aarch64.whl,
+# where sm_87 (this node) and sm_110 (Thor) ship side by side. Both nodes also run the
+# SAME L4T R39.2.1 / CUDA 13.2, so the image's CUDA-13.0 base (which must be <= the
+# driver's max API) is valid on both.
+#
+# ⚠ THE MODEL DOES NOT PORT FROM THE THOR. sm_87 is Ampere: no FP8, no NVFP4. The Thor's
+# unsloth/Qwen3.6-35B-A3B-NVFP4-Fast needs sm_100+. The fast 4-bit path here is INT4 via
+# Marlin, whose gate is `device_capability >= 75` (marlin_utils.py) — sm_87 passes.
+#
+# Placement: ecc/gpu-model=jetson-orin, tolerating the ecc/mesh AND ecc/gpu taints,
+# one GPU via the nvidia RuntimeClass (node runtime pinned mode=cdi).
+#
+# NO BACKEND EXCLUSIVITY HERE. On the Thor, scripts/runtime/switchLLMBackend.sh flips
+# vLLM and ollama 0<->1 because both want the one card. This node runs no Ollama, so
+# nothing competes for the GPU and this Deployment is not part of that dance.
+#
+# Model source: HuggingFace cache on a STATIC local PV on the node's NVMe — NOT the
+# `local-path` StorageClass the Thor uses. See vllm-model-cache-pv.yaml: k3s local-path
+# resolves to /var/lib/rancher/k3s/storage for every node, which on this box is the
+# 54 GiB eMMC root at 82% full (9.3 GiB free). A 5.14 GiB checkpoint plus HuggingFace's
+# download temporaries would fill the root filesystem and take the node down.
+#
+# ⚠ NO NFS SEED HERE, unlike the Thor app — the weights come from HuggingFace on first
+# start. csi-driver-nfs runs ONLY on nodes labelled `ecc/fileserver-lan=true`, which is
+# derived from `node.site == storage.fileserver.site` (src/nodes-k3s-mesh.ts). This node is
+# in `unibi-recslab`; the appliance is in `unibi-hclab`. So the CSI driver is not
+# registered here and a `nfs.csi.k8s.io` volume NEVER mounts — measured 2026-09-23:
+#   MountVolume.MountDevice failed ... driver name nfs.csi.k8s.io not found in the list of
+#   registered CSI drivers
+# and the pod sits in PodInitializing indefinitely. A hard mount fails BEFORE the seed
+# initContainer's fail-open logic can run, so an "optional" optimisation became a hard
+# block on serving.
+#
+# ⚠ Do NOT "fix" this by widening the ecc/fileserver-lan nodeSelector. The label asserts
+# "same site as the appliance", not "can route to it" — this node CAN reach 192.168.1.237
+# over tailscale (checked: NFS port open), but relabelling it would misstate the topology
+# for every other NFS consumer. If a seed is ever wanted here, give csi-driver-nfs its own
+# explicit opt-in list rather than overloading the site label.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm-orin
+spec:
+  # ⚠ `replicas:` IS DELIBERATELY ABSENT — do NOT add it back.
+  #
+  # This app syncs with ServerSideApply=true, so a literal here makes argocd-controller
+  # the SSA field manager that OWNS spec.replicas, and an owned field is reasserted from
+  # git on EVERY apply. ignoreDifferences + RespectIgnoreDifferences do not prevent that
+  # (they cover selfHeal and diffing, not ownership) — the trap that silently stopped the
+  # served model on the Thor five times on 2026-09-18, reporting nothing worse than
+  # `deployment.apps/vllm configured`.
+  #
+  # Omitting the field relinquishes ownership; Kubernetes defaults it to 1 at CREATE.
+  strategy:
+    # GPU is a single, non-shareable resource: a rolling update would deadlock
+    # (new pod Pending on nvidia.com/gpu the old pod still holds). Recreate first.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      priorityClassName: standard
+      # Stop k8s injecting legacy Docker-link env vars (e.g. VLLM_PORT=tcp://...:8000
+      # from the same-named `vllm` Service) — vLLM misreads VLLM_PORT as its listen
+      # port and crashes.
+      enableServiceLinks: false
+      # GPU injection via the nvidia container runtime in CDI mode. The node's
+      # nvidia-container-runtime is pinned mode=cdi (src/provisioning-scripts/20-install-gpu.sh),
+      # so this handler injects the node's auto-refreshed /var/run/cdi/nvidia.yaml.
+      # We do NOT use the cdi.k8s.io/* pod annotation: containerd 2.x removed
+      # annotation-based CDI injection, so it is silently ignored (pod runs but torch
+      # sees no GPU → vLLM "Failed to infer device type").
+      runtimeClassName: nvidia
+      nodeSelector:
+        # ecc/gpu-model, not ecc/gpu=true. The image would in fact run on the Thor too,
+        # but the MODEL is sized for this SoC's 29 GiB — pinning the model keeps a
+        # rescheduled pod from landing on hardware its args do not fit.
+        ecc/gpu-model: jetson-orin  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        # GPU nodes are mesh nodes, tainted ecc/mesh=true:NoSchedule.
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # GPU nodes are ALSO tainted ecc/gpu=true:NoSchedule so the scarce single-GPU box
+        # is opt-in only. Tolerating it is what makes this pod a deliberate GPU consumer.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Private in-cluster GitLab registry PULL credential (the CI build pushes with
+      # CI_REGISTRY_*; this secret is only for pulling the image at deploy time).
+      imagePullSecrets:
+        - name: vllm-registry-cred
+      containers:
+        - name: vllm
+          # SHARED WITH THE THOR — see the header. Built by GitLab CI from
+          # deployment/argocd-apps/vllm/{Dockerfile,.gitlab-ci.yml} on the Thor runner
+          # (tags:[thor] — the only arm64 builder; the artifact is arch-neutral).
+          # Keep this tag in step with that .gitlab-ci.yml IMAGE_TAG and with the Thor
+          # Deployment. Registry paths are lowercased by GitLab: AI -> ai.
+          image: registry.gitlab.subdomain1.your-domain.tld/deployments/infrastructure/ai/vllm-jetson:v0.29.0-cu13-jetson-r1 # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["vllm", "serve"]
+          args:
+            # RedHatAI/Qwen3.5-4B-quantized.w4a16 — INT4 weights / BF16 activations,
+            # 5.14 GiB of safetensors (measured via the HF API), dense (not MoE).
+            # compressed-tensors "pack-quantized", group-128 symmetric int4.
+            #
+            # WHY THIS ONE. The ask was a Home Assistant brain: tool calling for agentic
+            # control, low latency. Constraints that picked it:
+            #   - sm_87 has no FP8/NVFP4, so INT4-via-Marlin is the only fast 4-bit path.
+            #   - 29 GiB unified (CPU+iGPU share ONE pool), ~26 GiB usable. Qwen3.5-35B-A3B
+            #     -GPTQ-Int4 measures 22.74 GiB of weights — it would leave no KV cache.
+            #   - Unsloth publishes Qwen3.5 as GGUF only (no INT4/AWQ safetensors), and
+            #     vLLM moved GGUF OUT-OF-TREE to vllm-gguf-plugin with materially worse
+            #     TTFT. RedHat's build is made for vLLM, so it is the servable one.
+            #
+            # ⚠ ACCEPTED TRADE-OFF: 4B measures ~83% on Home-Assistant command benchmarks
+            # vs ~88-96% for 7-9B, and doc/llm-agents.md warns a 2b/4b model "will chat
+            # but fail to act reliably". Chosen deliberately for latency (~144ms vs ~291ms
+            # warm). Weights are only 5.14 of ~26 GiB, so the FALLBACK IS A ONE-LINE EDIT:
+            # swap to RedHatAI/Qwen3.5-9B-quantized.w4a16 (10.65 GiB, still ~14 GiB of KV
+            # headroom) if tool calling proves unreliable. Re-run the tool-call check.
+            - "RedHatAI/Qwen3.5-4B-quantized.w4a16"
+            # ⚠ compressed-tensors, NOT awq/gptq. The checkpoint's config.json declares
+            # quant_method "compressed-tensors" (format "pack-quantized"); naming another
+            # quantization makes vLLM read it with the wrong loader.
+            - "--quantization"
+            - "compressed-tensors"
+            - "--reasoning-parser"
+            - "qwen3"
+            # ⚠ THE SERVED NAME IS A TWO-PLACE EDIT: here and litellm/config.yaml.
+            # The prefix names the NODE, never the backend — so replacing vLLM with
+            # something else on this box does not invalidate saved client configs.
+            # NOT added to eda-pcb-agent's ALLOWED_MODELS: Hermes hard-refuses any model
+            # under 64,000 context and this one serves 32k (see --max-model-len).
+            - "--served-model-name"
+            - "orin/qwen3.5-4b-w4a16"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            # 32k, NOT the Thor's 262144. The checkpoint supports 262144, but context is
+            # paid for in KV cache. Home Assistant needs ~1,500-2,500 tokens to serialise
+            # its entities and tool definitions; 32k is generous headroom at a fraction of
+            # the cost. The Thor's huge value is load-bearing ONLY because Hermes refuses
+            # models under 64,000 — and Hermes does not use this model.
+            - "--max-model-len"
+            - "32768"
+            # Unified memory: this fraction is of the WHOLE 29 GiB pool the CPU also uses,
+            # not of a dedicated card. 0.80 leaves the OS and the node's system pods room
+            # while giving the engine ~20 GiB for weights + KV.
+            - "--gpu-memory-utilization"
+            - "0.80"
+            # Tool calling is the entire point for Home Assistant. qwen3_xml is registered
+            # in the 0.29.0 wheel (verified in vllm/tool_parsers/__init__.py) and is the
+            # same parser the Thor uses for the Qwen3 XML tool-call shape.
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "qwen3_xml"
+            - "--api-key"
+            - "$(VLLM_API_KEY)"
+          env:
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-orin-upstream
+                  key: api-key
+            # HuggingFace cache root — the static local PV on the NVMe.
+            - name: HF_HOME
+              value: /models/hf
+            # The nvidia/cuda base image bakes a DESKTOP-driver NVIDIA_REQUIRE_CUDA
+            # constraint. On Tegra, CUDA compat comes from L4T/JetPack, not a desktop
+            # driver version, so the runtime's requirement check fails at container create
+            # ("requirements not met: cuda>=13.0||...driver>=5xx...", StartError exit 128).
+            - name: NVIDIA_DISABLE_REQUIRE
+              value: "true"
+            # triton looks for ptxas ONLY in its own bundled backends/nvidia/bin/, which on
+            # the aarch64 jetson wheel ships cuobjdump + nvdisasm but NOT ptxas, and does
+            # not fall back to PATH/CUDA_HOME → "RuntimeError: Cannot find ptxas" at the
+            # first kernel compile. Point it at the one in the CUDA base.
+            - name: TRITON_PTXAS_PATH
+              value: /usr/local/cuda/bin/ptxas
+            # The Service is named `vllm`, so k8s would inject the legacy Docker-link var
+            # VLLM_PORT=tcp://<clusterIP>:8000, which vLLM reads as its own listen port and
+            # dies on ("appears to be a URI"). Pin it to the real port.
+            # (enableServiceLinks:false above also stops the injection.)
+            - name: VLLM_PORT
+              value: "8000"
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            # vLLM/torch need shared memory; the default 64Mi emptyDir /dev/shm is too small.
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            # A cold first run downloads 5.14 GiB over WireGuard, then does engine init.
+            # 80 × 15s = 20 min. Smaller than the Thor's 45 min budget because the
+            # checkpoint is ~4.5x smaller.
+            failureThreshold: 80
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            # Must exceed the worst-case cold start or liveness kills the pod before it
+            # ever serves. 1500s = 25 min > the 20 min readiness budget.
+            initialDelaySeconds: 1500
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-model-cache
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: vllm-orin
+spec:
+  # ClusterIP only — no ingress. Reachable at http://vllm.vllm-orin.svc:8000 from LiteLLM.
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000

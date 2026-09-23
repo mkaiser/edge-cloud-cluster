@@ -1,0 +1,12 @@
+# Namespace for the Vivado 2024.1 CONTAINER module build app. This app is BUILD-ONLY: it
+# holds the build trigger + the build-files ConfigMap. No secrets (the media is on the
+# TrueNAS installer export, and the licence host comes from `eda-secrets`, owned by
+# eda/secrets and sealed into every namespace that RUNS a module). Vivado itself RUNS inside the shared remote-desktop pod, via
+# podman in the module container — there is no desktop here.
+#
+# One namespace per EDA app, named after the app: pruning one app can never delete the
+# namespace another app's resources live in.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-xilinx-2024-1

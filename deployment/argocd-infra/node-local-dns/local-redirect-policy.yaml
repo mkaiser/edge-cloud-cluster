@@ -1,0 +1,69 @@
+# Steers pod traffic for the cluster DNS service to the node-local cache on the SAME node.
+#
+# This is what actually puts node-local-dns in the DNS path. Without it the DaemonSet runs
+# and answers nothing: it has an ordinary pod IP and no pod is configured to use it.
+#
+# ServiceMatcher, not AddressMatcher: the target is a real ClusterIP Service (kube-dns), so
+# matching it by name means nothing here hardcodes 10.43.0.10 — the VIP can change on a
+# recreate and this keeps working.
+#
+# ⚠ Requires `localRedirectPolicies.enabled: true` in the Cilium chart, set in BOTH
+# src/cni.ts and deployment/argocd-infra/app-of-apps/wave0-cilium.yaml. Without it the CRD
+# does not exist and this manifest fails to apply.
+#
+# ⚠ Cilium does NOT support UPDATING an LRP. To change anything below, DELETE the policy and
+# re-create it — an edit is silently not applied.
+#
+# ⚠ THE PORT NAMES BELOW ARE THE WHOLE TRICK, AND THEY ARE NOT UPSTREAM'S. Cilium maps an
+# LRP's frontend ports to its backend ports BY NAME, so THREE things must agree:
+#
+#     kube-dns Service ports      udp-53 / tcp-53   (coredns chart, hardcoded <proto>-<port>)
+#     node-local-dns container    udp-53 / tcp-53   (node-local-dns.yaml — renamed to match)
+#     toPorts below               udp-53 / tcp-53
+#
+# Upstream's example uses `dns` / `dns-tcp` and works because ITS kube-dns Service is named
+# that way too (k3s ships dns/dns-tcp/metrics). The coredns Helm chart offers no knob for
+# service port names, so the BACKEND is what had to move.
+#
+# A mismatch binds NOTHING and reports no error — not even a partial bind. `cilium-dbg lrp
+# list` shows the frontend matched with an empty right-hand side, which reads like the policy
+# was never processed:
+#
+#     kube-system  node-local-dns  clusterIP + all svc ports  kube-system/kube-dns
+#                  |               10.43.0.10:53/UDP ->
+#
+# Bisected on ecc212 2026-09-16, with the Service still named udp-53/tcp-53:
+#   toPorts dns only        -> UDP binds        (one name mismatched, but one port only)
+#   toPorts dns-tcp only    -> TCP binds
+#   toPorts dns + dns-tcp   -> NEITHER binds    <- what shipped, inert for two clusters
+#   Service renamed to dns/dns-tcp, toPorts unchanged -> BOTH bind
+# The last line is what proves it is the naming and not a multi-port bug in Cilium.
+#
+# ⚠ `use_tcp: true` on the zone (src/coredns.ts + app-of-apps/wave0-coredns.yaml) is a
+# SEPARATE prerequisite: without it the Service has no TCP port at all, so tcp-53 cannot be
+# matched and DNS-over-TCP has no path either.
+#
+# Existing long-lived connections are not redirected, only new ones. That is immaterial for
+# DNS (each query is a fresh connection) but is why Cilium's docs mention restarting clients.
+---
+apiVersion: cilium.io/v2
+kind: CiliumLocalRedirectPolicy
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+spec:
+  redirectFrontend:
+    serviceMatcher:
+      serviceName: kube-dns
+      namespace: kube-system
+  redirectBackend:
+    localEndpointSelector:
+      matchLabels:
+        k8s-app: node-local-dns
+    toPorts:
+      - port: "53"
+        name: udp-53
+        protocol: UDP
+      - port: "53"
+        name: tcp-53
+        protocol: TCP

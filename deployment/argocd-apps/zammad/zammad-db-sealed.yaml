@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zammad-db
+  namespace: zammad
+spec:
+  encryptedData:
+    db-password: AgCeFYHLw6czi5aYPq7Gr2+/U+cMFJQ8r6LZIxL4ih5FHTqbbefvRY8HTHwL3tfIvmbbhJYx0eC68G+AzAV9aeIN0gmod1YfjFpl6WIdest6gxp+Xga8um4ir2k24xFYe5T212beF0yAM3/IwbEJ+e+bh4rgnAtC3KdJbFd2iqb/wUtrzcCyeKRfHYXgbsyDvXdLZYI3drLFih/G3/F/+LA3ceowPfYFBJHe/MMP+S8S8j3FvferXYdvSA5S9E8er7eWbOQuPEh5t8NFrvQuRS9WAGI0EplFV0/ea4Vm8zEIJ4Ohyn5FgzyhzneZ+HlaoFZ9rVevJR/tLRPnMQTYlud7Z7OJ7m88rH7a64Uw899XCTXgwWXR7K/SLpGfa9RblL8OoVWdyM2bZcjOXz/nPfOH9E9nDL30u11f8W58hX4XlshSRYB2FtSofDBwdYEzcvSQTY0tojrP/8Zs4pdp6C1Ifw5veBTe+mtdTWbU/rvEfO79+t+UrKwjB9wM0QuWMxP68jEg9GBvPL3BpQ3Ux3KkDeLzuTF2TqAo4Q77wY+L+tBZho7jA4HF8Gyv+1RrR51ueuL0yGi2PzG7gfCa299IE8/eY6eewxkpQq5JqOI0wK7KK2qPQPYGkyaLw3iLIGAEhOtgeO8tUJYfHSJJWQPSgldWITyhZGCzHxC7gMLZUYpGxSQ1mYCws6jAd+ovp/IhEZ8BLA5YMwkXIwvIeKag1TAMj8fH64fLp1DCd7Te73BuzUvwDR3qOSSKPLJ4sLE=
+  template:
+    metadata:
+      name: zammad-db
+      namespace: zammad

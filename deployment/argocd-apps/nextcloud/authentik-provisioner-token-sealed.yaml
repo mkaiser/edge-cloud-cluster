@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: nextcloud
+spec:
+  encryptedData:
+    token: ""
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: nextcloud

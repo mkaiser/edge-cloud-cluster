@@ -1,0 +1,61 @@
+# POINTER (infra-owned): deploys the APPS ArgoCD instance.
+#
+# Owned by the INFRA ArgoCD (this Application lives in ns argocd-infra). At
+# sync-wave 19 — after the wave-18 barrier gates "all infra Synced+Healthy" — it
+# installs a SECOND ArgoCD Helm release into namespace argocd-apps, at host
+# argocd-apps.<tld>. That apps instance then self-bootstraps an app-of-apps
+# (extraObjects in its values) watching deployment/argocd-apps/app-of-apps/.
+#
+# Co-existence with the infra instance:
+#   - crds.install: false (in values.yaml)  — CRDs installed once by infra.
+#   - fullnameOverride: argocd-apps          — RBAC/Service names prefixed.
+#   - argocd-secret + repo creds pre-created by Pulumi in ns argocd-apps.
+#
+# Multi-source (mirrors argocd-infra-self):
+#   1. argo-cd Helm chart
+#   2. ref source for $values
+#   3. Git directory: the apps OIDC sealed secret (sealed into ns argocd-apps)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-apps
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "19"
+spec:
+  project: default
+  sources:
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+    - repoURL: https://argoproj.github.io/argo-helm
+      chart: argo-cd
+      targetRevision: "10.9.1" # renovate: datasource=helm depName=argo-cd registryUrl=https://argoproj.github.io/argo-helm
+      helm:
+        releaseName: argocd-apps
+        valueFiles:
+          - $values/deployment/argocd-infra/argocd-apps/values.yaml
+    # Plain manifests: the apps-instance OIDC sealed secret (ns argocd-apps).
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-infra/argocd-apps
+      directory:
+        exclude: '{values.yaml,*.template,*.sh}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-apps
+  # Same API-server defaulting of parentRefs as argocd-infra-self — see the note there.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: argocd-apps-server
+      namespace: argocd-apps
+      jsonPointers:
+        - /spec/parentRefs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

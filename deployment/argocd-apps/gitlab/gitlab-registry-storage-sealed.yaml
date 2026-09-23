@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: gitlab-registry-storage
+  namespace: gitlab
+spec:
+  encryptedData:
+    config: ""
+  template:
+    metadata:
+      name: gitlab-registry-storage
+      namespace: gitlab

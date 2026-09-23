@@ -1,152 +1,479 @@
 {
-    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-    "extends": ["config:recommended"],
-
-    "argocd": {
-        "managerFilePatterns": ["/deployment/apps/.+\\.yaml$/", "/deployment/.+/.+\\.yaml$/"]
-    },
-    "customManagers": [
-        {
-            "customType": "regex",
-            "description": "Pulumi helm.v3.Release versions in TypeScript source",
-            "managerFilePatterns": ["/src/.+\\.ts$/"],
-            "matchStrings": [
-                "chart: \"(?<depName>[^\"]+)\",(?:[^\\n]*\\n){1,3}[^\\n]*version: \"(?<currentValue>[^\"]+)\",[^\\n]*\\n(?:[^\\n]*\\n){0,2}[^\\n]*repositoryOpts: \\{ repo: \"(?<registryUrl>[^\"]+)\""
-            ],
-            "datasourceTemplate": "helm"
-        },
-        {
-            "customType": "regex",
-            "description": "Tool versions in scripts/environment/install.sh",
-            "managerFilePatterns": ["/scripts/install\\.sh/"],
-            "matchStrings": [
-                "[A-Z_]+=\"(?<currentValue>[^\"]+)\"\\s+# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)"
-            ]
-        },
-        {
-            "customType": "regex",
-            "description": "ArgoCD Helm Application targetRevision in deployment manifests",
-            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
-            "matchStrings": [
-                "repoURL:\\s*\"?(?<registryUrl>https?://[^\"\\n]+)\"?(?:[^\\n]*\\n){0,12}?chart:\\s*\"?(?<depName>[^\"\\n]+)\"?(?:[^\\n]*\\n){0,8}?targetRevision:\\s*\"?(?<currentValue>[^\"\\n# ]+)"
-            ],
-            "datasourceTemplate": "helm"
-        },
-        {
-            "customType": "regex",
-            "description": "Git targetRevision values annotated with renovate comments",
-            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
-            "matchStrings": [
-                "targetRevision:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
-            ]
-        },
-        {
-            "customType": "regex",
-            "description": "upgrade.cattle.io Plan version fields annotated with renovate comments",
-            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
-            "matchStrings": [
-                "version:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+versioning=(?<versioning>[^\\s]+))?"
-            ]
-        },
-        {
-            "customType": "regex",
-            "description": "YAML tag fields annotated with renovate comments",
-            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
-            "matchStrings": [
-                "tag:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
-            ]
-        },
-        {
-            "customType": "regex",
-            "description": "Container image tags in deployment manifests",
-            "managerFilePatterns": ["/deployment/.+\\.ya?ml$/"],
-            "matchStrings": [
-                "image:\\s*\"?(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@sha256:[a-f0-9]{64})?\"?"
-            ],
-            "datasourceTemplate": "docker"
-        }
-    ],
-    "packageRules": [
-        {
-            "description": "Catch-all: group everything not matched by a specific rule",
-            "matchFileNames": ["**/*"],
-            "groupName": "Update all"
-        },
-        {
-            "description": "Suppress bad ArgoCD OCI depName for zulip helm chart (chart name equals last path segment, causing double-append)",
-            "matchDepNames": ["ghcr.io/zulip/helm-charts/zulip/zulip"],
-            "enabled": false
-        },
-        {
-            "description": "Fix double https:// in sourceUrl for external-dns-hetzner-webhook (OCI label already contains https://)",
-            "matchDepNames": ["ghcr.io/mconfalonieri/external-dns-hetzner-webhook"],
-            "sourceUrl": "https://github.com/mconfalonieri/external-dns-hetzner-webhook"
-        },
-        {
-            "description": "Suppress ArgoCD git-tags lookup for system-upgrade-controller (git source without chart; github-releases annotation handles it)",
-            "matchDepNames": ["https://github.com/rancher/system-upgrade-controller"],
-            "matchDatasources": ["git-tags"],
-            "enabled": false
-        },
-        {
-            "description": "Pulumi infrastructure – minor updates",
-            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
-            "matchUpdateTypes": ["minor"],
-            "groupName": "Pulumi infrastructure (minor)"
-        },
-        {
-            "description": "Pulumi infrastructure – patch updates (automerge)",
-            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
-            "matchUpdateTypes": ["patch"],
-            "groupName": "Pulumi infrastructure (patch)",
-            "automerge": true,
-            "automergeType": "branch"
-        },
-        {
-            "description": "Pulumi infrastructure – major updates",
-            "matchFileNames": ["package.json", "package-lock.json", ".devcontainer/**", "src/**", "scripts/**"],
-            "matchUpdateTypes": ["major"],
-            "groupName": "Pulumi infrastructure"
-        },
-        {
-            "description": "Kubernetes infrastructure – minor updates",
-            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
-            "matchUpdateTypes": ["minor"],
-            "groupName": "Kubernetes infrastructure (minor)"
-        },
-        {
-            "description": "Kubernetes infrastructure – patch updates (automerge)",
-            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
-            "matchUpdateTypes": ["patch"],
-            "groupName": "Kubernetes infrastructure (patch)",
-            "automerge": true,
-            "automergeType": "branch"
-        },
-        {
-            "description": "Kubernetes infrastructure – major updates",
-            "matchFileNames": ["deployment/infrastructure/**", "deployment/argocd-sync-waves/wave[0-9]-*", "deployment/argocd-sync-waves/wave1[0-9]-*"],
-            "matchUpdateTypes": ["major"],
-            "groupName": "Kubernetes infrastructure"
-        },
-        {
-            "description": "Apps – minor updates",
-            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
-            "matchUpdateTypes": ["minor"],
-            "groupName": "Apps (minor)"
-        },
-        {
-            "description": "Apps – patch updates (automerge)",
-            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
-            "matchUpdateTypes": ["patch"],
-            "groupName": "Apps (patch)",
-            "automerge": true,
-            "automergeType": "branch"
-        },
-        {
-            "description": "Apps – major updates",
-            "matchFileNames": ["deployment/apps/**", "deployment/argocd-sync-waves/wave[2-9][0-9]-*", "deployment/argocd-sync-waves/wave[1-9][0-9][0-9]-*"],
-            "matchUpdateTypes": ["major"],
-            "groupName": "Apps"
-        }
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "separateMultipleMajor": true,
+  "dependencyDashboard": true,
+  "platformAutomerge": true,
+  "argocd": {
+    "managerFilePatterns": [
+      "/deployment/argocd-apps/.+\\.yaml$/",
+      "/deployment/.+/.+\\.yaml$/"
     ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pulumi helm.v3.Release versions in TypeScript source",
+      "managerFilePatterns": [
+        "/src/.+\\.ts$/"
+      ],
+      "matchStrings": [
+        "chart: \"(?<depName>[^\"]+)\",(?:[^\\n]*\\n){1,3}[^\\n]*version: \"(?<currentValue>[^\"]+)\",[^\\n]*\\n(?:[^\\n]*\\n){0,2}[^\\n]*repositoryOpts: \\{ repo: \"(?<registryUrl>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm"
+    },
+    {
+      "customType": "regex",
+      "description": "Pulumi helm.v3.Release versions annotated with an inline `// renovate:` comment. Two cases need this: an OCI-sourced chart (registry is in the chart: oci:// URL, so there is no repositoryOpts for the manager above to match), and a chart whose repositoryOpts sits too far from the version line for that manager's line window. registryUrl is OPTIONAL but must be captured when present: without it a `datasource=helm` lookup falls back to the public Helm hub and fails `no-result`, which is silent — the dependency is simply never checked. That hid argo-cd, cilium and longhorn for an unknown period (found 2026-09-04). Annotate as `// renovate: datasource=<ds> depName=<name>[ registryUrl=<url>]`.",
+      "managerFilePatterns": [
+        "/src/.+\\.ts$/"
+      ],
+      "matchStrings": [
+        "version: \"(?<currentValue>[^\"]+)\",\\s*//\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Tool versions in scripts/environment/install.sh and src/provisioning-scripts/*.sh (VAR=\"x\" # renovate: idiom, e.g. KATA_VERSION). The path is scripts/environment/install.sh — an earlier `scripts/install.sh` pattern matched nothing and left all 10 tool pins untracked. packageName is an OPTIONAL capture, needed by datasources whose depName is not itself resolvable — git-refs must be given the clone URL (PULUMI_SKILLS_COMMIT pins a COMMIT because pulumi/agent-skills publishes no git tags at all, so there is nothing for github-tags/github-releases to look up). Without the capture the extra key is silently dropped and the lookup fails no-result, the same silent class as the missing registryUrl above.",
+      "managerFilePatterns": [
+        "/scripts/environment/install\\.sh$/",
+        "/src/provisioning-scripts/.+\\.sh$/"
+      ],
+      "matchStrings": [
+        "[A-Z_]+=\"(?<currentValue>[^\"]+)\"\\s+# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)(?:\\s+packageName=(?<packageName>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "helm --version pins in manual install scripts (deployment/**/manual-*.sh), annotated with an inline `# renovate:` bash comment on the same line",
+      "managerFilePatterns": [
+        "/deployment/.+/manual-.+\\.sh$/"
+      ],
+      "matchStrings": [
+        "--version\\s+(?<currentValue>[^\\s\\\\]+)\\s+`#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s`]+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "ArgoCD Helm Application targetRevision in deployment manifests. ⚠ The `[ \\t]*` before chart:/targetRevision: is REQUIRED, not cosmetic: after a `(?:[^\\n]*\\n)` line-skip the cursor sits at a line START, and every one of these keys is indented under `sources:`. Without it this manager matched 0 of the 19 helm Applications in the repo and every chart pin was silently untracked.",
+      "managerFilePatterns": [
+        "/deployment/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "repoURL:\\s*\"?(?<registryUrl>https?://[^\"\\n]+?)\"?\\s*\\n(?:[^\\n]*\\n){0,12}?[ \\t]*chart:\\s*\"?(?<depName>[^\"\\n]+?)\"?\\s*\\n(?:[^\\n]*\\n){0,8}?[ \\t]*targetRevision:\\s*\"?(?<currentValue>[^\"\\n# ]+)"
+      ],
+      "datasourceTemplate": "helm"
+    },
+    {
+      "customType": "regex",
+      "description": "Git targetRevision values annotated with renovate comments",
+      "managerFilePatterns": [
+        "/deployment/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "targetRevision:\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Version constants in project_settings.ts (the `x: \"v\", // renovate:` idiom). Replaces a manager that targeted the upgrade.cattle.io Plan `version:` fields: those are GENERATED by updateConfigFromProjectSettings.sh from general.k3sVersion, so renovate must not touch them — it would fight the generator. k3sVersion here is the single declaration, and this file is at the repo ROOT, so the /src/.+\\.ts$/ patterns above never covered it.",
+      "managerFilePatterns": [
+        "/^project_settings\\.ts$/"
+      ],
+      "matchStrings": [
+        "\"(?<currentValue>[^\"]+)\",\\s*//\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "YAML tag: and value: fields annotated with renovate comments. `value:` is here for env vars on a container — a version pinned as an env var is the only shape Renovate can see when the consumer is a shell script inside args:, where a bare `# renovate:` comment matches nothing and would fail SILENTLY (the pin looks tracked and never moves).",
+      "managerFilePatterns": [
+        "/deployment/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:tag|value):\\s*\"(?<currentValue>[^\"]+)\"\\s+#\\s*renovate:\\s+datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Container image tags in deployment manifests (image: keys AND FROM lines embedded in ConfigMaps, e.g. vllm build-files-configmap.yaml)",
+      "managerFilePatterns": [
+        "/deployment/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image:\\s*\"?(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@sha256:[a-f0-9]{64})?\"?",
+        "FROM\\s+(?<depName>[a-z0-9./_-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@sha256:[a-f0-9]{64})?"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Dockerfile ARGs annotated with renovate comments (e.g. vLLM version from PyPI, torch from the official cu130 index). extractVersion strips the +cuXXX local suffix so 2.11.0+cu130 on the index compares against the bare 2.11.0 ARG. Also scans build-files-configmap.yaml: the real Dockerfile is excluded from those apps' ArgoCD source, so the EMBEDDED copy is what actually builds — bumping only the Dockerfile leaves the build on the old version (hit ollama: GO_VERSION 1.26.0 embedded vs 1.26.5 on disk). Inside the YAML literal block the ARG is indented, hence the leading [ \\t]*.",
+      "managerFilePatterns": [
+        "/deployment/.+/Dockerfile$/",
+        "/deployment/.+/build-files-configmap\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>[^\\s]+)\\s+depName=(?<depName>[^\\s]+)(?:\\s+registryUrl=(?<registryUrl>[^\\s]+))?(?:\\s+versioning=(?<versioning>[^\\s]+))?\\s*\\n[ \\t]*ARG\\s+[A-Z_]+=(?<currentValue>[^\\s]+)"
+      ],
+      "extractVersionTemplate": "^(?<version>[^+]+)"
+    },
+    {
+      "customType": "regex",
+      "description": ".mcp.json MCP server pins. JSON has no comment syntax, so the annotation cannot sit on the line; the npm package is matched by name inside the args array instead. Pinned deliberately -- @latest would silently roll the server under a running session, and argocd-mcp talks to BOTH ArgoCD instances with a read-only API token.",
+      "managerFilePatterns": [
+        "/^\\.mcp\\.json$/"
+      ],
+      "matchStrings": [
+        "\"(?<depName>argocd-mcp)@(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+      ],
+      "datasourceTemplate": "npm"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "CAP k3s AT 1.36.x — the CNI bounds the Kubernetes minor, not k3s. Cilium 1.20.2 lists supported Kubernetes as 1.33-1.36 (Documentation/network/kubernetes/requirements.rst); Cilium main tops out at 1.36 as well and 1.21.0 is still a -pre release. k3s v1.37.0+k3s1 was published 2026-09-14 and Renovate proposed it immediately; merging it would put the CNI outside its support matrix, and cilium is wave 0 on a recreate so everything else waits on it. ⚠ This bound is a REAL ongoing constraint, not a workaround for a transient upstream bug — raise it in the same commit as a Cilium release that lists the new minor, do not delete it. project_settings.ts general.k3sVersion carries the same reasoning.",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "k3s-io/k3s"
+      ],
+      "allowedVersions": "<1.37"
+    },
+    {
+      "description": "Suppress bad ArgoCD OCI depName for zulip helm chart (chart name equals last path segment, causing double-append)",
+      "matchDepNames": [
+        "ghcr.io/zulip/helm-charts/zulip/zulip"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Fix double https:// in sourceUrl for external-dns-hetzner-webhook (OCI label already contains https://)",
+      "matchDepNames": [
+        "ghcr.io/mconfalonieri/external-dns-hetzner-webhook"
+      ],
+      "sourceUrl": "https://github.com/mconfalonieri/external-dns-hetzner-webhook"
+    },
+    {
+      "description": "Suppress lookup of the self-referential vLLM Thor image. registry.gitlab.<tld>/deployments/infrastructure/ai/vllm-thor is CI-built in-cluster (.gitlab-ci.yml), private (anonymous tag list = 401), and has no upstream to track — the real version bump is the VLLM_VERSION ARG in the Dockerfile (pypi datasource). The image: tag is kept in sync with the Dockerfile by hand / updateConfigFromProjectSettings.sh, not Renovate. The pattern matches on the trailing image name only: it previously anchored to deployments/vllm-thor, which stopped matching when the image moved under deployments/infrastructure/ai/ — the suppression silently lapsed and the lookup failure came back (found 2026-09-04).",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "/(^|/)vllm-thor$/"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Suppress lookup of the NVIDIA-AI-IOT Jetson Ollama base image (the ollama Dockerfile's FROM). Its tags are L4T-versioned (r38.2.arm64-sbsa-cu130-24.04), not semver — Renovate's docker versioning can't order them and would churn. The tag must anyway track the Thor node's L4T/JetPack level (image CUDA minor <= node driver), so bumps are deliberate and manual.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/nvidia-ai-iot/ollama"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "PIN the vLLM Thor image's nvidia/cuda base to the 13.0.x line (allow patch only), scoped to the vllm deployment dir. The CUDA runtime/compat-driver MUST NOT exceed the Thor node's JetPack-7 driver max CUDA API (13.0, nvidia-smi on the node). A minor bump (13.0->13.3) mounts a 13.3 compat libcuda that mismatches the 13.0 kernel driver -> vllm serve dies at GPU init with cudaGetDeviceCount Error 803 (cudaErrorSystemDriverMismatch). Renovate auto-merged such a bump once (commit 916ead94) and re-broke the deliberate r13 pin. Block minor/major; bump manually only when the node's JetPack is upgraded.",
+      "matchFileNames": [
+        "deployment/argocd-apps/vllm/**"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "docker.io/nvidia/cuda",
+        "nvidia/cuda"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Suppress lookup of the self-referential Ollama Thor image. registry.gitlab.<tld>/deployments/infrastructure/ai/ollama-thor is CI-built in-cluster (.gitlab-ci.yml from the ollama Dockerfile), private (anonymous tag list = 401), and has no upstream — the real bump is the OLLAMA_VERSION ARG in the Dockerfile (github-releases datasource). The image: tag is kept in sync by hand / updateConfigFromProjectSettings.sh.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "/(^|/)deployments/infrastructure/ai/ollama-thor$/"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "EDA (1/2): suppress the SELF-BUILT module images. deployments/infrastructure/eda/modules/* live in the in-cluster GitLab registry, are built by each app's own .gitlab-ci.yml from installer media, and have NO upstream to track — an anonymous tag list is a 401, same situation as vllm-thor and ollama-thor above. Their tag IS the user-facing module version (`module load xilinx/2024.1`) and must never move: the broker resolves a module by <name>/<version>, the installer-media directory on the artifacts export is keyed on it (the CI's MEDIA_DIR), and the registry entry on the share names it. A Renovate bump here would break all three at once.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "/(^|/)deployments/infrastructure/eda/modules/"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "EDA (2/2): suppress UPSTREAM BASE image bumps inside the EDA app dirs (ubuntu, centos, rockylinux in the Dockerfiles AND in the build-files-configmap.yaml copies that actually build). These bases are NOT free to move: xilinx/2024.1 installs on ubuntu:22.04 specifically because AMD's supported-OS list for Vivado 2024.1 (UG973) stops at 22.04.3 — on 24.04 xsetup hangs in finalisation for hours (pipelines #46, #51), so a Renovate bump to 24.04 would reintroduce a build that never completes. quay.io/rockylinux/rockylinux:8 is the ONLY source of compat-openssl10 (real libcrypto.so.10/libssl.so.10 with OPENSSL_1.0.x symbols) which Vivado's bundled libthrift needs and no Debian/Ubuntu release ships; EL9 has only compat-openssl11 (wrong soname). quay.io/centos/centos:stream9 is required for hyperlynx because ubi9 lacks Xvfb. On top of that, every base bump rebuilds a multi-hour image and takes the app DOWN for the whole build (strategy: Recreate), and needs an `apt --dry-run` check first. So these are deliberate, manual, one-at-a-time changes. Scoped by path so the same bases stay tracked elsewhere (remote-desktop's own base still gets PRs).",
+      "matchFileNames": [
+        "deployment/argocd-apps/eda/**"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "docker.io/library/ubuntu",
+        "ubuntu",
+        "quay.io/centos/centos",
+        "quay.io/rockylinux/rockylinux"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Suppress ArgoCD git-tags lookup for system-upgrade-controller (git source without chart; github-releases annotation handles it)",
+      "matchDepNames": [
+        "https://github.com/rancher/system-upgrade-controller"
+      ],
+      "matchDatasources": [
+        "git-tags"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Global: apply patch/pin/digest updates automatically (auto-merge, no review) even for deps outside the domain globs",
+      "matchFileNames": [
+        "**/*"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Pulumi infrastructure – minor updates",
+      "matchFileNames": [
+        "package.json",
+        "package-lock.json",
+        ".devcontainer/**",
+        "src/**",
+        "scripts/**"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "Pulumi infrastructure (minor)"
+    },
+    {
+      "description": "Pulumi infrastructure – patch updates (automerge)",
+      "matchFileNames": [
+        "package.json",
+        "package-lock.json",
+        ".devcontainer/**",
+        "src/**",
+        "scripts/**"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Pulumi infrastructure (patch)",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Pulumi infrastructure – major updates (one PR per dependency)",
+      "matchFileNames": [
+        "package.json",
+        "package-lock.json",
+        ".devcontainer/**",
+        "src/**",
+        "scripts/**"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "major",
+        "pulumi-infrastructure"
+      ]
+    },
+    {
+      "description": "Kubernetes infrastructure – minor updates",
+      "matchFileNames": [
+        "deployment/argocd-infra/**",
+        "deployment/argocd-infra/app-of-apps/wave[0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave1[0-9]-*"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "Kubernetes infrastructure (minor)"
+    },
+    {
+      "description": "Kubernetes infrastructure – patch updates (automerge)",
+      "matchFileNames": [
+        "deployment/argocd-infra/**",
+        "deployment/argocd-infra/app-of-apps/wave[0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave1[0-9]-*"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Kubernetes infrastructure (patch)",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Kubernetes infrastructure – major updates (one PR per dependency)",
+      "matchFileNames": [
+        "deployment/argocd-infra/**",
+        "deployment/argocd-infra/app-of-apps/wave[0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave1[0-9]-*"
+      ],
+      "matchDepNames": [
+        "!cilium",
+        "!argo-cd"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "major",
+        "kubernetes-infrastructure"
+      ]
+    },
+    {
+      "description": "Apps – minor updates",
+      "matchFileNames": [
+        "deployment/argocd-apps/**",
+        "deployment/argocd-infra/app-of-apps/wave[2-9][0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave[1-9][0-9][0-9]-*"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "Apps (minor)"
+    },
+    {
+      "description": "Apps – patch updates (automerge)",
+      "matchFileNames": [
+        "deployment/argocd-apps/**",
+        "deployment/argocd-infra/app-of-apps/wave[2-9][0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave[1-9][0-9][0-9]-*"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Apps (patch)",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Apps – major updates (one PR per dependency)",
+      "matchFileNames": [
+        "deployment/argocd-apps/**",
+        "deployment/argocd-infra/app-of-apps/wave[2-9][0-9]-*",
+        "deployment/argocd-infra/app-of-apps/wave[1-9][0-9][0-9]-*"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "major",
+        "apps"
+      ]
+    },
+    {
+      "description": "CILIUM (CNI) — ONE PR for BOTH version pins, never auto-merged, never grouped with anything else. The chart version is duplicated by design and the two copies MUST move together: src/cni.ts is the Pulumi-managed release (used on bootstrap/recreate) and deployment/argocd-infra/app-of-apps/wave0-cilium.yaml is the ArgoCD-managed one (what actually deploys day-to-day). Without isolation they fall into two DIFFERENT groups (\"Pulumi infrastructure\" vs \"Kubernetes infrastructure\") = two PRs, and a patch bump would be AUTO-MERGED by the global patch rule — merging one pin while the other lags, so a later recreate silently installs a different Cilium than the running cluster. The isolation is enforced by EXCLUDING cilium from every broad rule above (matchDepNames \"!cilium\") rather than by relying on packageRules precedence, which the Renovate docs do not actually specify — do NOT remove those exclusions. automerge is false for every update type: Cilium is the wave-0 CNI and its ArgoCD app is automated+selfHeal, so merging this PR immediately rolls the agent on EVERY node.",
+      "matchDatasources": [
+        "helm"
+      ],
+      "matchDepNames": [
+        "cilium"
+      ],
+      "matchFileNames": [
+        "src/cni.ts",
+        "deployment/argocd-infra/app-of-apps/wave0-cilium.yaml"
+      ],
+      "groupName": "Cilium CNI (both pins)",
+      "groupSlug": "cilium-cni",
+      "separateMinorPatch": false,
+      "automerge": false,
+      "addLabels": [
+        "cilium",
+        "cni",
+        "needs-window"
+      ]
+    },
+    {
+      "description": "ARGO CD — ONE PR for ALL THREE version pins, never auto-merged, never grouped with anything else. Same reasoning as the Cilium rule above: the chart version is duplicated by design and the copies MUST move together. src/argocd.ts is the Pulumi-managed release (used on bootstrap/recreate), deployment/argocd-infra/argocd-infra-self/argocd-infra-self.yaml is the infra instance managing ITSELF, and deployment/argocd-infra/app-of-apps/wave19-argocd-apps.yaml is the apps instance. Left ungrouped they land in two DIFFERENT groups (\"Pulumi infrastructure\" for src/, \"Kubernetes infrastructure\" for deployment/) = two PRs, and a patch bump would be AUTO-MERGED by the global patch rule — moving one pin while the others lag, so a later recreate installs a different ArgoCD than the running cluster. Enforced by EXCLUDING argo-cd from every broad rule (matchDepNames \"!argo-cd\") rather than by packageRules precedence, which the Renovate docs do not specify — do NOT remove those exclusions. automerge is false for every update type: this rolls the GitOps controller that would be applying its own change, and the self-managed app needs a manual sync for version bumps. NOTE the CLI is deliberately NOT in this group: scripts/environment/install.sh pins the argocd CLI from a DIFFERENT datasource (github-releases argoproj/argo-cd, an app version like 3.5.2) while these three are helm CHART versions (10.8.0), so Renovate cannot group them — they are different dependencies. Keep the CLI in step by hand when bumping this group; chart 10.8.0 = appVersion v3.5.2.",
+      "matchDatasources": [
+        "helm"
+      ],
+      "matchDepNames": [
+        "argo-cd"
+      ],
+      "matchFileNames": [
+        "src/argocd.ts",
+        "deployment/argocd-infra/argocd-infra-self/argocd-infra-self.yaml",
+        "deployment/argocd-infra/app-of-apps/wave19-argocd-apps.yaml"
+      ],
+      "groupName": "Argo CD (all pins)",
+      "groupSlug": "argo-cd",
+      "separateMinorPatch": false,
+      "automerge": false,
+      "addLabels": [
+        "argocd",
+        "needs-window"
+      ]
+    },
+    {
+      "description": "Suppress lookups against the node-local image registry. remote-desktop and ollama pull from 127.0.0.1:30500 (image-registry's NodePort) for LAN speed; that address means 'this node' and is meaningless to Renovate, which resolves it to its own loopback and fails `no-result`. Those images are CI-built in-cluster and have no upstream to track — their real version key is IMAGE_TAG, deliberately bumped by hand only when image CONTENT changes. Left unsuppressed the failure is pure noise, and noise is what hid three genuine lookup failures (argo-cd, cilium, longhorn). ⚠ Match the BARE HOST: Renovate splits 127.0.0.1:30500/... on the colon and reports the depName as just `127.0.0.1`, so a pattern anchored on the host:port prefix never matches.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "/^127\\.0\\.0\\.1/"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Hold TypeScript on 6.x. @pulumi/pulumi declares peerOptional typescript '>= 3.8.3 < 7' — as of 3.261.0 (the latest) TS7, the native Go port, is explicitly excluded, and `npm i typescript@7` fails ERESOLVE. Pulumi IS this project, so TS7 cannot be adopted until upstream widens that range. Verified 2026-09-04. Drop this rule once @pulumi/pulumi allows <8.",
+      "matchDepNames": [
+        "typescript"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    }
+  ]
 }

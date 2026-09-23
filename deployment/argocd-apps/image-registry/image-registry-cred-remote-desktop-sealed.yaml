@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-cred
+  namespace: remote-desktop
+spec:
+  encryptedData:
+    .dockerconfigjson: ""
+  template:
+    metadata:
+      name: image-registry-cred
+      namespace: remote-desktop
+    type: kubernetes.io/dockerconfigjson

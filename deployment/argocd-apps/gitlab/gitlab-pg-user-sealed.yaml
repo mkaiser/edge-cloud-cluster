@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  name: gitlab-pg-user
+  namespace: gitlab
+spec:
+  encryptedData:
+    password: ""
+    username: AgB3xhP2KHY7hTkRxef0DwANHXQV+eVbVOToW3keOnav7OIbxL29rl9kqw8H/jVU8C0GpA2TZ1dAKmz1k+lAZejsyeyaf9AIRnUzI1Jg/gftT4cookw463kmgimNsbTnwbIsyI72ja+Yo+Al7m5QZPJ6M2Vx/vyv6Sr/cBj1Y1V5iel83Ye7po7H8y9UdcAllWwP13jwe+PANS2BGHWpppojChabiPvESpsDtc6UGYTDGMMBG6wmnZeu4EkDfEbukKB0jGBiDM6dO2ENGV8hUQy3j6aDWp/xW6wussbQhWTgwSweAXaltU2x1eAIwZj+50Q+erxa/HlLKfVb2b4PJBCYPgem/wUVDDIuf9kUvmLFjKlvq4TUH9UDDkGyhszp8I7en2z/h7p1sC5ph++MMY+HmyXG72qzF51nOn4dMNzMwtxELjMNiB1odp0QXLTGjynhvTW+Ne0dH7XcgVXcwp56/Qj/LNK5H9veK6eehw2gNllidR58ZtXFXgxvcqPivlk+dLwce3NvtJCFehHCcEUSHqiHnXN+fgCDVWmvFM3itWFOTUfjwxrrvy11IeButKW1COmNWHBz8QTQo/6RoR7nsq5cEgeA4xf4XO9cip+DyG7Kwg9OusTeAdlx8FrjpNTurytrh98XyGgWR9JkSIaxLykDwxuvySzgddaiCRfHUMkpiT02mpsG8UcD980HFUXhDSPUxhg=
+  template:
+    metadata:
+      name: gitlab-pg-user
+      namespace: gitlab

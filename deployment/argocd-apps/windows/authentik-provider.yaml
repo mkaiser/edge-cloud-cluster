@@ -1,0 +1,159 @@
+# Authentik group provisioning for the Windows VM.
+#
+# ⚠ NO PROVIDER AND NO APPLICATION TILE ANY MORE. This app used to own a public
+# "guacamole" OAuth2 provider, a "Remote Windows Desktop" application and an
+# `access-windows` policy, because it ran its own Guacamole portal at windows.<tld>.
+# That portal is gone: the VM's tile now lives in remote-desktop's Guacamole, which has
+# its OWN provider and is gated by `access-remote-desktop`. All this job still does is
+# create the group that tile's READ grant is keyed on.
+#
+#   PostSync job → create the windows-users group.
+#
+# ⚠ `windows-users` MUST ALSO BE IN `access-remote-desktop`
+# (remote-desktop/authentik-provider.yaml). That policy gates the PORTAL; Authentik
+# denies an application outright once >=1 binding exists and the user matches none, so
+# without it a member of this group reaches no portal and never sees the tile.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace). The provisioner role includes add_group so this job can create it
+# itself — no infra-git edit.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windows-authentik
+  namespace: windows
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windows-authentik-token-read
+  namespace: windows
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windows-authentik-token-read
+  namespace: windows
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windows-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: windows-authentik
+    namespace: windows
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: windows-authentik-provider
+  namespace: windows
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: windows-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n windows \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              # windows-users access group (idempotent).
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              GRP_PK=$(first_pk "core/groups/?name=windows-users")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'windows-users'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"windows-users","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "windows-users group pk=$GRP_PK"
+
+              echo "windows-users group configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: windows-authentik-provider-cleanup
+  namespace: windows
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: windows-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n windows \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              # ⚠ THIS APP NO LONGER CREATES EITHER OF THESE. Both are LEGACY objects from
+              # when it ran its own Guacamole portal, and a cluster provisioned before that
+              # change still carries them. The deletes stay so removing the app tidies them
+              # up; on a fresh cluster they simply find nothing. Both already tolerate
+              # absence (|| true, empty-pk guard), so this is a no-op there.
+              echo "Deleting legacy application 'windows' (if present)..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/windows/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=guacamole" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting legacy OAuth2 provider 'guacamole' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              # ⚠ windows-users is intentionally KEPT: it carries user memberships and the
+              # tile's READ grant in remote-desktop's Guacamole is keyed on it.
+              echo "Windows Authentik cleanup done."

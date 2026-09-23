@@ -1,0 +1,197 @@
+# CronJob: sync Authentik admin groups → Zulip realm-admin role every 15 min.
+#
+# WHY: Zulip's OIDC backend (GenericOpenIdConnectBackend) does NOT support role
+# syncing via OIDC claims — social_auth_sync_user_attributes() is SAML-only and
+# returns early for any other backend. There is no idp_config parameter to map an
+# OIDC claim to is_realm_admin. This cronjob is therefore the sole mechanism that
+# keeps Zulip admin status in sync with Authentik groups.
+#
+# Logic:
+#   1. GET Authentik users in groups: employees-extended ∪ authentik-admins → admin_set
+#   2. Exec into zulip-0, run Django shell on stdin:
+#      - users in admin_set → ROLE_REALM_ADMINISTRATOR (promote; skip if already admin)
+#      - users NOT in admin_set but currently admin → ROLE_MEMBER (demote; skip root@)
+#      - users in admin_set with no Zulip account yet → skip (will be promoted on first login)
+#
+# Auth:
+#   Authentik: AUTHENTIK_BOOTSTRAP_TOKEN read from authentik-secrets (authentik ns) via kubectl
+#   Zulip:     no token — Django shell via kubectl exec into zulip-0
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zulip-sync-admins
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zulip-sync-admins-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["authentik-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zulip-sync-admins-authentik-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zulip-sync-admins-authentik-secrets
+subjects:
+- kind: ServiceAccount
+  name: zulip-sync-admins
+  namespace: zulip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zulip-sync-admins
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zulip-sync-admins
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zulip-sync-admins
+subjects:
+- kind: ServiceAccount
+  name: zulip-sync-admins
+  namespace: zulip
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zulip-sync-admins
+  namespace: zulip
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: zulip-sync-admins
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: sync
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            - name: AUTHENTIK_URL
+              value: "http://authentik-server.authentik.svc.cluster.local"
+            # Union of these Authentik groups is the Zulip admin set.
+            - name: AUTHENTIK_GROUPS
+              value: "employees-extended authentik-admins"
+            command:
+            - /bin/sh
+            - -ec
+            - |
+              apk add --no-cache curl jq >/dev/null 2>&1
+
+              AUTHENTIK_TOKEN=$(kubectl get secret authentik-secrets -n authentik \
+                -o jsonpath='{.data.AUTHENTIK_BOOTSTRAP_TOKEN}' | base64 -d)
+              [ -z "$AUTHENTIK_TOKEN" ] && { echo "ERROR: could not read AUTHENTIK_BOOTSTRAP_TOKEN"; exit 1; }
+
+              echo "Fetching Authentik admin members (groups: $AUTHENTIK_GROUPS)..."
+              ADMIN_EMAILS=""
+              for GRP in $AUTHENTIK_GROUPS; do
+                PAGE=1
+                while true; do
+                  RESP=$(curl -sf \
+                    -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+                    "$AUTHENTIK_URL/api/v3/core/users/?groups__name=${GRP}&page_size=100&page=${PAGE}")
+                  BATCH=$(echo "$RESP" | jq -r '.results[].email // empty')
+                  [ -z "$BATCH" ] && break
+                  ADMIN_EMAILS=$(printf '%s\n%s' "$ADMIN_EMAILS" "$BATCH")
+                  NEXT=$(echo "$RESP" | jq -r '.pagination.next // 0')
+                  [ "$NEXT" = "0" ] || [ "$NEXT" = "null" ] && break
+                  PAGE=$((PAGE + 1))
+                done
+              done
+              ADMIN_EMAILS=$(echo "$ADMIN_EMAILS" | tr '[:upper:]' '[:lower:]' | sort -u | grep -v '^$' || true)
+              COUNT=$(printf '%s\n' "$ADMIN_EMAILS" | grep -c . || true)
+              echo "admin members (employees-extended ∪ authentik-admins): $COUNT"
+
+              # JSON array for Python literal — passed as ARGV[0] so no shell interpolation
+              # into the Python script body.
+              EMAILS_JSON=$(printf '%s\n' "$ADMIN_EMAILS" | python3 -c "
+              import sys, json
+              emails = [l.strip() for l in sys.stdin if l.strip()]
+              print(json.dumps(emails))
+              ")
+
+              echo "Reconciling Zulip admin roles (zulip-0)..."
+              # Django shell reads the script from stdin. su zulip is required because
+              # manage.py refuses to run as root. -i flag on kubectl exec ensures stdin
+              # is connected (the heredoc is piped through).
+              kubectl -n zulip exec -i zulip-0 -- \
+                su zulip -c "python3 /home/zulip/deployments/current/manage.py shell" \
+                <<PYEOF
+              import json, sys
+              from zerver.models import UserProfile
+
+              emails = json.loads('''${EMAILS_JSON}''')
+              emails = set(e.lower() for e in emails)
+
+              promoted = []
+              demoted  = []
+              skipped  = []
+
+              for email in emails:
+                  try:
+                      u = UserProfile.objects.get(delivery_email__iexact=email)
+                  except UserProfile.DoesNotExist:
+                      skipped.append(email)
+                      continue
+                  if u.role != UserProfile.ROLE_REALM_ADMINISTRATOR:
+                      u.role = UserProfile.ROLE_REALM_ADMINISTRATOR
+                      u.save(update_fields=['role'])
+                      promoted.append(email)
+
+              for u in UserProfile.objects.filter(role=UserProfile.ROLE_REALM_ADMINISTRATOR):
+                  if u.is_bot:
+                      continue
+                  if u.delivery_email.lower() in emails:
+                      continue
+                  u.role = UserProfile.ROLE_MEMBER
+                  u.save(update_fields=['role'])
+                  demoted.append(u.delivery_email)
+
+              if promoted: print('promoted:', promoted)
+              if demoted:  print('demoted:', demoted)
+              if skipped:  print('skipped (no account yet):', skipped)
+              print('done.')
+              PYEOF
+
+              echo "Admin sync complete."

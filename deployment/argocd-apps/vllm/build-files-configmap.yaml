@@ -1,0 +1,772 @@
+# Dockerfile + .gitlab-ci.yml content, embedded so postsync-build-image.yaml can
+# read them without cloning the (private) infra repo. Keep in sync by hand with
+# the sibling Dockerfile / .gitlab-ci.yml files whenever either changes.
+#
+# PreSync hook (weight -1, same as the build-trigger RBAC): the build-trigger
+# Job mounts this and is itself PreSync, so this must land before it — as a
+# plain sync-wave resource it's only applied after PreSync hooks finish,
+# which deadlocked the Job forever on "configmap not found".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-build-files
+  namespace: vllm
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  Dockerfile: |
+    # vLLM 0.24.0 for the Jetson Thor (Blackwell, sm_110 / arch 11.0), L4T R38 / JetPack 7 /
+    # CUDA 13.0 (verified on ecc/gpu-model=jetson-thor). Public dustynv/vllm images are
+    # JetPack-6/CUDA-12.8 and do NOT run here; nvcr.io/nvidia/vllm needs NGC auth —
+    # so we build our own image and push to registry.gitlab.<tld>.
+    #
+    # STRATEGY (r17, CHANGED from r16): install the RELEASED vLLM 0.24.0 abi3 aarch64
+    # wheel straight from PyPI, paired with the OFFICIAL cu130 PyTorch build from
+    # download.pytorch.org/whl/cu130. Proven on-node by a Step-0 spike:
+    # the official SBSA cu130 torch 2.11.0 DRIVES the Thor Tegra iGPU (torch.cuda works,
+    # engine builds KV cache, generates correctly) — so no source build, and no
+    # jetson-ai-lab index needed. vLLM's abi3 wheel is Python-version-agnostic
+    # (cp38-abi3 runs on our cp312). We do NOT use the vLLM nightly index: its dev
+    # wheels rotate and 404 within hours (unreproducible) — the PyPI RELEASE is stable.
+    #
+    # Base carries the CUDA runtime/toolkit — the `nvidia` RuntimeClass injects the
+    # driver + runtime libs at serve time, but the image must carry CUDA itself.
+    # arm64 tag confirmed on Docker Hub. Fully-qualified registry (docker.io/) is
+    # REQUIRED: buildah enforces short-name resolution and can't prompt without a TTY
+    # in CI ("short-name resolution enforced" otherwise).
+    #
+    # CUDA VERSION MUST MATCH THE JETPACK DRIVER — pin the toolkit MINOR to the driver's.
+    # The Thor runs L4T R38.4.0 (JetPack 7 GA), whose driver's max CUDA API is 13.0. A
+    # 13.3 base runtime overshoots it and `vllm serve` dies at GPU init with
+    # `cudaGetDeviceCount() ... Error 803: system has unsupported display driver / cuda
+    # driver combination` (= cudaErrorSystemDriverMismatch — runtime newer than driver).
+    # 13.0 also matches the cu130 torch/vllm wheels, so base, torch, and driver all
+    # align on 13.0. Bump the minor only when JetPack on the node is upgraded
+    # (nvidia-smi "CUDA Version" on the node = the ceiling).
+    # renovate: managed by the "Container image tags" regex manager (docker datasource)
+    FROM docker.io/nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+
+    # Released vLLM version. 0.24.0 was the first release supporting the target model's
+    # arch `Qwen3_5MoeForConditionalGeneration` + its `modelopt` NVFP4 quant.
+    #
+    # BUMPED 0.24.0 -> 0.27.1 to chase NATIVE FP4 on Thor. On 0.24.0 the pod
+    # logged `Using 'MARLIN' NvFp4 MoE backend` + "Your GPU does not have native support for
+    # FP4 computation", i.e. weight-only Marlin EMULATION — measured 9.6 tok/s single-stream
+    # vs Ollama's 34.6 on the same base model (doc/llm-performance.md).
+    #
+    # Upstream now includes sm_110 in the native CUTLASS FP4 path. Two gates, both read from
+    # the source: the runtime check is
+    #   `cuda_device_capability >= 100 && < 120`  (csrc/.../nvfp4_scaled_mm_entry.cu)
+    # which 110 satisfies, and the build gate compiles those kernels for
+    #   FP4_SM100_ARCHS = "10.0f;10.7f;11.0f"    (CMakeLists.txt, CUDA >= 13.0)
+    # where `11.0f` IS Thor. The CMake comment says "SM10x/11x FP4 kernels" outright.
+    #
+    # ⚠ CAVEAT: we install a PREBUILT WHEEL, so whether those kernels are actually compiled
+    # in is upstream's build decision, not ours — the CMake above is evidence of intent, not
+    # proof for this wheel. VERIFY IN-POD after the build: if the "MARLIN"/"does not have
+    # native support" lines are GONE from the pod log, it worked; if they persist, the wheel
+    # lacks the sm_110 kernels and only a source build would fix it. Re-run the concurrency
+    # benchmark either way, because the whole point was the single-stream gap.
+    # renovate: datasource=pypi depName=vllm
+    ARG VLLM_VERSION=0.29.0
+    # TORCH — the ABI-critical pin. vLLM 0.24.0's abi3 wheel declares torch==2.11.0 and
+    # its kernels (via the `humming-kernels` pkg, see below) link that libtorch ABI.
+    # Install it from the OFFICIAL cu130 index (NOT the jetson index used pre-r17): the
+    # spike proved this SBSA cu130 build runs on Thor's Tegra iGPU, and it is the build
+    # vLLM's wheel was compiled against. Install torch FIRST so the vllm install can't
+    # swap it for PyPI's default (cu128) 2.11.0 — a different-CUDA same-version torch is
+    # the classic `undefined symbol` ABI trap. The `+cu130` local tag is on the torch
+    # wheel; assert it after install. Bump together with VLLM_VERSION.
+    # renovate: datasource=pypi depName=torch registryUrl=https://download.pytorch.org/whl/cu130/
+    # ⚠ MUST match what the vLLM wheel declares, or `vllm serve` dies on an undefined
+    # symbol (the _C ABI mismatch).
+    # vllm 0.24.0 declared torch==2.11.0; 0.27.1 declares torch==2.13.0 — verified from the
+    # PyPI metadata, and torch-2.13.0+cu130 manylinux_2_28_aarch64 exists on the official
+    # cu130 index. The assertion further down enforces the pairing at build time.
+    ARG TORCH_VERSION=2.13.0
+    # OFFICIAL cu130 PyTorch wheel index (SBSA/aarch64). torch lives here; everything
+    # else (vllm + its deps: humming-kernels, triton, compressed-tensors, xgrammar,
+    # flashinfer, transformers, …) resolves from PyPI.
+    ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+    ENV DEBIAN_FRONTEND=noninteractive \
+        CUDA_HOME=/usr/local/cuda \
+        PATH=/usr/local/cuda/bin:${PATH}
+
+    # Shared-library runtime deps the cu130 aarch64 torch wheel links but the
+    # nvidia/cuda base image (NOT JetPack) lacks. Without them `import torch` dies at
+    # runtime with `<lib>: cannot open shared object file`. Determined authoritatively by
+    # `ldd` over torch/lib/*.so in the built image (carried over from r16, same base):
+    #   - NVPL LAPACK/BLAS  -> libnvpl-lapack0 libnvpl-blas0  (libnvpl_lapack_lp64_gomp.so.0)
+    #   - cuDSS (sparse solver) -> libcudss0-cuda-13          (libcudss.so.0)
+    # (ldd also flags libcuda.so.1, but that's the DRIVER stub injected at runtime by the
+    # nvidia container runtime / CDI — never shipped in the image, so not installed here.)
+    # All from the CUDA apt repo the base already trusts; -dev not needed (runtime only);
+    # unpinned — apt resolves the in-repo version matching the base image's CUDA repo.
+    # NOTE: these gaps did NOT surface in the build's import guards because CI builds on
+    # the Thor HOST where the host libs leak into the buildah chroot; only the isolated
+    # runtime pod exposes them.
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-venv python3-dev \
+            libopenblas-dev libnuma1 \
+            libnvpl-lapack0 libnvpl-blas0 \
+            libcudss0-cuda-13 \
+        && rm -rf /var/lib/apt/lists/* \
+        # cuDSS installs to a VERSIONED subdir NOT on the default linker path
+        # (/usr/lib/aarch64-linux-gnu/libcudss/13/), so `import torch` still can't find
+        # libcudss.so.0 after the apt install. NVPL lands in the standard multiarch dir
+        # and needs no help; cuDSS does. Register the dir with ld.so + refresh the cache.
+        && echo "/usr/lib/aarch64-linux-gnu/libcudss/13" > /etc/ld.so.conf.d/cudss.conf \
+        && ldconfig
+
+    # Isolated venv (Ubuntu 24.04 is PEP-668 externally-managed).
+    ENV VIRTUAL_ENV=/opt/venv
+    RUN python3 -m venv "$VIRTUAL_ENV"
+    ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+    RUN pip install -U pip setuptools wheel
+
+    # Install torch FIRST from the official cu130 index (pins the ABI), then the vLLM
+    # 0.24.0 wheel — letting it pull its OWN dependency set from PyPI.
+    #
+    # WHY NOT PIN vllm's sub-deps (triton/xgrammar/compressed-tensors): unlike r16
+    # (jetson index that omitted them), the PyPI vllm 0.24.0 wheel declares them
+    # exactly — `compressed-tensors==0.17.0`, `humming-kernels[cu13]==0.1.6`, an
+    # unpinned triton (resolves to 3.6.0), xgrammar, flashinfer. Pinning a stale
+    # `triton==3.5.0` (the r16 value) makes pip ResolutionImpossible against 0.24. So we
+    # name ONLY the wheel and let it resolve; all cu13 nvidia-* sub-deps have aarch64
+    # wheels on PyPI. `--extra-index-url` cu130 keeps torch satisfied at 2.11.0+cu130
+    # (already installed) and lets any cuda-13 nvidia-* wheels resolve.
+    #
+    # NOTE ON `_C`: vLLM 0.24 has NO bundled `vllm._C` extension — CUDA kernels moved to
+    # the separate `humming-kernels` pkg (+ triton). So the r16 build-guard
+    # `import vllm._C` is GONE (it would ModuleNotFoundError = false failure). The guard
+    # below instead imports `vllm`, the OpenAI api_server, and compressed_tensors — the
+    # actual serving path — which fails the BUILD on a real ABI/so break.
+    #
+    # Flaky-network hardening (the Thor joins over WireGuard; the link can trickle):
+    # vLLM's dependency tree is multi-GB (torch, flashinfer-cubin, etc.). KEEP pip's HTTP
+    # cache (no --no-cache-dir) so a killed/retried attempt reuses already-downloaded
+    # wheels; CI bind-mounts /root/.cache/pip from a node-local hostPath (see
+    # .gitlab-ci.yml) so it also survives ACROSS builds. Generous per-attempt wall cap
+    # (2h) under the job's 3h timeout; pip's --retries/--timeout/--resume-retries handle
+    # transient resets. `timeout` is the outer guard against a dead-socket hang.
+    RUN retry() { for i in 1 2; do timeout 7200 "$@" && return 0; \
+            echo "attempt $i failed/stalled (rc=$?), retrying in 30s..."; sleep 30; done; return 1; } \
+        && retry pip install --resume-retries 10 --retries 10 --timeout 120 \
+            --index-url "${TORCH_INDEX}" \
+            "torch==${TORCH_VERSION}" \
+        && retry pip install --resume-retries 10 --retries 10 --timeout 120 \
+            --extra-index-url "${TORCH_INDEX}" \
+            "vllm==${VLLM_VERSION}" \
+        # Fail the build if resolving vllm silently bumped torch off the +cu130 pin
+        # (would reintroduce an ABI mismatch at `vllm serve`). The +cu130 local tag IS
+        # present on the official torch wheel — assert both the version and the cuda build.
+        && python -c "import torch,sys; v=torch.__version__; cu=torch.version.cuda; \
+            ok = v=='${TORCH_VERSION}+cu130' and cu and cu.startswith('13'); \
+            sys.exit(0) if ok else (print(f'ERROR: torch {v} cuda {cu} != ${TORCH_VERSION}+cu130 (vllm resolution changed it)') or sys.exit(1))"
+
+    # Build-time verification. A heredoc'd script (NOT an inline `python -c`) so the logic
+    # is readable and the shell quoting stays sane. It:
+    #  - asserts torch is a CUDA build (torch.version.cuda set);
+    #  - force-imports vllm, the OpenAI api_server, and compressed_tensors — the serving
+    #    path — so a torch/vllm ABI break (`undefined symbol`) or a genuinely missing
+    #    image .so (NVPL/cuDSS) FAILS the build.
+    # It tolerates EXACTLY ONE gap: `libcuda.so.1`, the NVIDIA DRIVER stub. That is injected
+    # into the container at RUN time by the nvidia runtime / CDI and is (correctly) not in
+    # the image; CI also builds in a chroot where the host driver doesn't leak in, so the
+    # imports may hit `libcuda.so.1: cannot open shared object file` at build time even on
+    # a perfect image. Any OTHER ImportError still fails. (A green build is
+    # necessary-not-sufficient — the isolated runtime pod remains the final proof.)
+    # NOTE: vLLM 0.24 has no `vllm._C` — do NOT re-add that guard (see the install note).
+    RUN cat > /tmp/verify.py <<'PY' \
+     && python /tmp/verify.py \
+     && rm -f /tmp/verify.py
+    import sys, importlib
+    import torch
+    assert torch.version.cuda, f"torch has no CUDA (cpu-only build?): {torch.__version__}"
+    print("torch", torch.__version__, "cuda", torch.version.cuda)
+
+    def guard(name, fn):
+        try:
+            fn()
+            print(name, "OK")
+        except ImportError as e:
+            if "libcuda.so.1" in str(e):
+                print(name, "- libcuda.so.1 absent at build (driver injected at runtime), OK")
+            else:
+                print(name, "FAILED:", e)
+                sys.exit(1)
+
+    guard("server-import", lambda: (
+        importlib.import_module("vllm"),
+        importlib.import_module("vllm.entrypoints.openai.api_server"),
+    ))
+    # Quantized serving deps — a missing compressed_tensors only surfaces at model load
+    # (get_quantization_config), so assert it at build time too.
+    guard("compressed_tensors", lambda: importlib.import_module("compressed_tensors"))
+    print("vllm", importlib.import_module("vllm").__version__, "verify OK")
+    PY
+    # NOTE: no `pip cache purge` here. The pip cache lives at /root/.cache/pip, which CI
+    # bind-mounts from a persistent node-local hostPath (`buildah bud -v`, see
+    # .gitlab-ci.yml) so it survives ACROSS builds and lets rebuilds skip the slow
+    # origin. It is a build-time mount only — NOT committed to any image layer — so
+    # there's nothing to purge for image size, and purging would instead wipe the shared
+    # persistent cache mid-build. (Without the CI `-v`, the cache is just an ordinary
+    # in-build dir that vanishes with the build container — still no bloat.)
+
+    # ── Hermes tool-call chat template ────────────────────────────────────────────
+    # vLLM's examples/tool_chat_template_hermes.jinja, vendored so tool_choice:"auto"
+    # makes the model emit <tool_call> tags that the --tool-call-parser hermes parser can
+    # parse. RE-VALIDATE for the new model: nvidia/Qwen3.6-35B-A3B-NVFP4 is a Qwen3.5 MoE
+    # REASONING model and may work with its OWN chat_template + the qwen3 tool parser and
+    # NOT need this Hermes override — the Deployment chooses whether to pass
+    # --chat-template. Kept baked in so either path is available without an image rebuild.
+    # Embedded via a single-quoted heredoc (no shell/jinja expansion) because CI mirrors
+    # ONLY this Dockerfile + .gitlab-ci.yml into GitLab — a COPY of a sibling file has no
+    # build context.
+    RUN mkdir -p /etc/vllm && cat > /etc/vllm/tool_chat_template_hermes.jinja <<'HERMES_TEMPLATE_EOF'
+    {%- macro json_to_python_type(json_spec) %}
+        {%- set basic_type_map = {
+        "string": "str",
+        "number": "float",
+        "integer": "int",
+        "boolean": "bool"
+    } %}
+
+        {%- if basic_type_map[json_spec.type] is defined %}
+            {{- basic_type_map[json_spec.type] }}
+        {%- elif json_spec.type == "array" %}
+            {{- "list[" +  json_to_python_type(json_spec|items) + "]" }}
+        {%- elif json_spec.type == "object" %}
+            {%- if json_spec.additionalProperties is defined %}
+                {{- "dict[str, " + json_to_python_type(json_spec.additionalProperties) + ']' }}
+            {%- else %}
+                {{- "dict" }}
+            {%- endif %}
+        {%- elif json_spec.type is iterable %}
+            {{- "Union[" }}
+            {%- for t in json_spec.type %}
+                {{- json_to_python_type({"type": t}) }}
+                {%- if not loop.last %}
+                    {{- "," }}
+                {%- endif %}
+            {%- endfor %}
+            {{- "]" }}
+        {%- else %}
+            {{- "Any" }}
+        {%- endif %}
+    {%- endmacro %}
+
+
+    {{- bos_token }}
+    {{- "<|im_start|>system\nYou are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. Here are the available tools: <tools> " }}
+    {%- if tools is iterable and tools | length > 0 %}
+        {%- for tool in tools %}
+            {%- if tool.function is defined %}
+                {%- set tool = tool.function %}
+            {%- endif %}
+            {{- '{"type": "function", "function": ' }}
+            {{- '{"name": "' + tool.name + '", ' }}
+            {{- '"description": "' + tool.name + '(' }}
+            {%- for param_name, param_fields in tool.parameters.properties|items %}
+                {{- param_name + ": " + json_to_python_type(param_fields) }}
+                {%- if not loop.last %}
+                    {{- ", " }}
+                {%- endif %}
+            {%- endfor %}
+            {{- ")" }}
+            {%- if tool.return is defined %}
+                {{- " -> " + json_to_python_type(tool.return) }}
+            {%- endif %}
+            {{- " - " + tool.description + "\n\n" }}
+            {%- for param_name, param_fields in tool.parameters.properties|items %}
+                {%- if loop.first %}
+                    {{- "    Args:\n" }}
+                {%- endif %}
+                {{- "        " + param_name + "(" + json_to_python_type(param_fields) + "): " + param_fields.description|trim }}
+            {%- endfor %}
+            {%- if tool.return is defined and tool.return.description is defined %}
+                {{- "\n    Returns:\n        " + tool.return.description }}
+            {%- endif %}
+            {{- '"' }}
+            {{- ', "parameters": ' }}
+            {%- if tool.parameters.properties | length == 0 %}
+                {{- "{}" }}
+            {%- else %}
+                {{- tool.parameters|tojson }}
+            {%- endif %}
+            {{- "}" }}
+            {%- if not loop.last %}
+                {{- "\n" }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+    {{- " </tools>" }}
+    {{- 'Use the following pydantic model json schema for each tool call you will make: {"properties": {"name": {"title": "Name", "type": "string"}, "arguments": {"title": "Arguments", "type": "object"}}, "required": ["name", "arguments"], "title": "FunctionCall", "type": "object"}}
+    ' }}
+    {{- "For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:
+    " }}
+    {{- "<tool_call>
+    " }}
+    {{- '{"name": <function-name>, "arguments": <args-dict>}
+    ' }}
+    {{- '</tool_call><|im_end|>' }}
+    {%- for message in messages %}
+        {%- if message.role == "user" or message.role == "system" or (message.role == "assistant" and message.tool_calls is not defined) %}
+            {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+        {%- elif message.role == "assistant" and message.tool_calls is defined %}
+            {{- '<|im_start|>' + message.role }}
+            {%- for tool_call in message.tool_calls %}
+                {{- '\n<tool_call>\n' }}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '{' }}
+                {{- '"name": "' }}
+                {{- tool_call.name }}
+                {{- '"' }}
+                {%- if tool_call.arguments is defined %}
+                    {{- ', ' }}
+                    {{- '"arguments": ' }}
+                    {{- tool_call.arguments|tojson }}
+                {%- endif %}
+                {{- '}' }}
+                {{- '\n</tool_call>' }}
+            {%- endfor %}
+            {{- '<|im_end|>\n' }}
+        {%- elif message.role == "tool" %}
+            {%- if loop.previtem and loop.previtem.role != "tool" %}
+                {{- '<|im_start|>tool\n' }}
+            {%- endif %}
+            {{- '<tool_response>\n' }}
+            {{- message.content }}
+            {%- if not loop.last %}
+                {{- '\n</tool_response>\n' }}
+            {%- else %}
+                {{- '\n</tool_response>' }}
+            {%- endif %}
+            {%- if not loop.last and loop.nextitem.role != "tool" %}
+                {{- '<|im_end|>' }}
+            {%- elif loop.last %}
+                {{- '<|im_end|>' }}
+            {%- endif %}
+        {%- endif %}
+    {%- endfor %}
+    {%- if add_generation_prompt %}
+        {{- '<|im_start|>assistant\n' }}
+    {%- endif %}
+    HERMES_TEMPLATE_EOF
+
+    # ── Kernel-tuning toolchain ───────────────────────────────────────────────────
+    # These are for scripts/runtime/optimizeModel.sh, which tunes the fused-MoE kernel
+    # configs on the target GPU. They are NOT needed to serve, and are installed here only
+    # because the tuning has to run in the serving image: the tuned config it produces is
+    # keyed to the exact vLLM/torch/triton build that will consume it, so tuning in a
+    # different image would produce a config for the wrong kernels.
+    #
+    # ⚠ ray is a REAL dependency, not a convenience. benchmarks/kernels/benchmark_moe.py
+    # dispatches every measurement through `@ray.remote(num_gpus=1)` and calls ray.init()
+    # at module scope, so without it the script dies on `import ray` before parsing argv.
+    # Pinned rather than floating: ray's actor/serialization protocol is what carries the
+    # benchmark's torch tensors between driver and worker, so an unexpected major bump can
+    # break the run in ways that surface only on the node.
+    # renovate: datasource=pypi depName=ray
+    ARG RAY_VERSION=2.49.0
+    RUN pip install --retries 10 --timeout 120 "ray==${RAY_VERSION}" \
+        && python -c "import ray; print('ray', ray.__version__)"
+
+    # curl: the tuning script fetches the matching benchmark_moe.py for the INSTALLED vllm
+    # version at run time. The base image genuinely has neither curl nor wget, and carries
+    # no vLLM source tree, so without this there is no way to obtain the script in-pod —
+    # a gap that only shows up once the GPU is already idle and the service is down.
+    RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    # The OpenAI-compatible server entrypoint. Args (model, --served-model-name,
+    # --max-model-len, --api-key) come from the Deployment, not baked here.
+    EXPOSE 8000
+    ENTRYPOINT ["vllm"]
+    CMD ["serve", "--help"]
+  .gitlab-ci.yml: |
+    # vLLM Jetson image build — recover-or-rebuild. ONE image for BOTH Jetsons.
+    #
+    # SOURCE OF TRUTH: this file lives in the infra repo
+    # (deployment/argocd-apps/vllm/.gitlab-ci.yml). A bootstrap job MIRRORS it (+ the
+    # Dockerfile) into the in-cluster GitLab project deployments/infrastructure/ai/vllm-jetson via a git push;
+    # ArgoCD then TRIGGERS this pipeline on cluster creation. Do NOT hand-edit it in
+    # GitLab — changes there are overwritten on the next mirror.
+    #
+    # The job SKIPS itself if the tag already exists in the registry (recover after a
+    # pod restart / re-trigger). Bump IMAGE_TAG to force a rebuild.
+    #
+    # Runs on the Thor GPU node via tags:[thor] — sm_110 (Blackwell) CUDA-13 kernels
+    # can't be cross-built on x86. buildah builds in a PRIVILEGED in-pod (vfs +
+    # chroot), no docker daemon (k3s uses containerd). Rootless does NOT work on this
+    # node — the containerd runtime blocks buildah's mount/remount syscalls in every
+    # mode; the Thor runner therefore runs build pods privileged (see gitlab-runner.yaml).
+    stages: [build]
+
+    # Cancel superseded pipelines instead of letting them queue/stack. When several
+    # triggers land close together (ArgoCD refresh), only the newest build survives;
+    # older ones — including a mid-run one that's now redundant — are auto-cancelled
+    # (requires interruptible: true on the job). Keeps the single Thor node from
+    # thrashing on parallel/queued builds of the same image.
+    workflow:
+      auto_cancel:
+        on_new_commit: interruptible
+
+    build-vllm-jetson:
+      stage: build
+      tags: [thor]                       # -> Thor GPU runner (gitlab-runner-token-thor)
+      # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+      # for the registry gate below, which quay's image has never shipped. Built by
+      # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+      # ⚠ `-arm64`, because this job runs on [thor] — a Jetson. The amd64 image built on the
+      # [eda] nodes cannot start there: the pod comes up, the `build` container never becomes
+      # ready, and the job fails in "prepare environment: waiting for pod running" without ever
+      # naming architecture (measured 2026-09-03, ollama pipelines 10-12, which left ollama in
+      # ImagePullBackOff for over an hour).
+      # ⚠ The tag must be that app's IMAGE_TAG plus this suffix;
+      # remote-desktop/check-image-invariants.sh fails the commit if they drift. A consumer
+      # pinned to a tag that was never built simply never starts its build pod.
+      image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1-arm64
+      # Serialize builds. Every ArgoCD (re)sync of the vLLM app fires the PreSync trigger,
+      # and a manual refresh can fire several — each starting a fresh pipeline. Without a
+      # resource_group they ALL run concurrently on the single Thor GPU node, thrashing its
+      # CPU/RAM/disk (observed: 5 racing ~2h builds). resource_group serializes to one
+      # active job; process_mode oldest_first drains the queue in order. interruptible +
+      # auto_cancel (workflow below) cancel superseded pipelines instead of queueing them.
+      resource_group: thor-vllm-build
+      interruptible: true
+      # Cold builds are slow over WireGuard: the multi-GB vLLM/torch wheel tree + the
+      # multi-GB CUDA image push exceed the 1h GitLab default. 3h gives ample headroom
+      # (no buildah layer cache across CI pods). PyPI + the official cu130 index are
+      # faster than the old jetson-ai-lab origin, and the node-local pip cache (-v below,
+      # warmed by the r17 spike) lets a rebuild skip re-downloading torch/vllm.
+      timeout: 3h
+      variables:
+        # ⚠ The version in this tag is DESCRIPTIVE ONLY — nothing derives it from the
+        # Dockerfile's VLLM_VERSION, so the two CAN drift (the predecessor tag said v0.27.1
+        # while the image built 0.29.0). It was realigned with this rename, but a tag change
+        # is a full rebuild of a multi-GB image plus permanently orphaned blobs in a registry
+        # with no GC — so it will be left to drift again rather than rebuilt for cosmetics.
+        # NEVER read the version from this tag; ask the pod
+        # (`python3 -c 'import vllm; print(vllm.__version__)'`). It matters because a tuned
+        # MoE config is only valid for the vllm/triton build that produced it.
+        #
+        # `jetson`, not `sm110`: ONE image serves the Thor (sm_110) AND the Orin (sm_87).
+        # The build compiles nothing arch-specific — it installs the released PyPI abi3
+        # aarch64 wheel, whose fatbins carry sm_80/87/89/90/100/110/120 — and both nodes run
+        # the same L4T R39.2.1 / CUDA 13.2.
+        IMAGE_TAG: v0.29.0-cu13-jetson-r1  # bump to force a rebuild (PyPI released wheel + official cu130 torch)
+        IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+        # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+        # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+        # literally named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is
+        # fail-open, so that 404 reads as "not in the registry" and rebuilds from installer
+        # media every single time, silently. Measured on ecc188: the buggy form returned 404
+        # and this form returned 200 against the same tag.
+        # A `docker://` push destination is the opposite case — it MUST keep the tag, so those
+        # still use ${IMAGE#*/}.
+        IMAGE_REPO: $CI_PROJECT_PATH
+        # Registry TLS: prod cert is publicly trusted -> verify; staging CA is untrusted
+        # in the build pod -> false. Toggled by certIssuerType via the update script.
+        REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+        STORAGE_DRIVER: vfs
+        # PUSH the multi-GB image to the in-cluster registry service DIRECTLY, bypassing
+        # the public ingress. Pushing through the ingress (registry.gitlab.<tld>) drops
+        # mid-upload on large blobs: "write tcp ...:443: use of closed network connection"
+        # (the ingress' default client/server timeouts are far shorter than a multi-GB push).
+        # The internal endpoint is plain HTTP (--tls-verify=false) and the stored image is
+        # identical, so the Deployment can still PULL it via the canonical ingress name.
+        # Push via the topology-aware Service (trafficDistribution: PreferClose) so a build
+        # on a unibi-hclab node hits the LAN-local (mesh) registry replica, not the cloud one
+        # over WireGuard. See deployment/argocd-apps/gitlab/registry-preferclose-service.yaml
+        # Falls back to any replica if PreferClose
+        # can't find a close one (same shared-S3 backend, so the stored image is identical).
+        INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+        # ── Recreate-surviving archive ───────────────────────────────────────────────
+        # GitLab's registry is backed by Hetzner S3 and DIES WITH THE CLUSTER, so after a
+        # recreate this tag is absent and the gate above falls through to a full rebuild —
+        # hours of CUDA compilation, which is what makes a fresh cluster's apps instance
+        # stall on CI rather than on bootstrap.
+        #
+        # image-registry is backed by the TrueNAS export datapool/images
+        # (image-registry/nfs-images-pv.yaml, Retain), which does not go away. So the same
+        # image is archived there and restored from there instead of rebuilt. Same store,
+        # same credential and same mechanism the EDA module builds and remote-desktop already
+        # use — nothing new.
+        #
+        # ⚠ LAN-LOCAL, not a WireGuard hop. This runner and the image-registry pod are both on
+        # the unibi-hclab site, and the registry's CiliumNetworkPolicy already admits the
+        # gitlab-runner namespace: no policy edit and no new credential. `clusterLink: "vpn"`
+        # in project_settings describes how the node JOINED the cluster, not the data path
+        # between two pods on one LAN.
+        #
+        # ⚠ image-registry has NO GARBAGE COLLECTION (deliberate — see its README). Every
+        # IMAGE_TAG bump adds several GB here PERMANENTLY; the old tag's blobs are orphaned
+        # and nothing reclaims them. Prune by hand.
+        IMAGE_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+        # ⚠ image-archives/, NOT deployments/... — this registry also holds the EDA module
+        # images under deployments/, and those are pulled BY THE BROKER AND RUN AS ROOT,
+        # authorised by <repo>:<tag> in broker.sh allowed(). A separate repository namespace
+        # means this image can never be confused for a module in either direction.
+        SURVIVING_IMAGE: $IMAGE_REGISTRY/image-archives/vllm:$IMAGE_TAG
+        SURVIVING_IMAGE_REPO: image-archives/vllm
+      script:
+        # Trust the image-registry CA BEFORE anything talks to it. It serves TLS from a PRIVATE
+        # in-cluster CA, so the build pod cannot verify it from the system trust store.
+        # containers/image reads /etc/containers/certs.d/<host>/ca.crt, so skopeo and buildah
+        # both pick it up with no per-call flag. Writing the CA (rather than
+        # --tls-verify=false) means a wrong or missing CA fails loudly at the handshake
+        # instead of silently downgrading.
+        #
+        # ⚠ THIS MUST STAY ABOVE BOTH GATES — the archive-on-skip branch of the first one and
+        # the restore gate below. Both read this exact file and both are deliberately
+        # FAIL-OPEN, so with the write ordered after them the read fails on the missing CA,
+        # the gate concludes "not archived", and it can NEVER short-circuit. That is precisely
+        # the bug the three EDA pipelines shipped with. Enforced by
+        # remote-desktop/check-image-invariants.sh in precommit.
+        - |
+          if [ -n "${IMAGE_REGISTRY_CA:-}" ]; then
+            mkdir -p "/etc/containers/certs.d/${IMAGE_REGISTRY}"
+            printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${IMAGE_REGISTRY}/ca.crt"
+            echo "image-registry CA installed."
+          else
+            echo "WARN: IMAGE_REGISTRY_CA is empty — the recreate-surviving copy is unavailable."
+            echo "      The build still works; it just cannot restore or archive."
+          fi
+        - |
+          # Recover-or-rebuild: skip if the tag already exists in the registry.
+          #
+          # `skopeo inspect --raw` — NOT curl, and this is a REPAIR, not a refactor.
+          # ⚠ MEASURED ON ecc193 (2026-09-02): the curl form this replaces could never have
+          # worked. GitLab's registry answers /v2/ with `401 + WWW-Authenticate: Bearer
+          # realm="https://gitlab.<tld>/jwt/auth"`, so a BASIC-auth request returns 401 even
+          # for a tag that EXISTS — verified against remote-desktop:base-r40 (basic 401, bearer
+          # 200, same URL, same second). The gate is fail-open, so that 401 read as "absent"
+          # and this pipeline has never once skipped a build it could have skipped. skopeo
+          # performs the bearer token exchange and sends every manifest Accept header itself.
+          #
+          # --tls-verify=false replaces the old `-k`: under letsencrypt-staging the registry
+          # certificate is untrusted inside the build pod. This is a presence check, not a
+          # content fetch — bytes are digest-verified when they are actually pulled.
+          #
+          # Nor buildah: `inspect` only reads LOCAL storage and `pull` would fetch GB merely
+          # to test presence. skopeo is available because this job now runs on the CI build
+          # image (deployment/argocd-apps/ci-build-image).
+          set +e
+          _gate_out=$(skopeo inspect --raw --tls-verify=false \
+                   --creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" "docker://$IMAGE" 2>&1)
+          _gate_rc=$?
+          set -e
+          if [ "$_gate_rc" -eq 0 ]; then
+            echo "$IMAGE already exists — skipping build."
+            # ── Archive-on-skip ────────────────────────────────────────────────────────
+            # ⚠ "in GitLab's registry" does NOT imply "archived". base-r41 was built on
+            # ecc193 while the archive credential was broken (image-registry-auth's `password`
+            # key had been renamed to `push-password`), so it published fine and was never
+            # archived — and this gate then exits 0 on every later run, so nothing would ever
+            # notice until a recreate rebuilt it from scratch. Repair it here instead of
+            # waiting for the next tag bump.
+            # Cheap: registry-to-registry, and a no-op once the copy exists.
+            # ⚠ NEVER FATAL — the image is published and the app already works.
+            if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+              set +e
+              skopeo inspect --raw --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" >/dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                echo "  the recreate-surviving copy is MISSING — archiving it now..."
+                skopeo copy --retry-times 10 \
+                  --src-tls-verify=false --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                  --dest-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                  "docker://$IMAGE" "docker://$SURVIVING_IMAGE"
+                if [ $? -eq 0 ]; then
+                  echo "  archived $SURVIVING_IMAGE — this tag now survives a recreate."
+                else
+                  echo "  WARN: could not archive — the next recreate will rebuild this tag."
+                fi
+              else
+                echo "  recreate-surviving copy is present."
+              fi
+              set -e
+            else
+              echo "  WARN: no image-registry credential — cannot confirm the surviving copy."
+            fi
+            exit 0
+          fi
+          case "$_gate_out" in
+            *"manifest unknown"*|*"name unknown"*|*"was not found"*) : ;;
+            *) echo "registry gate: $IMAGE not readable (fail-open, continuing):"
+               echo "  skopeo: $_gate_out" ;;
+          esac
+          echo "$IMAGE not found — building on $(uname -m)..."
+        - |
+          # ── Restore from the recreate-surviving registry ─────────────────────────────
+          # Reached only when the tag is absent from GitLab's registry (the gate above), i.e.
+          # after a cluster recreate. Copying it back takes seconds against hours of rebuild.
+          #
+          # ⚠ NEVER FATAL. If anything here fails we fall through to the rebuild, which is
+          # slow but always correct. A backup path must not be able to redden a pipeline that
+          # would otherwise have produced a working image.
+          #
+          # No digest/completeness protocol is needed (unlike a tar archive on a filesystem):
+          # a registry is content-addressed, so a partial push never becomes a resolvable tag,
+          # and skopeo verifies each blob's digest as it goes.
+          #
+          # ⚠ ONE `skopeo copy`, REGISTRY TO REGISTRY. It replaces buildah pull + tag + push,
+          # and the difference is not stylistic:
+          #   - nothing is staged locally. `buildah pull` UNPACKED every layer into the node's
+          #     container store only to push the same bytes straight back out; skopeo streams
+          #     blob by blob and never materialises the image.
+          #   - ONE command carries BOTH credentials (--src-creds / --dest-creds). The
+          #     "credential missing on the second half" failure that cost ecc189 a full rebuild
+          #     of ollama AND remote-desktop cannot recur, because there is no second half —
+          #     and neither can the `#`-comment-inside-a-`\`-continued-`&&`-chain break that
+          #     silently dropped the `push` SUBCOMMAND and ran `push` as a command (rc=127).
+          # TLS: the SOURCE is verified against the image-registry CA in certs.d, written by the
+          # step above (which is why that step must stay first); the DESTINATION is the
+          # in-cluster registry Service on plain HTTP, hence --dest-tls-verify=false — exactly
+          # what the buildah push did.
+          if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+            echo "Checking the recreate-surviving registry for $SURVIVING_IMAGE ..."
+            set +e
+            _arc_out=$(skopeo inspect --raw \
+                     --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                     "docker://$SURVIVING_IMAGE" 2>&1)
+            _arc_rc=$?
+            set -e
+            if [ "$_arc_rc" -eq 0 ]; then
+              echo "[$(date -u +%F' '%T)] found it — copying it back instead of rebuilding..."
+              set +e
+              skopeo copy --retry-times 10 \
+                --src-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                --dest-tls-verify=false \
+                --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" "docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+              _restore_rc=$?
+              set -e
+              if [ "$_restore_rc" -eq 0 ]; then
+                echo "[$(date -u +%F' '%T)] restored $IMAGE from the surviving registry."
+                exit 0
+              fi
+              echo "WARN: restore failed (rc=$_restore_rc) — falling through to a full rebuild."
+            else
+              case "$_arc_out" in
+                *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+                  echo "  not there either — this tag has never been archived." ;;
+                *)
+                  echo "  archive not readable — rebuilding (fail-open):"
+                  echo "  skopeo: $_arc_out" ;;
+              esac
+            fi
+          fi
+        # CI_REGISTRY_* are injected by GitLab CI — no push secret needed here. Log in to
+        # BOTH endpoints: the login credential (JWT) is scoped per registry host.
+        - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+        # Bind-mount the node-local persistent pip cache into every Dockerfile RUN via `-v`.
+        # /pip-cache is a hostPath on the Thor node (mounted into this build pod by the Thor
+        # runner config) → survives across build pods. It mounts to /root/.cache/pip, pip's
+        # DEFAULT cache dir for the root build user, so pip uses it with no extra config.
+        # pypi.jetson-ai-lab.io is a single throttled origin (~300 kB/s, no CDN); with a warm
+        # cache a rebuild reuses already-downloaded wheels and skips the slow origin. The `-v`
+        # mount is BUILD-TIME ONLY — buildah does not commit `-v` mounts into image
+        # layers, so the cache never ends up in the image (no bloat).
+        - mkdir -p /pip-cache
+        - buildah bud --isolation chroot --storage-driver "$STORAGE_DRIVER" --format docker -v /pip-cache:/root/.cache/pip:rw -t "$IMAGE" .
+        - |
+          # Push to the internal endpoint under the SAME repository path as $IMAGE, so the
+          # stored image == the canonical $IMAGE. Retry a few times: even in-cluster, a
+          # multi-GB push can hit a transient reset (buildah resumes from cached blobs).
+          DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+          # WHY this push is fragile: the registry Service resolves to pods on the
+          # CLOUD node (edgecloudinfra-dedicated0), but this build runs on the Thor MESH node,
+          # so the ~6 GB push crosses the WireGuard mesh link. That link trickles/drops on
+          # large transfers → a blob PATCH dies mid-upload with "use of closed network
+          # connection", failing every attempt. Mitigations (buildah has NO chunk-size flag):
+          #   1. buildah's NATIVE --retry/--retry-delay retries INDIVIDUAL blobs in-process
+          #      (resumes the failed blob, not the whole image) — far more effective against
+          #      a mid-blob drop than restarting the whole `buildah push`. Give it a big
+          #      budget (--retry 20).
+          #   2. KEEP compression (gzip): the image is ~16.8 GB UNCOMPRESSED but ~6 GB
+          #      compressed. Over the ~0.28 MB/s WireGuard link every byte counts, so we push
+          #      the COMPRESSED image (do NOT --disable-compression — that tripled the transfer
+          #      and made a 17h push). NOTE: even 6 GB @ 0.28 MB/s is ~6h. The structural fix
+          #      is the mesh registry replica above (registry-preferclose), which keeps the
+          #      push LOCAL; this retry/timeout hardening is the backstop for when a push
+          #      still lands on a remote replica.
+          #   3. Keep an OUTER loop + `timeout` as the last resort if buildah's own retries are
+          #      exhausted or it hangs on a fully-dead socket — cap raised to 3h to let a slow
+          #      (but progressing) WireGuard push actually complete under the job's 3h timeout.
+          # DEBUG: buildah prints "Copying blob <sha>" once per blob and then goes SILENT
+          # while streaming the bytes — so a slow-but-alive multi-GB push over WireGuard
+          # looks identical to a hang. This sampler reads the primary NIC's TX byte counter
+          # from /proc/net/dev every 20s and logs elapsed time + instantaneous MB/s + total
+          # MB sent, so we can tell "crawling at 0.3 MB/s" from "dead at 0 MB/s". It runs in
+          # the background for the duration of each push attempt and is killed when the push
+          # returns. NIC name varies (eth0/ens*/cni*) — pick the busiest non-lo iface.
+          net_sampler() {
+            IFACE=$(awk -F'[: ]+' '/:/{if($2!="lo")print $2}' /proc/net/dev | head -1)
+            prev=$(awk -v i="$IFACE" '$0 ~ i":"{print $10}' /proc/net/dev); t0=$(date +%s); tprev=$t0
+            while :; do
+              sleep 20
+              now=$(awk -v i="$IFACE" '$0 ~ i":"{print $10}' /proc/net/dev); tnow=$(date +%s)
+              d=$(( now - prev )); dt=$(( tnow - tprev )); el=$(( tnow - t0 ))
+              [ "$dt" -gt 0 ] && rate=$(awk "BEGIN{printf \"%.2f\", $d/1048576/$dt}") || rate=0
+              tot=$(awk "BEGIN{printf \"%.0f\", $now/1048576}")
+              echo "[push-net $(date -u +%H:%M:%S)] elapsed=${el}s ${IFACE}=${rate} MB/s total_tx=${tot} MB"
+              prev=$now; tprev=$tnow
+            done
+          }
+          # GitLab CI runs this script with `set -e`, so a bare `buildah push` that exits
+          # non-zero ABORTS the whole step before the retry loop can react — which is exactly
+          # why earlier failures never showed a "retrying" line. Disable errexit AROUND the
+          # loop and use `if ! ...` so a failed push (incl. the transient JWT-auth DNS blip at
+          # token-refresh time) is CAUGHT and RETRIED. buildah resumes from already-uploaded
+          # blobs, so a retry re-attempts only the auth + remaining blobs — cheap.
+          set +e
+          n=0
+          until [ "$n" -ge 6 ]; do
+            echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) — image ~$(buildah images --format '{{.Size}}' "$IMAGE" 2>/dev/null | head -1) ==="
+            astart=$(date +%s)
+            net_sampler & SAMPLER=$!
+            timeout 10800 buildah push --tls-verify=false --storage-driver "$STORAGE_DRIVER" \
+              --retry 20 --retry-delay 10s \
+              "$IMAGE" "$DEST"
+            rc=$?
+            kill "$SAMPLER" 2>/dev/null
+            echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc duration=$(( $(date +%s) - astart ))s ==="
+            if [ "$rc" -eq 0 ]; then break; fi
+            n=$((n+1)); echo "push attempt $n failed (rc=$rc) — likely a transient WireGuard/DNS blip at token refresh; retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+          done
+          set -e
+          [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+        - |
+          # ── Archive to the recreate-surviving registry ───────────────────────────────
+          # ⚠ NEVER FATAL. The image is already pushed and the app already works; a failure
+          # here costs a rebuild after the NEXT recreate, which is exactly the status quo
+          # before this existed. Reddening the pipeline for it would be a regression.
+          #
+          # buildah, not skopeo — the image is still in LOCAL STORAGE from the build, so this
+          # is a plain push out of that store. skopeo's advantage is registry-to-registry (see
+          # the restore block above); it would buy nothing here.
+          if [ -n "${IMAGE_REGISTRY_USER:-}" ] && [ -n "${IMAGE_REGISTRY_CA:-}" ]; then
+            echo "[$(date -u +%F' '%T)] archiving $SURVIVING_IMAGE ..."
+            set +e
+            buildah --storage-driver "$STORAGE_DRIVER" login \
+              --tls-verify=true -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$IMAGE_REGISTRY" \
+            && buildah --storage-driver "$STORAGE_DRIVER" push \
+                 --retry 20 --retry-delay 10s "$IMAGE" "docker://$SURVIVING_IMAGE"
+            _arc_rc=$?
+            set -e
+            if [ "$_arc_rc" -eq 0 ]; then
+              echo "Archived $SURVIVING_IMAGE — this tag now survives a cluster recreate."
+            else
+              echo "WARN: could not archive to the surviving registry (rc=$_arc_rc). The build"
+              echo "      is still GOOD; the next recreate will just have to rebuild this tag."
+            fi
+          else
+            echo "WARN: no image-registry credential — skipping the recreate-surviving copy."
+          fi
+        - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY)"

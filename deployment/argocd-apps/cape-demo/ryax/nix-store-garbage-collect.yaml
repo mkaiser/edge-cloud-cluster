@@ -1,0 +1,129 @@
+# Garbage collection for the action-builder's Nix store.
+#
+# WHY: nothing in Ryax ever prunes /nix. Every action build adds store paths and none
+# are removed, so the volume grows monotonically until it fills — and because it is a
+# 3-replica Longhorn volume, every wasted GiB costs three.
+#
+# Measured 2026-09-21, before the first run:
+#
+#   store paths .......  7401
+#   dead (unreachable)   7243   (98% of paths)
+#   size used ..........   63 GiB
+#   DEAD ...............   52.6 GiB   (83% of bytes)
+#   live ...............   10.4 GiB
+#
+# x3 replicas that is ~158 GiB of disk, on a pool whose smallest member (bender,
+# 456 GiB) was down to 157 GiB free. The store had also grown 39 -> 63 GiB in a single
+# afternoon, so this was days from filling, not weeks.
+#
+# ⚠ `nix-collect-garbage` is NOT on PATH in this image, and the container has no grep
+# and no awk. It lives in the store itself, under a path whose hash changes with every
+# image bump — so it is DISCOVERED at runtime by glob rather than hardcoded. A literal
+# /nix/store/<hash>-nix-2.34.8/... would break silently on the next chart bump, and the
+# job would look like it ran.
+#
+# ⚠ Runs as UID 1200 (`ryax`), the image's own user, which owns /nix/store and
+# /nix/var/nix/db. Running as root would create root-owned entries in a store the
+# builder then cannot write, which breaks builds rather than the job.
+#
+# CONCURRENCY IS SAFE, and deliberately not worked around: nix takes /nix/var/nix/gc.lock
+# and registers temproots, so a GC running against a live build blocks or skips the
+# in-flight paths rather than deleting them. That is nix's own mechanism and it is why
+# this does not need to stop the builder or coordinate with it. The schedule is still
+# put in a quiet hour so a long GC does not slow an interactive build.
+#
+# ⚠ podAffinity, NOT a nodeSelector — the same constraint as the registry GC job.
+# ryax-action-builder-nix-store is ReadWriteOnce and permanently mounted by the builder
+# Deployment, so this Job can only attach it by landing on the SAME NODE. A site-level
+# selector would let the scheduler pick a different unibi-hclab node, where the pod hangs
+# in ContainerCreating on FailedAttachVolume forever — a silent hang, not a failure.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ryax-nix-store-garbage-collect
+  namespace: ryaxns
+spec:
+  # Weekly, Sunday 04:00. The store's live set is ~10 GiB and refills from the binary
+  # cache, so there is nothing to gain from collecting more often; a weekly run keeps
+  # the ceiling well below the claim while touching the builder as rarely as possible.
+  schedule: "0 4 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Keep failures around to read: a GC that starts failing is how the volume silently
+  # begins growing again.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # A full GC over a large store is slow (it stats every path). 2h is generous
+      # against the ~3 min a normal run takes, while still bounding a hang — e.g. a pod
+      # that can never attach the RWO volume, which otherwise waits forever.
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          restartPolicy: Never
+          # The image's own user owns the store. See the header.
+          securityContext:
+            runAsUser: 1200
+            runAsGroup: 1200
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: "kubernetes.io/hostname"
+                  labelSelector:
+                    matchExpressions:
+                      - key: "app"
+                        operator: "In"
+                        values:
+                          - "action-builder"
+          containers:
+            - name: nix-gc
+              # The builder's own image: it is what ships the nix binaries and it is
+              # already present on this node, so the job never pulls.
+              image: docker.io/ryaxtech/action-builder:26.9.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+
+                  echo "=== nix store GC starting $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+                  df -h /nix
+
+                  # Fail loudly if the PVC is not actually mounted, rather than
+                  # "succeeding" against the image's own throwaway copy of /nix and
+                  # reporting a GC that freed nothing real.
+                  if [ ! -d /nix/var/nix/db ]; then
+                    echo "FAILED: /nix/var/nix/db missing — the nix-store PVC is not mounted."
+                    exit 1
+                  fi
+
+                  # Discover the binary; see the header for why this is not hardcoded.
+                  NIX_GC=""
+                  for c in /nix/store/*-nix-[0-9]*/bin/nix-collect-garbage; do
+                    if [ -x "$c" ]; then NIX_GC="$c"; break; fi
+                  done
+                  if [ -z "$NIX_GC" ]; then
+                    echo "FAILED: no nix-collect-garbage found under /nix/store/*-nix-*/bin/."
+                    echo "The image layout changed — update this job rather than pinning a hash."
+                    exit 1
+                  fi
+                  echo "using $NIX_GC"
+
+                  # --delete-old also drops old profile generations, which are GC roots;
+                  # without it their closures are retained forever.
+                  "$NIX_GC" --delete-old
+
+                  echo "=== nix store GC finished $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+                  df -h /nix
+              volumeMounts:
+                - name: nix-store
+                  mountPath: /nix
+          volumes:
+            - name: nix-store
+              persistentVolumeClaim:
+                claimName: ryax-action-builder-nix-store

@@ -1,0 +1,13 @@
+# Namespace for the KiCad 10 CONTAINER module build app. This app is BUILD-ONLY: it holds
+# the build trigger + the build-files ConfigMap. No secrets and no installer media either —
+# KiCad is FOSS and installs from its own apt PPA, so unlike every other module here there is
+# nothing on the artifacts export to stage and no license server to inject. KiCad itself RUNS
+# inside the shared remote-desktop pod, via podman in the module container — there is no
+# desktop here.
+#
+# One namespace per EDA app, named after the app: pruning one app can never delete the
+# namespace another app's resources live in.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-kicad-10

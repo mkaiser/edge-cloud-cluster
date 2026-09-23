@@ -1,0 +1,157 @@
+# Values for the separate `ryax-worker-k8s` release — the Site that actually runs
+# actions. The ryax-engine chart ships no worker, so without this release Ryax has
+# an empty Site list and can deploy nothing.
+#
+# Applied by scripts/manageWorker.sh, never by helm directly: the `config.site`
+# block (Site id + Node Pool list) is minted by the Runner per cluster and is
+# passed as a second `-f` layer. Installing without it yields a worker with no Site.
+#
+#   manageWorker.sh <node>...          add nodes (existing ones kept)
+#   manageWorker.sh --list             show what is registered
+#   manageWorker.sh --remove <node>    stop sending work to a node
+#   manageWorker.sh --site <name>      pick the Ryax Site
+#
+# ⚠ Same cluster as the engine, so no Skupper: this worker reads the broker,
+# filestore and registry endpoints straight from the Secrets in ryaxns. Skupper in
+# upstream's worker how-to is only for a worker on a DIFFERENT cluster.
+
+global:
+  ryax:
+    userNamespace: ryaxns-execs  # must match the engine release
+  monitoring:
+    enabled: true
+    otlpEndpoint: ryax-tempo:4317
+  defaultStorageClass: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+  # Mesh nodes are tainted ecc/mesh=true:NoSchedule. Covers this release's own
+  # pods; the user action pods in ryaxns-execs are created by the Runner at run
+  # time and get theirs from the ryax-placement policy instead.
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+
+  # Keep this release's own pods off nodes below the x86-64-v2 CPU baseline, matching the
+  # engine (see global.affinity in values.yaml for the full reasoning and the measured
+  # failure). The label comes from node-feature-discovery, which reads it off the CPU.
+  #
+  # ⚠ This covers the WORKER's pods only. The user action pods in ryaxns-execs are created
+  # by the Runner at run time and are pinned to one exact node by the Node Pool — they take
+  # no placement from here, and deliberately get none from the admission policy either
+  # (admission-policies.yaml). Keeping a v1-only node out of ACTIONS is a Node Pool
+  # decision: do not register it with manageWorker.sh.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2
+                operator: In
+                values: ["true"]
+
+# Where this site's kubelet pulls action images, replacing the host the Runner
+# recorded in the image reference.
+#
+# The Runner stamps every execution pod's `image:` with RYAX_INTERNAL_REGISTRY,
+# which the KUBELET resolves — no cluster DNS, no ClusterIP route — so it can only
+# be a NodePort on the node's own loopback. That Service is `ryax-registry-ext`,
+# rendered by the engine chart because registry.ingress.enabled is false.
+#
+# Without this, pulls fail on every node with
+#   dial tcp 127.0.0.1:30012: connect: connection refused
+#
+# Set explicitly so both halves are visible together, and because a worker at
+# another site can point elsewhere.
+internalRegistryOverride: "127.0.0.1:30012"
+
+config:
+  MIG:
+    # ⚠ Keep disabled. The MIG labeler DaemonSet tolerates EVERYTHING
+    # (`operator: Exists`), so it lands on every node in the cluster and holds a
+    # ClusterRole with node patch. MIG is an A100/H100 feature needing the NVIDIA
+    # GPU Operator, which this cluster does not run, and neither GPU node
+    # (Jetson Thor, RTX 2070) supports it.
+    enabled: false
+  # ⚠ No `site:` block here on purpose — manageWorker.sh generates it. The Site id
+  # and pool list change on every cluster recreate, so committing them would
+  # guarantee drift and hard-code which nodes Ryax uses.
+
+# ResourceQuota in ryaxns-execs, so a runaway action cannot starve the other mesh
+# workloads (samba-ad, longhorn, the EDA runners) sharing these nodes.
+#
+# ⚠ SIZE THIS AGAINST THE LARGEST SINGLE ACTION, NOT THE AVERAGE. A quota smaller than one
+# pod's request does not throttle that pod — it makes it IMPOSSIBLE. The rejection happens at
+# ADMISSION, before the scheduler runs, so there is no pod, no event, and no "insufficient
+# memory" anywhere to explain it; the Ryax UI shows the step stuck in Waiting until someone
+# cancels it, which is then reported as "canceled by the user before running".
+#
+# Measured 2026-09-22: the "Real-time anomaly detection" workflow failed this way on all four
+# of its runs (09-18, 09-20 x2, 09-22). Its SCADA Streamer and SCADA Anomaly Detector modules
+# each declare 16Gi + 2 CPU, against a then-8Gi namespace cap:
+#   Forbidden: exceeded quota: requested: requests.memory=16Gi,
+#              used: requests.memory=0, limited: requests.memory=8Gi
+# Note `used: 0` — the namespace was idle. Not contention; one pod simply could not fit.
+#
+# 40Gi/8cpu holds those two 16Gi steps CONCURRENTLY plus the small trigger/unpack steps
+# alongside. The limits are 2x the requests, matching the ratio the chart shipped.
+#
+# ⚠ Headroom is bounded by the SMALLEST pool node's RAM, not the largest. This is about
+# MEMORY, not disk: bender has 251 GiB of RAM (9.2 GiB requested) but smartmirror1 has only
+# 30.3 GiB — it is a 32 GB i9-9900K box. Its 2.2 TiB of Longhorn disk is irrelevant here; a
+# pod's memory request must fit in the node's allocatable RAM.
+# So a single action above ~28Gi can be admitted by this quota and then never schedule if it
+# lands on the smartmirror pool. Keep per-action requests comfortably under smartmirror1's
+# allocatable RAM, or constrain such actions to a bender-only node pool.
+#
+# ⚠ NOT APPLIED BY ARGOCD. This file is input to the separate `ryax-worker-k8s` Helm release
+# that scripts/manageWorker.sh installs, so editing it changes nothing until that release is
+# re-run. Verify with: kubectl -n ryaxns-execs get resourcequota
+userNamespaceResources:
+  requests.cpu: "8"
+  requests.memory: 40Gi
+  limits.cpu: "16"
+  limits.memory: 80Gi
+
+# LimitRange in ryaxns-execs, for actions whose ryax_metadata.yaml sets no
+# `resources`. The chart default limit is 64Mi, which OOM-kills anything real.
+userActionResources:
+  request:
+    cpu: 0.1
+    memory: 256Mi
+  limit:
+    memory: 1Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+postgresql:
+  # The bitnami subchart ignores global.tolerations/nodeSelector.
+  primary:
+    tolerations:
+      - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    nodeSelector:
+      ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: feature.node.kubernetes.io/cpu-cpuid.X86_64_V2  # see global.affinity
+                  operator: In
+                  values: ["true"]
+    persistence:
+      storageClass: longhorn-unibi-ryax  # automatically updated from project-settings:applicationPlacements.ryaxStorageClass
+      size: 2Gi
+
+monitoring:
+  serviceMonitor:
+    enabled: true  # the engine's operator is scoped to ryaxns and picks this up

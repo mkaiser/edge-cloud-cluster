@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zammad-redis-auth
+  namespace: zammad
+spec:
+  encryptedData:
+    redis-password: AgBzdhki2WtpCagdpDc9e4rFs/mA0fvYxjf522Zu4BOexK9VFSbY63FrmhBgAAy3R5Kp1STc0iQRdEels0/iTx+RV45OaMECRGMKMmp/knv/sJYqxBX06kTDJCaCqXz2fqpveZ/97efxGcmm+gIGYFyPXb4nimGE5wyRtp1xaEZFohd1KZxcVZJMbQJGHPD2LQxagy+RDoo6hc/u0H1d2ERCSVc6GzBZW32A0sC78GCCux0hEG3rJleibptoRl/U+L4lJFiHVU8Iv1KodYE7plbQayMts6B/OSFg5BbN8yNzt+beNt9EQcZuzKUDp9I+GtWQfBss6Bg8irl0LRSHV7AeHPNBCwYzl98jf8nwU+NG8C8AhGyb+pggdDzQVFgWMbmvj9e4Lef3Hus+fR3v2PJpVSZNOR379ZBXY0LgtS5KHY4i9fc18VdCM0M2Yv44ejOTKax8HdIIxRPdfUD5MOq9334OeXSSqjOHFQEkP1DSJPzmUSp1JPazAhGFjutfOvfZrAHWJ5faRFIurnNNKTehO62rcoj1Ceq3PvfxxrU/ZMT0HdZmXOsK+RURy9opzTyAuW5l8TLYVuAhQO+nLDafCFla3sSs4lIk56fe5foyF4Yfxc3u7cTuMG6CSmZ+mUIi7OVqnGtWiM9t/kn5CEegfi7zjIvveeA+XB+f7wc1tEXQvcwvbuEBTwT52anYV48yay2UVmZ7Tu+wuyRD8zwZE/AzkKc49Ngk/UAyfYkKRoCZ7PY2ba6AIYQN2LYX0PQ=
+  template:
+    metadata:
+      name: zammad-redis-auth
+      namespace: zammad

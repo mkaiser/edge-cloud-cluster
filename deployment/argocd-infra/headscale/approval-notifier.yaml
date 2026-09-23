@@ -1,0 +1,426 @@
+# headscale approval notifier — emails the admin when a node is waiting for approval,
+# with one-click approve / reject links.
+#
+# WHY THIS EXISTS
+# headscale has no webhooks and no SMTP (checked hscontrol/types/config.go — the `Notifier`
+# in its config is internal client state-sync, not alerting). A pending registration lives
+# ONLY in an in-memory auth cache (hscontrol/auth.go: h.state.SetAuthCacheEntry) and is
+# exposed by neither the CLI nor the gRPC API — `headscale nodes list` shows only nodes that
+# already COMPLETED registration. So a pending node cannot be discovered by polling; the sole
+# externally-visible signal is one log line:
+#
+#   INF starting node registration using auth id: hskey-authreq-XXXXXXXX
+#
+# This Deployment tails that log and turns each occurrence into an email.
+#
+# WHY A GATEWAY AND NOT A BARE LINK
+# The registration URL headscale itself prints (<server_url>/register/<auth-id>) opens the
+# Headplane flow, which still requires picking an owner from a dropdown — and picking the
+# wrong one is the exact failure this is meant to prevent: a node registered to a user that
+# appears in no ACL grant gets a tailnet IP and silently never joins the cluster. So the mail
+# instead links to a tiny gateway in front of headscale's REST API, with the owner already
+# chosen per link:
+#
+#   POST /api/v1/auth/register  {user, auth_id}   (approve as a specific tier)
+#   POST /api/v1/auth/reject    {auth_id}         (reject)
+#
+# ⚠ SECURITY: these links are BEARER CREDENTIALS, and the gateway IS publicly routed (so the
+# links are clickable from a phone). Possession of the mail is therefore enough to approve a
+# node. What bounds the exposure:
+#   - every link carries an HMAC over (auth_id, action, user), so only URLs this service
+#     generated are honoured — a guessed or edited link is rejected;
+#   - links expire after LINK_TTL_MIN;
+#   - auth-ids are single-use and disappear from headscale's cache once acted on;
+#   - pending registrations cannot be enumerated through this endpoint — /act requires a
+#     valid signature and every other path 404s.
+# Treat the recipient mailbox as privileged.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+rules:
+# Read the headscale pod log (the only source of pending registrations) and the API key.
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+# resourceNames pins this to the two secrets actually needed. `list`/`watch` are omitted on
+# purpose: resourceNames does NOT constrain list, so granting it would expose every secret in
+# the namespace.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["headplane-secrets", "headscale-approval-notifier"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-approval-notifier
+subjects:
+- kind: ServiceAccount
+  name: headscale-approval-notifier
+  namespace: headscale
+---
+# Read-only access to the ONE authentik secret holding the SMTP relay credentials.
+# Same shape as headscale-post-deploy-authentik-email in post-deploy-job.yaml: a Role in the
+# authentik namespace pinned by resourceNames, `get` only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-approval-notifier-smtp
+  namespace: authentik
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["authentik-smtp", "authentik-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-approval-notifier-smtp
+  namespace: authentik
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-approval-notifier-smtp
+subjects:
+- kind: ServiceAccount
+  name: headscale-approval-notifier
+  namespace: headscale
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+spec:
+  selector:
+    app: headscale-approval-notifier
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+# PUBLIC route, so the approve/reject links in the mail are clickable from a phone without
+# being on the VPN. TLS terminates at the shared Gateway's wildcard listener.
+#
+# ⚠ This deliberately trades containment for convenience. With the route, possession of the
+# mail is enough to approve a node — the gateway is no longer VPN-only. What still protects
+# it: every link carries an HMAC over (auth_id, action, user) and an expiry, so only URLs
+# this service generated are honoured and only until LINK_TTL_MIN elapses; auth-ids are
+# single-use and vanish from headscale's cache once acted on; and there is no way to
+# enumerate pending registrations through this endpoint (/act needs a valid signature, and
+# any other path 404s). Treat the recipient mailbox as privileged.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - vpn-approve.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: headscale-approval-notifier
+          port: 8000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+data:
+  notifier.py: |
+    #!/usr/bin/env python3
+    """Tail headscale's log for pending registrations; email approve/reject links."""
+    import base64, hashlib, hmac, json, os, re, smtplib, ssl, subprocess, sys, threading, time
+    import urllib.error, urllib.parse, urllib.request
+    from email.message import EmailMessage
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    NS         = os.environ.get("NAMESPACE", "headscale")
+    BASE_URL   = os.environ["GATEWAY_BASE_URL"].rstrip("/")
+    TIERS      = [t for t in os.environ.get("APPROVE_TIERS", "").split(",") if t]
+    LINK_TTL   = int(os.environ.get("LINK_TTL_MIN", "1440")) * 60
+    HS_API     = os.environ.get("HEADSCALE_API", "http://headscale:8080")
+    # Matches hscontrol/auth.go: log.Info().Msgf("starting node registration using auth id: %s")
+    AUTH_RE    = re.compile(r"starting node registration using auth id:\s*(hskey-authreq-[A-Za-z0-9._-]+)")
+
+    def sh(*a):
+        return subprocess.run(a, capture_output=True, text=True, timeout=30).stdout.strip()
+
+    def secret(name, ns, key):
+        v = sh("kubectl", "get", "secret", name, "-n", ns, "-o", f"jsonpath={{.data.{key}}}")
+        return base64.b64decode(v).decode().strip() if v else ""
+
+    # Recipient: the cluster admin, read from the SEALED authentik bundle — the same
+    # CLUSTER_ADMIN_EMAIL every other consumer uses (blueprint-initial-users.yaml via
+    # !Env, headscale/post-deploy-job.yaml via this same kubectl read). It was a plaintext
+    # literal in this file's env block, which put a real person's address in git for no
+    # reason; the RBAC to read it was already granted above (`get` on authentik-secrets).
+    # MAIL_TO still overrides, so a site that wants a different recipient sets it.
+    MAIL_TO = (os.environ.get("MAIL_TO", "").strip()
+               or secret("authentik-secrets", "authentik", "CLUSTER_ADMIN_EMAIL"))
+    if not MAIL_TO:
+        # Fatal, as the bare os.environ["MAIL_TO"] was: without a recipient every approval
+        # request is silently dropped, and a node waiting on approval looks like a network
+        # fault rather than a missing address.
+        sys.exit("ERROR: no recipient — set MAIL_TO or seal CLUSTER_ADMIN_EMAIL "
+                 "into authentik-secrets.")
+
+    # Signing key: a dedicated secret, so a link cannot be forged without it. Falls back to
+    # the headscale API key only if absent, which keeps a fresh cluster working.
+    SIGN_KEY = (secret("headscale-approval-notifier", NS, "signing-key")
+                or secret("headplane-secrets", NS, "api-key")).encode()
+    # API key is read FRESH on every call, not cached: headscale-post-deploy (a PostSync hook)
+    # creates this key and patches it into headplane-secrets on its own schedule, with no
+    # ordering guarantee against this Deployment's startup — caching it here raced a fresh
+    # bootstrap often enough (401s until a manual pod restart) that it had to go.
+    def api_key():
+        return secret("headplane-secrets", NS, "api-key")
+
+    def sign(auth_id, action, user, exp):
+        msg = f"{auth_id}|{action}|{user}|{exp}".encode()
+        return hmac.new(SIGN_KEY, msg, hashlib.sha256).hexdigest()[:32]
+
+    def link(auth_id, action, user=""):
+        exp = int(time.time()) + LINK_TTL
+        q = urllib.parse.urlencode({"auth_id": auth_id, "action": action, "user": user,
+                                    "exp": exp, "sig": sign(auth_id, action, user, exp)})
+        return f"{BASE_URL}/act?{q}"
+
+    def hs_post(path, payload):
+        req = urllib.request.Request(
+            f"{HS_API}{path}", data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {api_key()}", "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode()
+
+    def send_mail(auth_id):
+        host = secret("authentik-smtp", "authentik", "AUTHENTIK_EMAIL__HOST")
+        port = int(secret("authentik-smtp", "authentik", "AUTHENTIK_EMAIL__PORT") or 587)
+        user = secret("authentik-smtp", "authentik", "AUTHENTIK_EMAIL__USERNAME")
+        pw   = secret("authentik-smtp", "authentik", "AUTHENTIK_EMAIL__PASSWORD")
+        frm  = secret("authentik-smtp", "authentik", "AUTHENTIK_EMAIL__FROM") or user
+        if not (host and user and pw):
+            print("ERROR: SMTP config unreadable — cannot send mail", flush=True); return
+
+        approve = "\n".join(f"  approve as {t}:\n    {link(auth_id,'register',t)}\n" for t in TIERS)
+        body = f"""A node is waiting for headscale approval.
+
+    auth-id: {auth_id}
+
+    APPROVE (pick the tier that matches the node):
+
+    {approve}
+    REJECT:
+      {link(auth_id, 'reject')}
+
+    These links are publicly reachable and expire in {LINK_TTL//60} minutes. Anyone
+    holding this mail can act on them until then — treat it as a credential and delete
+    it once the node is handled.
+
+    Tier meanings (they have IDENTICAL ACL permissions; the split is bookkeeping so
+    machines can be correlated and expired per tier):
+      on-premise-resident   mesh nodes living days-weeks (Longhorn-eligible)
+      on-premise-transient  mesh nodes living hours-days (no Longhorn)
+      k3s-cloud             cloud CP/worker nodes
+
+    Do NOT approve as a human/admin user: a node owned by a user that appears in no ACL
+    grant gets a tailnet IP but never joins the cluster, and the failure is silent.
+
+    CLI equivalent:
+      kubectl exec -n {NS} deploy/headscale -- \\
+        headscale auth register --user on-premise-resident --auth-id {auth_id}
+      kubectl exec -n {NS} deploy/headscale -- headscale auth reject --auth-id {auth_id}
+    """
+        m = EmailMessage()
+        m["Subject"] = f"headscale: node awaiting approval ({auth_id[-8:]})"
+        m["From"], m["To"] = frm, MAIL_TO
+        m.set_content(body)
+        s = smtplib.SMTP(host, port, timeout=30)
+        try:
+            s.starttls(context=ssl.create_default_context())
+            s.login(user, pw)
+            s.send_message(m)
+        finally:
+            s.quit()
+        print(f"mailed approval request for {auth_id} to {MAIL_TO}", flush=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, code, text):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(text.encode())
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/healthz":
+                return self._reply(200, "ok")
+            if u.path != "/act":
+                return self._reply(404, "not found")
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            auth_id, action = q.get("auth_id", ""), q.get("action", "")
+            user, exp, sig = q.get("user", ""), q.get("exp", "0"), q.get("sig", "")
+            # compare_digest, not ==: a plain comparison leaks the signature bytewise via timing.
+            if not hmac.compare_digest(sig, sign(auth_id, action, user, exp)):
+                return self._reply(403, "bad signature")
+            if time.time() > int(exp):
+                return self._reply(410, "link expired")
+            try:
+                if action == "register":
+                    code, out = hs_post("/api/v1/auth/register", {"user": user, "authId": auth_id})
+                    verb = f"approved as {user}"
+                elif action == "reject":
+                    code, out = hs_post("/api/v1/auth/reject", {"authId": auth_id})
+                    verb = "rejected"
+                else:
+                    return self._reply(400, "unknown action")
+            except urllib.error.HTTPError as e:
+                # headscale's own message is the useful part; a bare "HTTP Error 500" says
+                # nothing. The overwhelmingly common case is a link that was already used:
+                # auth-ids are single-use and drop out of the registration cache the moment
+                # they are acted on, so a second click (or a click after someone approved
+                # from the CLI/Headplane) lands here. Translate that into plain language
+                # instead of leaking a 500 at the user.
+                detail = ""
+                try:
+                    detail = json.loads(e.read().decode()).get("message", "")
+                except Exception:
+                    pass
+                if "not found in registration cache" in detail or "no pending auth session" in detail:
+                    return self._reply(410,
+                        "This link has already been used, or the registration expired.\n\n"
+                        f"auth-id: {auth_id}\n\n"
+                        "If the node still has not joined, re-run the provisioning script on\n"
+                        "it to get a fresh registration, then use the new mail.\n")
+                return self._reply(502, f"headscale API error: {detail or e}")
+            except Exception as e:
+                return self._reply(502, f"headscale API error: {e}")
+            print(f"{verb}: {auth_id} (HTTP {code})", flush=True)
+            return self._reply(200, f"{verb}\n\nauth-id: {auth_id}\nheadscale said: {out}\n")
+
+        def log_message(self, *a):  # quiet the default per-request stderr spam
+            pass
+
+    def serve():
+        ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+
+    def watch():
+        """Follow the headscale pod log. Re-resolves the pod so a restart is survivable."""
+        seen = set()
+        while True:
+            pod = sh("kubectl", "get", "pods", "-n", NS,
+                     "-l", "app.kubernetes.io/name=headscale",
+                     "-o", "jsonpath={.items[0].metadata.name}")
+            if not pod:
+                time.sleep(10); continue
+            print(f"tailing {pod}", flush=True)
+            # --since=1m, not --tail: on a restart this must NOT replay old auth-ids and
+            # re-mail already-handled (or expired) registrations.
+            p = subprocess.Popen(["kubectl", "logs", "-n", NS, pod, "-f", "--since=1m"],
+                                 stdout=subprocess.PIPE, text=True)
+            for line in p.stdout:
+                m = AUTH_RE.search(line)
+                if not m:
+                    continue
+                aid = m.group(1)
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                try:
+                    send_mail(aid)
+                except Exception as e:
+                    print(f"ERROR sending mail for {aid}: {e}", flush=True)
+            p.wait()
+            print("log stream ended — reconnecting", flush=True)
+            time.sleep(5)
+
+    if __name__ == "__main__":
+        threading.Thread(target=serve, daemon=True).start()
+        watch()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headscale-approval-notifier
+  namespace: headscale
+  annotations:
+    # The notifier script is read from its ConfigMap at container start, so an edit alone
+    # changes nothing in the running pod. Reloader (argocd-infra/reloader) rolls this
+    # Deployment when that content changes.
+    # ⚠ This Application has NO ServerSideApply, so Reloader's pod-template annotation would
+    # be stripped by selfHeal and re-added in a loop. wave8-headscale.yaml lists this
+    # Deployment's /spec/template/metadata/annotations in ignoreDifferences for that reason.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headscale-approval-notifier
+  template:
+    metadata:
+      labels:
+        app: headscale-approval-notifier
+    spec:
+      serviceAccountName: headscale-approval-notifier
+      containers:
+        - name: notifier
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "/app/notifier.py"]
+          env:
+            - name: NAMESPACE
+              value: "headscale"
+            # Public host (see the HTTPRoute above) so the mailed links are clickable from a
+            # phone without being on the VPN. Must match the HTTPRoute hostname.
+            - name: GATEWAY_BASE_URL
+              value: "https://vpn-approve.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # Recipient. EMPTY on purpose: the notifier reads CLUSTER_ADMIN_EMAIL out of the
+            # sealed authentik bundle, which is the single source of truth for the cluster
+            # admin's address. Set this only to send approvals somewhere else.
+            - name: MAIL_TO
+              value: ""
+            # Node tiers only. `operator` is deliberately absent: it is the HUMAN tier, and a
+            # node approved into it would sit outside the node-fabric grant.
+            - name: APPROVE_TIERS
+              value: "on-premise-resident,on-premise-transient,k3s-cloud"
+            - name: LINK_TTL_MIN
+              value: "1440"
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8000}
+            initialDelaySeconds: 5
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {memory: 256Mi}
+      volumes:
+        - name: script
+          configMap:
+            name: headscale-approval-notifier

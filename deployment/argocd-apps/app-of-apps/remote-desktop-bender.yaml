@@ -1,0 +1,96 @@
+# ArgoCD Application: the SECOND EDA desktop, pinned to unibi-hclab-bender, for `employees`.
+#
+# Same image, same module machinery and the same startup script as remote-desktop; what
+# differs is WHERE it runs and WHO may use it. It is a WORKSTATION app in the eda-pcb-agent
+# mould, NOT a fork of remote-desktop's Guacamole stack:
+#
+#   • Guacamole, its CNPG database and the public HTTPRoute stay in remote-desktop. This app
+#     seeds a TILE into that Guacamole (connection-seed.yaml), exactly as eda-pcb-agent and
+#     windows do. There is no chart, no Postgres and no hostname here.
+#   • The base image is remote-desktop's archived one. A second pipeline would build
+#     byte-identical content under a second cache key; the tag is guard-checked across every
+#     consumer by remote-desktop/check-image-invariants.sh.
+#   • The Authentik door is remote-desktop's too — `access-remote-desktop` had to learn
+#     `employees`, or this tile would be seeded and never seen (Authentik denies an
+#     application outright once >=1 binding exists and the user matches none).
+#
+# ⚠ TWO CROSS-APP DEPENDENCIES, both deliberate and both recorded in the README: this app's
+# tile needs remote-desktop's Postgres up, and its pod needs remote-desktop's pipeline to
+# have archived the base image. `retry` covers the first; the second is why the image tag
+# must never be bumped here alone.
+#
+# ⚠ SECURITY: the broker sidecar mounts the module registry, which is root-execution
+# authority, and the audience is every AD account. Deliberate — see the banner in
+# nfs-eda-modulefiles-bender-pv.yaml.
+#
+# placement.ecc/tier: mesh — the NFS exports only mount at the fileserver's site
+# (csi-driver-nfs's node driver is pinned to ecc/fileserver-lan), and the pod is pinned
+# harder still, to one node.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: remote-desktop-bender
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  # ⚠ ONE source, not remote-desktop's three: there is no Helm chart to render here.
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/remote-desktop-bender
+    directory:
+      recurse: true
+      # Contract checks and docs are not Kubernetes manifests and must not be applied.
+      exclude: "{*.sh,README.md}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: remote-desktop-bender
+  info:
+    - name: "MANUAL SYNC ONLY"
+      value: >-
+        Syncing restarts a single-replica Recreate Deployment and ENDS every logged-in
+        session. That is a human's decision, so there is no automated syncPolicy. The
+        desktop-rollout CronJob syncs it unattended only while it has ZERO ready replicas
+        (first boot, crash-loop) — i.e. exactly when there is no session to lose.
+    - name: "Tile lives in remote-desktop's Guacamole"
+      value: >-
+        No Guacamole, CNPG or HTTPRoute here. If remote-desktop is down, connection-seed
+        fails and retries; the desktop itself keeps running and stays reachable over SSH.
+  ignoreDifferences:
+    # Gateway API server-defaults are API-owned; under ServerSideApply ArgoCD reads them as
+    # permanent drift. Kept for symmetry with the other desktops even though this app ships
+    # no HTTPRoute today — harmless, and correct the moment one is added.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    # ⚠ NO `automated:` — DELIBERATE, and for the same reason as remote-desktop: applying a
+    # change here logs every user out. eda-pcb-agent CAN have selfHeal because syncing it
+    # ends only its own single shared session; this one ends other people's.
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      # Unbounded: on a fresh cluster the tile seed races remote-desktop's Postgres, and the
+      # keytab hook races the AD DCs. Expect a failed first attempt rather than reading it as
+      # a fault.
+      # ⚠ But `retry` does NOT cover a hook that fails on the LAST attempt of a sync which
+      # then succeeds overall. It re-attempts a FAILING sync; once the live manifests match
+      # git the sync stops failing, a no-op sync runs no hooks, and selfHeal only fires on
+      # drift. Measured on ecc215 2026-09-17: connection-seed failed, the app settled to
+      # Synced/Healthy with .status.operationState.phase frozen at Failed, and the Guacamole
+      # tile was still missing 3h46m later. tests/remoteDesktopBenderChecks.sh checks 4a/4b
+      # are what catch it; its header carries the one-command recovery.
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

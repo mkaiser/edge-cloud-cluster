@@ -1,0 +1,1292 @@
+# EDA fileserver provisioning — the TrueNAS datasets, exports and per-module
+# subdirectories that the EDA stack owns.
+#
+# WHY THIS IS ITS OWN APP, separate from argocd-infra/truenas/configure-job.yaml:
+# disabling the EDA stack should stop provisioning EDA storage. The infra
+# job keeps everything that is genuinely infra — homes, the SMB userhomes share, identity,
+# network and the AD join — and this app owns exactly the EDA slice: 3 datasets, their
+# exports, and the per-module subdirectory list.
+#
+# ⚠ ONE JOB, NOT ONE PER EDA APP. Four verified reasons, each of which per-app
+# provisioning trips:
+#   1. The appliance rate-limits authentication at 20 per 60s and then LOCKS OUT for ten
+#      minutes — cluster-wide, /home included. The EDA apps carry no sync-wave annotations,
+#      so they sync concurrently; N per-app jobs each opening a session is a real path to
+#      taking the fileserver down. One job = one auth.
+#   2. Credential spread. Per-app provisioning needs a sealed appliance credential in every
+#      EDA namespace. Here there is one, and it is a SCOPED API KEY rather than the
+#      appliance-admin password.
+#   3. datapool/eda/installers is genuinely SHARED — the [eda] runner and the remote-desktop
+#      broker both mount it. No single module app can own it.
+#   4. nfs_export() converges BY PATH and takes rows[0], so two controllers managing one
+#      export path flap. Exactly one writer per dataset/export.
+#
+# ⚠ FORWARD-ONLY: THIS NEVER DELETES. There is no pool.dataset.delete, no
+# sharing.nfs.delete and no filesystem.unlink anywhere in this file, deliberately.
+# "Disabling the EDA apps removes provisioning" means it STOPS RE-ASSERTING, nothing more —
+# the data stays. What a teardown path would destroy: HyperLynx installer media that has no
+# upstream any more, the 115 GB Vivado/SDI tarballs, the append-only OCI blob store (20-40
+# GB per image, no GC), and the broker's authorisation store. Every relevant PV is Retain
+# for the same reason. Do not add an un-provision path.
+#
+# ⚠ WAVE ORDERING IS EXPRESSED WITHIN THIS APP, because it cannot be expressed across them:
+# the argocd-apps instance itself only exists at wave 19, i.e. AFTER the infra exports
+# (16), csi-driver-nfs (17) and the barrier (18). So provisioning runs as a PreSync hook
+# and the static PVs/PVCs are ordinary resources — within the app the dataset exists before
+# a PV binds. Across apps nothing enforces it, which is fine: a static PV binds lazily, so
+# the EDA apps that own PVs (gitlab-runner-eda, remote-desktop, image-registry) tolerate a
+# not-yet-existing export on first sync.
+#
+# ⚠ MUST RUN ON THE APPLIANCE'S LAN. nodeSelector ecc/fileserver-lan plus the ecc/mesh
+# toleration, copied verbatim from the infra job. WITHOUT THE TOLERATION THE POD STAYS
+# PENDING FOREVER rather than failing — the worst diagnostic outcome.
+#
+# ⚠ tnclient.py IS A VERBATIM COPY of the one in
+# argocd-infra/truenas/configure-job.yaml. A ConfigMap cannot be mounted across namespaces
+# and that job's verify-job sibling already mounts the original, so the two must stay in
+# step by hand. deployment/argocd-apps/eda/fileserver/check-tnclient.sh asserts they are
+# byte-identical; precommit runs it.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-fileserver
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-fileserver-src
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-10"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+data:
+  tnclient.py: |
+    """Minimal TrueNAS 25.10 JSON-RPC-over-websocket client.
+
+    Deliberately dependency-free rather than `pip install truenas_api_client`: the
+    install would need egress from a lab-pinned pod on every run, and the wire protocol
+    here is a few dozen lines. Written against `core.get_methods` from the live appliance
+    (25.10.4), not against docs — 25.10 folded activedirectory/ldap/idmap into one
+    `directoryservices` namespace and REST v2.0 is removed in 26, so any older recipe
+    names methods that no longer exist.
+    """
+    import base64, json, os, socket, ssl, struct
+
+    class TrueNAS:
+        def __init__(self, host, user, password, timeout=30, api_key=None):
+            self.host, self.user, self.password, self.timeout = host, user, password, timeout
+            # An API key authenticates as API_KEY_PLAIN and takes precedence over the
+            # username/password pair. It exists so a consumer that needs only a NARROW slice
+            # of the appliance (e.g. the EDA provisioner: datasets + exports, no AD, no
+            # identity) can hold a SCOPED credential instead of a copy of the full
+            # appliance-admin password. `user` may be empty when a key is supplied.
+            self.api_key = api_key
+            self._id = 0
+            self._pending = bytearray()
+            self.changes = []          # human-readable log of what was actually mutated
+
+        # -- connection ---------------------------------------------------------
+        def __enter__(self):
+            ctx = ssl.create_default_context()
+            # The appliance serves its own self-signed cert. Verification is off, which is
+            # acceptable ONLY because this runs on the same LAN as the appliance (no
+            # routed path, ~0.09ms).
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            raw = socket.create_connection((self.host, 443), timeout=self.timeout)
+            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.send((
+                "GET /api/current HTTP/1.1\r\n"
+                f"Host: {self.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("appliance closed the connection during handshake")
+                buf += chunk
+            status = buf.split(b"\r\n")[0].decode(errors="replace")
+            if "101" not in status:
+                raise RuntimeError(f"websocket upgrade refused: {status}")
+            self._pending = bytearray(buf.partition(b"\r\n\r\n")[2])
+            # ONE auth for the whole run — see the rate-limit note in the manifest header.
+            if self.api_key:
+                payload = {"mechanism": "API_KEY_PLAIN",
+                           "username": self.user, "api_key": self.api_key}
+            else:
+                payload = {"mechanism": "PASSWORD_PLAIN",
+                           "username": self.user, "password": self.password}
+            r = self.call("auth.login_ex", [payload])
+            rt = (r.get("result") or {}).get("response_type")
+            if rt != "SUCCESS":
+                mech = payload["mechanism"]
+                raise RuntimeError(f"login failed ({mech}): {rt or r.get('error')}")
+            return self
+
+        def __exit__(self, *exc):
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+        # -- framing ------------------------------------------------------------
+        def _send(self, obj):
+            d = json.dumps(obj).encode()
+            mask = os.urandom(4)
+            n = len(d)
+            h = bytearray([0x81])
+            if n < 126:
+                h.append(0x80 | n)
+            elif n < 65536:
+                h.append(0x80 | 126); h += struct.pack(">H", n)
+            else:
+                h.append(0x80 | 127); h += struct.pack(">Q", n)
+            h += mask
+            h += bytes(b ^ mask[i % 4] for i, b in enumerate(d))
+            self.sock.send(bytes(h))
+
+        def _read(self, n):
+            while len(self._pending) < n:
+                chunk = self.sock.recv(1 << 20)
+                if not chunk:
+                    raise RuntimeError("appliance closed the connection")
+                self._pending.extend(chunk)
+            out = bytes(self._pending[:n])
+            del self._pending[:n]
+            return out
+
+        def _recv(self):
+            while True:
+                b0, b1 = self._read(2)
+                op, n = b0 & 0x0F, b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                payload = self._read(n)
+                if op == 1:
+                    return json.loads(payload)
+                if op == 9:                     # ping -> pong, or the box hangs up
+                    self._send_frame_pong(payload)
+                if op == 8:
+                    raise RuntimeError("appliance closed the websocket")
+
+        def _send_frame_pong(self, payload):
+            mask = os.urandom(4)
+            h = bytearray([0x8A, 0x80 | len(payload)]) + mask
+            h += bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            self.sock.send(bytes(h))
+
+        # -- rpc ----------------------------------------------------------------
+        def call(self, method, params=None):
+            self._id += 1
+            mid = self._id
+            self._send({"jsonrpc": "2.0", "id": mid, "method": method,
+                        "params": params or []})
+            while True:
+                msg = self._recv()
+                if msg.get("id") == mid:
+                    return msg
+
+        def rpc(self, method, params=None):
+            """call() + raise on error, so a typo'd method is loud rather than ignored."""
+            r = self.call(method, params)
+            if "error" in r and r["error"] is not None:
+                err = r["error"]
+                # ⚠ `data` is PRESENT-BUT-NULL on some errors, so `err.get("data", {})`
+                # returns None and the chained .get() raises
+                # "'NoneType' object is not subscriptable" — masking the REAL API error
+                # with a TypeError. That is not hypothetical: it hid a sharing.smb.setacl
+                # failure behind a wrong "the AD group does not exist" diagnosis while the
+                # eda share stayed world-writable. Default has to be applied AFTER the
+                # lookup, not inside it.
+                data = err.get("data") or {}
+                detail = data.get("reason") or err.get("message") or err
+                raise RuntimeError(f"{method} failed: {detail}")
+            return r.get("result")
+
+        def job(self, method, params=None, timeout=1800):
+            """Run a long operation and WAIT. Without this a job id is mistaken for
+            success — pool/dataset/join calls all return immediately otherwise."""
+            jid = self.rpc(method, params)
+            if not isinstance(jid, int):
+                return jid                       # not a job-returning method after all
+            import time
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                rows = self.rpc("core.get_jobs", [[["id", "=", jid]]])
+                if rows:
+                    st = rows[0].get("state")
+                    if st in ("SUCCESS", "FAILED", "ABORTED"):
+                        if st != "SUCCESS":
+                            raise RuntimeError(
+                                f"{method} job {jid} {st}: {rows[0].get('error')}")
+                        return rows[0].get("result")
+                time.sleep(3)
+            raise RuntimeError(f"{method} job {jid} did not finish within {timeout}s")
+
+        # -- convergence helper -------------------------------------------------
+        def converge(self, label, current, desired, apply_fn):
+            """Three outcomes, three branches — the rule that separates 'usually
+            idempotent' from actually so. A two-branch version re-creates on drift."""
+            drift = {k: (current.get(k), v) for k, v in desired.items()
+                     if current.get(k) != v}
+            if not drift:
+                print(f"  {label}: already correct")
+                return False
+            for k, (was, now) in drift.items():
+                print(f"  {label}: {k}: {was!r} -> {now!r}")
+            apply_fn(desired)
+            self.changes.append(label)
+            return True
+  provision.py: |
+    """Provision the EDA slice of the TrueNAS fileserver: datasets, exports, subdirs.
+
+    Idempotent and FORWARD-ONLY — it creates and converges, it never deletes. See the
+    manifest header for why that is deliberate and what a teardown path would destroy.
+
+    Authenticates ONCE per run — the appliance rate-limits at 20 auths per 60s and then locks
+    out for TEN MINUTES cluster-wide, /home included — with a SCOPED API KEY THIS JOB MINTS
+    ITSELF. See ensure_api_key(): the first run bootstraps with the appliance-admin credential,
+    mints a key via api_key.create, and caches it in a Secret this namespace owns; every run
+    after that uses the key alone and never touches the admin password.
+    """
+    import base64, json, os, ssl, sys, urllib.request
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    HOST     = os.environ["TN_HOST"]
+    LAB_CIDR = os.environ["LAB_CIDR"]
+
+    # Bootstrap credential — the appliance admin. Used ONLY to mint the scoped key below, and
+    # only when there is no cached key yet. Sealed by argocd-infra/truenas/sealSecrets.sh.
+    ADMIN_USER = os.environ.get("TN_ADMIN_USER", "")
+    ADMIN_PASS = os.environ.get("TN_ADMIN_PASS", "")
+
+    # Where the minted key is cached. A plain Secret in THIS namespace, created and owned by
+    # this Job — deliberately not a SealedSecret: nothing outside this namespace needs it, and
+    # a value that is regenerable on demand does not belong in git.
+    KEY_SECRET = os.environ.get("API_KEY_SECRET", "eda-fileserver-api")
+    KEY_NAME   = os.environ.get("API_KEY_NAME", "eda-fileserver")
+
+    # SMB share name for the artifacts tree. `eda` is short and obviously not a home
+    # directory; the UNC path a laptop uses is \\fs-1.<realm>\eda.
+    SMB_SHARE_NAME = os.environ.get("SMB_SHARE_NAME", "eda")
+
+    # AD group the share ACL is restricted to. Mirrored from the Authentik group of the same
+    # name by argocd-infra/samba-ad/postsync-provision-users.yaml step 2a; the Authentik
+    # group itself is created by this app's authentik-group.yaml.
+    #
+    # ⚠ NOT the same string as the NFS export/PV/PVC named "nfs-eda-installers" — those
+    # are RESOURCE names, all deliberately identical to each other and derived from the
+    # dataset path, whereas this is an IDENTITY typed by a human into Explorer.
+    # Renaming one must not rename the others.
+    ACL_GROUP = os.environ.get("SMB_ACL_GROUP", "eda-developer")
+
+    NAMESPACE  = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read().strip()
+
+    # The EDA datasets. PARENT first — a child cannot be created before it.
+    #
+    # ⚠ THE CHILDREN ARE SEPARATE DATASETS ON PURPOSE, and a common parent does NOT merge
+    # them. Their retention/replication policies differ in opposite directions:
+    #   installers   the installer MEDIA, never deleted -> long retention
+    #   builds       BUILD OUTPUTS, regenerable from git + a rebuild -> short retention,
+    #                EXCLUDED from off-site replication, own quota (GB per build)
+    #   modulefiles  NOT regenerable, and it is the broker's AUTHORISATION boundary (writing
+    #                a module.yaml there is what permits the privileged broker to pull and run
+    #                an image AS ROOT) -> long retention, DO replicate off-site
+    #   registry     the OCI blob store, mounted rw by an ORDINARY registry Deployment
+    # ⚠ Never merge modulefiles into registry: that would put root-execution authority inside
+    # a volume a non-privileged pod mounts rw.
+    PARENT   = os.environ["DS_EDA_PARENT"]      # datapool/eda
+    INSTALLERS = os.environ["DS_INSTALLERS"]      # datapool/eda/installers
+    IMAGES     = os.environ["DS_IMAGES"]       # datapool/images
+    AIMODELS   = os.environ["DS_AI_MODELS"]     # datapool/ai-models
+    MODFILES  = os.environ["DS_MODULEFILES"]    # datapool/eda/modulefiles
+    BUILDS    = os.environ["DS_BUILDS"]         # datapool/eda/builds
+
+    # Per-module subdirectories inside the artifacts dataset — NOT child datasets (each child
+    # multiplies snapshot and replication bookkeeping, and the policy is identical for all of
+    # them). One directory per module family+version.
+    #
+    # ⚠ THIS LIST IS A CONTRACT with each app's CI $MEDIA_DIR. If they disagree, a build
+    # cannot find its installer media. check-subdirs.sh asserts both derivations agree;
+    # precommit runs it.
+    #
+    # ⚠ The first segment is an ARBITRARY string, not a vendor taxonomy: `xilinx` happens to
+    # be a vendor, `hyperlynx` is the tool. All that matters is that this file and each
+    # app's CI derive the SAME one. Do NOT "correct" either side for symmetry.
+    SUBDIRS = (
+        "xilinx",
+        "hyperlynx", "hyperlynx/2604", "hyperlynx/2604/installer",
+    )
+
+
+    def _k8s(method, path, body=None):
+        """Minimal in-cluster Kubernetes API call. No kubectl in this image, and pulling one in
+        would be a much bigger dependency than twenty lines of urllib."""
+        root = "/var/run/secrets/kubernetes.io/serviceaccount"
+        token = open(f"{root}/token").read().strip()
+        ctx = ssl.create_default_context(cafile=f"{root}/ca.crt")
+        url = f"https://kubernetes.default.svc{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + token)
+        if data:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+
+
+    def cached_api_key():
+        """(user, key) this Job minted on an earlier run, or (None, None).
+
+        ⚠ THE USER COMES FROM THE CACHE, not from TN_ADMIN_USER. API_KEY_PLAIN still sends a
+        username, and on the cached path the admin secretKeyRef may legitimately be empty —
+        that env var is only populated to MINT a key. mint_api_key() stores TRUENAS_API_USER
+        alongside the key precisely so this path needs no admin credential at all.
+        """
+        try:
+            s = _k8s("GET", f"/api/v1/namespaces/{NAMESPACE}/secrets/{KEY_SECRET}")
+        except Exception:
+            return None, None
+        data = s.get("data") or {}
+        raw = data.get("TRUENAS_API_KEY")
+        if not raw:
+            return None, None
+        user_raw = data.get("TRUENAS_API_USER")
+        user = base64.b64decode(user_raw).decode() if user_raw else ADMIN_USER
+        return user, base64.b64decode(raw).decode()
+
+
+    def admin_credential():
+        """(user, password) for the appliance admin.
+
+        ⚠ THE ENV VARS ARE NOT ENOUGH, and this is the ecc182 bug. A secretKeyRef is
+        resolved at POD CREATION: if secret/truenas-admin does not exist yet at that
+        instant, TN_ADMIN_USER/TN_ADMIN_PASS are simply absent (`optional: true`) and stay
+        absent for the life of the pod — even though the init container then waits for the
+        Secret and sees it appear. Waiting fixes the ORDERING but cannot retro-fill an env
+        var, so the credential has to be re-read from the API once we know it is there.
+
+        Falls back to the API only when the env is empty, so the normal path costs nothing.
+        """
+        user, password = ADMIN_USER, ADMIN_PASS
+        if user and password:
+            return user, password
+        try:
+            sec = _k8s("GET", f"/api/v1/namespaces/{NAMESPACE}/secrets/truenas-admin")
+        except Exception as e:
+            print(f"  could not read secret/truenas-admin from the API: {e}", file=sys.stderr)
+            return user, password
+        data = sec.get("data") or {}
+
+        def _dec(k):
+            raw = data.get(k)
+            return base64.b64decode(raw).decode() if raw else ""
+
+        user = user or _dec("TRUENAS_ADMIN_USER")
+        password = password or _dec("TRUENAS_ADMIN_PASSWORD")
+        if user and password:
+            print("  read the admin credential from the API "
+                  "(the secretKeyRef env was empty at pod creation)")
+        return user, password
+
+
+    def mint_api_key(tn, admin_user):
+        """Mint a scoped API key and cache it in this namespace.
+
+        ⚠ THE VALUE IS RETURNED EXACTLY ONCE. TrueNAS never shows it again, so it must be
+        stored in the same breath it is created — that one-shot property is precisely why the
+        earlier hand-pasted key was a bad fit, and why this caches immediately.
+
+        ⚠ Any pre-existing key of the same name is REVOKED first. Re-minting without doing so
+        would leave orphans accumulating on the appliance, each as privileged as this one.
+        """
+        for k in (tn.rpc("api_key.query", [[["name", "=", KEY_NAME]]]) or []):
+            print(f"  revoking stale API key {KEY_NAME} (id={k.get('id')})")
+            tn.rpc("api_key.delete", [k["id"]])
+
+        created = tn.rpc("api_key.create", [{"name": KEY_NAME, "username": admin_user}])
+        key = (created or {}).get("key")
+        if not key:
+            raise RuntimeError(f"api_key.create returned no key: {str(created)[:200]}")
+
+        body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                "metadata": {"name": KEY_SECRET, "namespace": NAMESPACE},
+                "data": {"TRUENAS_API_KEY": base64.b64encode(key.encode()).decode(),
+                         "TRUENAS_API_USER": base64.b64encode(admin_user.encode()).decode()}}
+        try:
+            _k8s("POST", f"/api/v1/namespaces/{NAMESPACE}/secrets", body)
+            print(f"  cached the minted key in secret/{KEY_SECRET}")
+        except Exception:
+            # Already there (a previous run raced or was interrupted after create) — replace it,
+            # or the cached value would no longer match the key that now exists on the appliance.
+            _k8s("PUT", f"/api/v1/namespaces/{NAMESPACE}/secrets/{KEY_SECRET}", body)
+            print(f"  replaced the cached key in secret/{KEY_SECRET}")
+        return key
+
+
+    def ensure_dataset(tn, name):
+        rows = tn.rpc("pool.dataset.query", [[["name", "=", name]]])
+        if rows:
+            # ⚠ NEVER re-apply acltype on an existing dataset. It is a CREATE-TIME property and
+            # changing it rewrites permissions on everything inside. Report instead, so a wrong
+            # one is visible rather than silently "fixed".
+            got = (rows[0].get("acltype") or {}).get("value")
+            if got != "NFSV4":
+                print(f"  {name}: EXISTS with acltype={got}, expected NFSV4 — NOT changing it "
+                      "(create-time property; a change would rewrite permissions). Recreate "
+                      "the dataset by hand if this is wrong.")
+            else:
+                print(f"  {name}: already correct (acltype NFSV4)")
+            return
+        # ⚠ acltype EXPLICIT, not inherited: the pool root is acltype=POSIX, and POSIX ACLs
+        # break SMB semantics on TrueNAS. NFSV4 is also what the NFSv4 export needs.
+        print(f"  {name}: absent -> creating with acltype NFSV4")
+        tn.job("pool.dataset.create", [{
+            "name": name,
+            "type": "FILESYSTEM",
+            "acltype": "NFSV4",
+            "aclmode": "PASSTHROUGH",
+            "casesensitivity": "SENSITIVE",
+            "comments": "managed by eda-fileserver (ArgoCD)",
+        }])
+        tn.changes.append(f"dataset {name}")
+
+
+    def nfs_export(tn, label, dataset):
+        """Converge ONE NFSv4 export on a dataset's mountpoint.
+
+        ⚠ maproot_user=root IS REQUIRED. NFS squashes an incoming root to `nobody` by default,
+        so the csi-driver-nfs provisioner — which mounts the export and mkdirs a subdirectory
+        per PVC — fails with "failed to make subdirectory: ... permission denied" and every
+        PVC sits Pending, in a message that mentions neither squashing nor the export.
+
+        ⚠ ro=False: the EDA build jobs WRITE here (installer media staged in, container
+        archives written out).
+
+        The exposure is bounded by `networks` — only the lab LAN can mount these at all.
+        ⚠ modulefiles is exported rw to the whole lab CIDR like the rest, and that is NOT an
+        oversight: the obvious tightening (rw for the broker, ro for the runner) is IMPOSSIBLE
+        because both run on the same node, so the server sees one source IP. What actually
+        bounds access is WHICH PODS MOUNT IT — remote-desktop/nfs-eda-modulefiles-pv.yaml, broker sidecar
+        only. Never add that claim to the [eda] runner or the desktop container.
+
+        ⚠ Converges BY PATH and takes rows[0], so exactly ONE controller may manage a given
+        export path. These three are this job's alone — the infra job must not touch them.
+        """
+        path = "/mnt/" + dataset
+        rows = tn.rpc("sharing.nfs.query", [[["path", "=", path]]])
+        desired = {
+            "path": path,
+            "comment": f"{label} (managed by eda-fileserver)",
+            "networks": [LAB_CIDR],
+            "enabled": True,
+            "ro": False,
+            "maproot_user": "root",
+            "maproot_group": "root",
+        }
+        if rows:
+            cur = rows[0]
+            tn.converge(f"nfs export {label}",
+                        {k: cur.get(k) for k in desired},
+                        desired,
+                        lambda d: tn.rpc("sharing.nfs.update", [cur["id"], {
+                            k: v for k, v in d.items() if k != "path"}]))
+        else:
+            print(f"  nfs export {path}: absent -> creating")
+            tn.rpc("sharing.nfs.create", [desired])
+            tn.changes.append(f"nfs export {label}")
+
+
+    def ensure_subdir(tn, dataset, sub):
+        d = f"/mnt/{dataset}/{sub}"
+        # `sub` may be nested (xilinx/2024.1), so list its PARENT and match the last
+        # component — listing the dataset root would never see a nested name.
+        parent, _, leaf = d.rpartition("/")
+        names = {e.get("name") for e in (tn.rpc("filesystem.listdir", [parent]) or [])}
+        if leaf in names:
+            print(f"  {d}: already present")
+            return
+        print(f"  {d}: absent -> creating")
+        # Mode is a fallback only. These datasets are acltype=NFSV4, where the POSIX bits are
+        # a lossy projection of the real ACL — group write is carried by the ACE that
+        # ensure_group_acl() sets, and its `dir_inherit` is what makes new subdirectories
+        # writable too. Do NOT try to express this as a mode: filesystem.setperm REJECTS
+        # anything above 777, so setgid cannot be set that way at all
+        # (see argocd-infra/truenas/configure-job.yaml on the sticky bit).
+        tn.rpc("filesystem.mkdir", [{"path": d, "options": {"mode": "775"}}])
+        tn.changes.append(f"dir {sub}")
+
+
+    def ensure_group_acl(tn, dataset, group):
+        r"""Give ACL_GROUP write access on the FILESYSTEM, via the dataset's NFSv4 ACL.
+
+        ⚠ TWO INDEPENDENT PERMISSION LAYERS, BOTH REQUIRED. The SMB share ACL (smb_share
+        below) is evaluated when a client CONNECTS. This filesystem ACL is evaluated on
+        every read and write. `filesystem.mkdir` creates root:root 0775, i.e. writable by
+        root ALONE, so before this existed a member of ACL_GROUP authenticated, saw the
+        share, listed it — and then got NT_STATUS_ACCESS_DENIED on the first file. That
+        reads as a wrong password or a missing group membership, and is neither. Measured
+        2026-09-04: testadmin could list the share and could not create anything in it,
+        share root included.
+
+        ⚠ THE GROUP MUST BE DOMAIN-PREFIXED: "AD\\eda-developer", not "eda-developer".
+        Verified against the live appliance — `group.get_group_obj` on the bare name raises
+        "group with this name does not exist", while the prefixed form returns
+        gr_gid=6001 source=ACTIVEDIRECTORY. An ACE naming the bare group is rejected, so
+        the prefix is not cosmetic. The NetBIOS domain is read from the appliance's own
+        join rather than hardcoded, so a realm change cannot silently break this.
+
+        ⚠ NOT filesystem.setperm. These datasets are acltype=NFS4, and setperm refuses any
+        mode above 777 ([EINVAL] "Please supply a value between 000 and 777"), so the setgid
+        bit that would make new files inherit the group CANNOT be expressed as a mode.
+        FILE_INHERIT/DIRECTORY_INHERIT on the ACE is the NFSv4 way to say the same thing,
+        and it is what keeps media a human drops in readable by the [eda] runner.
+
+        ⚠ setacl is a JOB — tn.job() waits for it. A plain rpc() returns a job id that reads
+        as success while nothing has been applied.
+
+        ⚠ getacl/setacl take POSITIONAL arguments here, not a dict. `[{"path": p}]` fails
+        with "[EINVAL] path: Input should be a valid string".
+
+        ⚠ Converges by inspecting OUR ace only. The appliance keeps owner@/group@/everyone@
+        entries (a fresh dataset is `trivial: True`, i.e. mode-derived) and may reorder or
+        annotate them; rewriting the whole ACL every run would fight it and churn the tree.
+        """
+        path = "/mnt/" + dataset
+
+        # The appliance's own NetBIOS domain — the prefix its idmap expects. Falls back to
+        # the bare group only if the appliance is somehow not joined, where the setacl below
+        # will fail loudly rather than silently granting nothing.
+        try:
+            smb_cfg = tn.rpc("smb.config") or {}
+            netbios_domain = smb_cfg.get("workgroup") or ""
+        except Exception:
+            netbios_domain = ""
+        who = f"{netbios_domain}\\{group}" if netbios_domain else group
+
+        # The gid the appliance will store the ACE under. It RESOLVES `who` to a numeric id
+        # and returns the ACE with `id: <gid>` and `who: null` — so identity must be
+        # matched on the ID, not the name. Matching on `who` made _is_ours() never match
+        # its own previous ACE and APPENDED A DUPLICATE ON EVERY RUN (observed: two
+        # identical GROUP/6001 entries after two syncs).
+        try:
+            grp = tn.rpc("group.query", [[["group", "=", who]]]) or []
+            acl_gid = (grp[0] or {}).get("gid") if grp else None
+        except Exception as exc:
+            acl_gid = None
+            print(f"  filesystem acl {path}: group lookup for {who!r} failed — {str(exc)[:120]}")
+        if acl_gid is None:
+            print(f"  filesystem acl {path}: NOT SET — no gid for {who!r} on the appliance.")
+            print("    Members of that group cannot WRITE to the share until this applies.")
+            return
+
+        cur = tn.rpc("filesystem.getacl", [path]) or {}
+        acl = cur.get("acl") or []
+
+        def _is_ours(ace):
+            # Match on the resolved id; `who` is null on read-back.
+            return ace.get("tag") == "GROUP" and ace.get("id") == acl_gid
+
+        ours = [a for a in acl if _is_ours(a)]
+        # MODIFY = read+write+delete but not chown/ACL rewrite — same intent as the share
+        # ACL's CHANGE. Compare the BASIC forms; the appliance echoes them back unexpanded.
+        #
+        # ⚠ EXACTLY ONE matching ACE, not "at least one". An earlier revision matched the
+        # ACE by name, which never matched what it had written and so appended a duplicate
+        # every sync. `any()` here would then declare the tree correct and never collapse
+        # them — the rewrite below is what removes the extras, so it must still run when
+        # there is more than one.
+        want_ok = (len(ours) == 1
+                   and ours[0].get("type") == "ALLOW"
+                   and (ours[0].get("perms") or {}).get("BASIC") == "MODIFY"
+                   and (ours[0].get("flags") or {}).get("BASIC") == "INHERIT")
+        if want_ok:
+            print(f"  filesystem acl {path}: already grants {who!r} (gid {acl_gid}) MODIFY (inherited)")
+            return
+
+        got = [(a.get("tag"), a.get("who") or a.get("id")) for a in acl]
+        print(f"  filesystem acl {path}: {got} -> +[{who!r} gid={acl_gid} MODIFY INHERIT]")
+        ace = {
+            "tag": "GROUP",
+            # `id`, not `who`: this is the form the appliance stores and returns, so writing
+            # it this way makes the next run's comparison match instead of appending again.
+            "id": acl_gid,
+            "type": "ALLOW",
+            "perms": {"BASIC": "MODIFY"},
+            # INHERIT = FILE_INHERIT + DIRECTORY_INHERIT, so subdirectories and files added
+            # later are covered without re-running this.
+            "flags": {"BASIC": "INHERIT"},
+        }
+        tn.job("filesystem.setacl", [{
+            "path": path,
+            "dacl": [a for a in acl if not _is_ours(a)] + [ace],
+            # stripacl=False keeps the appliance's owner@/group@/everyone@ entries.
+            "options": {"recursive": True, "traverse": False, "stripacl": False},
+        }])
+        tn.changes.append(f"filesystem acl {path}")
+
+
+    def smb_share(tn, name, dataset):
+        """Converge ONE SMB share so a Windows client can add installer media by hand.
+
+        WHY SMB AT ALL when everything in-cluster uses NFS: vendor installer media arrives
+        from a human's laptop, and Explorer speaks SMB. The headscale `human@` user already
+        has a grant to the lab CIDR on port 445, so a laptop on the VPN reaches this without
+        any new network rule.
+
+        ⚠ AD-AUTHENTICATED, not guest. The appliance is a domain member, so access is the
+        user's own AD identity — same as `userhomes`. Never set guestok here: this tree
+        feeds images the privileged broker runs as root.
+
+        ⚠ Writable ON PURPOSE, and it shares the tree with the [eda] runner. That is the
+        point (adding an installer is the use case), but it means a human CAN overwrite
+        media a build is reading. Drop new media in a NEW <tool>/<version>/ directory rather
+        than editing one in place while a pipeline runs.
+
+        ⚠ This holds installer media ONLY — there are no image archives (that scheme was
+        retired; the registry blob store on datapool/images is what survives a
+        recreate). The media is the rebuild fallback, so deleting it costs a multi-hour
+        rebuild with no upstream to re-fetch from.
+        """
+        path = "/mnt/" + dataset
+        rows = tn.rpc("sharing.smb.query", [[["path", "=", path]]])
+        if rows:
+            print(f"  smb share {path}: already present as {rows[0].get('name')!r}")
+            # ⚠ NO early return: the ACL below must converge on EVERY run, not only when
+            # the share is first created — otherwise an ACL widened by hand stays widened.
+            name = rows[0].get("name") or name
+        if not rows:
+            print(f"  smb share {path}: absent -> creating as {name!r}")
+            tn.rpc("sharing.smb.create", [{
+                "path": path,
+                "name": name,
+                "comment": "EDA installer media (managed by eda-fileserver)",
+                "enabled": True,
+            }])
+            tn.changes.append(f"smb share {name}")
+
+        # ⚠ THE SHARE ACL IS THE ONLY THING THAT NARROWS THIS. A new SMB share defaults to
+        # `S-1-1-0` (Everyone) with FULL — i.e. writable by EVERY domain user, which for a
+        # tree the [eda] builds read is too wide. Restrict it to the AD group that
+        # argocd-infra/samba-ad/postsync-provision-users.yaml step 2a mirrors from Authentik.
+        #
+        # ⚠ THIS CONVERGES EVERY RUN, not only at create: an ACL widened by hand in the UI is
+        # put back. That is deliberate — the whole point is that the narrow ACL is the
+        # declared state.
+        #
+        # ⚠ THE ACE MUST NAME THE GROUP BY **SID**, NOT BY NAME. Passing `ae_who_str` here
+        # hits a BUG IN THE APPLIANCE MIDDLEWARE, not in us: sharing.smb.setacl raises
+        #   TypeError: 'NoneType' object is not subscriptable
+        #   .../middlewared/api/base/server/ws_handler/rpc.py process_method_call
+        # for ANY ae_who_str, prefixed or not. Verified 2026-09-04 against the live 25.10
+        # appliance: `ae_who_str: "AD\eda-developer"` -> that TypeError, while the same call
+        # with `ae_who_sid` SUCCEEDS and the appliance echoes back the resolved
+        # ae_who_str/ae_who_id itself. This is why the share sat on everyone@ for a full
+        # cluster life: the call failed every run, and our own error extraction then MASKED
+        # the appliance's TypeError with an identical-looking one of its own (see the `data`
+        # null note in tnclient.rpc), so the log blamed a missing AD group. The group
+        # existed throughout.
+        #
+        # The SID comes from the directory via the appliance's OWN group lookup, so nothing
+        # is hardcoded and a re-provisioned domain (new SID) follows automatically. The
+        # group must be domain-prefixed for THAT lookup — the bare name does not resolve
+        # (`group.get_group_obj "eda-developer"` -> "group with this name does not exist").
+        try:
+            netbios_domain = (tn.rpc("smb.config") or {}).get("workgroup") or ""
+        except Exception:
+            netbios_domain = ""
+        acl_who = f"{netbios_domain}\\{ACL_GROUP}" if netbios_domain else ACL_GROUP
+
+        try:
+            grp = tn.rpc("group.query", [[["group", "=", acl_who]]]) or []
+            acl_sid = (grp[0] or {}).get("sid") if grp else None
+        except Exception as exc:
+            acl_sid = None
+            print(f"  smb acl {name}: group lookup for {acl_who!r} failed — {str(exc)[:120]}")
+
+        if not acl_sid:
+            # Fail LOUDLY about the exposure rather than pretending the share is narrowed.
+            print(f"  smb acl {name}: NOT SET — no SID for {acl_who!r} on the appliance.")
+            print("    THIS SHARE IS OPEN TO EVERY DOMAIN USER until the ACL applies.")
+            print(f"    Check: group.query [[['group','=',{acl_who!r}]]] — it must return a sid.")
+            return
+
+        desired_acl = [{
+            "ae_who_sid": acl_sid,
+            "ae_perm": "CHANGE",     # read+write, but not ownership/ACL changes
+            "ae_type": "ALLOWED",
+        }]
+        try:
+            cur = tn.rpc("sharing.smb.getacl", [{"share_name": name}]) or {}
+            cur_acl = cur.get("share_acl") or []
+            # Compare on the SID — the appliance fills in ae_who_str/ae_who_id from it.
+            same = (len(cur_acl) == 1
+                    and cur_acl[0].get("ae_who_sid") == acl_sid
+                    and cur_acl[0].get("ae_perm") == "CHANGE"
+                    and cur_acl[0].get("ae_type") == "ALLOWED")
+            if same:
+                print(f"  smb acl {name}: already restricted to {acl_who!r} ({acl_sid})")
+            else:
+                who = [e.get("ae_who_str") or e.get("ae_who_sid") for e in cur_acl] or ["<none>"]
+                print(f"  smb acl {name}: {who} -> [{acl_who!r} CHANGE]")
+                tn.rpc("sharing.smb.setacl", [{"share_name": name, "share_acl": desired_acl}])
+                tn.changes.append(f"smb acl {name}")
+        except Exception as exc:
+            # ⚠ Do NOT guess a cause here. A previous version asserted the AD group did not
+            # exist; it existed, and that wrong diagnosis sent debugging into samba-ad.
+            # Print the API error and what it means for exposure, nothing more.
+            print(f"  smb acl {name}: NOT SET — {str(exc)[:200]}")
+            print(f"    Wanted ae_who_sid={acl_sid} ({acl_who!r}). THIS SHARE IS STILL OPEN")
+            print("    TO EVERY DOMAIN USER until the ACL applies.")
+
+
+    def main():
+        # ── credential ───────────────────────────────────────────────────────────────────
+        # Steady state: a cached scoped key, no admin password involved at all.
+        # First run on an appliance (or after the cache is lost): bootstrap with the admin
+        # credential, mint, cache, and carry on in the SAME session — minting does not cost a
+        # second authentication, which matters against the 20-per-60s lockout.
+        api_user, api_key = cached_api_key()
+        if api_key:
+            print(f"[0/3] using the cached scoped API key ({KEY_NAME}) as {api_user}")
+            with TrueNAS(HOST, api_user, "", api_key=api_key) as tn:
+                return provision(tn)
+
+        admin_user, admin_pass = admin_credential()
+        if not admin_user or not admin_pass:
+            print("ERROR: no cached API key and no admin credential to mint one with.\n"
+                  "       Expected secret/truenas-admin in this namespace — seal it with\n"
+                  "       deployment/argocd-infra/truenas/sealSecrets.sh", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[0/3] no cached key — bootstrapping with {admin_user} to mint {KEY_NAME}")
+        with TrueNAS(HOST, admin_user, admin_pass) as tn:
+            mint_api_key(tn, admin_user)
+            return provision(tn)
+
+
+    def provision(tn):
+        print("[1/3] datasets")
+        # Parent BEFORE children — ZFS cannot create a child of a missing dataset.
+        for name in (PARENT, INSTALLERS, IMAGES, MODFILES, BUILDS, AIMODELS):
+            ensure_dataset(tn, name)
+
+        print("\n[2/3] per-module subdirectories")
+        for sub in SUBDIRS:
+            ensure_subdir(tn, INSTALLERS, sub)
+
+        # AFTER the subdirectories exist, so the recursive grant covers them, and only on
+        # INSTALLERS — the SMB share's dataset. modulefiles must NOT get this: writing a
+        # module.yaml there is what authorises the privileged broker to run an image as
+        # root, so it stays root-only. images is served by the registry Deployment, which
+        # runs as its own user and needs no AD group.
+        ensure_group_acl(tn, INSTALLERS, ACL_GROUP)
+        # BUILDS too, and for a different reason: users run a synthesis BY HAND on an
+        # interactive machine and must be able to write their outputs, not just read them.
+        # Same AD group as the installer share, so no second group to keep in step.
+        # ⚠ Still NOT modulefiles — see above; that one stays root-only.
+        ensure_group_acl(tn, BUILDS, ACL_GROUP)
+
+        print("\n[3/3] nfs exports")
+        # No export on the PARENT: it is a grouping dataset only. Exporting it would
+        # expose every child through one path and defeat the per-child boundary.
+        nfs_export(tn, "nfs-eda-installers", INSTALLERS)
+        nfs_export(tn, "nfs-images", IMAGES)
+        # Model-weight seed store. No ensure_group_acl: like `images` it is served to a
+        # pod, not browsed by AD users, so it stays root-owned.
+        nfs_export(tn, "nfs-ai-models", AIMODELS)
+        nfs_export(tn, "nfs-eda-modulefiles", MODFILES)
+        nfs_export(tn, "nfs-eda-builds", BUILDS)
+
+        # An SMB share on the INSTALLERS dataset only — so installer media can be added from
+        # a Windows machine over the VPN. Deliberately NOT on modulefiles (writing there is
+        # what authorises the privileged broker to run an image as root) and NOT on registry
+        # (an OCI blob store is not something to edit by hand).
+        smb_share(tn, SMB_SHARE_NAME, INSTALLERS)
+
+        print()
+        if tn.changes:
+            print(f"CHANGED ({len(tn.changes)}): " + ", ".join(tn.changes))
+        else:
+            print("No changes — appliance already converged.")
+
+
+    if __name__ == "__main__":
+        main()
+  verify.py: |
+    """Assert the EDA half of the fileserver is actually in the state provision.py intends.
+
+    The appliance is NOT a k8s resource, so ArgoCD reports the app Synced regardless of what
+    the fileserver really looks like. This is what turns appliance drift into a visible failure.
+
+    Runs as a PostSync hook, AFTER provision.py's PreSync — verifying what this sync just did.
+    """
+    import os, sys
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    HOST     = os.environ["TN_HOST"]
+    # The scoped key the PreSync Job minted and cached. This runs PostSync, so by now it
+    # exists — no admin credential here at all, which is the point of minting one.
+    USER     = os.environ.get("TN_API_USER", "")
+    API_KEY  = os.environ.get("TN_API_KEY", "")
+
+    PARENT    = os.environ["DS_EDA_PARENT"]
+    INSTALLERS = os.environ["DS_INSTALLERS"]
+    IMAGES     = os.environ["DS_IMAGES"]
+    AIMODELS   = os.environ["DS_AI_MODELS"]
+    MODFILES  = os.environ["DS_MODULEFILES"]
+
+    # Same default as provision.py — gate 4 asserts BOTH the share ACL and the filesystem
+    # ACL name this group. Env-overridable so the two halves cannot drift apart.
+    ACL_GROUP = os.environ.get("SMB_ACL_GROUP", "eda-developer")
+
+    # Keep in step with provision.py SUBDIRS — check-subdirs.sh asserts both agree with
+    # each app's CI.
+    SUBDIRS = ("xilinx",
+               "hyperlynx/2604", "hyperlynx/2604/installer")
+
+    failures = []
+
+
+    def check(label, ok, detail=""):
+        print(("  PASS  " if ok else "  FAIL  ") + label + (f"  ({detail})" if detail else ""))
+        if not ok:
+            failures.append(label)
+        return ok
+
+
+    def main():
+        if not API_KEY:
+            print("ERROR: no TRUENAS_API_KEY — the PreSync provisioning Job should have\n"
+                  "       minted and cached one in secret/eda-fileserver-api. Check its log.",
+                  file=sys.stderr)
+            sys.exit(1)
+        with TrueNAS(HOST, USER, "", api_key=API_KEY) as tn:
+            print("gate 1: datasets")
+            for dataset in (PARENT, INSTALLERS, IMAGES, MODFILES, AIMODELS):
+                ds = tn.rpc("pool.dataset.query", [[["name", "=", dataset]]])
+                if not check(f"dataset {dataset} exists", bool(ds)):
+                    continue
+                # ⚠ acltype is CREATE-TIME. If this ever reads POSIX the dataset was made wrong
+                # and must be recreated — POSIX ACLs break SMB semantics on TrueNAS.
+                check(f"dataset {dataset} acltype is NFSV4",
+                      (ds[0].get("acltype") or {}).get("value") == "NFSV4",
+                      f"got {(ds[0].get('acltype') or {}).get('value')!r}")
+
+            print("\ngate 2: exports")
+            # ⚠ The PARENT must NOT be exported — exporting it would expose all three children
+            # through one path and defeat the per-child boundary, in particular putting the
+            # broker's authorisation store inside a path other pods could claim.
+            parent_export = tn.rpc("sharing.nfs.query", [[["path", "=", "/mnt/" + PARENT]]])
+            check(f"parent {PARENT} is NOT exported", not parent_export,
+                  "an export here would expose all three children through one path")
+            for label, dataset in (("eda-artifacts", INSTALLERS), ("image-registry", IMAGES),
+                                   ("eda-modulefiles", MODFILES), ("ai-models", AIMODELS)):
+                p = "/mnt/" + dataset
+                nfs = tn.rpc("sharing.nfs.query", [[["path", "=", p]]])
+                if not check(f"NFS export exists on {p}", bool(nfs)):
+                    continue
+                # ⚠ Exactly ONE export per path. nfs_export() converges by path and takes
+                # rows[0], so a second one means two managers and silent flapping.
+                check(f"exactly one export manages {p}", len(nfs) == 1, f"got {len(nfs)}")
+                e = nfs[0]
+                check(f"NFS export {label} enabled", bool(e.get("enabled")))
+                # ⚠ read-write matters: the CI writes the container archive through this export.
+                check(f"NFS export {label} is read-write", not e.get("ro"))
+                # ⚠ Without maproot the csi-driver-nfs provisioner cannot mkdir and every PVC
+                # stays Pending with a message that reads like a node-side filesystem error.
+                check(f"NFS {label} maproot_user is root", e.get("maproot_user") == "root",
+                      f"got {e.get('maproot_user')!r}")
+                # An export open to the world would be a real exposure, since maproot is on.
+                check(f"NFS export {label} is network-restricted", bool(e.get("networks")),
+                      f"networks={e.get('networks')}")
+
+            print("\ngate 3: per-module subdirectories")
+            # A missing one surfaces as "no .tar.gz found" or an archive that never appears —
+            # neither of which points at a missing mkdir.
+            for sub in SUBDIRS:
+                d = f"/mnt/{INSTALLERS}/{sub}"
+                try:
+                    check(f"{d} exists", bool(tn.rpc("filesystem.stat", [d])))
+                except Exception as exc:
+                    check(f"{d} exists", False, str(exc)[:80])
+
+            # ─── gate 4 ────────────────────────────────────────────────────────────────
+            # WHY THIS GATE EXISTS: without it this job passed every check while the SMB
+            # share was WORLD-WRITABLE and simultaneously UNUSABLE. Both halves of the
+            # 2026-09-04 failure were invisible here — the share ACL had silently failed to
+            # apply (leaving everyone@), and the filesystem ACL granted nobody but root, so
+            # a legitimate eda-developer member got NT_STATUS_ACCESS_DENIED on every write.
+            # NFS was verified in detail and SMB not at all.
+            print("\ngate 4: smb share")
+            p = "/mnt/" + INSTALLERS
+            smb = tn.rpc("sharing.smb.query", [[["path", "=", p]]])
+            if check(f"SMB share exists on {p}", bool(smb)):
+                sh = smb[0]
+                name = sh.get("name")
+                check(f"exactly one SMB share manages {p}", len(smb) == 1, f"got {len(smb)}")
+                check(f"SMB share {name} enabled", bool(sh.get("enabled")))
+                # ⚠ guestok would make the tree that feeds root-executed images anonymous.
+                check(f"SMB share {name} is NOT guest-accessible", not sh.get("guestok"))
+                # ⚠ ro would break the entire point — adding installer media by hand.
+                check(f"SMB share {name} is read-write", not sh.get("ro"))
+
+                # The share ACL: restricted to ACL_GROUP, not everyone@. This is the check
+                # that failed silently before — setacl raised, the code caught it, printed a
+                # WRONG diagnosis ("the AD group probably does not exist") and carried on.
+                try:
+                    sacl = tn.rpc("sharing.smb.getacl", [{"share_name": name}]) or {}
+                    entries = sacl.get("share_acl") or []
+                    who = [(e.get("ae_who_str") or e.get("ae_who_sid") or "?") for e in entries]
+                    # Domain-prefixed, like provision.py writes it — the bare name does
+                    # not resolve on the appliance.
+                    try:
+                        wg0 = (tn.rpc("smb.config") or {}).get("workgroup") or ""
+                    except Exception:
+                        wg0 = ""
+                    want_share_who = f"{wg0}\\{ACL_GROUP}" if wg0 else ACL_GROUP
+                    check(f"SMB share {name} ACL is restricted to {want_share_who!r}",
+                          any((e.get("ae_who_str") or "").lower() == want_share_who.lower()
+                              for e in entries),
+                          f"who={who}")
+                    # everyone@/S-1-1-0 present means the restriction did not take.
+                    check(f"SMB share {name} ACL does not grant everyone",
+                          not any((e.get("ae_who_str") or "").lower() in ("everyone@", "everyone")
+                                  or e.get("ae_who_sid") == "S-1-1-0" for e in entries),
+                          f"who={who}")
+                except Exception as exc:
+                    check(f"SMB share {name} ACL readable", False, str(exc)[:80])
+
+            # The FILESYSTEM ACL — the layer the share ACL does not cover. A share ACL is
+            # checked at connect; these ACEs are checked on every write. Both must grant
+            # ACL_GROUP or the share is browsable and read-only in practice.
+            try:
+                # ⚠ POSITIONAL path, not a dict — a dict fails "[EINVAL] path: Input should
+                # be a valid string". And the ACE names the DOMAIN-PREFIXED group
+                # ("AD\\eda-developer"): the bare name does not resolve on the appliance.
+                facl = tn.rpc("filesystem.getacl", [p]) or {}
+                aces = facl.get("acl") or []
+                try:
+                    wg = (tn.rpc("smb.config") or {}).get("workgroup") or ""
+                except Exception:
+                    wg = ""
+                want_who = f"{wg}\\{ACL_GROUP}" if wg else ACL_GROUP
+                # ⚠ Match on the RESOLVED GID, not the name: the appliance stores a GROUP
+                # ACE as `id: <gid>` with `who: null`, so a name comparison never matches
+                # and reads as "no entry" on a correctly configured tree.
+                try:
+                    g = tn.rpc("group.query", [[["group", "=", want_who]]]) or []
+                    want_gid = (g[0] or {}).get("gid") if g else None
+                except Exception:
+                    want_gid = None
+                ours = [a for a in aces
+                        if a.get("tag") == "GROUP" and a.get("id") == want_gid]
+                # More than one identical ACE means the converge step is appending rather
+                # than matching — the tree still works, but the ACL grows every sync.
+                check(f"filesystem ACL on {p} has no duplicate {want_who!r} entries",
+                      len(ours) <= 1, f"found {len(ours)}")
+                if check(f"filesystem ACL on {p} has an entry for {want_who!r} (gid {want_gid})",
+                         bool(ours),
+                         f"entries={[(a.get('tag'), a.get('who') or a.get('id')) for a in aces]}"):
+                    a = ours[0]
+                    check(f"{want_who} filesystem ACE is ALLOW",
+                          a.get("type") == "ALLOW", f"got {a.get('type')!r}")
+                    # MODIFY (or FULL_CONTROL) is what permits creating files. READ would
+                    # reproduce exactly the ACCESS_DENIED-on-write symptom.
+                    perms = (a.get("perms") or {}).get("BASIC")
+                    check(f"{want_who} filesystem ACE allows writing",
+                          perms in ("MODIFY", "FULL_CONTROL"), f"BASIC={perms!r}")
+                    # Without inheritance, subdirectories added later are not writable.
+                    flags = (a.get("flags") or {}).get("BASIC")
+                    check(f"{want_who} filesystem ACE is inherited",
+                          flags == "INHERIT", f"BASIC={flags!r}")
+            except Exception as exc:
+                check(f"filesystem ACL on {p} readable", False, str(exc)[:80])
+
+        print()
+        if failures:
+            print(f"EDA FILESERVER VERIFY FAILED — {len(failures)} gate(s):", file=sys.stderr)
+            for f in failures:
+                print("  " + f, file=sys.stderr)
+            sys.exit(1)
+        print("All EDA fileserver gates passed.")
+
+
+    if __name__ == "__main__":
+        main()
+---
+# The provisioning Job mints its own scoped TrueNAS API key and caches it in a Secret in
+# THIS namespace, so it needs to read and write exactly that. Namespace-scoped Role, not a
+# ClusterRole: nothing here touches any other namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-fileserver-provision
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-fileserver-provision
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  # get   — is there already a cached key from an earlier run?
+  # create/update — cache a freshly minted one. NO list and NO watch: this Job addresses one
+  # Secret by name, and the admin credential it bootstraps from lives in the same namespace,
+  # so `list` would hand it the ability to read that too.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["eda-fileserver-api"]
+    verbs: ["get", "update"]
+  # The init container waits for the bootstrap credential to be decrypted, and the main
+  # container re-reads it through this same grant when the secretKeyRef env came up empty
+  # (see admin_credential(): a secretKeyRef binds at POD CREATION, so a Secret that appears
+  # during the init wait never reaches the env). get on this ONE name, no list and no watch.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["truenas-admin"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-fileserver-provision
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-5"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-fileserver-provision
+subjects:
+  - kind: ServiceAccount
+    name: eda-fileserver-provision
+    namespace: eda-fileserver
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-fileserver-provision
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # ⚠ hook-weight, NOT sync-wave. A PreSync Job that mounts a PreSync ConfigMap fails
+    # with "configmap not found" if the ConfigMap is ordered by sync-wave — hooks order
+    # among themselves by hook-weight only.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ LOW ON PURPOSE. A failed run has already spent auth attempts against the appliance's
+  # 20-per-60s limit, and a retry storm turns a small error into a ten-minute lockout of
+  # the whole appliance — /home included. One retry, then fail loudly.
+  backoffLimit: 1
+  # Bounded: an unbounded PreSync hook blocks the Application indefinitely.
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-fileserver-provision
+      # ⚠ BOTH are required and are copied verbatim from the infra job. The appliance is
+      # only reachable from its own LAN, and WITHOUT THE TOLERATION THE POD STAYS PENDING
+      # FOREVER rather than failing.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # ⚠ WAIT FOR THE DECRYPTED SECRET, do not just order the SealedSecret ahead of this
+      # Job. The hook-weight on truenas-admin-sealed.yaml (-20) guarantees the SealedSecret
+      # CUSTOM RESOURCE exists before this pod — it does NOT guarantee secret/truenas-admin
+      # exists, because ArgoCD considers a SealedSecret synced as soon as the CR is applied,
+      # while the actual Secret appears only once the sealed-secrets controller has
+      # decrypted it. That is an asynchronous step this Job cannot see.
+      #
+      # A secretKeyRef is resolved at POD CREATION. Lose that race and the env var is simply
+      # absent (`optional: true`), the script exits 1 on the "no admin credential" path, and
+      # backoffLimit:1 gives it one immediate retry that is very likely to lose the race
+      # again — reproducing the original deadlock intermittently, which is strictly worse
+      # than reproducing it always.
+      #
+      # ⚠ THIS MUST QUERY THE API — a mounted `optional: true` secret volume does NOT work:
+      # when the Secret is absent at pod creation the kubelet mounts an empty dir and NEVER
+      # repopulates it, so a file test waits forever even after the Secret appears. Same
+      # root cause as the secretKeyRef race, so it cannot be used to guard against it.
+      initContainers:
+        - name: wait-for-credential
+          # Same image every other kubectl-running hook in this repo uses, so it is
+          # already present on the lab nodes and renovate tracks it in one place.
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command:
+            - sh
+            - -c
+            - |
+              # ⚠ IF THE SCOPED KEY IS ALREADY CACHED, DO NOT WAIT FOR THE ADMIN SECRET.
+              # The admin credential is only needed to MINT that key on a fresh cluster;
+              # once secret/eda-fileserver-api exists the provision script never reads it.
+              # Blocking on truenas-admin here would make a steady-state re-sync fail for a
+              # credential it does not use.
+              if kubectl get secret eda-fileserver-api -n eda-fileserver >/dev/null 2>&1; then
+                echo "secret/eda-fileserver-api is cached — admin credential not needed"
+                exit 0
+              fi
+
+              # Existence only — `get` on the object, never reading its contents. The Role
+              # grants get on this one name, so this cannot read any other Secret here.
+              #
+              # ⚠ 600s, NOT 120s. hook-weight -20 orders the APPLY of the SealedSecret, but
+              # secret/truenas-admin only appears once the sealed-secrets controller has
+              # DECRYPTED it — an asynchronous step no hook weight can wait for. On a
+              # bootstrap that gap runs to minutes, well past a 120s budget, and every retry
+              # loses the same race because `hook-delete-policy: BeforeHookCreation`
+              # recreates the pod each time. On a
+              # fresh cluster the controller is competing with every other app's first sync,
+              # so the budget has to cover a slow bootstrap, not a quiet cluster.
+              i=0
+              until kubectl get secret truenas-admin -n eda-fileserver >/dev/null 2>&1; do
+                i=$((i+1))
+                if [ "$i" -ge 300 ]; then
+                  echo "ERROR: secret/truenas-admin did not appear after 600s." >&2
+                  echo "       The SealedSecret is applied at hook-weight -20, but decryption" >&2
+                  echo "       is asynchronous — check the controller actually unsealed it:" >&2
+                  echo "         kubectl -n eda-fileserver get sealedsecret,secret truenas-admin" >&2
+                  echo "         kubectl -n kube-system logs deploy/sealed-secrets-controller" >&2
+                  echo "       A decryption failure usually means it was sealed against a" >&2
+                  echo "       DIFFERENT cluster key — re-run" >&2
+                  echo "       deployment/argocd-infra/truenas/sealSecrets.sh." >&2
+                  exit 1
+                fi
+                [ $((i % 15)) -eq 1 ] && echo "waiting for secret/truenas-admin ... $((i * 2))s"
+                sleep 2
+              done
+              echo "secret/truenas-admin is present"
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+      containers:
+        - name: provision
+          image: docker.io/library/python:3.14-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "/src/provision.py"]
+          env:
+            - name: TN_HOST
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: LAB_CIDR
+              value: "192.168.1.0/24" # automatically updated from project-settings:storage.fileserver.labCidr
+            - name: DS_EDA_PARENT
+              value: "datapool/eda" # automatically updated from project-settings:storage.fileserver.datasets.eda.parent
+            - name: DS_INSTALLERS
+              value: "datapool/eda/installers" # automatically updated from project-settings:storage.fileserver.datasets.eda.installers
+            - name: DS_IMAGES
+              value: "datapool/images" # automatically updated from project-settings:storage.fileserver.datasets.imageRegistry.dataset
+            - name: DS_AI_MODELS
+              value: "datapool/ai-models" # automatically updated from project-settings:storage.fileserver.datasets.aiModels.dataset
+            - name: DS_MODULEFILES
+              value: "datapool/eda/modulefiles" # automatically updated from project-settings:storage.fileserver.datasets.eda.moduleFiles
+            - name: DS_BUILDS
+              value: "datapool/eda/builds" # automatically updated from project-settings:storage.fileserver.datasets.eda.builds
+            # BOOTSTRAP credential — the appliance admin, used ONLY to mint the scoped key
+            # on first run (see ensure/mint_api_key). Once a key is cached in
+            # secret/eda-fileserver-api this is never read again. Sealed for THIS namespace
+            # by argocd-infra/truenas/sealSecrets.sh, which writes all three copies in one
+            # run so a rotation cannot leave them disagreeing.
+            # `optional: true` so a cluster that has not sealed it yet fails with this job's
+            # own clear message rather than an unschedulable pod.
+            - name: TN_ADMIN_USER
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER, optional: true }
+            - name: TN_ADMIN_PASS
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD, optional: true }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: src
+          configMap: { name: eda-fileserver-src }
+---
+# PostSync: assert the appliance really is in the state the PreSync job intended. The
+# fileserver is not a k8s resource, so ArgoCD reports this app Synced regardless of what it
+# actually looks like — this is what makes drift visible.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-fileserver-verify
+  namespace: eda-fileserver
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # One retry only: a failed run has already spent auth attempts against the appliance's
+  # 20-per-60s limit, whose penalty is a ten-minute cluster-wide lockout.
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: verify
+          image: docker.io/library/python:3.14-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["python3", "/src/verify.py"]
+          env:
+            - name: TN_HOST
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: DS_EDA_PARENT
+              value: "datapool/eda" # automatically updated from project-settings:storage.fileserver.datasets.eda.parent
+            - name: DS_INSTALLERS
+              value: "datapool/eda/installers" # automatically updated from project-settings:storage.fileserver.datasets.eda.installers
+            - name: DS_IMAGES
+              value: "datapool/images" # automatically updated from project-settings:storage.fileserver.datasets.imageRegistry.dataset
+            - name: DS_AI_MODELS
+              value: "datapool/ai-models" # automatically updated from project-settings:storage.fileserver.datasets.aiModels.dataset
+            - name: DS_MODULEFILES
+              value: "datapool/eda/modulefiles" # automatically updated from project-settings:storage.fileserver.datasets.eda.moduleFiles
+            - name: DS_BUILDS
+              value: "datapool/eda/builds" # automatically updated from project-settings:storage.fileserver.datasets.eda.builds
+            # The scoped key the PreSync Job minted. No admin credential in this Job.
+            - name: TN_API_USER
+              valueFrom:
+                secretKeyRef: { name: eda-fileserver-api, key: TRUENAS_API_USER, optional: true }
+            - name: TN_API_KEY
+              valueFrom:
+                secretKeyRef: { name: eda-fileserver-api, key: TRUENAS_API_KEY, optional: true }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: src
+          configMap: { name: eda-fileserver-src }

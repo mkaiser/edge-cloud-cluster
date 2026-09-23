@@ -1,0 +1,167 @@
+# PostSync Job: seeds the remote-desktop connections into Guacamole's PostgreSQL.
+# Runs once after each ArgoCD sync (idempotent — all INSERTs use ON CONFLICT DO NOTHING /
+# WHERE NOT EXISTS).
+#
+# Creates the 'remote-desktop-users' Guacamole group and ONE connection — RDP on :3389,
+# per-user LDAP sessions:
+#   'EDA Workstation'  → remote-desktop-gvisor-vnc  (container modules)
+# and grants READ on it to that group and to authentik-admins.
+#
+# OIDC users whose JWT contains "remote-desktop-users" in the groups claim are
+# automatically mapped to this group by Guacamole's openid extension.
+#
+# ORDERING IS LOAD-BEARING: the migration block (drop superseded connections, rename the
+# survivor) runs BEFORE any INSERT. The INSERTs key on connection_name, so an insert
+# running first would recreate a dropped row and leave duplicate tiles.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guacamole-connection-seed
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: postgres:18-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: remote-desktop-secrets
+                  key: db-password
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              PGHOST=guacamole-pg-rw
+              PGPORT=5432
+              PGUSER=guacamole_user
+              PGDB=guacamole_db
+
+              echo "Waiting for Guacamole DB..."
+              until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDB"; do
+                sleep 3
+              done
+
+              # Wait for the Guacamole chart's initDb to have applied the schema
+              # (guacamole_entity must exist). BOUNDED: this is a PostSync hook, so an
+              # unbounded wait blocks the whole sync forever — observed wedging this app
+              # for 4+ days because the Guacamole Deployment (which creates the schema)
+              # is itself created by the sync that this hook is holding up.
+              # Fail instead, so ArgoCD reports the sync as failed and retries later.
+              for _ in $(seq 1 60); do
+                psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "\d guacamole_entity" > /dev/null 2>&1 && break
+                echo "Schema not ready yet, retrying in 5s..."
+                sleep 5
+              done
+              if ! psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -c "\d guacamole_entity" > /dev/null 2>&1; then
+                echo "ERROR: guacamole_entity absent after 5 min — has the Guacamole chart's initDb run?" >&2
+                echo "       (the connection seed is optional; failing fast so the sync is not blocked)" >&2
+                exit 1
+              fi
+
+              psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" <<'SQL'
+              -- Create group entities (match Authentik group names)
+              INSERT INTO guacamole_entity (name, type)
+              VALUES ('remote-desktop-users', 'USER_GROUP'), ('authentik-admins', 'USER_GROUP')
+              ON CONFLICT (type, name) DO NOTHING;
+
+              INSERT INTO guacamole_user_group (entity_id, disabled)
+              SELECT entity_id, false FROM guacamole_entity
+              WHERE name IN ('remote-desktop-users', 'authentik-admins') AND type = 'USER_GROUP'
+              ON CONFLICT (entity_id) DO NOTHING;
+
+              -- ── MIGRATION — MUST RUN BEFORE THE INSERTS BELOW ──────────────────
+              -- The inserts key on connection_name; running them first would recreate a
+              -- dropped tile and leave the renamed one duplicated.
+              --
+              -- a) Drop superseded connections. Children first (FK), then the connection.
+              --    'Remote Desktop'            — the pre-LDAP shared-VNC path: ONE root
+              --      desktop on :1 that everyone shared, behind a single VNC password that
+              --      cannot be attributed to a person.
+              --    'Remote Desktop RDP (kata)' — the kata-runtime desktop, no longer
+              --      deployed. The EDA Workstation tile serves the same tools, ~0.7 s vs
+              --      3m23s to start one.
+              DELETE FROM guacamole_connection_parameter
+               WHERE connection_id IN (SELECT connection_id FROM guacamole_connection
+                                        WHERE connection_name IN ('Remote Desktop',
+                                                                  'Remote Desktop RDP (kata)')
+                                          AND parent_id IS NULL);
+              DELETE FROM guacamole_connection_permission
+               WHERE connection_id IN (SELECT connection_id FROM guacamole_connection
+                                        WHERE connection_name IN ('Remote Desktop',
+                                                                  'Remote Desktop RDP (kata)')
+                                          AND parent_id IS NULL);
+              DELETE FROM guacamole_connection
+               WHERE connection_name IN ('Remote Desktop', 'Remote Desktop RDP (kata)')
+                 AND parent_id IS NULL;
+
+              -- b) Rename the survivor IN PLACE (UPDATE, not delete+insert) so its
+              --    permissions, parameters and connection history survive.
+              --    The old name leaked the sandbox runtime, which means nothing to a user
+              --    and no longer distinguishes anything (the kata tile it contrasted with
+              --    is gone, dropped just above).
+              UPDATE guacamole_connection SET connection_name = 'EDA Workstation'
+               WHERE connection_name = 'Remote Desktop RDP (gvisor)' AND parent_id IS NULL;
+
+              -- ── EDA workstation (container modules: HyperLynx, vivado-container) ──
+              -- parent_id IS NULL, and ON CONFLICT ignores NULLs, so idempotency is
+              -- WHERE NOT EXISTS rather than ON CONFLICT.
+              --
+              -- No username/password params: xrdp's greeter prompts, and the credentials
+              -- are the user's own Authentik/LDAP ones (fallback local user `desktop`).
+              -- Guacamole's OIDC login never sees a password to forward, so there is
+              -- nothing to put here — see README.md, "Why does the desktop ask for a
+              -- password again?".
+              -- Drive redirection enables browser drag-and-drop file transfer.
+              INSERT INTO guacamole_connection (connection_name, protocol, parent_id)
+              SELECT 'EDA Workstation', 'rdp', NULL
+              WHERE NOT EXISTS (
+                SELECT 1 FROM guacamole_connection
+                WHERE connection_name = 'EDA Workstation' AND parent_id IS NULL
+              );
+
+              INSERT INTO guacamole_connection_parameter (connection_id, parameter_name, parameter_value)
+              SELECT c.connection_id, p.name, p.value
+              FROM guacamole_connection c
+              CROSS JOIN (VALUES
+                ('hostname', 'remote-desktop-gvisor-vnc'),
+                ('port', '3389'),
+                ('security', 'any'),
+                ('ignore-cert', 'true'),
+                ('resize-method', 'display-update'),
+                ('enable-drive', 'true'),
+                ('drive-name', 'Guacamole'),
+                ('drive-path', '/tmp/guac-drive/${GUAC_USERNAME}'),
+                ('create-drive-path', 'true')
+              ) AS p(name, value)
+              WHERE c.connection_name = 'EDA Workstation'
+              ON CONFLICT (connection_id, parameter_name) DO NOTHING;
+
+              -- ── Permissions: READ on both tiles for both groups ──
+              INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)
+              SELECT e.entity_id, c.connection_id, 'READ'
+              FROM guacamole_entity e
+              CROSS JOIN guacamole_connection c
+              WHERE e.name IN ('remote-desktop-users', 'authentik-admins') AND e.type = 'USER_GROUP'
+                AND c.connection_name = 'EDA Workstation'
+              ON CONFLICT (entity_id, connection_id, permission) DO NOTHING;
+              SQL
+
+              echo "Connection seed complete."

@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: litellm-pg-user
+  namespace: litellm
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: ""
+    username: ""
+  template:
+    metadata:
+      name: litellm-pg-user
+      namespace: litellm

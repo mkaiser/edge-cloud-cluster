@@ -1,0 +1,329 @@
+# Post-deploy Job: creates headscale API key (for headplane) and per-tier users + pre-auth keys
+# (k3s-cloud → secret; on-premise-resident / on-premise-transient → printed to log once).
+# RBAC resources have no sync-wave (wave 0). A higher wave would deadlock: ArgoCD waits for the
+# headscale Deployment (wave 0) to be healthy before applying higher waves, but the Deployment
+# needs the OIDC volume (added by PostSync args-patch) to be healthy. With all resources in wave 0,
+# ArgoCD applies everything, PostSync runs unconditionally, and the OIDC volume gets added.
+# Headplane blocks on headplane-secrets Secret existing before it can start.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-post-deploy
+subjects:
+- kind: ServiceAccount
+  name: headscale-post-deploy
+  namespace: headscale
+---
+# Read-only access to the ONE authentik secret holding CLUSTER_ADMIN_EMAIL, so the
+# `operator` user can be created with the admin's email (see the users loop below).
+# A Role in the authentik namespace, not a ClusterRole: this grants exactly one secret in
+# one namespace. resourceNames pins it to authentik-secrets — the SA cannot read any other
+# secret there, including the OIDC and SMTP credentials that live alongside it.
+# `list`/`watch` are deliberately omitted: resourceNames does not constrain list, so
+# granting it would expose every secret in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-post-deploy-authentik-email
+  namespace: authentik
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["authentik-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-post-deploy-authentik-email
+  namespace: authentik
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-post-deploy-authentik-email
+subjects:
+- kind: ServiceAccount
+  name: headscale-post-deploy
+  namespace: headscale
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-post-deploy
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: headscale-post-deploy
+      restartPolicy: OnFailure
+      containers:
+      - name: setup
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: NAMESPACE
+          value: "headscale"
+        - name: OIDC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: headscale-oidc-client-secret
+              key: client-secret
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # --- Wait for headscale pod to be ready ---
+          echo "Waiting for headscale pod..."
+          POD=""
+          for i in $(seq 1 60); do
+            POD=$(kubectl get pods -n "$NAMESPACE" \
+              -l app.kubernetes.io/name=headscale \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "$POD" ]; then
+              if kubectl wait --for=condition=ready "pod/$POD" -n "$NAMESPACE" --timeout=30s 2>/dev/null; then
+                echo "Headscale pod ready: $POD"
+                break
+              fi
+            fi
+            echo "  Attempt $i/60 — waiting 5s..."
+            sleep 5
+          done
+
+          if [ -z "$POD" ]; then
+            echo "ERROR: headscale pod not found after 5 minutes"
+            exit 1
+          fi
+
+          # --- Check if headplane-secrets already has a valid API key ---
+          EXISTING_API_KEY=$(kubectl get secret headplane-secrets -n "$NAMESPACE" \
+            -o jsonpath='{.data.api-key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+          if [ -n "$EXISTING_API_KEY" ]; then
+            echo "headplane-secrets already exists with an API key — skipping API key creation."
+            echo "To force recreation, delete the secret: kubectl delete secret headplane-secrets -n $NAMESPACE"
+          else
+            echo "Creating headscale API key for headplane..."
+            API_KEY=$(kubectl exec -n "$NAMESPACE" "$POD" -- \
+              headscale apikeys create --expiration 999d 2>/dev/null)
+
+            if [ -z "$API_KEY" ]; then
+              echo "ERROR: Failed to create API key"
+              exit 1
+            fi
+
+            echo "Patching headplane-secrets with api-key and oidc-client-secret..."
+            # Use patch to preserve cookie-secret seeded by the PreSync bootstrap job
+            API_KEY_B64=$(printf '%s' "$API_KEY" | base64 -w0)
+            OIDC_B64=$(printf '%s' "$OIDC_CLIENT_SECRET" | base64 -w0)
+            kubectl patch secret headplane-secrets -n "$NAMESPACE" \
+              -p "{\"data\":{\"api-key\":\"$API_KEY_B64\",\"oidc-client-secret\":\"$OIDC_B64\"}}"
+
+            echo "headplane-secrets updated with api-key and oidc-client-secret."
+          fi
+
+          # --- Tailnet users + cloud pre-auth key ---
+          # Three NODE tiers, each a separate headscale user so machines can be
+          # correlated and expired per-tier:
+          #   k3s-cloud            permanent cloud CP/worker nodes
+          #   on-premise-resident  on-prem nodes living days–weeks (Longhorn-eligible)
+          #   on-premise-transient on-prem nodes living hours–days (no Longhorn)
+          #
+          # ...and ONE human tier:
+          #   operator             admin laptops. Full reach (6443, node SSH, LAN routes).
+          #
+          # It MUST exist: `headscale policy check` does NOT validate user references
+          # (verified — a policy naming a nonexistent `nosuchuser@` passes), so a missing
+          # user turns its grants into silent no-ops rather than an error. Keeping admin
+          # laptops in their own user also keeps them out of on-premise-resident, i.e. out
+          # of the wide-open node-fabric grant.
+          #
+          # There is deliberately NO `human` user. Ordinary people are self-service: they
+          # authenticate through Authentik (group `vpn-users`) and headscale creates one
+          # user PER PERSON from the OIDC claim. The policy grants those by
+          # autogroup:member — any untagged, i.e. personal, device — so no shared username
+          # is involved and nothing here has to be provisioned per user.
+          #
+          # Node tiers and `operator` enroll with PRE-AUTH KEYS, never manual Headplane
+          # approval: the registration endpoint is reachable by anyone who knows the
+          # server URL, so a manual approval queue could be flooded with bogus requests.
+          # (OIDC logins are a different path — Authentik authenticates them first.)
+          #
+          # Only the cloud key is stored in a K8s secret (consumed by the
+          # mesh-gateway DaemonSet for automated CP enrollment). On-premise keys
+          # are NOT stored in any secret — they are minted on demand by
+          # scripts/provisioning/generateProvisioningScripts.sh (admin-run) and baked into a
+          # DO-NOT-COMMIT join script. This job only ensures the users exist.
+          #
+          # NB: pre-auth key expiry limits when NEW registrations are accepted; it
+          # does NOT expire already-joined nodes (those persist until removed via
+          # Headplane / `headscale nodes expire`).
+
+          # Resolve a headscale user's numeric ID by name (v0.28+: --user needs ID).
+          resolve_uid() {
+            kubectl exec -n "$NAMESPACE" "$POD" -- headscale users list -o json 2>/dev/null | \
+              awk -v n="$1" '/"id":/{id=$2} $0 ~ "\"name\": \""n"\""{gsub(/[^0-9]/,"",id); print id; exit}'
+          }
+
+          # `operator` is the HUMAN tier, so it gets the cluster admin's email; the three node
+          # tiers deliberately do not (they own machines, not people).
+          #
+          # The email is what lets Headplane auto-match an SSO login to this headscale user.
+          # Without it, every admin logging into Headplane gets a "Link your Headscale account"
+          # picker and must choose a user by hand — and picking a NODE tier there mixes a human
+          # identity into the bucket that owns mesh nodes.
+          #
+          # ⚠ SET-ONCE. headscale (v0.29.2) exposes only CreateUser/RenameUser/DeleteUser/
+          # ListUsers — there is NO UpdateUser in the CLI or the gRPC API, and `users create`
+          # is a no-op on an existing user. So this takes effect on a FRESH cluster only; an
+          # existing one keeps whatever it was created with and needs the Headplane picker.
+          # Non-fatal if unreadable: an empty email costs the auto-match, nothing else.
+          ADMIN_EMAIL=$(kubectl get secret authentik-secrets -n authentik \
+            -o jsonpath='{.data.CLUSTER_ADMIN_EMAIL}' 2>/dev/null | base64 -d 2>/dev/null || true)
+          [ -n "$ADMIN_EMAIL" ] \
+            && echo "operator email: $ADMIN_EMAIL" \
+            || echo "WARNING: CLUSTER_ADMIN_EMAIL unreadable — 'operator' gets no email, so Headplane logins will need the manual account-link picker."
+
+          for USER in k3s-cloud on-premise-resident on-premise-transient operator; do
+            echo "Creating '$USER' user (if not exists)..."
+            if [ "$USER" = "operator" ] && [ -n "$ADMIN_EMAIL" ]; then
+              kubectl exec -n "$NAMESPACE" "$POD" -- \
+                headscale users create "$USER" --email "$ADMIN_EMAIL" 2>/dev/null \
+                || echo "  User already exists (email NOT updated — headscale has no user-update API)."
+            else
+              kubectl exec -n "$NAMESPACE" "$POD" -- \
+                headscale users create "$USER" 2>/dev/null || echo "  User already exists."
+            fi
+          done
+
+          # --- Cloud CP key (stored in secret headscale-preauthkey-cloud) ---
+          CLOUD_UID=$(resolve_uid k3s-cloud)
+          if [ -z "$CLOUD_UID" ]; then
+            echo "ERROR: could not resolve user ID for k3s-cloud"
+            exit 1
+          fi
+          EXISTING_CLOUD_KEY=$(kubectl get secret headscale-preauthkey-cloud -n "$NAMESPACE" \
+            -o jsonpath='{.data.key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+          if [ -n "$EXISTING_CLOUD_KEY" ]; then
+            echo "headscale-preauthkey-cloud already exists — skipping."
+          else
+            # --tags tag:k8s-node makes the ACL policy's tag-based grants match the cloud
+            # CP (policy-configmap.yaml). Tagged at MINT time so the tag is re-asserted on
+            # every re-registration and survives a cluster recreate; ownership moves to the
+            # special user `tagged-devices`, which the fabric grant tolerates because it
+            # names BOTH tag:k8s-node and the raw tier users.
+            # NB: the EXISTING_CLOUD_KEY guard above means this branch does NOT run on a
+            # cluster whose key already exists — an existing cluster must be tagged with
+            # `headscale nodes tag`. This only takes effect on the next recreate.
+            echo "Creating reusable cloud pre-auth key (1 year expiry, tag:k8s-node)..."
+            CLOUD_KEY=$(kubectl exec -n "$NAMESPACE" "$POD" -- \
+              headscale preauthkeys create --user "$CLOUD_UID" --reusable --expiration 8760h \
+              --tags tag:k8s-node 2>/dev/null)
+            if [ -z "$CLOUD_KEY" ]; then
+              echo "ERROR: Failed to create cloud pre-auth key"
+              exit 1
+            fi
+            kubectl create secret generic headscale-preauthkey-cloud -n "$NAMESPACE" \
+              --from-literal=key="$CLOUD_KEY" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "headscale-preauthkey-cloud created."
+          fi
+
+          # --- Approve the CP subnet route on EVERY advertising node (edge API HA) ---
+          # headscale fails the 10.0.0.0/23 subnet route over only among APPROVED routers.
+          # If only cp0 is approved, killing cp0 isolates every edge node from the private
+          # network (apiserver). Approve on all nodes advertising it (available_routes),
+          # selected by advertisement not tag/user. Idempotent. Runs on every sync so a
+          # rebuild / CP replacement re-asserts it without needing an edge re-provision.
+          # Keep 10.0.0.0/23 in sync with project_settings.ts network.subnetRange.
+          SUBNET_RANGE="10.0.0.0/23" # automatically updated from project-settings:network.subnetRange
+          echo
+          echo "Approving subnet route $SUBNET_RANGE on all advertising CP nodes..."
+          ROUTE_IDS=$(kubectl exec -n "$NAMESPACE" "$POD" -- headscale nodes list-routes --output json 2>/dev/null \
+            | SUBNET="$SUBNET_RANGE" python3 -c "import sys,json,os; sub=os.environ['SUBNET']; d=json.load(sys.stdin); d=d if isinstance(d,list) else d.get('nodes',[]); print(' '.join(str(n['id']) for n in d if sub in (n.get('available_routes') or n.get('availableRoutes') or [])))" 2>/dev/null || true)
+          if [ -n "$ROUTE_IDS" ]; then
+            for ID in $ROUTE_IDS; do
+              kubectl exec -n "$NAMESPACE" "$POD" -- \
+                headscale nodes approve-routes --identifier "$ID" --routes "$SUBNET_RANGE" >/dev/null 2>&1 \
+                && echo "  approved $SUBNET_RANGE for node $ID" \
+                || echo "  WARNING: could not approve $SUBNET_RANGE for node $ID"
+            done
+          else
+            echo "  no nodes advertising $SUBNET_RANGE yet (CPs may join the mesh later) — skipping."
+          fi
+
+          # Site subnets (nodes.mesh[].advertiseRoutes, e.g. pcie-tb-s -> 192.168.1.0/24).
+          # headscale holds EVERY advertised route disabled until approved, and the block above
+          # only approves SUBNET_RANGE — so a subnet-routing mesh node comes up Available but
+          # never Approved, with nothing in the provisioning path fixing it. The failure is
+          # silent: `tailscale status` looks healthy while the LAN is simply not served.
+          # Approve whatever is actually advertised, so adding a site needs no change here.
+          # Runs on every sync, so a node joining later is picked up without a re-provision.
+          # NB: Approved+Serving is necessary but NOT sufficient for cloud->lab traffic — the
+          # cloud CP also needs RouteAll to install it, which is deliberately off.
+          echo
+          echo "Approving advertised site subnets (everything except $SUBNET_RANGE)..."
+          SITE_ROUTES=$(kubectl exec -n "$NAMESPACE" "$POD" -- headscale nodes list-routes --output json 2>/dev/null \
+            | SUBNET="$SUBNET_RANGE" python3 -c "import sys,json,os; sub=os.environ['SUBNET']; d=json.load(sys.stdin); d=d if isinstance(d,list) else d.get('nodes',[]); print(' '.join(str(n['id'])+'='+r for n in d for r in (n.get('available_routes') or n.get('availableRoutes') or []) if r != sub and r not in (n.get('approved_routes') or n.get('approvedRoutes') or [])))" 2>/dev/null || true)
+          if [ -n "$SITE_ROUTES" ]; then
+            for PAIR in $SITE_ROUTES; do
+              ID="${PAIR%%=*}"; ROUTE="${PAIR#*=}"
+              kubectl exec -n "$NAMESPACE" "$POD" -- \
+                headscale nodes approve-routes --identifier "$ID" --routes "$ROUTE" >/dev/null 2>&1 \
+                && echo "  approved site route $ROUTE for node $ID" \
+                || echo "  WARNING: could not approve site route $ROUTE for node $ID"
+            done
+          else
+            echo "  no unapproved site subnets advertised — nothing to do."
+          fi
+
+          echo
+          echo "=== Post-deploy setup complete ==="
+          echo "Headplane secrets:     secret/headplane-secrets"
+          echo "Cloud CP pre-auth key:  secret/headscale-preauthkey-cloud"
+          echo "  kubectl get secret headscale-preauthkey-cloud -n $NAMESPACE -o jsonpath='{.data.key}' | base64 -d"
+          echo "On-premise users:       on-premise-resident, on-premise-transient"
+          echo "  keys are minted on demand by scripts/provisioning/generateProvisioningScripts.sh"
+          echo "Admin user:             operator (full reach)"
+          echo "  key minted on demand by scripts/runtime/mintUserKey.sh"
+          echo "Ordinary users:         self-service via Authentik group 'vpn-users'"
+          echo "  no key, no per-user setup — see doc/vpn-user-access.md"

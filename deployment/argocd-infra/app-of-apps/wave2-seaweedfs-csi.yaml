@@ -1,0 +1,34 @@
+# ArgoCD Application: SeaweedFS CSI driver — provides the `seaweedfs` StorageClass.
+# Wave 2: runs after the wave-1 barrier confirms the SeaweedFS cluster (wave 0) is
+# Healthy, so the filer it connects to is guaranteed up. Available well before any
+# consumer (essential apps from wave 6, flex apps from wave 20).
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seaweedfs-csi-driver
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  sources:
+    - repoURL: https://seaweedfs.github.io/seaweedfs-csi-driver/helm
+      chart: seaweedfs-csi-driver
+      targetRevision: "0.2.38" # renovate: datasource=helm depName=seaweedfs-csi-driver registryUrl=https://seaweedfs.github.io/seaweedfs-csi-driver/helm
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/seaweedfs-csi-driver/values.yaml
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: seaweedfs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

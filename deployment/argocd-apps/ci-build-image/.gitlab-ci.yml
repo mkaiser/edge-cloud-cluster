@@ -1,0 +1,194 @@
+# CI build image (buildah + skopeo) — build once, used by every other build.
+#
+# SOURCE OF TRUTH: this file lives in the infra repo
+# (deployment/argocd-apps/ci-build-image/.gitlab-ci.yml). The build-trigger
+# (presync-build-trigger.yaml) MIRRORS it (+ Dockerfile) into the in-cluster GitLab
+# project deployments/infrastructure/ci/build-image via a git push, then ArgoCD TRIGGERS
+# this pipeline. Do NOT hand-edit it in GitLab — overwritten on the next mirror.
+# Bump IMAGE_TAG to force a rebuild.
+#
+# ⚠ THIS PIPELINE RUNS ON THE PLAIN quay.io/buildah/stable, NOT on its own output, and
+# its gate is therefore curl and not `skopeo inspect`. That is deliberate and must stay
+# that way: an image that builds itself cannot be built on a cluster where it does not
+# exist yet, which is every cluster on the first sync after a recreate.
+#
+# ⚠ BUILT TWICE, ONCE PER ARCHITECTURE. The consumers are not all on one arch: the three
+# EDA modules and remote-desktop build on [eda] (amd64), while ollama and vllm build on
+# [thor] — a Jetson, which is arm64. An image built on [eda] cannot start there at all: the
+# job pod comes up, the `build` container never becomes ready, and the job dies in
+# "prepare environment: waiting for pod running" with nothing that mentions architecture
+# (measured 2026-09-03 on ollama pipelines 10-12, which left its image unrestored for over
+# an hour). So there is an amd64 job and an arm64 job, each pushing its own tag, and each
+# consumer pins the tag for the runner it lands on.
+#
+# Deliberately NOT a manifest list: two plain tags need no `buildah manifest` dance, and the
+# pin in each consumer then says out loud which arch that pipeline runs on.
+stages: [build]
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+build-ci-image:
+  stage: build
+  tags: [eda]
+  # renovate: tracked by "Container image tags" regex (docker datasource)
+  image: quay.io/buildah/stable:v1.43.2
+  # Serialize on the runner: every ArgoCD (re)sync fires the PreSync trigger.
+  resource_group: ci-build-image-build
+  interruptible: true
+  # dnf install + a ~673 MB push. Minutes, not hours — but the push crosses to the cloud
+  # registry service, so leave room for a slow link rather than failing a cheap build.
+  timeout: 1h
+  variables:
+    # Bump whenever the Dockerfile changes — the tag is the sole cache key for the gate
+    # below AND the pin every consumer's `image:` carries.
+    # ⚠ A bump is a two-file change by construction: this line and the `image:` line in
+    # all six consumer pipelines (plus their build-files ConfigMaps). Enforced by
+    # remote-desktop/check-image-invariants.sh, which fails the commit if they disagree.
+    IMAGE_TAG: v1.43.2-skopeo-r1
+    IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+    # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+    # literally named "…/<name>:<tag>", which cannot exist -> 404 forever, and the gate
+    # (fail-open) rebuilds every run. A `docker://` push destination is the opposite
+    # case — it MUST keep the tag, so those still use ${IMAGE#*/}.
+    IMAGE_REPO: $CI_PROJECT_PATH
+    # overlay on the ext4 hostPath scratch (privileged pod) — vfs would copy the tree
+    # once per layer.
+    STORAGE_DRIVER: overlay
+    # ⚠ ITS OWN STORAGE ROOT, not the /build-scratch/buildah-storage the EDA module builds
+    # share. This project is outside the modules group, so the runner's one-build-per-node
+    # anti-affinity (which keys on that group's namespace-id) does NOT constrain it and it
+    # can land beside a running module build. A separate root means the two cannot see
+    # each other's layers at all.
+    BUILDAH_ROOT: /build-scratch/ci-build-image-storage
+    BUILDAH_RUNROOT: /build-scratch/ci-build-image-run
+    # Push to the in-cluster registry Service directly, bypassing the public ingress.
+    # PreferClose lands the push on the LAN-local (unibi-hclab) registry replica.
+    INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+    # ⚠ NO image-registry ARCHIVE, deliberately. remote-desktop/ollama/vllm archive to the
+    # TrueNAS-backed registry because rebuilding them costs 10 min to several hours. This
+    # image is `dnf install skopeo` on top of a pulled base: a rebuild after a recreate is
+    # a few minutes, cheaper than the machinery — and image-registry has NO GC, so every tag
+    # kept there is permanent.
+  script:
+    - |
+      # ── Recover-or-rebuild gate ──────────────────────────────────────────────────
+      # ⚠ curl, NOT `skopeo inspect` — see the header: this one pipeline runs on the
+      # image that HAS no skopeo. Ask the registry over the v2 API and accept BOTH
+      # manifest media types: a `--format docker` push produces a schema2 manifest and
+      # omitting the header can 404 a manifest the registry holds perfectly well.
+      #
+      # ⚠ REPORT THE HTTP CODE. The gate is fail-open, so every failure mode otherwise
+      # looks identical to "not in the registry" (401 = credential, 404 = genuinely
+      # absent, 000 = TLS/DNS/connect). Failing open costs a rebuild, never a wrong image.
+      _gate=$(curl -sS -o /dev/null -w '%{http_code}' \
+                -u "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                -k "https://${CI_REGISTRY}/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" 2>&1) || true
+      case "$_gate" in
+        200) echo "$IMAGE already exists — skipping build."; exit 0 ;;
+        404) echo "registry gate: HTTP 404 — tag not present, building." ;;
+        *)   echo "registry gate: HTTP $_gate — treating as absent, building." ;;
+      esac
+      echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+    - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+    - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+      bud --isolation chroot --format docker
+      -t "$IMAGE" .
+    # The acceptance test is the Dockerfile's own `buildah --version && skopeo --version`
+    # RUN step: it executes in the very layer that is published, so a missing skopeo fails
+    # the BUILD instead of reaching consumers — whose gates fail open, i.e. would answer a
+    # broken image with hours of silent rebuilding.
+    - |
+      # Push under the SAME repository path as $IMAGE so the stored image == the canonical
+      # $IMAGE (jobs pull it via the ingress name). Retries resume from uploaded blobs.
+      DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+      set +e
+      n=0
+      until [ "$n" -ge 6 ]; do
+        echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+        timeout 1800 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+          push --tls-verify=false --retry 20 --retry-delay 10s "$IMAGE" "$DEST"
+        rc=$?
+        echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+        [ "$rc" -eq 0 ] && break
+        n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s..."; sleep 30
+      done
+      set -e
+      [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+    - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+  # Runs on SUCCESS AND FAILURE: the storage root is a node-local hostPath nothing else
+  # ever wipes, and a failed `buildah bud` is exactly the case that leaves layers behind.
+  # ⚠ No `set -e` and every command `|| true` — after_script must not turn a green build
+  # red, nor mask the real error on the failure path.
+  after_script:
+    - |
+      BA="buildah --root $BUILDAH_ROOT --runroot $BUILDAH_RUNROOT --storage-driver $STORAGE_DRIVER"
+      $BA rm -a || true
+      $BA rmi -a -f || true
+      $BA prune -a -f || true
+      df -h /build-scratch || true
+
+
+# ── arm64, for the [thor] consumers (ollama, vllm) ───────────────────────────────────────
+# Same Dockerfile, same tag + `-arm64`. It runs on the Jetson because that is the only arm64
+# builder here; quay.io/buildah/stable is multi-arch, so the base pulls natively.
+build-ci-image-arm64:
+  stage: build
+  tags: [thor]
+  # renovate: tracked by "Container image tags" regex (docker datasource)
+  image: quay.io/buildah/stable:v1.43.2
+  resource_group: ci-build-image-build-arm64
+  interruptible: true
+  timeout: 1h
+  variables:
+    # ⚠ MUST stay IMAGE_TAG + "-arm64": check-image-invariants.sh derives the arm64 pin from
+    # the amd64 one, so a hand-written variant here would pass the check and still be wrong.
+    IMAGE_TAG: v1.43.2-skopeo-r1-arm64
+    IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    IMAGE_REPO: $CI_PROJECT_PATH
+    # vfs, and no --root: the [thor] runner has no /build-scratch hostPath, and this build is
+    # two layers — the copy-per-layer cost that makes vfs unusable for the EDA images does
+    # not matter at 673 MB.
+    STORAGE_DRIVER: vfs
+    INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+  script:
+    - |
+      _gate=$(curl -sS -o /dev/null -w '%{http_code}' \
+                -u "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                -k "https://${CI_REGISTRY}/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" 2>&1) || true
+      case "$_gate" in
+        200) echo "$IMAGE already exists — skipping build."; exit 0 ;;
+        404) echo "registry gate: HTTP 404 — tag not present, building." ;;
+        *)   echo "registry gate: HTTP $_gate — treating as absent, building." ;;
+      esac
+      echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+    - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+    - buildah bud --isolation chroot --storage-driver "$STORAGE_DRIVER" --format docker -t "$IMAGE" .
+    - |
+      DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+      set +e
+      n=0
+      until [ "$n" -ge 6 ]; do
+        echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+        timeout 1800 buildah push --tls-verify=false --storage-driver "$STORAGE_DRIVER" \
+          --retry 20 --retry-delay 10s "$IMAGE" "$DEST"
+        rc=$?
+        echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+        [ "$rc" -eq 0 ] && break
+        n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s..."; sleep 30
+      done
+      set -e
+      [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+    - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+  after_script:
+    - buildah --storage-driver "$STORAGE_DRIVER" rm -a || true
+    - buildah --storage-driver "$STORAGE_DRIVER" rmi -a -f || true

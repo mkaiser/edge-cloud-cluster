@@ -1,0 +1,55 @@
+# iperf3 listener — DaemonSet on mesh nodes only.
+# The mesh throughput probe (iperf3-cronjob.yaml) runs from the control plane
+# and connects OUT to each mesh peer, so each mesh node needs an always-on
+# `iperf3 -s`. This is the ONE piece of the mesh-monitoring design that puts a
+# (tiny) resident cost on the on-premise boxes — everything else (status,
+# ping) is CP-side only. hostNetwork:true binds the node's mesh IP so the CP
+# can reach it at <peer-mesh-ip>:5201 over tailscale0.
+#
+# Scheduling: nodeSelector node.kubernetes.io/mesh-worker (present on every
+# mesh node) + toleration for the ecc/mesh=true:NoSchedule taint (same pattern
+# as Longhorn in src/storage.ts).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-iperf3-server
+  namespace: headscale
+  labels:
+    app: mesh-iperf3-server
+spec:
+  selector:
+    matchLabels:
+      app: mesh-iperf3-server
+  template:
+    metadata:
+      labels:
+        app: mesh-iperf3-server
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node.kubernetes.io/mesh-worker: "true"
+      tolerations:
+        - key: "ecc/mesh"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      containers:
+        - name: iperf3
+          # iperf3 baked into a multi-arch image (amd64 + arm64 for thor). Must
+          # NOT apk-install at runtime: several mesh nodes are behind restrictive
+          # egress and can't reach the Alpine CDN (apk fails -> exit 127).
+          image: docker.io/taoyou/iperf3-alpine:v3.11  # renovate: tracked by "Container image tags" regex (docker datasource)
+          # -s server on :5201, long-running so the hourly probe always finds it.
+          command: ["iperf3", "-s", "-p", "5201"]
+          ports:
+            - name: iperf3
+              containerPort: 5201
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "5m"
+              memory: "16Mi"
+            limits:
+              cpu: "500m"
+              memory: "64Mi"

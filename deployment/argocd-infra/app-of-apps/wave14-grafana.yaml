@@ -1,0 +1,30 @@
+# Grafana, split out of kube-prometheus-stack into its own app so it can serve
+# several datasources (Prometheus, Loki, …) without being owned by any one of
+# them. The Application manifest itself lives in deployment/argocd-infra/prometheus/grafana/.
+#
+# Wave 14: after kube-prometheus-stack (wave 2), which still renders the built-in
+# dashboards and the Prometheus datasource that this Grafana's sidecars pick up.
+# The Authentik (wave 6) dependency is soft — OIDC login 503s until Authentik is
+# up, then self-heals, exactly as the Prometheus OIDC route does.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana-app
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "14"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/prometheus/grafana
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

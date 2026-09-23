@@ -1,0 +1,155 @@
+# dockur/windows — Windows 11 LTSC VM via QEMU with KVM acceleration.
+# Selected by CAPABILITY, not by location: ecc/kvm=true is the only nodeSelector.
+# Hetzner Cloud shared VMs do not have /dev/kvm; use dedicated servers only.
+#
+# Port 3389 is ClusterIP-only; access via Guacamole (RDP) or Headscale VPN.
+# Port 8006 (built-in web viewer) is intentionally NOT exposed via Ingress.
+#
+# First start: ~60-120 min to download 4.7 GB ISO and install Windows (TCG).
+# Monitor progress: kubectl logs -n windows -l app=windows-vm -f
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: windows-vm-storage
+  namespace: windows
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # windows is KVM-anywhere (flex tier), but a Longhorn volume lives in exactly ONE scope
+  # and the pod must schedule where its replicas are — so the StorageClass, not the
+  # nodeSelector, is what constrains this workload to a subset of the KVM nodes.
+  #
+  # `unibi` is the CROSS-LAN scope, carried by every enabled KVM mesh node, so the pod is
+  # free to land on any of them and ecc/kvm alone is a truthful selector. A single-site
+  # scope would silently re-introduce a location pin: the volume would exist on one LAN
+  # and the pod would hang unattachable anywhere else, with the nodeSelector still
+  # claiming "any KVM node".
+  #
+  # It also keeps the 2 vCPU / 4Gi reservation off the cloud control-plane — the only
+  # cloud node, and at 93% CPU requests — because no cloud node carries a mesh scope.
+  #
+  # NO S3 BACKUP — this volume is deliberately excluded (local snapshots are kept).
+  # That policy is NOT expressible on this PVC: it is a label on the Longhorn Volume CR,
+  # which ArgoCD does not manage. It lives in backup-policy.yaml (same directory), which
+  # is a separate file precisely so it can be deactivated on its own — see that file for
+  # the rationale, the mechanism, and how to turn it off or re-enable backups.
+  storageClassName: longhorn-unibi
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: windows-vm
+  namespace: windows
+  labels:
+    app: windows-vm
+spec:
+  replicas: 1
+  # Recreate, NOT the default RollingUpdate: windows-vm-storage is ReadWriteOnce.
+  # RollingUpdate starts the replacement before stopping the old pod, and a RWO
+  # volume attaches to one node only — so any rollout that places the new pod
+  # elsewhere deadlocks on FailedAttachVolume with no timeout. Enforced by
+  # scripts/environment/checkRwoRolloutStrategy.py.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: windows-vm
+  template:
+    metadata:
+      labels:
+        app: windows-vm
+    spec:
+      # ecc/kvm is the whole selector — the capability this workload actually needs, with no
+      # site name to drift when a node moves or a site is renamed. What narrows it further is
+      # the PVC's StorageClass (longhorn-unibi, see above): only nodes carrying that Longhorn
+      # scope can attach the volume, and no cloud node does.
+      nodeSelector:
+        ecc/kvm: "true"  # automatically updated from project-settings:applicationPlacements.labels.kvm
+      # Mesh nodes are tainted ecc/mesh=true:NoSchedule; tolerate it so windows can run on
+      # a KVM mesh node too (flex / KVM-anywhere). Harmless on the cloud KVM box.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 120
+      priorityClassName: low
+      containers:
+        - name: windows
+          image: dockurr/windows:6.05  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: VERSION
+              value: "11l"  # Windows 11 LTSC
+            - name: RAM_SIZE
+              value: "4G"
+            - name: CPU_CORES
+              value: "2"
+            - name: DISK_SIZE
+              value: "36G"
+            - name: USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: windows-secrets
+                  key: WINDOWS_USERNAME
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: windows-secrets
+                  key: WINDOWS_PASSWORD
+            - name: KVM
+              value: "Y"
+          ports:
+            - containerPort: 8006
+              name: web
+              protocol: TCP
+            - containerPort: 3389
+              name: rdp-tcp
+              protocol: TCP
+            - containerPort: 3389
+              name: rdp-udp
+              protocol: UDP
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - mountPath: /storage
+              name: storage
+          resources:
+            # The CPU *request* is a scheduler reservation, not a cap. The old "2" reserved
+            # 25% of a node while the idle VM actually used ~46m, which is what crowded the
+            # control-plane. 500m keeps real headroom for an interactive desktop; the limit
+            # still allows both vCPUs to burst.
+            requests:
+              memory: "4Gi"
+              cpu: "500m"
+            limits:
+              memory: "6Gi"
+              cpu: "4"
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: windows-vm-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: windows-vm
+  namespace: windows
+spec:
+  selector:
+    app: windows-vm
+  type: ClusterIP
+  ports:
+    - name: rdp-tcp
+      port: 3389
+      protocol: TCP
+      targetPort: 3389
+    - name: rdp-udp
+      port: 3389
+      protocol: UDP
+      targetPort: 3389

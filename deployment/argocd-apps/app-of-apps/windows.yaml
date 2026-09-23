@@ -1,0 +1,58 @@
+# ArgoCD Application: Windows 11 VM (dockur/windows, QEMU/KVM — windows-vm.yaml).
+#
+# ⚠ NO GUACAMOLE, NO PORTAL, NO DATABASE OF ITS OWN. This app used to run a whole
+# Guacamole chart plus a CNPG Postgres at windows.<tld> to front ONE connection. The
+# browser front-end is now remote-desktop's, shared with every other desktop: the tile is
+# seeded into ITS database by connection-seed.yaml, and users reach the VM at the common
+# portal. This app owns the VM and nothing else.
+#
+# Reaching it: the tile on remote-desktop's portal, or a native RDP client on 3389 over
+# the headscale VPN.
+#
+# BEFORE FIRST DEPLOY: run deployment/argocd-apps/windows/sealSecrets.sh to generate
+# windows-secrets-sealed.yaml, then commit and push.
+#
+# Single git source — raw manifests only (windows-vm, connection-seed, secrets).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: windows
+  namespace: argocd-apps
+  annotations:
+    # flex / KVM-anywhere: nodeSelector ecc/kvm + an ecc/mesh toleration. Now placed on the
+    # home-martin mesh site (longhorn-home-martin) to keep its CPU/RAM reservation off the
+    # single cloud control-plane; ecc/site in windows-vm.yaml must match that scope.
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/windows
+      directory:
+        exclude: "*.sh"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: windows
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      # Unbounded: the tile seed is a PostSync hook against remote-desktop's Postgres, so on
+      # a fresh cluster it races that app coming up and a first failure is expected rather
+      # than a fault. It also recovers the tile whenever remote-desktop is down or redeployed.
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

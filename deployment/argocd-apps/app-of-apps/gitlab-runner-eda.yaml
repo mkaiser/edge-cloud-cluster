@@ -1,0 +1,259 @@
+# ArgoCD Application: the shared [eda] GitLab runner — the privileged buildah builder for
+# every EDA image build. FIVE consumers, all routing on tags:[eda]: eda-xilinx-2024-1,
+# eda-xilinx-2026-1, eda-petalinux-2024-1, eda-hyperlynx-2604 and remote-desktop's base
+# image.
+#
+# OWNERSHIP: shared infrastructure, like gitlab-runner-thor.yaml — NOT owned by any
+# single app, and it STAYS shared. A per-app runner would mean N runner managers, and
+# the one-build-per-node anti-affinity below only constrains pods scheduled by THIS
+# manager's config — N managers would each schedule freely and could co-locate builds on
+# one node-local scratch disk, which is the data-loss race that anti-affinity exists to
+# prevent. This has been raised before; the answer is here so it is not re-litigated.
+#
+# SELF-CONTAINED TOKEN: unlike the thor/mesh/default runners (whose tokens are minted
+# by the gitlab app's bootstrap job), THIS runner mints its OWN token via the sibling
+# gitlab-runner-eda/presync-runner-token.yaml (a PreSync hook of this very app). So the
+# runner + its token gitlab-runner-token-eda share one lifecycle and depend on NO other
+# app's sync — only on GitLab being reachable at runtime (unavoidable: the token is a
+# GitLab API call). Two sources below: [1] the Helm chart, [2] this app's git dir
+# carrying the token job.
+#
+# SCHEDULED BY CAPABILITY LABEL, not a hostname pin: build pods select
+# ecc/eda-builder=true (project_settings nodes.mesh `edaBuilder`), currently
+# both ecc/eda-builder nodes. PRIVILEGED (rootless buildah does not work under
+# k3s/containerd — same constraint as the Thor runner).
+#
+# ⚠ THE SPREAD BUYS RESILIENCE AND THROUGHPUT. Builds keep working when one node is busy,
+# cordoned or rebooting, and a 2-6 h build can land off the node hosting the AD DC and the
+# desktop. concurrent=2 plus a HARD one-build-per-node anti-affinity also runs two module
+# builds at once — see the concurrent comment
+# below for why the anti-affinity is what makes that safe rather than a data-loss race.
+#
+# ⚠ A DEDICATED label, not ecc/fileserver-lan alone: a future lab node should not be
+# silently enrolled as a ~115 GB-per-build host. But the site pin is still REQUIRED
+# alongside it — the csi-driver-nfs controller and node DaemonSet are nodeSelector'd to
+# ecc/fileserver-lan, so a build anywhere else fails with
+# "driver name nfs.csi.k8s.io not found in the list of registered CSI drivers".
+#
+# ⚠ EACH ENROLLED NODE PAYS ITS OWN EXTRACTION COST. /build-scratch is node-local, so the
+# deliberately shared EXTRACT=/build-scratch/xilinx-2024-1-extracted tree stops being
+# shared across nodes: each node needs its own 115 GB extraction and its own buildah
+# store. Disk is fine
+# (~1.8 TB ephemeral on both); time is not.
+#
+# Two mounts every EDA build relies on:
+#   /artifacts      READ-WRITE vendor media + built module archives on the TrueNAS NFS
+#                   export (static PV/PVC, gitlab-runner-eda/nfs-installers-pv.yaml).
+#                   One copy for all builds, survives cluster recreation.
+#   /build-scratch  node-local buildah storage + extraction target (hostPath
+#                   /var/lib/xilinx-build, historical name, disposable). Extraction MUST
+#                   land here and not on the export — buildah binds node-local paths and a
+#                   build should not write tens of GB onto the fileserver every run.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab-runner-eda
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  sources:
+    # [1] the runner chart (inline values)
+    - repoURL: https://charts.gitlab.io
+      chart: gitlab-runner
+      targetRevision: "0.92.2" # renovate: datasource=helm depName=gitlab-runner registryUrl=https://charts.gitlab.io
+      helm:
+        releaseName: gitlab-runner-eda
+        valuesObject:
+          gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+          # ⚠ 2 — AND THAT NUMBER IS BOUND TO THE HARD POD ANTI-AFFINITY BELOW.
+          # RAISED 1 -> 2. The two are ONE mechanism, not two settings:
+          # never raise this without the matching anti-affinity, and never weaken that
+          # anti-affinity to `preferred` while this is > 1.
+          #
+          # WHAT MAKES CONCURRENCY UNSAFE IS SHARED NODE-LOCAL STATE, NOT CONCURRENCY:
+          #   /build-scratch/buildah-storage             shared by ALL FOUR eda apps
+          #   /build-scratch/xilinx-2024-1-extracted     used by eda-xilinx-2024-1
+          # Both live on the `build-scratch` hostPath. Two builds on the SAME node share
+          # them and corrupt each other — the observed failure was the second job's
+          # `rm -rf` deleting the 115 GB extraction out from under the first job's
+          # in-flight tar. `resource_group:` cannot prevent it (project-scoped, and these
+          # are separate projects) and the flock on
+          # /build-scratch/.xilinx-2024-1-extract.lock cannot either once builds may land
+          # on either node — a hostPath flock is node-local by construction.
+          #
+          # A hostPath is PER-NODE. So one-build-per-node makes every one of those paths
+          # unshared again, and the flock becomes correct rather than merely unnecessary.
+          # That is what the required (never preferred) anti-affinity below guarantees:
+          # with exactly two ecc/eda-builder nodes it is also the cap that keeps this at 2
+          # in practice — a third concurrent build has nowhere to schedule and stays
+          # Pending, which is the safe failure mode.
+          #
+          # COST: each node pays its own 115 GB extraction and its own buildah store
+          # (~1.8 TB ephemeral on both, so disk is fine — time is what you spend). The
+          # sharing that concurrent=1 bought within a node is traded for genuine
+          # parallelism across nodes.
+          concurrent: 2
+          runners:
+            secret: gitlab-runner-token-eda
+            config: |
+              [[runners]]
+                # Internal clone URL — external https://gitlab.<tld> is untrusted
+                # in build pods under letsencrypt-staging (see cloud runner note).
+                # PORT 8181 = workhorse: git-over-HTTP needs the workhorse JWT;
+                # 8080 hits puma directly -> "Nil JSON web token" 403.
+                clone_url = "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+                [runners.kubernetes]
+                  namespace = "gitlab-runner"
+                  image = "alpine:latest"
+                  privileged = true
+                  # ⚠ REQUESTS ARE WHAT THE SCHEDULER SEES, and they must fit on EITHER
+                  # ecc/eda-builder node beside the work already there — a request that only
+                  # one node can satisfy turns any load on that node into an unschedulable
+                  # pipeline, which fails as "prepare environment: waiting for pod running"
+                  # and reads like a build error rather than a placement one.
+                  #
+                  # The two nodes are lopsided, and each was the binding constraint once:
+                  #   bender       16 cores / 251Gi  -> CPU is the scarce axis
+                  #   pcie-tb-s    24 cores /  30Gi  -> MEMORY is the scarce axis
+                  # 8 is a deliberate undershoot of cpu_limit=16 so a build still fits on
+                  # bender's 16 cores next to its steady-state load; 6Gi keeps it schedulable
+                  # on pcie-tb-s, whose 30Gi is largely spoken for by the AD DC, the desktop
+                  # and ryax-action-builder. Both remain soft floors — cpu_limit=16 still
+                  # lets a build take the whole box when it is free.
+                  cpu_request = "8"
+                  memory_request = "6Gi"
+                  # ⚠ 16, not 8. concurrent=1, so no other [eda] build competes, and 8 leaves
+                  # most of the box idle for the whole 2 h install.
+                  # ⚠ 16 is the ceiling on the SMALLEST ecc/eda-builder node that can
+                  # actually run a build (bender's 16 cores), not on pcie-tb-s's 24. It also
+                  # mattered for CORRECTNESS: the Xilinx
+                  # installer's bundled JRE sizes its thread pools from the HOST cpu count
+                  # and then runs inside this cgroup, and on the FULL module set that
+                  # mismatch wedged pipeline #46 in a lock convoy (40 threads on
+                  # futex_do_wait, ~0% CPU, no output for 2 h, 230 min of timeout unused).
+                  # The primary fix is JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount in the
+                  # Dockerfile; this widening reduces the pressure that exposed it.
+                  # ⚠ Keep ActiveProcessorCount in step with this number.
+                  cpu_limit = "16"
+                  memory_limit = "24Gi"
+                  # BOTH labels are load-bearing — see the header:
+                  #   ecc/eda-builder     the capability (which nodes may run EDA builds)
+                  #   ecc/fileserver-lan  csi-driver-nfs runs ONLY on nodes with a route to
+                  #                       the appliance LAN, so the /artifacts PVC below
+                  #                       cannot mount anywhere else
+                  # ⚠ NEEDED SINCE remote-desktop's base build began pulling its CI image
+                  # from the LAB-LOCAL registry (remote-desktop/ci-base.yml). The KUBELET
+                  # does that pull and a pull secret is matched by registry HOST STRING, so
+                  # the FQDN-keyed image-registry-cred in this namespace does NOT apply to a
+                  # 127.0.0.1:30500 reference — the pod never starts and the job dies in
+                  # prepare_script with `no basic auth credentials`, before any script line.
+                  # Measured on ecc204. The read-only eda-pull account, sealed into this
+                  # namespace by image-registry/sealSecrets.sh.
+                  image_pull_secrets = ["image-registry-cred-node"]
+                  [runners.kubernetes.node_selector]
+                    "ecc/eda-builder" = "true"  # automatically updated from project-settings:applicationPlacements.labels.edaBuilder
+                    "ecc/fileserver-lan" = "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+                  [runners.kubernetes.node_tolerations]
+                    "ecc/mesh=true" = "NoSchedule"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+                  # ⚠ ONE EDA BUILD PER NODE — THIS IS WHAT MAKES concurrent=2 SAFE.
+                  # Read the concurrent comment above before touching either.
+                  #
+                  # REQUIRED, never preferred: `preferred` lets the scheduler co-locate two
+                  # builds under pressure, and the corruption that follows (shared
+                  # /build-scratch/buildah-storage) is SILENT — a wrong image, not a failed
+                  # job. A third build finding no free node stays Pending instead, which is
+                  # the failure mode we want.
+                  #
+                  # SELECTOR: `project.runner.gitlab.com/namespace-id` is set by the runner
+                  # on every build pod and is READ-ONLY (cannot be overridden by a job). 11
+                  # is the GitLab group deployments/infrastructure/eda/modules, which holds
+                  # every eda module project — so this matches all EDA builds and nothing
+                  # else. Deliberately NOT manager.runner.gitlab.com/name: that is the runner
+                  # MANAGER'S POD NAME and changes on every manager restart.
+                  #
+                  # ⚠ THE GROUP ID IS ENVIRONMENT STATE, NOT A CONSTANT. It is assigned by
+                  # GitLab when the build-trigger creates the group chain on a fresh cluster,
+                  # so a recreate CAN land on a different id. If it does, this selector
+                  # matches nothing, the anti-affinity silently stops constraining anything,
+                  # and concurrent=2 becomes unsafe with no visible error. After a recreate
+                  # verify it:
+                  #   kubectl get pods -n gitlab-runner \
+                  #     -L project.runner.gitlab.com/namespace-id
+                  [runners.kubernetes.affinity.pod_anti_affinity]
+                    [[runners.kubernetes.affinity.pod_anti_affinity.required_during_scheduling_ignored_during_execution]]
+                      topology_key = "kubernetes.io/hostname"
+                      namespaces = ["gitlab-runner"]
+                      [runners.kubernetes.affinity.pod_anti_affinity.required_during_scheduling_ignored_during_execution.label_selector]
+                        [[runners.kubernetes.affinity.pod_anti_affinity.required_during_scheduling_ignored_during_execution.label_selector.match_expressions]]
+                          key = "project.runner.gitlab.com/namespace-id"
+                          operator = "In"
+                          values = ["11"]
+                  # EDA artifacts on the TrueNAS fileserver over NFSv4, READ-WRITE.
+                  # Static PV/PVC: gitlab-runner-eda/nfs-installers-pv.yaml.
+                  #
+                  # Reads at ~126 MB/s, so the 115 GB SDI tarball is minutes. EVERY module's
+                  # installer media lives here. Layout is per-vendor, and NOT uniform:
+                  #   /artifacts/xilinx/<sdi>.tar[.gz]              flat — both Vivado
+                  #                                                versions plus PetaLinux
+                  #                                                share this directory, so
+                  #                                                each app's CI names its
+                  #                                                own file ($MEDIA_TAR)
+                  #                                                rather than globbing.
+                  #   /artifacts/hyperlynx/2604/installer/         per-version
+                  #
+                  # There are NO image archives — datapool/images (the blob store)
+                  # is what carries built images across a recreate.
+                  #
+                  # ⚠ WRITABLE: media is staged in by hand through this mount.
+                  [[runners.kubernetes.volumes.pvc]]
+                    name = "nfs-eda-installers"
+                    mount_path = "/artifacts"
+                  # buildah storage + scratch. EDA images are 40-80 GB — far past
+                  # the build pod's ephemeral storage (evicts the pod). Node-local +
+                  # disposable (safe to wipe; rebuild repopulates).
+                  [[runners.kubernetes.volumes.host_path]]
+                    name = "build-scratch"
+                    mount_path = "/build-scratch"
+                    host_path = "/var/lib/xilinx-build"
+          rbac:
+            create: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+    # [2] this app's own git dir — the self-contained token-mint PreSync job
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/gitlab-runner-eda
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab-runner
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    # ⚠ RETRY FOREVER — this app's PreSync hook depends on ANOTHER component finishing
+    # bring-up, and on a recreate it is not ready yet. ArgoCD's DEFAULT budget is 5 retries;
+    # on the ecc187 recreate gitlab-runner-eda burned all five before GitLab was serving and
+    # then stayed `phase=Failed retry=5` PERMANENTLY — no [eda] runner, so the remote-desktop
+    # base image could never build and the desktop sat in Init:ImagePullBackOff. One unlucky
+    # ordering took out the whole EDA desktop, recoverable only by a manual `argocd app sync`.
+    #
+    # A plain re-sync fixes it once the dependency is up, with no manifest change — which is
+    # exactly what this retry automates. Same block as remote-desktop.yaml; read its comment
+    # for the fuller reasoning.
+    #
+    # Do NOT enlarge the hook's own budget instead: a pending PreSync hook holds the
+    # Application open and blocks everything behind it. The outer loop is the right lever.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

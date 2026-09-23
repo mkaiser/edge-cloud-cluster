@@ -1,0 +1,331 @@
+# Ollama — OpenAI-compatible GGUF/llama.cpp server on the Jetson-Thor GPU node.
+# IN-CLUSTER ONLY: no Ingress. The only client is the LiteLLM gateway
+# (deployment/argocd-apps/litellm), route `coder-ollama`. Ollama has NO built-in
+# API auth — same trust model as the vLLM Service (ClusterIP, reachable only
+# in-cluster); LiteLLM sends a dummy api_key it ignores.
+#
+# EXCLUSIVE with vLLM, and SCHEDULER-ENFORCED: the Thor advertises exactly 1 nvidia.com/gpu
+# and this Deployment requests it. Whichever backend is scaled up owns the device; the
+# other's pod simply stays Pending on "Insufficient nvidia.com/gpu".
+#
+# It ships replicas: 1 (see the replicas comment below), and ArgoCD ignores /spec/replicas
+# (app-of-apps/ollama.yaml ignoreDifferences) so a runtime scale survives selfHeal.
+# scripts/runtime/switchLLMBackend.sh is a convenience for sequencing the hand-off; it is
+# NOT what makes the two exclusive — the scheduler is.
+#
+# Image: ollama v0.32.1 built on-node for the Thor by GitLab CI (like vLLM). The
+# prebuilt ghcr.io/nvidia-ai-iot/ollama image is v0.11.6, whose engine can't load
+# the target model's `qwen35moe` arch — so we rebuild v0.32.1 FROM that base (which
+# already carries the CUDA-13 toolchain) via .gitlab-ci.yml + the build-trigger /
+# registry-cred PreSync jobs. See Dockerfile for the three build fixes (Go 1.26,
+# gcc-14 for the SME CPU variant, -DOLLAMA_LLAMA_BACKENDS=cuda_v13).
+#
+# Model source: GGUF pulled at runtime by Ollama from HuggingFace
+# (hf.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-IQ3_XXS, ~14 GiB — the GGUF twin of
+# the NVFP4 model vLLM serves; IQ3_XXS fits the Thor GPU budget) onto the
+# node-local `local-path` PVC below.
+# NOT Longhorn — but by CHOICE, not necessity: Thor CAN attach Longhorn (the kernel rebuild
+# provides CONFIG_ISCSI_TCP). The weights are a large, disposable, re-downloadable cache, so
+# replicating them over WireGuard would buy nothing;
+# a node reimage just re-pulls them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  # UP by default, and vLLM ships at replicas: 0 — the two are exclusive, so exactly one
+  # backend serves the Thor GPU at a time. Do NOT set both to 0: the node then sits idle
+  # while the LiteLLM routes pointing at it 500 for anyone who picks them.
+  #
+  # Exclusivity is enforced by the scheduler, not by these numbers: both request the single
+  # nvidia.com/gpu, so whichever is up owns it and the other stays Pending. Flipping which
+  # one serves means scaling BOTH in the same change (or via scripts/runtime/
+  # switchLLMBackend.sh). ArgoCD ignores /spec/replicas (app-of-apps/ollama.yaml) so a
+  # runtime flip sticks.
+  replicas: 1
+  strategy:
+    # Single non-shareable GPU: a rolling update would deadlock (new pod Pending
+    # on nvidia.com/gpu the old pod still holds). Same as vLLM.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      priorityClassName: standard
+      # No service-link env vars — Ollama doesn't read them, but keep parity with
+      # vLLM's hygiene (a Service named like an env prefix can poison a process).
+      enableServiceLinks: false
+      # GPU injection via the device plugin / CDI, with a real nvidia.com/gpu
+      # request — same as vLLM and as the discrete-GPU node.
+      #
+      # ⚠ This works only on the CI-built v0.32.x. The prebuilt jetson image
+      # (ghcr.io/nvidia-ai-iot/ollama, which reports "ollama version 0.0.0") crashes at GPU
+      # discovery under CDI — its cudart_bootstrap probe corrupts its stack on
+      # NVIDIA_VISIBLE_DEVICES=void ("*** stack smashing detected ***" SIGABRT at
+      # gpu.go:217), which is what forces the legacy env path (NVIDIA_VISIBLE_DEVICES=all +
+      # no resource request). Healthy looks like:
+      #   inference compute library=CUDA compute=11.0 name="NVIDIA Thor" driver=13.2
+      #     type=iGPU total="122.9 GiB"
+      #   ollama ps -> qwen3.5:0.8b  100% GPU
+      #
+      # This matters beyond tidiness: holding a real allocation makes exclusivity with vLLM
+      # SCHEDULER-enforced on this single-GPU node (the second pod simply stays Pending)
+      # instead of depending on scripts/runtime/switchLLMBackend.sh sequencing it.
+      runtimeClassName: nvidia
+      nodeSelector:
+        # ecc/gpu-model (not ecc/gpu=true): this image is built for Thor's Blackwell
+        # sm_110 / CUDA 13 and will NOT run on another GPU model, so it must pin the
+        # model, not merely "some GPU".
+        ecc/gpu-model: jetson-thor  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        # GPU nodes are mesh nodes, tainted ecc/mesh=true:NoSchedule.
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        # GPU nodes are ALSO tainted ecc/gpu=true:NoSchedule so the scarce single-GPU box
+        # is opt-in only. Tolerating it is what makes this pod a deliberate GPU consumer.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+        # ⚠ EVICT FAST — the k8s default is 300s and that window IS the outage.
+        # The lab nodes go away for hours at a time. At the default the pod keeps its claim
+        # on a dead node for five minutes before eviction even begins, during which it still
+        # reports `1/1 Running` while its Service has zero endpoints — so the failure reads
+        # as an application fault rather than a node fault (measured twice on 2026-09-14).
+        # 30s is well clear of a transient kubelet hiccup and costs nothing while healthy:
+        # the taint is only applied once the node controller declares the node unreachable.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      # ⚠ TWO PULL SECRETS, AND BOTH ARE NEEDED — a pull secret is matched by REGISTRY HOST
+      # STRING, and these two carry different hosts:
+      #   ollama-registry-cred      registry.gitlab.<tld>  (GitLab deploy token, created at
+      #                             bootstrap by presync-registry-cred.yaml)
+      #   image-registry-cred-node  127.0.0.1:30500        (read-only eda-pull, sealed by
+      #                             image-registry/sealSecrets.sh)
+      # The image below is pulled through the NodePort on loopback, because the KUBELET
+      # resolves through the NODE's resolver and a node does not resolve *.svc.cluster.local.
+      # Without the node-keyed secret that pull fails with "no basic auth credentials".
+      # The registry's CA is trusted via containerd's certs.d directory, written by
+      # image-registry/node-registries-config.yaml.
+      imagePullSecrets:
+        - name: ollama-registry-cred
+        - name: image-registry-cred-node
+      containers:
+        - name: ollama
+          # Ollama v0.32.1 built for the Thor by GitLab CI (.gitlab-ci.yml,
+          # tags:[thor]) FROM the NVIDIA-AI-IOT jetson base, then pushed here. WHY
+          # not the prebuilt ghcr.io image directly: that ships ollama v0.11.6, whose
+          # engine does NOT know the `qwen35moe` arch — the target Qwen3.6-35B-A3B
+          # GGUF fails to load (`unknown model architecture: 'qwen35moe'`). v0.32.1
+          # adds it. Keep this tag in sync with .gitlab-ci.yml IMAGE_TAG.
+          # Registry paths are lowercased by GitLab: AI -> ai in the image path.
+          # ⚠ THE LAB REGISTRY, NOT GITLAB'S — and no subdomain anchor, because there is
+          # no hostname in it to rewrite on a recreate. 127.0.0.1:30500 is the NodePort of
+          # image-registry, reachable from every lab node's kubelet since the registries.yaml
+          # + CA that image-registry/node-registries-config.yaml installs (verified on all
+          # four unibi-hclab nodes 2026-09-03 with `k3s crictl pull`).
+          #
+          # WHY: this image is multi-GB and GitLab's registry writes through to Hetzner S3 —
+          # ~5 MB/s from the lab against ~126 MB/s for this registry on the LAN. Pulling it
+          # from the cloud was the round trip the lab registry exists to avoid.
+          #
+          # ⚠ THE ARCHIVE IS NOW LOAD-BEARING FOR STARTUP, not just for recreate speed. The
+          # pipeline pushes to GitLab's registry AND archives here; if that archive step ever
+          # fails, this pod has nothing to pull. That is why the gate archives on skip too
+          # (ollama/.gitlab-ci.yml) — the copy is repaired on any later run rather than only
+          # on a rebuild.
+          image: 127.0.0.1:30500/image-archives/ollama:v0.34.2-cu13-sm110-r1
+          # The image's default CMD is `/start_ollama && /bin/bash`: start_ollama
+          # launches `ollama serve` in the BACKGROUND (logging to a file) and
+          # returns, then /bin/bash runs. Under k8s there's no TTY, so bash reads
+          # EOF and exits immediately → the container Completes (exit 0) → k8s
+          # restarts it → CrashLoopBackOff. Override CMD to run serve in the
+          # FOREGROUND. We replicate start_ollama's SBSA setup: the CUDA ggml
+          # runner libs live under /opt/ollama/build/lib/ollama (LD_LIBRARY_PATH)
+          # and OLLAMA_LLM_LIBRARY=cuda_v13 selects the CUDA-13 backend on Thor
+          # (SBSA). `exec` so ollama is PID 1 and gets SIGTERM on pod stop.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              export LD_LIBRARY_PATH="/opt/ollama/build/lib/ollama:${LD_LIBRARY_PATH}"
+              export OLLAMA_LLM_LIBRARY="cuda_v${CUDA_VERSION_MAJOR}"
+              exec ollama serve
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            # Model store on the node-local PVC (mounted below).
+            - name: OLLAMA_MODELS
+              value: /data/models
+            - name: HOME
+              value: /data
+            # Keep a loaded model resident rather than unloading after the default 5m idle:
+            # reloading a 14-38 GB GGUF is minutes of latency, and this is the big-model box.
+            #
+            # ⚠ -1 means NEVER release on idle, and this node now serves THREE models (14, 20
+            # and 38 GB) instead of the one pinned model it was set up for. 72 GB of weights
+            # would fit the ~117 GiB free, but that memory is UNIFIED and shared with the
+            # GNOME desktop, the 7 other pods on this node, and the page cache — so
+            # "it fits" is not the same as "it is safe".
+            #
+            # OLLAMA_MAX_LOADED_MODELS below is what actually bounds it: Ollama evicts LRU to
+            # stay under the cap, which is the behaviour that makes -1 tolerable. Verified:
+            # loading the 38 GB q8_0 evicted the other two rather than stacking on top.
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"
+            # Cap resident models to TWO. Rationale: the largest pair that can sensibly
+            # co-reside is 14 + 20 = 34 GB; admitting a third would let the 38 GB q8_0 join
+            # them for 72 GB of a shared 122 GiB pool. Two keeps a fast model warm alongside
+            # whatever is in use, without letting idle weights crowd out the rest of the node.
+            # Without this, the default plus KEEP_ALIVE=-1 is an unbounded ratchet.
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "2"
+            # Queue rather than 503 when the loaded model's slots are busy. Not
+            # Tegra-specific; the discrete node has had it and this one simply never got it.
+            # OLLAMA_NUM_PARALLEL is deliberately NOT set here, and setting it would be
+            # misleading rather than merely useless. Set to 4, the pod logs
+            #     WARN "model architecture does not currently support parallel requests"
+            #          architecture=qwen35moe
+            #     srv load_model: n_slots = 1
+            # so llama.cpp silently falls back to ONE decode slot for this MoE. Concurrent
+            # requests then serialize: 4 streams aggregated 35.6 tok/s (the same as 1 stream's
+            # 34.6), and 16 streams produced ONE completion with 15 client timeouts.
+            #
+            # That is a hard architectural limit of the engine for qwen35moe, not a tuning
+            # knob — which is precisely why vLLM exists on this node (it batched the same base
+            # model to 101.3 tok/s aggregate at 16 streams). See doc/llm-performance.md.
+            # The Turing node DOES set NUM_PARALLEL=2, because qwen3.5 dense models there do
+            # support it.
+            - name: OLLAMA_MAX_QUEUE
+              value: "64"
+            # ⚠ This is the SERVER-WIDE DEFAULT for a request that names no context, and
+            # 16384 is small enough to break agent loops silently. A Hermes turn starts at
+            # ~8.2k tokens of system prompt + tool schemas, so any substantial reply hit
+            #     slot context shift, n_keep = 4, n_left = 16379, n_discard = 8189
+            # — llama.cpp discarding the OLDEST HALF of the window, i.e. the system prompt
+            # and the tool definitions. The model then generates with its instructions gone
+            # and never emits a terminal tool call, which surfaces one layer up as
+            # "worker exited cleanly without calling kanban_complete — protocol violation".
+            # Measured 2026-09-15: that was the cause of every eda-pcb-agent card failure.
+            #
+            # It is left at 16384 DELIBERATELY: chat clients do not need more, and a large
+            # server-wide default would reserve KV for every model that loads. Callers that
+            # need a real window ask for one per request — see `num_ctx` on the thor/*
+            # route in ../litellm/config.yaml, currently 131072.
+            #
+            # ⚠ Raising THIS value is not the way to give an agent more context, and it is
+            # capped anyway: KV costs a measured 96 KiB/token for qwen3-coder:30b (12,288 MiB
+            # at 131,072 tokens), and no model served here trains beyond 262,144 —
+            # qwen2.5-coder:32b stops at 32,768. Check `ollama show <model>` before assuming
+            # a window exists.
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "16384"
+            # Jetson/L4T: disable the image's NVIDIA_REQUIRE_CUDA gate — on Tegra
+            # CUDA compat comes from L4T/JetPack, not a desktop driver version,
+            # so the runtime's requirement check fails at container create.
+            # Same as vLLM.
+            # Drive the nvidia runtime's LEGACY GPU injection (see runtimeClassName
+            # comment): the ollama cudart probe crashes on the CDI `void` value, so
+            # we bypass the device plugin and inject all Tegra GPU nodes/libs by env.
+          ports:
+            - containerPort: 11434
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /data
+            # llama.cpp mmaps the model; give it a real /dev/shm (the upstream
+            # Thor run command uses --shm-size=16g; 4Gi suffices for serving).
+            - name: dshm
+              mountPath: /dev/shm
+          # ONE GPU, scheduler-enforced. The Thor advertises exactly 1 nvidia.com/gpu, so
+          # this request is also what makes ollama and vLLM mutually exclusive without a
+          # script: whichever is scaled up takes the device, the other stays Pending.
+          #
+          # Memory limits matter MORE here than on a discrete-GPU node: Tegra unified memory
+          # means the GGUF weights and system RAM are the same pool, so an unbounded pod is
+          # BestEffort QoS and is the first thing the kubelet evicts under node pressure.
+          # No CPU limit on purpose — llama.cpp uses every core it can get for prompt
+          # processing (same reasoning as ollama-turing).
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              nvidia.com/gpu: 1
+              memory: 32Gi
+          readinessProbe:
+            httpGet:
+              # Root returns 200 "Ollama is running" — server liveness. Model
+              # download happens lazily on first request, AFTER ready.
+              path: /
+              port: 11434
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            # The server is up long before any model loads; no vLLM-style 50min
+            # budget needed (Ollama serves its API during model pulls).
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            # timeoutSeconds/failureThreshold are NOT defaults here on purpose. The default
+            # 1s timeout + 3 failures will restart the pod mid-load: loading a multi-GiB
+            # GGUF starves the HTTP handler for longer than a second, and this node loads a
+            # BIGGER model than the discrete one does. A probe that fires during the load
+            # kills the pod and the load restarts from scratch.
+            timeoutSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: ollama-data
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+# GGUF model store on a node-local local-path PVC. Deliberately node-local: the store is
+# large, disposable and re-downloadable, so Longhorn replication would buy nothing. (Thor
+# CAN attach Longhorn — that is not the constraint.) A GPU-node reimage wipes it and Ollama
+# re-pulls from HuggingFace. RWO is fine — a single pod (Recreate) ever
+# mounts it. 40Gi: the UD-Q4_K_M GGUF is ~22.7 GiB + manifest/blob overhead +
+# headroom for one alternate quant. (Sized for the ~22.7 GiB UD-Q4_K_M; the route actually
+# serves UD-IQ3_XXS at ~14 GiB, so there is more slack than this number suggests.)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+  namespace: ollama
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # local-path (WaitForFirstConsumer) binds on whichever node the pod schedules
+  # to — always the Thor via the ecc/gpu-model nodeSelector.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  # ClusterIP only — no ingress. LiteLLM reaches http://ollama.ollama.svc:11434/v1.
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434

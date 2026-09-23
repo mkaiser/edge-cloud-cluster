@@ -1,0 +1,52 @@
+# Minimal Ryax action — the smallest thing that proves the worker actually runs
+# code on the unibi-hclab mesh nodes.
+#
+# Deliberately has NO requirements.txt and NO `dependencies:` list. Every python
+# dependency is a nix build in the action-builder, and binary deps pull nixpkgs;
+# an empty dep set keeps the first build to a couple of minutes instead of tens,
+# which matters because this action's only job is to answer "does the pipeline
+# work end to end". Add deps once it has passed.
+apiVersion: "ryax.tech/v2.0"
+kind: Processor
+spec:
+  id: mesh-hello
+  human_name: Mesh Hello
+  version: "1.0"
+  description: >-
+    Smoke test for the Ryax Kubernetes worker: echoes a message and reports the
+    node, pod and architecture it actually executed on. Use it to confirm a Site /
+    Node Pool is wired up correctly and lands on the nodes you expect.
+  type: python3
+  categories:
+    - test
+  # Must stay inside the LimitRange defaults from worker-values.yaml
+  # (request 0.1 CPU / 256Mi, limit 1Gi) and the ryaxns-execs ResourceQuota.
+  resources:
+    cpu: 0.5
+    memory: 256M
+    time: 5m
+  inputs:
+    - name: message
+      human_name: Message
+      help: Text echoed back in the greeting output.
+      type: string
+      default_value: hello from ryax
+  outputs:
+    - name: greeting
+      human_name: Greeting
+      help: The echoed message.
+      type: string
+    - name: node_name
+      human_name: Node name
+      help: >-
+        Kubernetes node the action ran on. This is the value that proves
+        placement: it must be one of the mesh nodes at the Ryax site, never a cloud node.
+      type: string
+    - name: pod_name
+      human_name: Pod name
+      help: Name of the pod Ryax created for this execution (in ryaxns-execs).
+      type: string
+    - name: architecture
+      human_name: Architecture
+      help: CPU architecture of the executing node (x86_64 or aarch64).
+      type: string

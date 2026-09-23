@@ -1,0 +1,30 @@
+# Registers Loki as a Grafana datasource.
+#
+# Lives in the `prometheus` namespace, NOT `loki`: Grafana's datasource sidecar
+# is release-namespace scoped (searchNamespace unset), unlike its dashboard
+# sidecar which is set to ALL. Putting this next to Loki would silently do
+# nothing.
+#
+# Sidecar discovery (a labelled ConfigMap) rather than the Grafana chart's
+# `datasources:` values block on purpose — that block renders a second
+# provisioning file, which would mean redefining Prometheus and Alertmanager by
+# hand here and keeping them in sync with whatever kube-prometheus-stack emits.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-grafana-datasource
+  namespace: prometheus
+  labels:
+    grafana_datasource: "1"
+data:
+  loki-datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki-gateway.loki.svc.cluster.local
+        isDefault: false
+        jsonData:
+          maxLines: 1000

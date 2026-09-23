@@ -1,0 +1,125 @@
+# SearXNG — self-hosted metasearch, the web-search backend for the Hermes agent.
+#
+# WHY: Hermes has a first-class `searxng` web-search provider
+# (external/git_NousResearch_hermes-agent/agent/web_search_registry.py), configured with a
+# single env var, SEARXNG_URL, and NO api key. Every other provider in its fallback chain
+# (exa, brave, tavily, firecrawl, parallel) needs a paid or rate-limited external account, so
+# self-hosting is both cheaper and the only option that keeps agent queries off third parties.
+#
+# IN-CLUSTER ONLY — no Ingress, deliberately. A public SearXNG is an open proxy: anyone can
+# make it fetch arbitrary URLs on their behalf, and its own docs treat a public instance as a
+# thing to run with a rate limiter and bot protection. The only client here is the Hermes pod.
+#
+# NOT stateful: no PVC, no database. SearXNG holds no user data of its own — settings come
+# from the ConfigMap, the secret from the Secret, and results are proxied live. A restart
+# loses nothing.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: searxng
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: searxng
+  annotations:
+    # SearXNG reads settings.yml ONCE at startup, so a ConfigMap edit alone changes nothing
+    # in the running pod while ArgoCD reports Synced/Healthy. Reloader
+    # (argocd-infra/reloader) watches searxng-settings and searxng-secrets and rolls this
+    # Deployment when their content changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: one replica with no shared state, so a surge pod buys
+  # nothing and the redis-less limiter has no cross-pod coordination anyway.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      priorityClassName: low
+      # Cloud tier: this is a stateless HTTP service with no GPU and no locality requirement.
+      # Tolerate nothing — it must NOT land on a mesh/GPU node and take capacity from models.
+      securityContext:
+        # The upstream image runs as this uid and needs to write /etc/searxng at startup
+        # (it templates settings.yml). fsGroup lets the mounted ConfigMap be readable.
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
+      containers:
+        - name: searxng
+          image: docker.io/searxng/searxng:2026.8.22-9fea41204 # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Public-facing base URL. Even in-cluster this must be set: SearXNG builds
+            # absolute URLs from it, and leaving it unset makes it guess from the Host header.
+            - name: SEARXNG_BASE_URL
+              value: "http://searxng.searxng.svc:8080/"
+            # Signs the per-session/per-query tokens. Overrides settings.yml's placeholder
+            # `secret_key: "ultrasecretkey"` — which is a literal in the upstream default and
+            # must never survive into a deployment.
+            - name: SEARXNG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: searxng-secrets
+                  key: secret-key
+            # Single worker: this serves ONE agent, and each uwsgi worker is ~100 MB.
+            - name: UWSGI_WORKERS
+              value: "1"
+            - name: UWSGI_THREADS
+              value: "4"
+          volumeMounts:
+            - name: settings
+              mountPath: /etc/searxng/settings.yml
+              subPath: settings.yml
+              readOnly: true
+          # /search?format=json is what Hermes calls; / is the human UI. Probe the cheap one.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # templates settings into /etc/searxng at startup
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: settings
+          configMap:
+            name: searxng-settings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: searxng
+spec:
+  selector:
+    app: searxng
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

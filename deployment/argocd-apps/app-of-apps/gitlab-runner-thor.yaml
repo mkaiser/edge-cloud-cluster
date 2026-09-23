@@ -1,0 +1,117 @@
+# ArgoCD Application: THOR GitLab runner (arm64 GPU node; buildah image builds).
+#
+# Split out of the combined app-of-apps/gitlab-runner.yaml into its own file so the
+# GPU build runner can be enabled/disabled independently of the cloud + mesh runners.
+#
+# SHARED on purpose: tags:[thor] jobs from BOTH deployment/argocd-apps/vllm and
+# deployment/argocd-apps/ollama land here — the two LLM backends build for the same
+# single Jetson-Thor GPU node (they are mutually exclusive at RUNTIME, but their
+# image builds are ordinary sequential CI jobs). Because it has no single owning
+# app it stays here rather than inside one of them; putting it in vllm/ would make
+# ollama's builds silently depend on vllm being enabled.
+#
+# Its token (gitlab-runner-token-thor, tags arm64,thor,buildah) is minted by the
+# gitlab bootstrap PostSync job together with the other shared runner tokens.
+#
+# buildah runs PRIVILEGED in-pod: rootless does NOT work on this k3s/containerd
+# node — the runtime blocks the mount/remount syscalls buildah's storage layer
+# needs in EVERY mode (vfs+chroot "remount / permission denied", overlay+
+# fuse-overlayfs blocked, /dev/fuse absent), even with SYS_ADMIN + userns +
+# subuid ranges. A privileged pod is the only path that builds here (verified).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+    name: gitlab-runner-thor
+    namespace: argocd-apps
+    annotations:
+        placement.ecc/tier: mesh
+spec:
+    project: default
+    source:
+        repoURL: https://charts.gitlab.io
+        chart: gitlab-runner
+        targetRevision: "0.92.2"
+        helm:
+            valuesObject:
+                gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+                runners:
+                    secret: gitlab-runner-token-thor
+                    # Build pods pinned to the Thor node (arm64 + JetPack-7 toolchain
+                    # parity for sm_110 CUDA-13 kernels) and tolerating the mesh taint.
+                    config: |
+                        [[runners]]
+                          # Internal clone URL — external https://gitlab.<tld> is untrusted
+                          # in build pods under letsencrypt-staging (see cloud runner note).
+                          # PORT 8181 = workhorse: git-over-HTTP needs the workhorse JWT;
+                          # 8080 hits puma directly -> "Nil JSON web token" 403.
+                          clone_url = "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+                          [runners.kubernetes]
+                            namespace = "gitlab-runner"
+                            image = "alpine:latest"
+                            # The runner MANAGER runs on a cloud x86_64 node, so the chart
+                            # auto-picks the x86_64 helper image — but BUILD pods run on the
+                            # arm64 Thor node, so that helper has "no match for platform".
+                            # Pin the arm64 helper explicitly. Keep the tag in step with the
+                            # chart's gitlab-runner version (0.91.0 → runner v19.1.x).
+                            helper_image = "registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper:arm64-v19.1.1"
+                            privileged = true
+                            cpu_request = "2"
+                            memory_request = "4Gi"
+                            cpu_limit = "6"
+                            memory_limit = "16Gi"
+                            # ecc/gpu-model, not ecc/gpu: this runner builds the sm_110 vLLM
+                            # image, so it must land on a Thor specifically, not "any GPU".
+                            [runners.kubernetes.node_selector]
+                              "ecc/gpu-model" = "jetson-thor"  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+                            # GPU nodes carry BOTH taints: ecc/mesh (all mesh nodes) and
+                            # ecc/gpu (dedicated scarce GPU box, opt-in only).
+                            [runners.kubernetes.node_tolerations]
+                              "ecc/mesh=true" = "NoSchedule"  # automatically updated from project-settings:applicationPlacements.labels.mesh
+                              "ecc/gpu=true" = "NoSchedule"  # automatically updated from project-settings:applicationPlacements.labels.gpu
+                            # Persistent pip cache (node-local hostPath on the Thor node).
+                            # The vLLM build pulls a multi-GB dep tree from pypi.jetson-ai-lab.io,
+                            # a single throttled origin (~300 kB/s, no CDN) — a cold pull is ~1h+.
+                            # Every build pod ALWAYS runs on this one Thor node (node_selector
+                            # above), so a hostPath dir survives across build pods and lets pip
+                            # reuse wheels it already downloaded → later rebuilds skip the slow
+                            # origin entirely. The build points PIP_CACHE_DIR here (.gitlab-ci.yml).
+                            # hostPath (not a PVC): the cache is intentionally node-local and
+                            # disposable (safe to wipe; it just re-downloads), and every build pod
+                            # is pinned to this one node anyway, so Longhorn would add replication
+                            # cost for nothing. (Thor CAN attach Longhorn — the Tegra kernel
+                            # rebuild has CONFIG_ISCSI_TCP — so that is not the reason.)
+                            # mount_path is inside the build container; host_path is the dir
+                            # created on the node.
+                            [[runners.kubernetes.volumes.host_path]]
+                              name = "pip-cache"
+                              mount_path = "/pip-cache"
+                              host_path = "/var/lib/gitlab-runner-cache/pip"
+                rbac:
+                    create: true
+                resources:
+                    requests:
+                        cpu: 100m
+                        memory: 128Mi
+                    limits:
+                        memory: 512Mi
+    destination:
+        server: https://kubernetes.default.svc
+        namespace: gitlab-runner
+    syncPolicy:
+        automated:
+            prune: true
+            selfHeal: true
+        syncOptions:
+            - CreateNamespace=true
+        # ⚠ RETRY FOREVER — kept in step with its three sibling runner apps (gitlab-runner,
+        # -eda, -thor/-mesh) so a recreate cannot strand one of them on ArgoCD's default budget of
+        # 5 retries, the way gitlab-runner-eda was stranded on ecc187. This app carries NO hooks
+        # (chart-only, and its gitlab-runner-token-thor secret is minted by the gitlab app's
+        # bootstrap job), so here it covers transient sync failures only — a runner pod waiting on
+        # a not-yet-minted token shows as Degraded, which no retry budget addresses.
+        retry:
+          limit: -1
+          backoff:
+            duration: 1m
+            factor: 2
+            maxDuration: 10m

@@ -1,0 +1,47 @@
+# Public STUN entry for headscale's embedded DERP — source-IP preserving.
+#
+# WHY not the chart's headscale-derp Service: that Service was type LoadBalancer.
+# k3s ServiceLB (klipper) fronts every LoadBalancer with an svclb pod that DNATs the
+# host port to the service's NodePort on the host IP and MASQUERADES — unconditionally
+# (the pod needs the return path), regardless of externalTrafficPolicy. headscale's
+# STUN server therefore saw the svclb pod address (10.42.0.x) as every client's source
+# and returned THAT as the client's reflexive address. Every node's advertised "public
+# endpoint" was a pod IP: NAT traversal between two NATed sites could never work and
+# all site↔site traffic fell back to the DERP relay permanently (~90 GB through the
+# relay in hours).
+#
+# Fix: bypass klipper entirely — plain NodePort with a PINNED nodePort equal to the
+# STUN port. kube-proxy DNATs <public-ip>:30478 straight to the headscale pod, and
+# externalTrafficPolicy Local means no masquerade (client source preserved) and only
+# nodes running the pod answer. No externalIPs / no IP literals here (domain-name-only
+# policy for manifests): the derpmap advertises hostname vpn.<tld> + this STUN port,
+# so clients resolve the address themselves.
+#
+# Port 30478: must sit in the NodePort range (30000-32767) for kube-proxy to own it —
+# that rules out standard 3478 (also owned by jitsi's coturn, see wave8-headscale.yaml)
+# and the previous 3479. Single source: wave8-headscale.yaml service.derp.port
+# templates the container port AND derp.server.stun_listen_addr (so the derpmap
+# advertises 30478 automatically); the Hetzner/host firewall rule comes from
+# project_settings.ts network.firewall ("Headscale embedded DERP STUN"). Keep all
+# three in sync. Selector matches the chart's selectorLabels.
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale-stun
+  namespace: headscale
+  labels:
+    app.kubernetes.io/name: headscale
+    app.kubernetes.io/instance: headscale
+    ecc/purpose: stun-source-ip-preserving
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: headscale
+    app.kubernetes.io/instance: headscale
+  ports:
+    - name: derp
+      port: 30478
+      nodePort: 30478
+      targetPort: derp
+      protocol: UDP

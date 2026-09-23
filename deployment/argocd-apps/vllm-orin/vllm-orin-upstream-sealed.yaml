@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: vllm-orin-upstream
+  namespace: vllm-orin
+spec:
+  encryptedData:
+    api-key: AgCcIr207pJHRv8YnZpmCvIm9O7VYxGjSRYNyJB62+2KBJxXb9YRNiE2dkemxNmUZ6oUKtp9D6BBrANspJt5nm9+ptKP+vI1FRALXgMs49L0mFz0a3W3DE3rO6fDoMaVTiecWsFPi6WhcOF8LkSuIzayQtQbBJje35BrE4ZyYieXFxHTKv1fgkqCyK+f3ONahuER2rGltYCJmVxIkXDJFsMjz0S2St1vxBor4iYYsn0JPha7W4lpjKtBAy8MYM5h+Chdm9r0BX5ok8KaJGTfwr8uS0eJXa0+uRevw8MYFlyGU9tzR7JZhH9FdQDHD/KFXEmKlz6eAl7jumg4Mh1JTWSAwtPl8mFOrdIvsYNwh5G8Ut2COrXy8MvhAtFluf/EZC9WW+yWSQDaiS0nDxAxQwA0d2S0f+sEo3I2utV+mwdd/PG6xOxgeKQuY9I1XEFhUnJ/pu8nUk4G9stLnEgD2uPgFiowI2F2UneIy7viyySSZkgwATylnJKdn48DLHwGYVW3lA6c3MIONsIRfzjf7XTHcJ5mFHfZOoEeCHMQA4PX1Ju9brjXfhnprOzHAviQOEKm8y+qx+kWZC0HIcIoKGJEQqlf3Q1a0SOI8muBPXbtdl8LfBIW6o1DUeiJ1GzgvbSPDmXmxH04g633CxTGVLeAGRRPsRmaK43vBUZOq8LTc/Sf564JkNYcP+UjLeMPpE6FTR+epRf5YAHicUCa4yUsntoAL6YPbGdyzlF8TxYx0t5OyoiU94mpfu6Ki/qhPfwCyxmfQCu+Sdo6mfptzBfA
+  template:
+    metadata:
+      name: vllm-orin-upstream
+      namespace: vllm-orin

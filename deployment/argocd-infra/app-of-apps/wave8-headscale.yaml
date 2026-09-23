@@ -1,0 +1,265 @@
+# ArgoCD Application: headscale + headplane (moved from wave 12).
+# Self-hosted Tailscale-compatible VPN via Wrenix headscale helm chart.
+# Accessible at https://vpn.subdomain.domain.tld (headscale) and https://headplane.subdomain.domain.tld/admin (GUI)
+# Issues its own cert via cert-manager (letsencrypt-staging, DNS-01 Hetzner).
+#
+# OIDC via Authentik (provider registered by Authentik blueprint-apps).
+# The headscale-oidc-client-secret sealed secret must match the value sealed
+# into authentik-secrets (deployment/argocd-infra/authentik/sealSecrets.sh).
+#
+# Multi-source:
+#   1. Helm chart from Codeberg git repo (avoids OCI registry auth issues)
+#   2. Git repo directory for plain manifests (headplane, jobs, sealed secrets)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: headscale
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "8"
+spec:
+  project: default
+  sources:
+    # Helm chart from git: Renovate tracks Forgejo tags (chart tags like headscale-v1.0.15).
+    - repoURL: https://codeberg.org/wrenix/helm-charts.git
+      targetRevision: "main" # renovate: datasource=forgejo-tags depName=wrenix/helm-charts registryUrl=https://codeberg.org versioning=regex:^headscale-v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
+      path: headscale
+      helm:
+        valuesObject:
+          image:
+            # ⚠ KEEP THE `-debug` SUFFIX. The chart's headscale-keys hook AND
+            # headscale/headscale-keys-bootstrap.yaml both run `sh` inside this image.
+            # Upstream's release image is gcr.io/distroless/base-debian13 — no shell at all
+            # (.goreleaser.yml `kos:`), so the plain tag fails with `exec: "sh": not found`.
+            # The `-debug` build is the same binary on distroless `:debug`, which ships busybox.
+            tag: "v0.29.3-debug" # renovate: datasource=docker depName=ghcr.io/juanfont/headscale
+
+          # Disable chart-generated TLS cert (defaults to example.com/letsencrypt-prod).
+          # Gated on headscale.certmanager.enabled (not tls.enabled).
+          # grpc_allow_insecure=true: headplane uses REST API, not gRPC, so no cert needed.
+          # config must be nested under headscale.config — chart secret template uses .Values.headscale.config
+          headscale:
+            certmanager:
+              enabled: false
+            config:
+              server_url: "https://vpn.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+              grpc_allow_insecure: true
+              # ⚠ PIN THE DERP RELAY'S IPv4, or the CP has NO working relay fallback.
+              #
+              # Without this the derpmap advertises only `HostName: vpn.<tld>`, and each
+              # client resolves it itself. The mesh-gateway DaemonSet resolves through
+              # CoreDNS, which answers with the AAAA (2a01:4f8:...::2) — but the node has no
+              # IPv6 DEFAULT route, only link-local. So tailscaled dials v6, gets
+              # "connection refused", and DERP never connects:
+              #   derphttp.Client.Send connect to region 999 (headscale): GET failed
+              # It is invisible from the host, which resolves via Hetzner's resolvers and
+              # gets the A record — every check run there passes.
+              #
+              # CONSEQUENCE WHEN MISSING: the mesh survives ONLY on the direct WireGuard
+              # path (UDP 41641). Anything that interrupts it — a headscale roll, a NAT
+              # rebind — black-holes every lab node (tx>0, rx=0) until the direct path is
+              # re-established by hand. Observed twice in one evening; each time all three
+              # the lab nodes went NotReady ~5 min later (one node-monitor grace period).
+              #
+              # headscale documents this exact use ("especially when ... DNS is not
+              # working"). Setting IPv4 makes the client dial the address directly instead
+              # of resolving HostName. IPv6 is deliberately NOT set: the node cannot route
+              # it, and advertising an unreachable address is what caused this.
+              derp:
+                server:
+                  ipv4: "203.0.113.10" # automatically updated from project-settings:nodes.dedicated[0].publicIp
+              prefixes:
+                v4: "10.0.10.0/23" # automatically updated from project-settings:network.meshRange (edge VPN pool 10.0.10.1–10.0.11.255)
+                allocation: sequential
+              database:
+                type: postgres
+                postgres:
+                  host: headscale-pg-rw
+                  port: 5432
+                  name: headscale
+                  user: headscale
+                  # pass injected via HEADSCALE_DATABASE_POSTGRES_PASS env by args-patch.yaml
+                  pass: ""
+              dns:
+                magic_dns: true
+                base_domain: "ts.internal"
+                override_local_dns: false
+                extra_records:
+                  # k3s API endpoint for edge nodes: the CP tailscale/mesh IPs, NOT the
+                  # kube-vip private VIP (10.0.0.100). Edge nodes resolve this name and
+                  # connect to the API over the tailscale mesh; they cannot reach 10.0.0.100
+                  # (cp0 doesn't forward 10.0.0.0/23 off tailscale0). We publish ONE A record
+                  # per LIVE control-plane so the k3s-agent client-LB fails over across CPs
+                  # when one dies, so cp0 is not a single point of failure for name
+                  # resolution.
+                  #
+                  # The block between the BEGIN/END markers below is REGENERATED wholesale by
+                  # updateConfigFromProjectSettings.sh from project_settings network.cpMeshIps
+                  # (= controlPlaneMeshIps(): non-HA → just cp0 [.1]; HA → cp0/cp1/cp2 [.1/.2/.3],
+                  # sequential mesh allocation). The record COUNT tracks highAvailability, so a
+                  # non-HA cluster does not advertise cp1/cp2 that never exist. Do NOT edit the
+                  # lines inside the markers by hand — the script overwrites them.
+                  # BEGIN cpMeshIps-records (auto-generated from project-settings:network.cpMeshIps)
+                  - name: "k3s-api.ts.internal"
+                    type: "A"
+                    value: "10.0.10.1"
+                  # END cpMeshIps-records
+              # ACL policy. The file is deployment/argocd-infra/headscale/policy-configmap.yaml,
+              # mounted at this path by the args-patch Sync hook (the chart has no policy
+              # support of its own). mode "file" keeps git the source of truth, matching
+              # every other convention in this repo; the alternative, mode "database",
+              # would need a Job to push the policy in and would let a hand-run
+              # `headscale policy set` drift away from the repo unnoticed.
+              #
+              # Removing these two keys (or the ConfigMap) reverts the tailnet to
+              # allow-all, which is the documented no-policy default and the rollback.
+              policy:
+                mode: "file"
+                path: "/etc/headscale/policy/policy.hujson"
+              tls_cert_path: ""
+              tls_key_path: ""
+              oidc:
+                issuer: "https://id.subdomain1.your-domain.tld/application/o/headscale/" # automatically updated from project-settings:{general.subdomain,general.domain}
+                client_id: "headscale"
+                client_secret_path: "/etc/headscale/oidc/oidc_client_secret"
+                scope: ["openid", "profile", "email", "groups"]
+                # Self-service VPN accounts: anyone in the Authentik group `vpn-users`
+                # authenticates through Authentik and headscale CREATES their user on
+                # first login (createOrUpdateUserFromClaim). No admin runs
+                # `headscale users create`, no pre-auth key is minted, no CLI
+                # `headscale auth register` — group membership IS the account.
+                #
+                # allowed_groups is the enforcement point and it is fail-CLOSED: a user
+                # in no listed group is rejected at the token exchange, regardless of any
+                # Authentik-side policy. It reads the `groups` claim, which is why the
+                # `groups` scope above is mandatory (headscale/authentik-provider.yaml
+                # attaches the matching scope mapping to the provider).
+                #
+                # The resulting headscale user is named per-person, NOT `human`, so the
+                # ACL policy grants by autogroup:member (= any untagged/personal device)
+                # rather than by username — see headscale/policy-configmap.yaml.
+                allowed_groups: ["vpn-users"]
+                only_start_if_oidc_is_available: false
+
+          # Embedded-DERP STUN listener port. Not 3478: jitsi's coturn (STUN/TURN)
+          # needs the standard 3478/UDP on the same node for browser WebRTC clients.
+          # Not 3479 (the previous choice) either: STUN must be served by kube-proxy
+          # with the client's source address INTACT, and kube-proxy can only own a
+          # port in the NodePort range (30000-32767) — hence 30478.
+          #
+          # type ClusterIP (was LoadBalancer): klipper's svclb pod MASQUERADES every
+          # LoadBalancer packet (regardless of externalTrafficPolicy), so headscale
+          # returned the svclb pod IP as every client's STUN reflexive address —
+          # breaking NAT traversal cluster-wide (site↔site stuck on the DERP relay).
+          # The chart has no externalTrafficPolicy knob, so the public UDP entry is
+          # the sibling manifest headscale/derp-stun-service.yaml: NodePort pinned to
+          # this same port + externalTrafficPolicy Local (kube-proxy DNATs
+          # <public-ip>:30478 straight to the pod, source preserved, no svclb hop).
+          #
+          # This single value feeds the container port, the (now ClusterIP) chart
+          # Service port AND derp.server.stun_listen_addr, so the embedded derpmap
+          # advertises 30478 to clients automatically. STUN REACHABILITY: the Hetzner
+          # firewall MUST allow inbound UDP 30478 (+ 41641 for the direct WireGuard
+          # data path) — project_settings.ts network.firewall / src/network.ts.
+          # Without those open, clients get "no IPv4 STUN response", no direct path
+          # forms, and everything falls back to the DERP relay over 443/TCP.
+          service:
+            derp:
+              type: ClusterIP
+              port: 30478
+
+          persistence:
+            enabled: true
+            storageClass: "longhorn-cloud"
+            size: 1Gi
+
+          # Chart has no Gateway API support — routing is an HTTPRoute in the
+          # second source (deployment/argocd-infra/headscale/httproute.yaml),
+          # which carries the 3600s long-poll timeout.
+          ingress:
+            enabled: false
+
+    # Second source: plain manifests (headplane, jobs, sealed secrets)
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-infra/headscale
+      directory:
+        exclude: '{*.template,*.sh}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - group: ""
+      kind: PersistentVolumeClaim
+      name: headscale
+      namespace: headscale
+      jsonPointers:
+        - /spec/storageClassName
+    # The rendered headscale config. headscale/ad-dns-watch.yaml patches
+    # dns.nameservers.split + dns.search_domains into it at RUNTIME, because the values are
+    # the AD DCs' MESH addresses and those are assigned by headscale at join time — they are
+    # not derivable from project_settings the way network.cpMeshIps is, so they cannot be
+    # written into `headscale.config` above.
+    #
+    # ⚠ WITHOUT THIS ENTRY the patch is reverted on every resync: this Secret is a Helm
+    # pre-install/pre-upgrade hook, so ArgoCD re-renders it from the chart values and
+    # selfHeal restores the un-patched copy. That would silently drop VPN clients' only
+    # resolver for the AD zone — and, because the pod mounts this Secret, ROLL THE CONTROL
+    # PLANE on every resync as Reloader saw the content flip back and forth.
+    - group: ""
+      kind: Secret
+      name: headscale
+      namespace: headscale
+      jsonPointers:
+        - /data/config.yaml
+    - group: apps
+      kind: Deployment
+      name: headscale
+      namespace: headscale
+      jsonPointers:
+        - /spec/strategy
+        - /spec/template/spec/containers/0/args
+        - /spec/template/spec/containers/0/env
+        - /spec/template/spec/containers/0/volumeMounts
+        - /spec/template/spec/volumes
+        # Written by two other managers, neither of which this manifest declares:
+        # reloader.stakater.com/auto (put there by the args-patch job, since the chart
+        # exposes no podAnnotations) and reloader.stakater.com/last-reloaded-from (written
+        # by Reloader itself on every content change). This Application has NO
+        # ServerSideApply, so without this entry selfHeal strips them on every resync and
+        # they get re-added — an endless roll of the VPN control plane.
+        #
+        # ⚠ SIDE EFFECT, and the reason Reloader is load-bearing here: this path also
+        # carries the CHART's own `config-hash` (templates/deployment.yaml, a sha256 of
+        # .Values.headscale.config). Combined with RespectIgnoreDifferences below, ArgoCD
+        # never applies that path — so the chart's built-in "roll the pod when the config
+        # changes" mechanism is INERT in this app, and the live annotation is frozen at
+        # whatever value it had when the Deployment was created. Editing
+        # `headscale.config` above therefore does not roll the pod by itself. What does is
+        # the chart's config SECRET (templates/secret.yaml, same hash) — it is mounted by
+        # the pod, so Reloader sees its content change and rolls. Do not "fix" the frozen
+        # config-hash by hand; it is not the mechanism any more.
+        - /spec/template/metadata/annotations
+    - group: apps
+      kind: Deployment
+      name: headscale-approval-notifier
+      namespace: headscale
+      # Same reasoning as the headscale Deployment above: no ServerSideApply on this
+      # Application, so Reloader's last-reloaded-from annotation must be ignored or
+      # selfHeal reverts it and the pod rolls forever.
+      jsonPointers:
+        - /spec/template/metadata/annotations
+    - group: ""
+      kind: Secret
+      name: headscale-keys
+      namespace: headscale
+      jsonPointers:
+        - /data

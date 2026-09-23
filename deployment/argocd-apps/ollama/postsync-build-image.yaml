@@ -1,0 +1,502 @@
+# PreSync on the ollama app: seed + trigger the CI image build. Mirrors the vLLM
+# build-trigger exactly (see vllm/postsync-build-image.yaml for the full rationale).
+# On every ollama sync it: mints a root PAT (gitlab-toolbox exec), ensures the group
+# chain deployments/infrastructure/ai + the ollama-thor project, mirrors Dockerfile +
+# .gitlab-ci.yml from the ollama-build-files ConfigMap into that project on main via
+# git push (root:PAT over workhorse :8181), and triggers a pipeline. The pipeline
+# skips the build if the image tag already exists (recover-or-rebuild); an idempotency
+# gate here also skips the whole mirror+trigger when the tag is already in the registry
+# (avoids the buildah-SIGTERM `canceling` deadlock). RBAC at wave -1, Job at wave 0;
+# the registry-cred job runs at wave 1 after this completes.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ollama-build-trigger
+  namespace: ollama
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ollama-build-trigger
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ollama-build-trigger
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ollama-build-trigger
+subjects:
+- kind: ServiceAccount
+  name: ollama-build-trigger
+  namespace: ollama
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-build-trigger
+  namespace: ollama
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ must exceed the in-container waits — 30m for GitLab plus 15m for the CI build
+  # image — else the deadline kills the Job mid-wait and the retry budget is never spent.
+  # 3600, not 2400: 40m does not cover both waits, and the failure mode is a Job killed
+  # with no diagnosis.
+  activeDeadlineSeconds: 3600
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    spec:
+      serviceAccountName: ollama-build-trigger
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: trigger
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        - name: GITLAB_API
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080/api/v4"
+        # git-http push/pull MUST go through workhorse (:8181); :8080 is Rails and
+        # rejects git with "Nil JSON web token". REST API is fine on :8080.
+        - name: GITLAB_GIT_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+        - name: IMAGE_REPO
+          value: "deployments/infrastructure/ai/ollama-thor"
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -eu
+            GROUP_PATH="${IMAGE_REPO%/*}"   # everything up to the last '/' = the group chain
+            PROJ_NAME="${IMAGE_REPO##*/}"    # last segment = the project
+            ENC_REPO=$(echo "$IMAGE_REPO" | sed 's#/#%2F#g')
+
+            # ⚠ MUST outlast GitLab's cold start on a cluster recreate, and MUST FAIL (not fall
+            # through) when it does not. Measured 2026-08-30 (ecc186→ecc187): a 10m wait expired
+            # while GitLab was still starting; the old loop then `break`ed and carried on, turning
+            # "GitLab never came up" into a misleading downstream error.
+            echo "Waiting for GitLab API (up to 30m)..."
+            i=1
+            ready=0
+            while [ "$i" -le 180 ]; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness")
+              if [ "$code" = "200" ]; then ready=1; break; fi
+              echo "Try ${i}/180: GitLab not ready (HTTP ${code}), retrying in 10s..."
+              i=$((i + 1)); sleep 10
+            done
+            if [ "$ready" != "1" ]; then
+              echo "ERROR: GitLab API not ready after 30m — refusing to continue." >&2
+              exit 1
+            fi
+
+            # --- Mint a root PAT via the toolbox ---
+            echo "Creating PAT via toolbox..."
+            PAT_NAME="ollama-build-$(date +%s)"
+            PAT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner \
+              "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'${PAT_NAME}',scopes:['api'],expires_at:1.year.from_now); puts t.token" \
+              2>/dev/null | tail -1)
+            if [ -z "$PAT" ]; then
+              echo "ERROR: could not obtain PAT"; exit 1
+            fi
+            echo "PAT obtained."
+
+            # --- Ensure the group CHAIN exists (self-healing fallback) ---
+            echo "Ensuring GitLab group chain ${GROUP_PATH}..."
+            GROUP_ID=""
+            ACCUM=""
+            PARENT_ID=""
+            IFS='/'
+            for SEG in $GROUP_PATH; do
+              IFS=' '
+              [ -z "$SEG" ] && continue
+              ACCUM="${ACCUM:+$ACCUM/}$SEG"
+              ENC_ACCUM=$(echo "$ACCUM" | sed 's#/#%2F#g')
+              GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/groups/${ENC_ACCUM}" || true)
+              GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -z "$GID" ]; then
+                echo "  creating group ${ACCUM}..."
+                GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/groups" \
+                  --data-urlencode "name=${SEG}" \
+                  --data-urlencode "path=${SEG}" \
+                  ${PARENT_ID:+--data "parent_id=${PARENT_ID}"} \
+                  --data "visibility=private" || true)
+                GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                if [ -z "$GID" ]; then
+                  GID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                    "${GITLAB_API}/groups/${ENC_ACCUM}" \
+                    | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                fi
+              fi
+              if [ -z "$GID" ]; then
+                echo "  ERROR: could not ensure group ${ACCUM}"; exit 1
+              fi
+              PARENT_ID="$GID"
+              GROUP_ID="$GID"
+              IFS='/'
+            done
+            IFS=' '
+            echo "  leaf group ${GROUP_PATH} id=${GROUP_ID}."
+
+            # --- Ensure the project exists under that group ---
+            echo "Ensuring GitLab project ${IMAGE_REPO}..."
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/projects/${ENC_REPO}" || true)
+            if [ "$code" != "200" ]; then
+              echo "  creating project ${PROJ_NAME} in group ${GROUP_PATH} (HTTP ${code} on lookup)..."
+              curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/projects" \
+                --data-urlencode "name=${PROJ_NAME}" \
+                --data-urlencode "path=${PROJ_NAME}" \
+                --data "namespace_id=${GROUP_ID}&visibility=private&initialize_with_readme=true" \
+                | grep -qE '"id":|already been taken' \
+                && echo "  project ensured." || { echo "  ERROR creating project"; exit 1; }
+            else
+              echo "  project exists."
+            fi
+
+            # --- Raise the project CI timeout ceiling (default 1h clamps the 3h job) ---
+            echo "Setting project build_timeout to 3h..."
+            curl -sS -o /dev/null -w '  build_timeout PATCH: HTTP %{http_code}\n' \
+              -H "PRIVATE-TOKEN: ${PAT}" -X PUT \
+              "${GITLAB_API}/projects/${ENC_REPO}" \
+              --data "build_timeout=10800" || true
+
+            # --- Allow force-push + root pipeline-create on main (see vLLM comment) ---
+            echo "Allowing force-push to main..."
+            ROOT_UID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/user" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+            echo "  root user id=${ROOT_UID}"
+            curl -sS -o /dev/null -w '  disable default_branch_protection: HTTP %{http_code}\n' \
+              -H "PRIVATE-TOKEN: ${PAT}" -X PUT \
+              "${GITLAB_API}/projects/${ENC_REPO}" \
+              --data "default_branch_protection=0" || true
+            curl -sS -o /dev/null -w '  unprotect main: HTTP %{http_code}\n' \
+              -H "PRIVATE-TOKEN: ${PAT}" -X DELETE \
+              "${GITLAB_API}/projects/${ENC_REPO}/protected_branches/main" || true
+            curl -sS -o /dev/null -w '  protect main (force_push + root push): HTTP %{http_code}\n' \
+              -H "PRIVATE-TOKEN: ${PAT}" -X POST \
+              "${GITLAB_API}/projects/${ENC_REPO}/protected_branches" \
+              --data "name=main&allow_force_push=true&merge_access_level=40" \
+              --data "allowed_to_push[][user_id]=${ROOT_UID}" || true
+
+            # --- Publish the image-registry credential as project CI variables ----------
+            # The build pushes a SECOND copy of the image to the lab-local image-registry,
+            # which is backed by the TrueNAS export datapool/images and therefore
+            # SURVIVES A CLUSTER RECREATE (GitLab's registry is on Hetzner S3 and does
+            # not). The pipeline restores from that copy instead of rebuilding — which for
+            # this image is hours of CUDA compilation, and is why a fresh cluster's apps
+            # instance stalls on CI rather than on bootstrap.
+            #
+            # ⚠ The push is LAN-LOCAL, not a WireGuard hop: this runner is on the
+            # unibi-hclab site and so is the image-registry pod, and the registry's
+            # CiliumNetworkPolicy already admits the gitlab-runner namespace. No policy
+            # edit, no new credential, no cross-site transfer.
+            #
+            # ⚠ NON-FATAL. The image still reaches GitLab's registry and the app still
+            # works; a missing image-registry only costs a rebuild after the NEXT recreate,
+            # which is exactly the status quo before this existed.
+            #
+            # Idempotent: PUT if it exists, POST otherwise, re-asserted every sync so a
+            # rotation (image-registry/sealSecrets.sh --regenerate) reaches CI on its own.
+            echo "Publishing image-registry credentials as CI variables..."
+            # ⚠ eda-push, NOT eda. The registry has TWO accounts since the push/pull split
+            # (image-registry/sealSecrets.sh): `eda-push` for CI, `eda-pull` for the broker,
+            # and the nginx authz map in front of the registry keys on those exact names.
+            # The old single `eda` account no longer exists, so this published a username
+            # the registry rejects — visible only as `authentication required` from a
+            # never-fatal archive step (ecc193 pipeline 23, 2026-09-02).
+            IMG_REG_USER=eda-push
+            IMG_REG_PASS=$(kubectl -n image-registry get secret image-registry-auth \
+              -o jsonpath='{.data.push-password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+            IMG_REG_CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+              -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d 2>/dev/null || true)
+            [ -n "$IMG_REG_CA" ] || IMG_REG_CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+              -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d 2>/dev/null || true)
+
+            # ⚠ CHECK THE HTTP CODE. With `-o /dev/null` and no `-f`, curl exits 0 on a
+            # 400 — which is how the EDA triggers printed "created IMAGE_REGISTRY_USER" for a
+            # variable that did not exist, green every run, until the build died at
+            # `buildah login` with "reading username: EOF" much later.
+            set_ci_var() {
+              _k="$1"; _v="$2"; _masked="$3"
+              _code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/projects/${ENC_REPO}/variables/${_k}" || true)
+              if [ "$_code" = "200" ]; then
+                _m=PUT; _url="${GITLAB_API}/projects/${ENC_REPO}/variables/${_k}"; _extra=""
+              else
+                _m=POST; _url="${GITLAB_API}/projects/${ENC_REPO}/variables"
+                _extra="--data-urlencode key=${_k}"
+              fi
+              # shellcheck disable=SC2086
+              # ⚠ protected=true IS REQUIRED, and is not "extra hardening". GitLab exposes a
+              # variable to a pipeline only when the variable's protected flag MATCHES the
+              # ref: a protected variable reaches protected refs, an unprotected one reaches
+              # only UNPROTECTED refs. It is either/or, not a permission level.
+              #
+              # This trigger protects `main` itself (allow_force_push, so it can mirror the
+              # build files) and then fires the pipeline on `main`. With protected=false the
+              # pipeline therefore received EMPTY strings for all of these, the registry
+              # answered 401, and the recover-or-rebuild gate — which is fail-open and treats
+              # 401 as "absent" — rebuilt every module from installer media (hours) on every
+              # single run. Nothing errored: the trigger logged POST 201 and the job logged a
+              # successful build. Verified live on ecc188 (CI_COMMIT_REF_PROTECTED=true with
+              # all three variables empty).
+              _rc=$(curl -sS -o /tmp/civar.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                -X "$_m" "$_url" $_extra \
+                --data-urlencode "value=${_v}" \
+                --data "masked=${_masked}&protected=true" || echo 000)
+              case "$_rc" in
+                20*) echo "  ${_k}: ok (${_m} ${_rc}, masked=${_masked})" ;;
+                *)   echo "  WARNING: ${_k} ${_m} returned HTTP ${_rc}: $(head -c 200 /tmp/civar.out)"
+                     echo "           the recreate-surviving copy will be skipped this run" ;;
+              esac
+            }
+            if [ -n "$IMG_REG_PASS" ] && [ -n "$IMG_REG_CA" ]; then
+              # ⚠ THE USERNAME MUST NOT BE MASKED: GitLab rejects a masked value shorter
+              # than 8 characters and the registry user is `eda` (3). A masked POST returns
+              # 400, the variable is never created, and the build fails much later at
+              # `buildah login`. The username is not a secret (image-registry/README.md); the
+              # PASSWORD is, and stays masked. The CA is multi-line — GitLab refuses to mask
+              # that — and a CA certificate is public anyway.
+              set_ci_var IMAGE_REGISTRY_USER     "${IMG_REG_USER}" false
+              set_ci_var IMAGE_REGISTRY_PASSWORD "${IMG_REG_PASS}" true
+              set_ci_var IMAGE_REGISTRY_CA       "${IMG_REG_CA}"   false
+            else
+              echo "  WARNING: image-registry secrets not readable (auth=$([ -n "$IMG_REG_PASS" ] && echo yes || echo no),"
+              echo "           ca=$([ -n "$IMG_REG_CA" ] && echo yes || echo no)) — is the image-registry app synced?"
+              echo "           The image will build normally but will NOT survive a recreate."
+            fi
+
+            # ⚠ THE GATES BELOW SET SKIP_BUILD; THEY NO LONGER `exit 0`. Exiting here also
+            # skipped the MIRROR, so a change to this app's .gitlab-ci.yml could not reach
+            # GitLab while the image existed — a pipeline fix was undeliverable without
+            # bumping IMAGE_TAG, which CLAUDE.md forbids doing gratuitously (image-registry
+            # has no GC, so every needless bump orphans GB permanently). The build files
+            # are now mirrored either way; only the pipeline TRIGGER is gated. A mirror
+            # push does fire a pipeline, and that is fine: its own gate skips the build in
+            # seconds and, for the archived apps, repairs a missing archive on the way out.
+            SKIP_BUILD=0
+
+            # ⚠ ORDERED AFTER the credential publishing above, not before it. The gate
+            # exits 0 for every sync of an app whose image is already built — which is
+            # nearly every sync — so anything placed before it stops running once the
+            # image exists. That is how image-registry's rename of the `password` key to
+            # `push-password` went unnoticed for a whole cluster lifetime: the variables
+            # were only ever republished when a build was needed, so CI kept an empty
+            # credential and every archive and restore was silently off (ecc193,
+            # 2026-09-02).
+            # --- Idempotency gate: skip the WHOLE trigger if the tag already exists.
+            # (Prevents a redundant re-sync starting a pipeline that grabs the
+            # resource_group and deadlocks the real build — buildah ignores SIGTERM
+            # mid-layer. Contract: bump IMAGE_TAG to force a rebuild.) ---------------
+            TARGET_TAG=$(sed -n 's/.*IMAGE_TAG:[[:space:]]*\([^[:space:]#]*\).*/\1/p' /files/.gitlab-ci.yml | head -1)
+            if [ -n "$TARGET_TAG" ]; then
+              echo "Target image tag: ${TARGET_TAG} — checking registry..."
+              REPO_ID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/projects/${ENC_REPO}/registry/repositories" \
+                | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -n "$REPO_ID" ]; then
+                TAG_CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+                  -H "PRIVATE-TOKEN: ${PAT}" \
+                  "${GITLAB_API}/projects/${ENC_REPO}/registry/repositories/${REPO_ID}/tags/${TARGET_TAG}" || true)
+                if [ "$TAG_CODE" = "200" ]; then
+                  echo "Image ${IMAGE_REPO}:${TARGET_TAG} already in registry — no build needed (mirroring anyway, not firing a pipeline)."
+                  SKIP_BUILD=1
+                fi
+                echo "  tag ${TARGET_TAG} not in registry (HTTP ${TAG_CODE}) — proceeding to build."
+              else
+                echo "  no registry repository yet — proceeding to build."
+              fi
+            else
+              echo "WARN: could not read IMAGE_TAG from /files/.gitlab-ci.yml — proceeding to build."
+            fi
+
+            # --- Wait for the shared CI build image ----------------------------------
+            # This app's pipeline RUNS IN deployments/infrastructure/ci/build-image (buildah
+            # to build, skopeo for the registry gate). Firing a pipeline before that image
+            # exists does not fail with a message: the build POD never starts, the job dies
+            # at image pull, and NOTHING re-triggers it — this trigger has already exited 0
+            # and the Application is Healthy. So block here, and FAIL if it never appears:
+            # the Application retries forever (retry limit -1) and the next attempt finds it.
+            #
+            # ⚠ Ordered AFTER the idempotency gate above on purpose. When this app's image is
+            # already published there is nothing to build, so a missing CI build image must
+            # not turn a no-op sync into a failure.
+            #
+            # The tag is read out of the MIRRORED CI file, so this can never wait for a
+            # different tag than the pipeline will ask for.
+            CI_IMG_REPO="deployments/infrastructure/ci/build-image"
+            CI_IMG_TAG=$(sed -n 's#^[[:space:]]*image:.*ci/build-image:\([A-Za-z0-9._-]*\).*#\1#p' /files/.gitlab-ci.yml | head -1)
+            if [ -n "$CI_IMG_TAG" ]; then
+              ENC_CI=$(echo "$CI_IMG_REPO" | sed 's#/#%2F#g')
+              # The WAIT is only meaningful when a pipeline will actually run; the
+              # allowlist entry below is asserted either way, since it costs one API call
+              # and its absence is what makes a later build fail at image pull.
+              if [ "$SKIP_BUILD" = "1" ]; then
+                echo "Image already built — not waiting for the CI build image."
+                n=1; have=1
+              else
+                echo "Waiting for the CI build image ${CI_IMG_REPO}:${CI_IMG_TAG} (up to 15m)..."
+                n=1; have=0
+                while [ "$n" -le 30 ]; do
+                  CI_RID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                    "${GITLAB_API}/projects/${ENC_CI}/registry/repositories" \
+                    | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                  if [ -n "$CI_RID" ]; then
+                    ci_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                      "${GITLAB_API}/projects/${ENC_CI}/registry/repositories/${CI_RID}/tags/${CI_IMG_TAG}" || true)
+                    if [ "$ci_code" = "200" ]; then have=1; break; fi
+                  fi
+                  echo "  try ${n}/30: not published yet — retrying in 30s..."
+                  n=$((n + 1)); sleep 30
+                done
+              fi
+              if [ "$have" != "1" ]; then
+                echo "ERROR: ${CI_IMG_REPO}:${CI_IMG_TAG} is not in the registry after 15m." >&2
+                echo "       Is the ci-build-image app synced and did its pipeline pass?" >&2
+                echo "       Refusing to fire a pipeline that would die at image pull." >&2
+                exit 1
+              fi
+              echo "  CI build image is available."
+
+              # --- Authorise THIS project's job token to pull that image --------------
+              # ⚠ NOT OPTIONAL, and it cannot be done from the image's side. The build pod
+              # pulls with THIS project's CI_JOB_TOKEN, and GitLab refuses a job token from
+              # another project unless this project is on that project's INBOUND allowlist.
+              # Measured on ecc193 (2026-09-02): the image's own trigger cannot switch the
+              # allowlist off — the instance ENFORCES it ("Job token scope cannot be
+              # disabled for this project because it is enforced for the instance", HTTP
+              # 400). So each consumer registers itself, which also means adding a pipeline
+              # never requires editing a list somewhere else.
+              #
+              # A missing entry does NOT produce a permissions message: the build pod never
+              # starts and the job fails at image pull.
+              #
+              # Idempotent: 201 the first time, 400 "already in the job token allowlist"
+              # afterwards.
+              #
+              # ⚠ THE `^{"id":` ANCHOR IS LOAD-BEARING. The usual `.*"id":\([0-9]*\)` idiom
+              # is GREEDY and returns the LAST id on the line — for a project payload that
+              # is some nested object's id (measured: 8 instead of 3), and the allowlist
+              # would then name the wrong project, silently.
+              MY_ID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/projects/${ENC_REPO}" \
+                | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+              CI_IMG_ID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/projects/${ENC_CI}" \
+                | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+              if [ -n "$MY_ID" ] && [ -n "$CI_IMG_ID" ]; then
+                al_code=$(curl -sS -o /tmp/allow.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                  -X POST "${GITLAB_API}/projects/${CI_IMG_ID}/job_token_scope/allowlist" \
+                  --data "target_project_id=${MY_ID}" || echo 000)
+                case "$al_code" in
+                  20*) echo "  job-token allowlist: project ${MY_ID} may now pull ${CI_IMG_REPO}." ;;
+                  400) if grep -q "already in the job token allowlist" /tmp/allow.out; then
+                         echo "  job-token allowlist: already present."
+                       else
+                         echo "  WARNING: allowlist POST 400: $(head -c 200 /tmp/allow.out)"
+                         echo "           the build pod will fail to PULL the CI build image."
+                       fi ;;
+                  *)   echo "  WARNING: allowlist POST HTTP ${al_code}: $(head -c 200 /tmp/allow.out)"
+                       echo "           the build pod will fail to PULL the CI build image." ;;
+                esac
+              else
+                echo "  WARNING: could not resolve project ids (mine=${MY_ID:-?}, image=${CI_IMG_ID:-?})"
+                echo "           — job-token allowlist not asserted; the pull may be refused."
+              fi
+            else
+              echo "WARN: no ci/build-image pin in /files/.gitlab-ci.yml — skipping the wait."
+            fi
+
+            # --- Mirror Dockerfile + .gitlab-ci.yml via a git push (HTTPS + PAT) ---
+            echo "Mirroring build files into ${IMAGE_REPO}@main..."
+            export GIT_TERMINAL_PROMPT=0
+            GIT_URL="${GITLAB_GIT_URL#http://}"
+            GIT_URL="http://root:${PAT}@${GIT_URL}/${IMAGE_REPO}.git"
+            rm -rf /tmp/repo
+            git clone -q --depth 1 --branch main "$GIT_URL" /tmp/repo 2>/tmp/git.log \
+              || { sed "s#${PAT}#REDACTED#g" /tmp/git.log; exit 1; }
+            cp /files/Dockerfile /files/.gitlab-ci.yml /tmp/repo/
+            cd /tmp/repo
+            git config user.email "ollama-build-trigger@cluster.local"
+            git config user.name "ollama-build-trigger"
+            git add Dockerfile .gitlab-ci.yml
+            PUSHED=0
+            if git diff --cached --quiet; then
+              echo "  files already up to date."
+            else
+              git commit -q -m "chore: mirror ollama build files from infra repo"
+              git push -q origin main 2>/tmp/git.log \
+                || { sed "s#${PAT}#REDACTED#g" /tmp/git.log; exit 1; }
+              echo "  files mirrored."
+              PUSHED=1
+            fi
+            cd /
+
+            # --- Trigger the pipeline on main (only if the push didn't auto-trigger) ---
+            # ⚠ SKIP_BUILD gates the TRIGGER, not the mirror: the build files above are
+            # published either way so a pipeline fix is deliverable without an IMAGE_TAG
+            # bump, but an image that already exists must not have a pipeline fired at it
+            # on every sync. (If the mirror did push, GitLab fires one anyway — that run
+            # hits its own registry gate and skips in seconds.)
+            if [ "$SKIP_BUILD" = "1" ]; then
+              echo "Image already in the registry — not firing a pipeline."
+            elif [ "$PUSHED" = "1" ]; then
+              echo "Pipeline auto-triggered by the git push (source=push); not firing a second one."
+            else
+              echo "No push happened — triggering pipeline via API on main..."
+              pcode=$(curl -sS -o /tmp/pipe.json -w '%{http_code}' \
+                -H "PRIVATE-TOKEN: ${PAT}" \
+                -X POST "${GITLAB_API}/projects/${ENC_REPO}/pipeline?ref=main" || true)
+              if [ "$pcode" = "201" ]; then
+                echo "  pipeline created: $(sed -n 's/.*\"web_url\":\"\([^\"]*\)\".*/\1/p' /tmp/pipe.json)"
+              else
+                echo "  WARN: pipeline trigger returned HTTP ${pcode}: $(cat /tmp/pipe.json)"
+              fi
+            fi
+            echo "Ollama build trigger completed."
+        volumeMounts:
+          - name: files
+            mountPath: /files
+            readOnly: true
+      volumes:
+        - name: files
+          configMap:
+            name: ollama-build-files

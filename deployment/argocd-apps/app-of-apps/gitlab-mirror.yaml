@@ -1,0 +1,44 @@
+# ArgoCD Application: pull-side git mirror of every GitLab repository onto the appliance.
+#
+# WHY: GitLab is cloud-pinned so it survives a mesh outage, which means lab users lose git
+# when the tunnel drops and the repositories have no on-prem copy. This is that copy — real
+# bare repos on `datapool/gitlab/mirror`, clonable with nothing else running.
+#
+# ⚠ mesh tier and lab-pinned BECAUSE IT MUST BE: the job needs the public GitLab API and the
+# lab LAN in the same process, and only a mesh node reaches both.
+#
+# ⚠ Repositories and wikis only — no issues, MRs, CI config or database. Not a GitLab
+# restore. The toolbox backup is the other half; see plans/old/gitlab-storage-placement.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab-mirror
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/gitlab-mirror
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab-mirror
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # On a recreate this can sync before csi-driver-nfs is up on the mesh nodes, leaving the
+    # PVC Pending. Retry rather than parking the app Failed.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

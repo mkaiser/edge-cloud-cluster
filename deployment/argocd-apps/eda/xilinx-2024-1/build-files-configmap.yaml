@@ -1,0 +1,890 @@
+# ConfigMap carrying the eda-xilinx-2024-1 build files for the build-trigger to mirror
+# into the in-cluster GitLab project
+# deployments/infrastructure/eda/modules/xilinx-2024-1.
+#
+# GENERATED — never hand-edit the embedded copies. Regenerate after editing any source file:
+#   deployment/argocd-apps/remote-desktop/sync-build-files.sh \
+#     deployment/argocd-apps/eda/xilinx-2024-1
+# and verify before every commit with the same command plus --check. The trigger reads THIS
+# ConfigMap, not the raw files, so silent drift ships a stale build.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-xilinx-2024-1-build-files
+  namespace: eda-xilinx-2024-1
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # -2: must exist before the trigger Job (weight 0) mounts it.
+    argocd.argoproj.io/sync-wave: "-2"
+data:
+  Dockerfile: |
+    # Vivado 2024.1 CONTAINER module image — a SELF-CONTAINED runnable image.
+    #
+    # `module load xilinx/2024.1` generates a `podman run` wrapper (module-cli.sh) that
+    # executes this image inside the sandboxed desktop pod. It therefore carries its OWN system
+    # libs, so a missing dependency is a change HERE rather than a remote-desktop base bump.
+    # It pays for that with an unpack on the node at first launch.
+
+    # ── Stage 1: batch install into /opt/Xilinx ───────────────────────────────────
+    # renovate: DISABLED for EDA apps (packageRules "EDA (2/2)") — these bases are pinned on
+    # purpose and each bump is a multi-hour rebuild that takes the app down. Bump by hand.
+    FROM docker.io/library/ubuntu:22.04 AS install
+
+    # BASE IS 22.04 (jammy), NOT 24.04, and that is load-bearing. AMD's supported-OS list for
+    # 2024.1 (UG973) stops at "Ubuntu Linux ... 22.04.3 LTS" — 24.04 is NOT a supported host for
+    # this release. Building on 24.04 is what made xsetup hang: it printed "It took N minutes to
+    # install files" and then sat in finalisation forever (pipelines #46 and #51 both idled ~2 h
+    # past that line and had to be cancelled; the successful #29 printed "Installation completed
+    # successfully" 6 s after it).
+    #
+    # The documented cause of that exact symptom is a missing ncurses 5 / tinfo 5, which xsetup
+    # dlopens during finalisation. 22.04 ships BOTH as real packages, so they are installed here
+    # by name. 24.04 ships only the .so.6 generation, and the compat symlinks this file creates
+    # for the RUNTIME stage are useless to xsetup — that stage is built AFTER the install stage
+    # has already run, so the install stage had no libncurses.so.5/libtinfo.so.5 at all.
+    #
+    # ⚠ Do NOT "modernise" this to 24.04 to match the runtime stage. The two stages are
+    # deliberately on different releases: install must be on a version AMD supports, runtime is
+    # 24.04 for a current library set. That split is why the compat symlinks below still exist.
+    #
+    # xsetup bundles its own JRE but dlopens X/terminfo libs even in batch mode
+    # (package set per Tosainu/docker-vivado).
+    # The package set is taken from the installer's OWN installLibs.sh doUbuntu() branch (read
+    # out of the 2026.1 media, which ships the same script), not from a blog post. Only the
+    # entries that a BATCH install in a container actually needs are here — no xvfb (nothing is
+    # displayed), no git/make/g++/libtool (no user builds happen at image-build time).
+    #
+    # python3 is REQUIRED, not optional: with Vitis enabled, xsetup's post-install step byte-
+    # compiles the Vitis SDK and without an interpreter the install still "succeeds" but prints
+    #   ######## Execution of Pre/Post Installation Tasks Failed ########
+    #   Error: The SDK needs a python installed
+    # which is a silently degraded Vitis. Observed exactly that in pipeline #64.
+    RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates file locales xz-utils \
+        libtinfo5 libncurses5 \
+        libtinfo6 libncurses6 libx11-6 libxext6 libxrender1 libxtst6 libxi6 \
+        python3 python3-dev \
+        libnss3 libgdk-pixbuf-2.0-0 libgtk-3-0 libxss1 libasound2 libsecret-1-0 \
+        libyaml-dev graphviz net-tools unzip zip \
+        && ln -sf /usr/bin/python3 /usr/local/bin/python \
+        && locale-gen en_US.UTF-8 \
+        && rm -rf /var/lib/apt/lists/*
+    ENV LANG=en_US.UTF-8
+
+    COPY install_config.txt /install_config.txt
+
+    # /installer = bind mount of the EXTRACTED SDI (buildah bud -v
+    # /build-scratch/xilinx-2024-1-extracted:/installer:ro) — not part of the image.
+    # On config/module-name drift (AMD renames device modules between releases), fall back to
+    # ConfigGen and dump the generated reference config into the build log so install_config.txt
+    # can be fixed without shelling into the node. 2024.1 is an OLDER release than the 2026.1
+    # module this was ported from, so this fallback is EXPECTED to fire on the first build:
+    # 2024.1 still has the ML Standard/Enterprise edition split that 2026.1 dropped, and its
+    # device-module names are the older spellings.
+    #
+    # The bulk of the commentary for this RUN is kept HERE rather than inside it, purely so the
+    # command chain stays readable. (Whole-line `#` comments inside a `\`-continued chain are
+    # stripped by the parser before the line is joined — buildah and docker both do this, and
+    # this very RUN relies on it — so putting them inside would work, it would just bury the
+    # commands.)
+    #
+    # What the RUN does after the install, in order:
+    #   1. Normalize the layout to /opt/Xilinx/2024.1/<Product>, for EVERY product, not just
+    #      Vivado. 2025.1+ install there natively; 2024.1 uses /opt/Xilinx/<Product>/<ver>.
+    #      Normalizing keeps the COPY paths in stage 2 static — but it MUST be all-or-nothing.
+    #      Moving Vivado alone (what this did until 2026-09-03) leaves a layout that matches
+    #      NEITHER release, and Vivado's own launcher then cannot find its siblings: bin/vivado
+    #      sources bin/setupEnv.sh, which sets RDI_APPROOT from the binary's location, and
+    #      bin/rdiArgs.sh takes RDI_INSTALLVERSION=`basename $RDI_APPROOT` — the literal string
+    #      "Vivado" once Vivado sits under 2024.1/, not "2024.1". Its two Vitis_HLS lookups,
+    #      $RDI_INSTALLROOT/Vitis_HLS/$RDI_INSTALLVERSION and $RDI_BASEROOT/Vitis_HLS, then both
+    #      miss and the user gets `WARNING: Default location for XILINX_HLS not found` on every
+    #      vivado run, with XILINX_HLS unset and Vitis_HLS/bin off PATH. XILINX_VITIS misses the
+    #      same way. With ALL products moved, $RDI_BASEROOT/Vitis_HLS resolves — that elif is
+    #      exactly the 2025.1+ branch.
+    #   2. Rewrite the settings64 scripts, which the move would otherwise break. They are the one
+    #      part of the tree that is NOT relocatable: xsetup bakes absolute paths into them at
+    #      install time, so Vivado's settings64.sh sources /opt/Xilinx/Vivado/2024.1/
+    #      .settings64-Vivado.sh and that file exports the pre-move XILINX_VIVADO. Everything
+    #      else finds itself relative to argv[0] via setupEnv.sh.
+    #   3. Assert the result: Vivado's settings64.sh exists, Vitis_HLS landed under the new root
+    #      (so the XILINX_HLS lookup above can succeed), and no settings64 script still names the
+    #      old layout.
+    #   4. Split the bulk device data out so the final image ships two layers (a failed registry
+    #      push then resumes with less loss). The two releases ship Vivado/data DIFFERENTLY and
+    #      the code must handle both:
+    #        - 2026.1: a SYMLINK -> ../../data (a tree shared between products). A plain `mv`
+    #          would relocate the LINK and leave /xilinx-data dangling, so the link must be
+    #          removed and the RESOLVED directory moved instead; otherwise the COPY in stage 2
+    #          fails with `lstat "/xilinx-data"("/data"): no such file or directory`.
+    #        - 2024.1: a REAL directory. Confirmed on pipeline #30, which died here with
+    #          `rm: cannot remove '.../data': Is a directory`. `rm -f` does NOT silently no-op
+    #          on a directory — it exits 1, and `set -e` then kills the build after a successful
+    #          6-minute install. Hence the `[ -L ]` guard: unlink only when it IS a link, and
+    #          let `mv` relocate the real directory directly.
+    #      `readlink -f` covers both shapes (on a real dir it returns that dir).
+    #      (`du -sh` follows symlinks and so cannot verify the result — `test -d` does not, hence
+    #      the explicit `[ -d ] && [ ! -L ]` assertion afterwards.)
+    RUN set -e; \
+        # ⚠ CONTAINER-AWARENESS FOR THE INSTALLER JVM. xsetup bundles its own JRE, which sizes
+        # its thread pools from the HOST cpu count (24 on unibi-hclab-pcie-tb-s) while the build
+        # pod is capped at cpu_limit=16 by the [eda] runner (was 8 when #46 wedged). Under runc that cap IS enforced, so
+        # the JVM oversubscribes itself and, on the FULL module set, wedged in a lock convoy:
+        # 40 threads on futex_do_wait, ~0% CPU, 12 KB/min of I/O, no output for 2 h after
+        # writing 90 GB — with 230 min of job timeout still unused, so not a timeout
+        # ActiveProcessorCount makes the JVM agree with its cgroup.
+        # UseContainerSupport is the default on modern JREs but is stated explicitly because the
+        # bundled JRE's vintage is not guaranteed.
+        export JAVA_TOOL_OPTIONS="-XX:ActiveProcessorCount=16 -XX:+UseContainerSupport"; \
+        XSETUP=$(find /installer -maxdepth 2 -name xsetup -type f | head -1); \
+        [ -n "$XSETUP" ] || { echo "ERROR: xsetup not found under /installer — is the SDI tar extracted?" >&2; exit 1; }; \
+        echo "Using installer: $XSETUP"; \
+        if ! "$XSETUP" --batch Install \
+        --agree XilinxEULA,3rdPartyEULA \
+        --config /install_config.txt \
+        --location /opt/Xilinx; then \
+        echo "==== INSTALL FAILED — generating ConfigGen reference config for comparison ===="; \
+        "$XSETUP" --batch ConfigGen --product Vivado --edition 'Vivado ML Standard' || true; \
+        find /root/.Xilinx -name 'install_config*.txt' -exec sh -c 'echo "---- {} ----"; cat {}' \; || true; \
+        echo "==== fix install_config.txt (Edition + module names!) against the reference above ===="; \
+        exit 1; \
+        fi; \
+        rm -rf /opt/Xilinx/.xinstall /opt/Xilinx/Downloads /opt/Xilinx/xic /root/.Xilinx; \
+        for p in /opt/Xilinx/*/2024.1; do \
+          [ -d "$p" ] || continue; \
+          prod=$(basename "$(dirname "$p")"); \
+          mkdir -p /opt/Xilinx/2024.1; \
+          mv "$p" "/opt/Xilinx/2024.1/$prod"; \
+          rmdir "$(dirname "$p")" || echo "NOTE: /opt/Xilinx/$prod not empty after the move"; \
+        done; \
+        for f in /opt/Xilinx/2024.1/*/settings64.sh /opt/Xilinx/2024.1/*/settings64.csh \
+                 /opt/Xilinx/2024.1/*/.settings64-*.sh /opt/Xilinx/2024.1/*/.settings64-*.csh; do \
+          [ -f "$f" ] || continue; \
+          sed -i 's|/opt/Xilinx/\([A-Za-z0-9_]*\)/2024\.1|/opt/Xilinx/2024.1/\1|g' "$f"; \
+        done; \
+        [ -f /opt/Xilinx/2024.1/Vivado/settings64.sh ] || { echo "ERROR: settings64.sh missing — unexpected install layout:" >&2; find /opt/Xilinx -maxdepth 3 -type d >&2; exit 1; }; \
+        [ -d /opt/Xilinx/2024.1/Vitis_HLS ] || { echo "ERROR: Vitis_HLS is not under the normalised root — the XILINX_HLS lookup will miss:" >&2; find /opt/Xilinx -maxdepth 2 -type d >&2; exit 1; }; \
+        if grep -l '/opt/Xilinx/[A-Za-z0-9_]*/2024\.1' /opt/Xilinx/2024.1/*/settings64.sh /opt/Xilinx/2024.1/*/.settings64-*.sh >/dev/null 2>&1; then \
+          echo "ERROR: a settings64 script still names the pre-normalisation layout:" >&2; \
+          grep -l '/opt/Xilinx/[A-Za-z0-9_]*/2024\.1' /opt/Xilinx/2024.1/*/settings64.sh /opt/Xilinx/2024.1/*/.settings64-*.sh >&2; \
+          exit 1; \
+        fi; \
+        DATA=$(readlink -f /opt/Xilinx/2024.1/Vivado/data); \
+        [ -d "$DATA" ] || { echo "ERROR: device data dir not found (data -> $DATA)" >&2; ls -la /opt/Xilinx/2024.1/Vivado/data >&2; exit 1; }; \
+        if [ -L /opt/Xilinx/2024.1/Vivado/data ]; then rm -f /opt/Xilinx/2024.1/Vivado/data; fi; \
+        mv "$DATA" /xilinx-data; \
+        [ -d /xilinx-data ] && [ ! -L /xilinx-data ] || { echo "ERROR: /xilinx-data is not a real directory" >&2; exit 1; }; \
+        du -sh /opt/Xilinx /xilinx-data
+    # ── end of the SHARED install stage ───────────────────────────────────────────
+
+    # ── Stage 1b: a REAL OpenSSL 1.0, lifted from Rocky 8 ─────────────────────────
+    # Vivado's OWN bundled libthrift-0.11.0.so has DT_NEEDED libcrypto.so.10 / libssl.so.10 AND
+    # needs their OPENSSL_1.0.x VERSIONED SYMBOLS. A compat SYMLINK onto OpenSSL 3 cannot supply
+    # those: the loader opens the file, then rejects it with
+    #   version `libcrypto.so.10' not found (required by .../libthrift-0.11.0.so)
+    # which is what failed pipeline #64 on p4bm-vitisnet (Vitis Networking P4). A missing FILE and
+    # a missing SYMBOL VERSION look alike in `ldd` output but only the first is symlink-fixable.
+    #
+    # No Debian/Ubuntu release ships OpenSSL 1.0 any more (checked on jammy AND noble:
+    # libssl1.0.0, libssl1.0.2 and compat-openssl10 are all absent), so it has to come from
+    # somewhere else. AMD's own installLibs.sh is the authority on what this needs, and it
+    # resolves the question:
+    #   doRocky():   dnf install -y compat-openssl10        <- installed
+    #   doUbuntu():  #apt-get install -y compat-openssl10   <- COMMENTED OUT by AMD
+    # i.e. AMD requires OpenSSL 1.0 for these tools and simply has no Ubuntu package to name.
+    # So take theirs: Rocky 8's compat-openssl10 (1.0.2o) ships libcrypto.so.10 and libssl.so.10
+    # as REAL files whose recorded SONAME matches the filename and which export
+    # OPENSSL_1.0.1 + OPENSSL_1.0.2. Verified before writing this, not assumed.
+    #
+    # Safe to graft onto Ubuntu: their only DT_NEEDED entries are libdl/libz/libc — no RHEL-only
+    # dependency comes along. They are additive (distinct sonames), so nothing on the system
+    # links them by accident; ONLY a binary explicitly asking for .so.10 resolves here.
+    #
+    # ⚠ This is an END-OF-LIFE crypto library, deliberately scoped: it exists for Vivado's
+    # bundled thrift, which uses it for tool-internal RPC. Nothing here terminates TLS for
+    # anything the cluster exposes. Do NOT widen its use, and do not expect security updates —
+    # 1.0.2 has been unsupported upstream since 2019.
+    # renovate: DISABLED for EDA apps (packageRules "EDA (2/2)") — these bases are pinned on
+    # purpose and each bump is a multi-hour rebuild that takes the app down. Bump by hand.
+    FROM quay.io/rockylinux/rockylinux:8 AS openssl10
+    RUN set -e; \
+        dnf install -y --setopt=install_weak_deps=False compat-openssl10 >/dev/null; \
+        for so in libcrypto.so.10 libssl.so.10; do \
+          [ -f "/usr/lib64/$so" ] || { echo "ERROR: /usr/lib64/$so not shipped by compat-openssl10" >&2; exit 1; }; \
+        done; \
+        mkdir -p /openssl10; \
+        cp -a /usr/lib64/libcrypto.so.1.0* /usr/lib64/libcrypto.so.10 \
+              /usr/lib64/libssl.so.1.0*    /usr/lib64/libssl.so.10    /openssl10/; \
+        ls -la /openssl10
+
+    # ── Stage 2: runnable Vivado image ────────────────────────────────────────────
+    # Carries its own runtime libs: the module runs as its own container, so nothing outside
+    # the image is on its library path.
+    # renovate: DISABLED for EDA apps (packageRules "EDA (2/2)") — these bases are pinned on
+    # purpose and each bump is a multi-hour rebuild that takes the app down. Bump by hand.
+    FROM docker.io/library/ubuntu:24.04
+
+    # Vivado's GUI + batch runtime deps. Batch synthesis still needs the X/render libs: the
+    # binaries link them unconditionally and fail at load time, not at first GUI call.
+    RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates locales \
+        libtinfo6 libncurses6 libx11-6 libxext6 libxrender1 libxtst6 libxi6 \
+        libxft2 libfontconfig1 libfreetype6 libsm6 libice6 libglib2.0-0 \
+        libgl1 libglx0 libopengl0 libegl1 \
+        libssl3t64 libcurl4t64 \
+        && locale-gen en_US.UTF-8 \
+        && rm -rf /var/lib/apt/lists/*
+
+    # The real OpenSSL 1.0 from stage 1b (see there for why a symlink cannot do this job).
+    # Landed in a DEDICATED dir + ld.so.conf.d entry rather than dropped into the multiarch dir,
+    # so it can never shadow the system OpenSSL 3 for anything else in the image.
+    COPY --from=openssl10 /openssl10/ /opt/openssl10/
+    RUN set -e; \
+        echo /opt/openssl10 > /etc/ld.so.conf.d/zz-openssl10.conf; \
+        ldconfig; \
+        for so in libcrypto.so.10 libssl.so.10; do \
+          [ -f "/opt/openssl10/$so" ] || { echo "ERROR: /opt/openssl10/$so missing" >&2; exit 1; }; \
+          ldconfig -p | grep -q "$so" || { echo "ERROR: $so not in the ldconfig cache" >&2; exit 1; }; \
+        done; \
+        printf '%s\n' "openssl 1.0 bundled:" "$(ls /opt/openssl10)"
+
+    # RHEL7-era SONAMEs that Vivado 2024.1 links but Ubuntu 24.04 does not ship. Vivado bundles
+    # ~81 of its own libraries under lib/lnx64.o (found via settings64.sh's LD_LIBRARY_PATH);
+    # these are the ones it expects from the SYSTEM under a name that no longer exists:
+    #   libtinfo.so.5  -> ncurses 5; 24.04 ships .so.6
+    #   libcurl.so.4   -> present as libcurl.so.4 via libcurl4t64, symlink only
+    # Compat symlinks onto the modern versions, verified against the real unresolved set from
+    # pipeline #33 rather than guessed.
+    #
+    # ⚠ libcrypto.so.10 / libssl.so.10 are NOT in this list any more, and must not be added back
+    # as symlinks onto OpenSSL 3. "The ABIs are close enough; they are used for licensing/HTTP,
+    # not the synthesis core" holds only for the binaries pipeline #33 happened to check. It is
+    # FALSE for Vivado's bundled libthrift-0.11.0.so, which needs OPENSSL_1.0.x *versioned
+    # symbols* — a symlink satisfies the filename and then fails at load time. See stage 1b:
+    # they come from a real OpenSSL 1.0 in /opt/openssl10.
+    #
+    # ⚠ DO NOT verify these with `ldconfig -p`. ldconfig indexes a library under the SONAME
+    # recorded INSIDE the file, not under its filename, so `libcrypto.so.10 -> libcrypto.so.3`
+    # never appears in the cache and the check fails on a working image (pipeline #35 died that
+    # way). The dynamic loader still resolves it: a binary with DT_NEEDED libcrypto.so.10 finds
+    # and runs against the symlink — confirmed with patchelf + ldd on a real ubuntu:24.04 pod.
+    # So assert the FILE resolves to a readable target, which is what actually matters.
+    RUN set -e; \
+        ARCH_DIR=/usr/lib/x86_64-linux-gnu; \
+        ln -sf "$ARCH_DIR"/libtinfo.so.6  "$ARCH_DIR"/libtinfo.so.5; \
+        [ -e "$ARCH_DIR"/libcurl.so.4 ] || ln -sf "$ARCH_DIR"/libcurl.so.4t64 "$ARCH_DIR"/libcurl.so.4; \
+        ldconfig; \
+        for so in libtinfo.so.5 libcurl.so.4; do \
+          [ -e "$ARCH_DIR/$so" ] || { echo "ERROR: compat soname $so missing from $ARCH_DIR" >&2; exit 1; }; \
+          [ -r "$(readlink -f "$ARCH_DIR/$so")" ] || { echo "ERROR: $so resolves to a missing target" >&2; exit 1; }; \
+        done; \
+        echo "compat SONAMEs OK"
+
+    # Assert the SONAMEs Vivado links, so a missing library fails the BUILD rather than a user's
+    # launch hours later. Silent-at-startup missing libs cost a full build cycle on hyperlynx
+    # (libgomp exited 0; libOpenGL.so.0 only errored at launch).
+    # Comments stay ABOVE the RUN: mid-chain `#` would comment out the rest of the joined line.
+    RUN for so in libX11.so.6 libXext.so.6 libXrender.so.1 libXtst.so.6 libXi.so.6 \
+                  libtinfo.so.6 libfreetype.so.6 libfontconfig.so.1 libGL.so.1; do \
+          ldconfig -p | grep -q "$so" \
+            || { echo "ERROR: $so missing from the runtime image" >&2; exit 1; }; \
+        done; \
+        echo "runtime SONAMEs OK"
+    ENV LANG=en_US.UTF-8
+
+    COPY --from=install /opt/Xilinx /opt/Xilinx
+    COPY --from=install /xilinx-data /opt/Xilinx/2024.1/Vivado/data
+
+    # Assert the installed tree can actually LOAD in this image. This is deliberately a
+    # LINKAGE test, not a
+    # "vivado runs" test: `vivado -version` shells through a Tcl/Java launcher that can exit
+    # non-zero for license or $DISPLAY reasons that have nothing to do with this image, and
+    # failing a 4 h build on that would be a false negative.
+    #
+    # ⚠ ldd MUST RUN WITH VIVADO'S OWN LIBRARY PATH. Vivado bundles ~81 of its libraries
+    # (librdi_*, libxv_*, libboost_*, libtcl8.6, libprotobuf.so.32, libpython3.8, ...) under
+    # lib/lnx64.o and finds them at runtime via settings64.sh's LD_LIBRARY_PATH. A BARE `ldd`
+    # cannot see that directory, so it reports all 81 as "not found" and the assertion fails a
+    # perfectly good image — pipeline #33 died exactly that way, flagging 39 binaries when only
+    # FOUR libraries were genuinely absent. Export LD_LIBRARY_PATH first; then a remaining
+    # "not found" is a REAL missing system library.
+    #
+    # Implementation notes (kept OUT of the RUN below: a `#` comment inside a `\`-continued
+    # chain is joined onto one line by the parser and silently comments out everything after it):
+    #   - `ldd` on a non-ELF (Vivado's wrapper scripts) prints "not a dynamic executable"; those
+    #     are skipped WITHOUT `file`, which is not installed in this image.
+    #   - a zero examined-count fails the build: an assertion that checks nothing must not pass.
+    RUN set -e; \
+        VROOT=/opt/Xilinx/2024.1/Vivado; \
+        BIN="$VROOT/bin/unwrapped"; \
+        [ -d "$BIN" ] || { echo "ERROR: $BIN missing — unexpected install layout" >&2; ls -la "$VROOT/bin" >&2; exit 1; }; \
+        LIBDIR=$(ls -d "$VROOT"/lib/lnx64.o 2>/dev/null || true); \
+        [ -n "$LIBDIR" ] || { echo "ERROR: $VROOT/lib/lnx64.o missing — cannot resolve bundled libs" >&2; exit 1; }; \
+        export LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/Default:$VROOT/tps/lnx64/python-3.8.3/lib:${LD_LIBRARY_PATH:-}"; \
+        checked=0; missing=0; \
+        for f in $(find "$BIN" -maxdepth 2 -type f -perm -u+x); do \
+          out=$(ldd "$f" 2>/dev/null) || continue; \
+          case "$out" in *"not a dynamic executable"*) continue ;; esac; \
+          checked=$((checked+1)); \
+          if printf '%s\n' "$out" | grep 'not found'; then \
+            echo "ERROR: unresolved libraries in $f (see above)" >&2; missing=1; \
+          fi; \
+        done; \
+        [ "$missing" -eq 0 ] || exit 1; \
+        [ "$checked" -gt 0 ] || { echo "ERROR: no ELF binaries examined under $BIN — the check is not doing anything" >&2; ls -la "$BIN" >&2; exit 1; }; \
+        echo "linkage OK: $checked ELF binaries under $BIN, no unresolved libraries"
+    # Informational only — never gates the build (see above).
+    RUN /opt/Xilinx/2024.1/Vivado/bin/vivado -version || \
+        echo "NOTE: 'vivado -version' exited non-zero (often license/DISPLAY, not linkage) — continuing."
+
+    # Module manifest. Note the SOURCE is module.yaml (this app's own, declaring
+    # runtime: container + the non-default `image:` repo) but the in-image PATH is always
+    # /module.yaml — the broker and module CLI read that fixed location for every module.
+    COPY module.yaml /module.yaml
+  .gitlab-ci.yml: |
+    # Vivado 2024.1 CONTAINER module image build — recover-or-rebuild.
+    #
+    # SOURCE OF TRUTH: this file lives in the infra repo
+    # (deployment/argocd-apps/eda/xilinx-2024-1/.gitlab-ci.yml). The build-trigger
+    # (postsync-build-image.yaml) MIRRORS it (+ Dockerfile + install_config.txt + module.yaml)
+    # into the in-cluster GitLab project
+    # deployments/infrastructure/eda/modules/xilinx-2024-1; ArgoCD then TRIGGERS this
+    # pipeline. Do NOT hand-edit it in GitLab — overwritten on the next mirror.
+    #
+    # Its own GitLab project, NOT .../modules/vivado (which is 2026.1's): one project per app,
+    # so two triggers can never overwrite each other's mirror. module.yaml's `image:` key points
+    # the broker at this repo.
+    #
+    # Runs on unibi-hclab-pcie-tb-s via tags:[eda]. The 2024.1 media (115 GB .tar.GZ) lives on the
+    # TrueNAS NFS export, mounted READ-WRITE at /artifacts by the [eda] runner (static PV,
+    # gitlab-runner-eda/nfs-installers-pv.yaml) — see $MEDIA_DIR below. It was moved off the
+    # SMB share because that read at ~11.5 MB/s, i.e. ~2.8 h before the first install step; this
+    # export measured ~126 MB/s. buildah bind-mounts the extracted tree BUILD-TIME only (never
+    # committed to a layer).
+    stages: [build]
+
+    workflow:
+      auto_cancel:
+        on_new_commit: interruptible
+
+    build-xilinx-2024-1:
+      stage: build
+      tags: [eda]                     # -> pcie-tb-s [eda] runner (gitlab-runner-token-eda)
+      # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+      # for the registry gate below, which quay's image has never shipped. Built by
+      # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+      # ⚠ The tag must equal that app's IMAGE_TAG; remote-desktop/check-image-invariants.sh
+      # fails the commit if they drift. A consumer pinned to a tag that was never built simply
+      # never starts its build pod.
+      image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+      # Serialize rebuilds of THIS app. resource_group is PROJECT-scoped; the 115 GB extraction
+      # on /build-scratch is additionally guarded by an flock (see the extract step below).
+      resource_group: xilinx-2024-1-build
+      interruptible: true
+      # ── MEASURED COSTS ───────────────────────────────────────────────────────────────────
+      # Phase timings for a trimmed device set (6 families):
+      #     extract 115 GB from NFS   15:40 -> 15:57   ~17 min
+      #     buildah bud (xsetup)      15:57 -> 16:21   ~25 min
+      #     push to registry          16:21 -> 17:36   ~75 min   (22.8 GB compressed)
+      #     archive to NFS            17:36 -> 17:45   ~9 min    (40.2 GB uncompressed tar)
+      #     TOTAL                                      ~125 min
+      # The FULL module set (#46, all 17 modules, EnableDiskUsageOptimization=0) installs
+      # longer and pushes more; budget ~3 h end to end rather than 2.
+      #
+      # DISK on /build-scratch — MEASURED, not estimated:
+      #     extracted installer tree                 110 GB
+      #     buildah storage, trimmed set (peak)      224 GB
+      #     buildah storage, full set (mid-install)  275 GB and still climbing
+      #     => peak ~450 GB for the full set; the guards below are set from these numbers.
+      # ⚠ The extraction is kept by the .extract-done marker, so a retry skips the 17 min
+      # re-read entirely.
+      #
+      # SIZES for capacity planning, for the FULL module set (a trimmed set is roughly half of
+      # each):
+      #     registry tag (compressed)   42.8 GB   <- what a pull costs, and what the blob
+      #                                              store on datapool/images holds
+      #     uncompressed image          86.8 GB   <- what a pull expands to on disk
+      #     installed tree              53 GB /opt/Xilinx + 29 GB /xilinx-data
+      #
+      # ⚠ TIMING, also from #71: total 203 min, of which the PUSH alone was 135 min (05:50→08:05)
+      # and the install only 8. The 6h timeout is therefore NOT generous for the full set — a
+      # slower push or one retry would exceed it. Raise it before adding anything to Modules=.
+      timeout: 6h
+      variables:
+        FORCE_REBUILD: "0"                 # set to "1" for a ONE-SHOT rebuild of the same tag after a
+                                           # Dockerfile/install_config fix (IMAGE_TAG is the user-facing
+                                           # module version and must not be bumped); reset to 0 once published
+        IMAGE_TAG: "2024.1"                # the MODULE version (module load xilinx/2024.1)
+        IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+        # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+        # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+        # literally named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is
+        # fail-open, so that 404 reads as "not in the registry" and rebuilds from installer
+        # media every single time, silently. Measured on ecc188: the buggy form returned 404
+        # and this form returned 200 against the same tag.
+        # A `docker://` push destination is the opposite case — it MUST keep the tag, so those
+        # still use ${IMAGE#*/}.
+        IMAGE_REPO: $CI_PROJECT_PATH
+        # ── installer media on the NFS export ────────────────────────────────────────────
+        # ONE FLAT DIRECTORY per vendor on the fast export, mounted rw at /artifacts by the
+        # [eda] runner (static PV, gitlab-runner-eda/nfs-installers-pv.yaml). Both xilinx
+        # versions' media sit side by side in it, next to unrelated PetaLinux .run installers.
+        # MEDIA ONLY: container images are not archived here — the registry blob store is the
+        # only copy.
+        MEDIA_DIR: /artifacts/xilinx
+        #
+        # ⚠ NAMED IN FULL, not globbed. $MEDIA_DIR is shared with 2026.1 and with the PetaLinux
+        # installers, so `ls $MEDIA_DIR/*.tar.gz | head -1` would be a lottery the moment a
+        # second .tar.gz lands there — and the loser builds silently against the wrong media,
+        # publishing it under this app's user-facing module tag. The extension alone is not a
+        # discriminator either: 2026.1's media is an uncompressed .tar today, but nothing
+        # guarantees that stays true. Update this when the media file is replaced.
+        MEDIA_TAR: FPGAs_AdaptiveSoCs_Unified_2024.1_0522_2023.tar.gz
+        #
+        # Module identity on the module share, for the recreate-skip in the build trigger.
+        # Declared separately from IMAGE_TAG on purpose: the two coincide today, but a tag that
+        # ever diverged from the module version would silently check the wrong module.
+        MODULE_NAME: "xilinx"
+        MODULE_VERSION: "2024.1"
+        REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+        STORAGE_DRIVER: overlay
+        BUILDAH_ROOT: /build-scratch/buildah-storage
+        BUILDAH_RUNROOT: /build-scratch/buildah-run
+        # ⚠ THE LAB-LOCAL REGISTRY, not GitLab's. EDA module images are published here and
+        # ONLY here; GitLab's registry stays the home for everything else (remote-desktop
+        # base, vLLM, …). See deployment/argocd-apps/image-registry/README.md.
+        #
+        # WHY: registry-preferclose only kept the CLIENT HOP on the LAN — the registry behind
+        # it still wrote through to Hetzner S3 in Nuremberg, which is the ~5.3 MB/s that made
+        # a 31 GB push take 16 min. image-registry stores to the TrueNAS export on the lab LAN
+        # (~92 MB/s write / ~126 MB/s read), so S3 leaves the path entirely.
+        #
+        # ⚠ AUTHENTICATED (htpasswd) and TLS from a PRIVATE in-cluster CA. Both are
+        # required, not hardening: what this registry serves is executed AS ROOT by the
+        # remote-desktop broker, whose allowed() gate authorises by <repo>:<tag> and never
+        # checks the CONTENT at that tag. The credential arrives as masked CI variables and
+        # the CA as IMAGE_REGISTRY_CA, both published by this app's build-trigger.
+        # Still ClusterIP-only — the CA is private, so an external client could not verify
+        # it; never give this an ingress.
+        INTERNAL_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+      script:
+        # Trust the image-registry CA. containers/image reads
+        # /etc/containers/certs.d/<host>:<port>/*.crt automatically, so writing it here
+        # means every later buildah call verifies TLS with NO per-call flag — and a missing
+        # CA fails loudly at handshake instead of silently downgrading.
+        - |
+          mkdir -p "/etc/containers/certs.d/${INTERNAL_REGISTRY}"
+          printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt"
+          # ⚠ NOT openssl — quay.io/buildah/stable is Fedora-based and does NOT ship it
+          # (verified by probing the image). python3 IS present, and a stdlib-only parse keeps
+          # the fail-loud intent with no package install and no network at build time.
+          python3 - "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt" <<'CACHECK' \
+            || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+          import base64, re, sys
+          raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+          m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S)
+          if not m:
+              sys.exit("no PEM CERTIFICATE block")
+          try:
+              der = base64.b64decode("".join(m.group(1).split()), validate=True)
+          except Exception as exc:
+              sys.exit(f"base64 decode failed: {exc}")
+          # 0x30 = ASN.1 SEQUENCE, the first byte of every X.509 certificate.
+          if len(der) < 64 or der[0] != 0x30:
+              sys.exit("does not parse as a DER certificate")
+          print(f"image-registry CA OK ({len(der)} bytes DER)")
+          CACHECK
+        - |
+          # Recover-or-rebuild: skip if the tag already exists in the registry.
+          #
+          # IMAGE_TAG is the USER-FACING module version (`module load xilinx/2024.1`), so it
+          # cannot be bumped just to force a rebuild after a Dockerfile fix — that would rename
+          # the module. Set FORCE_REBUILD=1 (pipeline variable, or here) to rebuild the same tag
+          # in place; the push overwrites it.
+          if [ "${FORCE_REBUILD:-0}" = "1" ]; then
+            echo "FORCE_REBUILD=1 — rebuilding $IMAGE even though it may already exist."
+          # ⚠ ASK THE REGISTRY WE ACTUALLY PUSH TO — not GitLab's API.
+          #
+          # Do NOT query $CI_API_V4_URL/.../registry/repositories: EDA module images are
+          # published to the lab-local $INTERNAL_REGISTRY, not GitLab's registry, so GitLab's
+          # API reports the tag ABSENT forever — the gate would never short-circuit and EVERY
+          # pipeline would rebuild from installer media (hours of Xvfb) instead of skipping.
+          #
+          # `skopeo inspect --raw` is how to ask. One command performs the registry's auth
+          # dance, sends the Accept header for every manifest media type, and verifies TLS
+          # against /etc/containers/certs.d/<host>/ca.crt — the file the step above writes,
+          # which is why THAT STEP MUST STAY FIRST (enforced by
+          # remote-desktop/check-image-invariants.sh). skopeo is present because this pipeline
+          # now runs on the CI build image (deployment/argocd-apps/ci-build-image). It is NOT in
+          # quay.io/buildah/stable — do not point this job back at that image.
+          #
+          # Nor buildah: `inspect` errors with 'unsupported transport "docker" for looking up
+          # local images' (it only reads LOCAL storage), `manifest inspect` likewise, and `pull`
+          # would download tens of GB merely to test presence. All measured, not assumed.
+          #
+          # ${IMAGE#*/} strips the registry host from $IMAGE, leaving repository AND tag — the
+          # same derivation the push below uses, so the two can never disagree about WHICH tag
+          # was checked. (A /v2/ URL is the opposite case and must NOT carry the tag.)
+          #
+          # Still FAIL-OPEN: anything but a clean success means "treat as absent and build",
+          # which costs a rebuild, never a wrong image.
+          else
+            # ⚠ PRINT WHAT WENT WRONG. This gate is fail-open by design, so every failure mode
+            # otherwise looks identical to "not in the registry" and costs a multi-hour rebuild
+            # with no error anywhere. A discarded stderr hid three separate defects: a `skopeo`
+            # that was not in the image, a CA file written after this check, and empty
+            # credentials from an unprotected variable on a protected ref. skopeo's own message
+            # distinguishes them (authentication required = credential, manifest unknown =
+            # genuinely absent, x509 = CA, dial tcp = DNS/connect).
+            #
+            # Credentials empty is NOT a soft failure — it means the CI variables did not reach
+            # this pipeline (see the protected=true note in this app's build trigger), so every
+            # run would rebuild forever. Fail loudly instead of silently burning hours.
+            if [ -z "${IMAGE_REGISTRY_USER:-}" ] || [ -z "${IMAGE_REGISTRY_PASSWORD:-}" ]; then
+              echo "ERROR: IMAGE_REGISTRY_USER/PASSWORD are empty in this pipeline."
+              echo "       The registry gate cannot run, so this build would restore nothing and"
+              echo "       rebuild from installer media (hours) on EVERY run."
+              echo "       Cause: the CI variables are published unprotected while this ref is"
+              echo "       protected (CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-unset})."
+              echo "       Fix: publish them with protected=true in this app's build trigger."
+              exit 1
+            fi
+            # ⚠ REPORT THE REF THAT WAS ACTUALLY CHECKED. $IMAGE names the GitLab registry,
+            # but module images live ONLY in $INTERNAL_REGISTRY (image-registry) — printing
+            # $IMAGE here claimed the tag was in a registry this gate never asked, which is
+            # exactly the wrong hint to leave in a recreate post-mortem.
+            _gate_ref="${INTERNAL_REGISTRY}/${IMAGE#*/}"
+            set +e
+            _gate_out=$(skopeo inspect --raw \
+                     --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                     "docker://${_gate_ref}" 2>&1)
+            _gate_rc=$?
+            set -e
+            if [ "$_gate_rc" -eq 0 ]; then
+              echo "$_gate_ref already exists — skipping build."
+              exit 0
+            fi
+            case "$_gate_out" in
+              *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+                echo "registry gate: tag not present in $INTERNAL_REGISTRY — building." ;;
+              *"authentication required"*|*"unauthorized"*)
+                echo "registry gate: AUTH REJECTED by $INTERNAL_REGISTRY. The credential is wrong,"
+                echo "  not the tag. Building anyway (fail-open), but the recreate-survival path is"
+                echo "  NOT working — fix the credential."
+                echo "  skopeo: $_gate_out" ;;
+              *x509*|*certificate*)
+                echo "registry gate: TLS verification failed against $INTERNAL_REGISTRY. Is"
+                echo "  IMAGE_REGISTRY_CA the CA of the CURRENT cluster? A recreate mints a new one."
+                echo "  skopeo: $_gate_out" ;;
+              *)
+                echo "registry gate: unexpected failure — treating as absent, building."
+                echo "  skopeo: $_gate_out" ;;
+            esac
+          fi
+          echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+        - |
+          # The SDI tarball lives on the NFS export ($MEDIA_DIR); extract onto node-local
+          # /build-scratch, because buildah needs a writable tree and node-local disk is still
+          # faster than any network mount for the millions of small files xsetup then reads.
+          # Idempotent: marker + xsetup presence, with the marker written LAST so a
+          # partial/aborted extraction is redone.
+          #
+          # ⚠ THE FLOCK IS NOT redundant with resource_group, which is scoped to ONE GitLab
+          # project. Today only this project uses $EXTRACT, so nothing contends for it; the lock
+          # stays because the failure mode if a second consumer is ever added is severe and
+          # SILENT — a concurrent job's `rm -rf "$EXTRACT"` deletes the tree out from under an
+          # in-flight tar ("Cannot open: No such file or directory" for every payload member),
+          # and a build can end up reading another's media. Any second consumer must also read
+          # the same $MEDIA_DIR/$MEDIA_TAR, or one tree gets populated from two sources.
+          #
+          # NOTE the media differs from 2026.1's in two ways: it is a FLAT file (not under an
+          # install_files/ subdir) and it is GZIPPED (.tar.gz, hence -xzf).
+          set -e
+          TAR=$MEDIA_DIR/$MEDIA_TAR
+          EXTRACT=/build-scratch/xilinx-2024-1-extracted
+          LOCK=/build-scratch/.xilinx-2024-1-extract.lock
+          touch "$LOCK"
+          # 4 h: long enough to wait out a full extraction by a lock holder, short enough to fail the
+          # job rather than sit until the pipeline timeout with no diagnostic.
+          flock -w 14400 "$LOCK" sh -euc '
+            EXTRACT="$1"; TAR="$2"; MEDIA_DIR="$3"
+            if [ -f "$EXTRACT/.extract-done" ] && [ -n "$(find "$EXTRACT" -maxdepth 2 -name xsetup -type f 2>/dev/null)" ]; then
+              echo "Installer already extracted at $EXTRACT (by this job or its twin)."
+              exit 0
+            fi
+            [ -f "$TAR" ] || {
+              echo "ERROR: installer media not found at $TAR — has it been staged onto the NFS"
+              echo "       export, and does \$MEDIA_TAR still name the file that is there?"
+              ls -la "$MEDIA_DIR" 2>&1 | head -20; exit 1; }
+            avail_gb=$(df -BG --output=avail /build-scratch | tail -1 | tr -dc "0-9")
+            # MEASURED on a trimmed-set build: 110G extraction + 224G buildah storage = ~334G
+            # peak, on a 1.8T disk. The full module set (every family + Vitis + Model Composer +
+            # PDM + DocNav, EnableDiskUsageOptimization=0) grows the storage side, hence 500G —
+            # a threshold sized for the trimmed set passes silently into a wall.
+            # ⚠ This is a WARN, not a gate: it never fails the job. Deliberate (a tight-but-
+            # sufficient disk should still build) but it means the message is the only signal.
+            [ "$avail_gb" -ge 500 ] || echo "WARN: only ${avail_gb}G free on /build-scratch — measured peak for the FULL module set is ~450-500G (110G extraction + 340G+ storage). This build may fail on ENOSPC."
+            echo "[$(date -u +%F" "%T)] extracting $TAR (115 GB at the measured ~126 MB/s NFS read — expect ~15 min, plus gunzip)..."
+            rm -rf "$EXTRACT"; mkdir -p "$EXTRACT"
+            tar -xzf "$TAR" -C "$EXTRACT"
+            find "$EXTRACT" -maxdepth 2 -name xsetup -type f | grep -q . || { echo "ERROR: no xsetup in extracted tar"; exit 1; }
+            touch "$EXTRACT/.extract-done"
+            echo "[$(date -u +%F" "%T)] extraction done."
+          ' sh "$EXTRACT" "$TAR" "$MEDIA_DIR"
+          # Re-assert outside the lock: if the twin extracted it, this is what we build against.
+          [ -f "$EXTRACT/.extract-done" ] || { echo "ERROR: $EXTRACT/.extract-done missing after the extract step"; exit 1; }
+          avail_gb=$(df -BG --output=avail /build-scratch | tail -1 | tr -dc '0-9')
+          # 340G: the trimmed set measured 224G of buildah storage; the full set is larger and
+          # EnableDiskUsageOptimization=0 removes the installer's own shrink pass.
+          [ "$avail_gb" -ge 340 ] || echo "WARN: only ${avail_gb}G free on /build-scratch — the FULL module set measured ~340G of buildah storage alone."
+        # BOTH registries: $CI_REGISTRY for the Dockerfile's base-image pull, and
+        # $INTERNAL_REGISTRY (image-registry) for the push — separate hosts, separate creds.
+        - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        - buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+        - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+        - echo "[$(date -u +%F' '%T)] buildah bud starting (xsetup install inside, expect 1-2 h)..."
+        # -v bind-mounts the extracted installer BUILD-TIME only (never committed to a layer).
+        # --root/--runroot put layer storage on the node-local scratch hostPath.
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+          bud --isolation chroot --format docker
+          -v /build-scratch/xilinx-2024-1-extracted:/installer:ro
+          -t "$IMAGE" .
+        - |
+          # Push under the SAME repository path as $IMAGE (pods/broker pull via the
+          # ingress name). PreferClose keeps bytes on the lab LAN; retries resume per-blob.
+          DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+          set +e
+          n=0
+          until [ "$n" -ge 6 ]; do
+            echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+            timeout 10800 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+              push --retry 20 --retry-delay 10s \
+              "$IMAGE" "$DEST"
+            rc=$?
+            echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+            [ "$rc" -eq 0 ] && break
+            n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+          done
+          set -e
+          [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+        - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+      # ── ALWAYS-RUN SCRATCH RECLAIM ───────────────────────────────────────────────────────
+      # Runs on SUCCESS AND FAILURE, which is the whole point: the `rmi --prune` at the end of
+      # `script:` is unreachable when the build dies, and a failed `buildah bud` is exactly the
+      # case that leaves the most behind (measured 224-340 GB of layer storage for the full
+      # module set). /build-scratch is the node-local hostPath /var/lib/xilinx-build; nothing
+      # else ever wipes it, so before this existed every failed pipeline leaked its whole layer
+      # store until someone noticed the disk was full.
+      #
+      # WHAT IS DELETED: buildah's containers, images and layer cache, and only via buildah's
+      # own subcommands — never `rm -rf $BUILDAH_ROOT`, which can leave overlay mounts behind
+      # and break the next run. Order matters: `rm -a` first (a working container holds a
+      # reference that makes `rmi` fail), then `rmi -a -f` (the `rmi --prune` in `script:` drops
+      # only DANGLING images, so the tagged build stayed forever), then `prune -a -f` for the
+      # intermediate/mount cache neither of those reaches.
+      #
+      # Dropping the tagged image is safe: it has already been pushed to image-registry, which is
+      # its only permanent home. On the failure path there is nothing worth keeping anyway.
+      #
+      # WHAT IS KEPT: $EXTRACT, the extracted installer tree, guarded by .extract-done and
+      # deliberately SHARED with the twin app. Deleting it would cost every subsequent build a
+      # re-read of the whole tarball off NFS and defeat the flock/marker design. Reclaim it by
+      # hand when the disk is genuinely tight:
+      #   rm -rf /var/lib/xilinx-build/*-extracted /var/lib/xilinx-build/hyperlynx-media
+      #
+      # ⚠ NO `set -e` and every command `|| true`: after_script must not turn a green build red,
+      # and on the failure path it must not mask the real error with a cleanup error. GitLab
+      # gives after_script its own 5-min default timeout, so keep it cheap.
+      after_script:
+        - |
+          echo "[$(date -u +%F' '%T)] scratch reclaim (job status: ${CI_JOB_STATUS:-unknown})"
+          df -h /build-scratch || true
+          BA="buildah --root $BUILDAH_ROOT --runroot $BUILDAH_RUNROOT --storage-driver $STORAGE_DRIVER"
+          $BA rm -a || true
+          $BA rmi -a -f || true
+          $BA prune -a -f || true
+          echo "[$(date -u +%F' '%T)] after reclaim:"
+          df -h /build-scratch || true
+          du -sh /build-scratch/* 2>/dev/null | sort -h || true
+  install_config.txt: |
+    #### Vivado 2024.1 batch install configuration ####
+    # Consumed by xsetup --batch Install --config ... (Dockerfile install stage).
+    #
+    # Module names below are VERBATIM from the 2024.1 installer's OWN reference config, dumped
+    # by the Dockerfile's ConfigGen fallback and pasted in. Do NOT
+    # invent or "tidy" them — any unknown key or module aborts xsetup with
+    # "The value specified in the configuration file for Modules (...) is not valid."
+    # To regenerate the reference list, let a build fail and read the
+    # ---- /root/.Xilinx/install_config.txt ---- block in the job log.
+    #
+    # 2024.1 vs 2026.1 differences that actually bit (the first attempt was rejected for these):
+    #   1. 2024.1 HAS the ML Standard/Enterprise split that 2026.1 dropped. "Vivado ML Standard"
+    #      is correct and is the free tier; ML Enterprise needs a license to install.
+    #   2. Older, shorter device spellings: "Artix-7" not "Artix-7 FPGAs", "Zynq-7000" not
+    #      "Zynq-7000 All Programmable SoC", "Zynq UltraScale+ MPSoC" (singular, no "s").
+    #   3. Several families simply DO NOT EXIST in the 2024.1 ML Standard installer and must be
+    #      omitted entirely rather than set to :0 — naming them is itself the error. Notably:
+    #      Versal (any series), Virtex-7, Virtex UltraScale (non-plus), Zynq UltraScale+ RFSoC,
+    #      and the Alveo/edge-acceleration module.
+    #   4. Vitis Model Composer's name embeds a parenthesised description CONTAINING COMMAS.
+    #      It must be reproduced exactly, commas and all — the parser handles it.
+    #
+    # Selection intent: EVERYTHING the 2024.1 ML Standard installer offers
+    # is enabled — every device family plus Vitis Embedded Development, Vitis Networking P4,
+    # Vitis Model Composer, PDM, Kria and DocNav. The module is named `xilinx` rather than
+    # `vivado` precisely because it is no longer Vivado-only.
+    #
+    # ⚠ Vitis Embedded Development:1 is what makes /opt/Xilinx/Vitis/2024.1 (and `xsct`) exist.
+    # Note the path: the installer puts every product at /opt/Xilinx/<Product>/2024.1 and the
+    # Dockerfile normalises ONLY Vivado to /opt/Xilinx/2024.1/Vivado, so Vitis stays where the
+    # installer left it.
+    # module.yaml's cli_entries must gain xsct once a BUILT image confirms the path — verify
+    # against the image, never infer it from this file.
+    #
+    # ⚠ EnableDiskUsageOptimization is now 0: it exists to shrink the installed tree, which
+    # directly contradicts a full install. Expect the image to grow substantially (~30 GB with
+    # the trimmed set); the /build-scratch guards in .gitlab-ci.yml were sized for that and may
+    # need raising — check the actual free space before a rebuild rather than assuming.
+    #
+    # To turn something OFF again, flip its :1 to :0 — and regenerate
+    # build-files-configmap.yaml (sync-build-files.sh) in BOTH app dirs.
+    Edition=Vivado ML Standard
+
+    Product=Vivado
+
+    # Path where AMD FPGAs & Adaptive SoCs software will be installed.
+    # NOTE the installer's own reference says /tools/Xilinx; we deliberately use /opt/Xilinx,
+    # which the Dockerfile's layout normalisation and the module.yaml paths both assume.
+    Destination=/opt/Xilinx
+
+    # ⚠ DocNav is the ONE exception at :0, and it is not a size decision (it is only 608 MB).
+    # It hangs xsetup's FINALISATION step — after every file is written. MEASURED twice
+    # against a successful build for contrast:
+    #
+    #   #29 (DocNav off): "It took 5 minutes to install files"  16:03:21
+    #                     "INFO - Installation completed successfully"  16:03:27   <- 6 SECONDS
+    #   #51 (DocNav on) : "It took 9 minutes to install files"  21:04:06
+    #                     ...no further output ever. Hung 2 h+, then cancelled.
+    #
+    # So the file copy REACHES 100% (Done) and every component lands — Vivado 45.5 GB, Vitis
+    # 24.1 GB, Vitis_HLS 9.9 GB, PDM 2.7 GB, DocNav 0.6 GB. The JVM then parks in the
+    # post-install phase: state=S, 35-40 threads on futex_do_wait, 0 bytes and ~0% CPU over 75 s.
+    # DocNav's last-written files are resources/xhubs.xml + xdocs.xml, its ONLINE DOC CATALOGUE,
+    # timestamped 21:04:05 — one second before the final progress line. That catalogue is
+    # fetched from AMD's servers; this lab's egress is filtered and the fetch has no visible
+    # timeout.
+    #
+    # ⚠ TWO HYPOTHESES WERE WRONG, recorded so they are not retried:
+    #   - NOT a timeout: 130 min elapsed of a 360 min limit, 230 min unused.
+    #   - NOT cpu throttling: #51 ran with -XX:ActiveProcessorCount=16 and cpu_limit raised
+    #     8 -> 16 and stalled at the IDENTICAL point with ~90.27 GB written.
+    # Leave DocNav OFF unless someone gives the build a working HTTPS path to AMD AND verifies
+    # "Installation completed successfully" actually appears.
+    #
+    # Every OTHER module the 2024.1 ML Standard installer offers is :1. The families NOT listed
+    # here (Versal, Virtex-7, Virtex UltraScale non-plus, Zynq UltraScale+ RFSoC, Alveo) do not
+    # exist in this installer and must stay ABSENT — naming them at all aborts xsetup.
+    Modules=Artix-7:1,Kintex-7:1,Zynq-7000:1,Kintex UltraScale+:1,Virtex UltraScale+:1,Zynq UltraScale+ MPSoC:1,Spartan-7:1,Artix UltraScale+:1,Kintex UltraScale:1,Virtex UltraScale+ 58G:1,Virtex UltraScale+ HBM:1,Install Devices for Kria SOMs and Starter Kits:1,Vitis Embedded Development:1,Vitis Networking P4:1,Vitis Model Composer(Toolbox for MATLAB and Simulink. Includes the functionality of System Generator for DSP):1,Power Design Manager (PDM):1,DocNav:0
+
+    # Post-install scripts. Licensing is provided at RUNTIME via the sealed
+    # XILINXD_LICENSE_FILE/LM_LICENSE_FILE (see desktop-gvisor.yaml) — never at build time.
+    # The 2024.1 reference emits an EMPTY InstallOptions=; the 2026.1-era
+    # "Acquire or Manage a License Key:0" spelling is not a valid 2024.1 option.
+    InstallOptions=
+
+    ## Shortcuts and File associations ##
+    # No shortcuts/associations: the desktop image provides its own launcher and .desktop entry
+    # (generated from module.yaml's desktop_entries), so the installer's are redundant.
+    CreateProgramGroupShortcuts=0
+    ProgramGroupFolder=Xilinx Design Tools
+    CreateShortcutsForAllUsers=0
+    CreateDesktopShortcuts=0
+    CreateFileAssociation=0
+
+    # Shrink the installed tree (this payload is squashfs'd/pushed over the mesh, so size matters).
+    EnableDiskUsageOptimization=0
+  module.yaml: |
+    # Xilinx 2024.1 CONTAINER module manifest — baked into the runnable module image at
+    # /module.yaml. Read by the remote-desktop broker (which publishes it) and the module CLI
+    # (which generates `podman run` launchers from it).
+    #
+    # `runtime: container` marks it: the tool runs in ITS OWN container via podman inside the
+    # sandboxed desktop pod, NOT natively on PATH.
+    #
+    # NAMED `xilinx`, NOT `vivado`, because the image is not Vivado-only: the full module set
+    # installs Vitis (under its own root /opt/Xilinx/Vitis/2024.1), Vitis Networking P4, Model
+    # Composer and PDM alongside Vivado. `module load xilinx/2024.1` is the user-facing name.
+    #
+    # Consequences of the container path, all deliberate:
+    #   - NO Lmod modulefile is generated, so `env.set`, `env.prepend_path`, `env.source` and
+    #     `conflicts` would all be INERT here and are omitted rather than shipped as dead keys.
+    #   - `module load` generates wrappers rather than manipulating the env via Lmod. GUI entries
+    #     (desktop_entries) are printed by name; CLI entries (cli_entries) go on PATH via a
+    #     per-module shim dir. The shim dir is NOT Lmod — the `env.*` keys above stay inert.
+    #   - Only `license-server` is honoured in set_from_secret (module-cli.sh maps it to the
+    #     pod's MODULE_LICENSE_SERVER and passes it as a `podman run -e` flag).
+    name: xilinx
+    version: "2024.1"
+    runtime: container
+    # Publish/pull from THIS app's own GitLab project rather than the default
+    # <IMAGE_BASE>/<name>, which for name `xilinx` would resolve to .../modules/xilinx — a path
+    # no app owns and which would put this image and the 2026.1 one in the SAME repo, differing
+    # only by tag. Keeping an explicit per-app project is what lets the two be independently
+    # deletable and independently restorable from their own NFS archives.
+    # Honoured by broker.sh module_image() + module-cli.sh (base-r14+).
+    image: deployments/infrastructure/eda/modules/xilinx-2024-1
+    env:
+      # FlexNet license host, injected by the launcher as `podman run -e
+      # XILINXD_LICENSE_FILE=$MODULE_LICENSE_SERVER`. The VALUE is never baked into the image
+      # or written to git; it comes from the RUNTIME's MODULE_LICENSE_SERVER, which is fed from
+      # `eda-secrets` (eda/secrets, sealed into every namespace that runs a module).
+      set_from_secret:
+        XILINXD_LICENSE_FILE: license-server
+    desktop_entries:
+      # `command` is the full in-CONTAINER path (there is no PATH set up for us); `exec` is only
+      # the short wrapper/desktop-file name -> $HOME/.local/bin/module-vivado-vivado.
+      - name: "Vivado 2024.1"
+        exec: "vivado"
+        command: "/opt/Xilinx/2024.1/Vivado/bin/vivado"
+        categories: "Development;Engineering;"
+    # CLI entries — for BATCH/scripted use, not the Applications menu. Each generates a wrapper
+    # named after the REAL binary into a per-module shim dir
+    # ($HOME/.local/module-bin/xilinx/2024.1/) which `module load` prepends to PATH.
+    # An existing batch script then runs unchanged: `vivado -mode batch -source build.tcl`.
+    #
+    # Distinct from desktop_entries on purpose: those are named `module-<mod>-<exec>` and must
+    # stay that way (menu + no PATH collisions), whereas these MUST carry the tool's own name or
+    # a script would not find them. `vivado` therefore appears in both lists — one menu entry,
+    # one PATH shim — which is intended, not a duplicate.
+    #
+    # Every path below was verified against the BUILT image (podman run … -x test), not inferred
+    # from the Dockerfile:
+    #   - NO xsct YET, even though Vitis IS installed. install_config.txt sets
+    #     `Vitis Embedded Development:1`, and the built image really does carry Vitis — but at
+    #     /opt/Xilinx/Vitis/2024.1, NOT under the normalised /opt/Xilinx/2024.1/ root: the
+    #     Dockerfile's layout normalisation moves only Vivado. Add an xsct entry pointing at the
+    #     path a BUILT image confirms, never one inferred from the Dockerfile. (xsdb below is
+    #     Vivado's own copy and already works.)
+    #   - NO vivado_lab: that is the separate Lab Edition install, not part of this image.
+    cli_entries:
+      - name: vivado
+        command: /opt/Xilinx/2024.1/Vivado/bin/vivado
+      - name: hw_server
+        command: /opt/Xilinx/2024.1/Vivado/bin/hw_server
+      - name: xsdb
+        command: /opt/Xilinx/2024.1/Vivado/bin/xsdb
+      - name: xsim
+        command: /opt/Xilinx/2024.1/Vivado/bin/xsim
+      - name: xelab
+        command: /opt/Xilinx/2024.1/Vivado/bin/xelab
+      - name: xvlog
+        command: /opt/Xilinx/2024.1/Vivado/bin/xvlog
+      - name: xvhdl
+        command: /opt/Xilinx/2024.1/Vivado/bin/xvhdl
+      - name: xsc
+        command: /opt/Xilinx/2024.1/Vivado/bin/xsc
+      - name: updatemem
+        command: /opt/Xilinx/2024.1/Vivado/bin/updatemem
+      - name: bootgen
+        command: /opt/Xilinx/2024.1/Vivado/bin/bootgen

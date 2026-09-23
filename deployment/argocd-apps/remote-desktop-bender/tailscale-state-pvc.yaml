@@ -1,0 +1,32 @@
+# Persistent state for the tailscale sidecar — the ONE thing this app does differently from
+# remote-desktop's otherwise identical sidecar.
+#
+# ⚠ WHY A PVC FOR A SIDECAR THAT "OWNS NO DATA". It owns its NODE IDENTITY. tailscaled's
+# state dir holds the machine key it registered with; lose it and the next start is a NEW
+# registration. This is a Recreate-strategy pod, so every roll re-registers, headscale
+# de-duplicates the hostname with a -N suffix, and the CLEAN name stays bound to the OFFLINE
+# predecessor while the live pod answers as `<name>-1`. Measured on remote-desktop
+# 2026-09-13: `remote-desktop.ts.internal` was a dead registration and the only drifted name
+# in the tailnet, cleanable only by `make prune-orphaned-mesh-nodes` by hand.
+#
+# 100Mi is far more than tailscaled's state needs; it is the smallest size worth asking a
+# Longhorn class for.
+#
+# ⚠ RWO, and that is correct here rather than a limitation: the pod is `Recreate` and pinned
+# to one node, so there is never a second attacher. RWX would need a share-manager for no
+# gain.
+#
+# ⚠ longhorn-unibi-hclab, NOT the default longhorn-cloud. A cloud volume cannot attach to a
+# mesh node; the class is anchored so it follows a change of mesh storage scope.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: remote-desktop-bender-tailscale-state
+  namespace: remote-desktop-bender
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-unibi-hclab # automatically updated from project-settings:applicationPlacements.meshStorageClass
+  resources:
+    requests:
+      storage: 100Mi

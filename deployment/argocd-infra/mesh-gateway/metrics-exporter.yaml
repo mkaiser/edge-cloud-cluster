@@ -1,0 +1,229 @@
+# Mesh link metrics exporter — sidecar script + Service.
+# The mesh-gateway DaemonSet (daemonset.yaml) runs this as a second container:
+# a stdlib-only Python HTTP server on :9105 (host network, CP nodes only) that
+# queries tailscaled's LocalAPI over the shared unix socket on every scrape —
+# the same JSON as `tailscale status --json`. ONE CP vantage point sees the
+# link state of EVERY mesh peer (online, direct-vs-DERP, handshake age, rx/tx
+# byte counters), so no per-mesh-node agent is needed and zero resource cost
+# lands on the (sometimes low-power) on-premise boxes.
+# Scraped via the additionalServiceMonitors entry "mesh-gateway" in
+# deployment/argocd-infra/prometheus/kube-prometheus-stack/prometheus.yaml.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-metrics-exporter
+  namespace: headscale
+data:
+  exporter.py: |
+    import json
+    import re
+    import socket
+    import ssl
+    import sys
+    import http.client
+    import urllib.request
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    SOCKET_PATH = "/var/run/tailscale/tailscaled.sock"
+    LISTEN_PORT = 9105
+
+
+    class UDSHTTPConnection(http.client.HTTPConnection):
+        """HTTP over tailscaled's unix socket (LocalAPI)."""
+
+        def __init__(self, path):
+            super().__init__("local-tailscaled.sock")
+            self.uds_path = path
+
+        def connect(self):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(self.uds_path)
+            self.sock = sock
+
+
+    def tailscale_status():
+        conn = UDSHTTPConnection(SOCKET_PATH)
+        try:
+            conn.request("GET", "/localapi/v0/status")
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise RuntimeError(f"LocalAPI HTTP {resp.status}")
+            return json.loads(resp.read())
+        finally:
+            conn.close()
+
+
+    def handshake_age_seconds(ts):
+        # Go zero time (0001-01-01...) = no handshake yet
+        if not ts or ts.startswith("0001-"):
+            return None
+        # strip Go's nanosecond fraction; second precision is plenty
+        ts = re.sub(r"\.\d+", "", ts).replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+    def node_host_map():
+        # Map each mesh node's machine Hostname -> (k3s node name, site). The
+        # tailscale/headscale IPs churn on re-registration (stale duplicates get
+        # fresh sequential IPs that no longer match the k3s InternalIP recorded at
+        # join), so the STABLE join key is the machine hostname: a peer's
+        # tailscale HostName equals the k3s node's Hostname address. We then relabel
+        # with the k3s node id (<site>-<box>) + ecc/site. Read via the in-cluster
+        # API with the mounted serviceaccount token.
+        try:
+            token = open(
+                "/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+            ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            ctx = ssl.create_default_context(cafile=ca)
+            req = urllib.request.Request(
+                "https://kubernetes.default.svc/api/v1/nodes",
+                headers={"Authorization": f"Bearer {token}"})
+            data = json.loads(
+                urllib.request.urlopen(req, timeout=10, context=ctx).read())
+        except Exception as exc:
+            print(f"node_host_map failed: {exc}", file=sys.stderr)
+            return {}
+        m = {}
+        for n in data.get("items", []):
+            labels = n["metadata"].get("labels") or {}
+            # only mesh nodes carry this label; skip cloud CPs/workers
+            if labels.get("node.kubernetes.io/mesh-worker") != "true":
+                continue
+            name = n["metadata"]["name"]
+            site = labels.get("ecc/site", "")  # automatically updated from project-settings:applicationPlacements.labels.site
+            for addr in n.get("status", {}).get("addresses", []):
+                if addr.get("type") == "Hostname":
+                    m[addr.get("address")] = (name, site)
+        return m
+
+
+    def best_per_node(status, host_to_node):
+        # Collapse the many (often stale) peer registrations to one entry per
+        # mesh node: key by k3s node resolved from the peer's HostName, keeping
+        # the best candidate (Online first, then freshest handshake).
+        best = {}
+        for peer in (status.get("Peer") or {}).values():
+            entry = host_to_node.get(peer.get("HostName", ""))
+            if not entry:
+                continue  # not a current k3s mesh node (stale/foreign peer)
+            node, site = entry
+            ips = peer.get("TailscaleIPs") or []
+            v4 = next((i for i in ips if ":" not in i), "")
+            age = handshake_age_seconds(peer.get("LastHandshake", ""))
+            # rank: online beats offline; then smaller handshake age wins
+            rank = (1 if peer.get("Online") else 0,
+                    -(age if age is not None else 1e18))
+            prev = best.get(node)
+            if prev is None or rank > prev[0]:
+                best[node] = (rank, peer, v4, site)
+        return best
+
+
+    def render_metrics():
+        status = tailscale_status()
+        host_to_node = node_host_map()
+        best = best_per_node(status, host_to_node)
+        peer_count = len(status.get("Peer") or {})
+        online, direct, handshake, rx, tx = [], [], [], [], []
+        for node, (_rank, peer, v4, site) in sorted(best.items()):
+            labels = f'node="{node}",site="{site}",ip="{v4}"'
+            online.append(
+                f"mesh_peer_online{{{labels}}} {1 if peer.get('Online') else 0}")
+            # CurAddr set = direct WireGuard path; empty = relayed via DERP
+            direct.append(
+                f"mesh_peer_direct_connection{{{labels}}} "
+                f"{1 if peer.get('CurAddr') else 0}")
+            age = handshake_age_seconds(peer.get("LastHandshake", ""))
+            if age is not None:
+                handshake.append(
+                    f"mesh_peer_last_handshake_seconds{{{labels}}} {age:.0f}")
+            rx.append(f"mesh_peer_rx_bytes_total{{{labels}}} {peer.get('RxBytes', 0)}")
+            tx.append(f"mesh_peer_tx_bytes_total{{{labels}}} {peer.get('TxBytes', 0)}")
+
+        out = []
+        for name, help_text, type_, samples in [
+            ("mesh_peer_online",
+             "Peer is connected to the mesh (tailscale Online flag).",
+             "gauge", online),
+            ("mesh_peer_direct_connection",
+             "1 = direct WireGuard path, 0 = relayed via DERP.",
+             "gauge", direct),
+            ("mesh_peer_last_handshake_seconds",
+             "Age of the last WireGuard handshake with this peer.",
+             "gauge", handshake),
+            ("mesh_peer_rx_bytes_total",
+             "Cumulative bytes received from this peer (tailscale counter).",
+             "counter", rx),
+            ("mesh_peer_tx_bytes_total",
+             "Cumulative bytes sent to this peer (tailscale counter).",
+             "counter", tx),
+        ]:
+            out.append(f"# HELP {name} {help_text}")
+            out.append(f"# TYPE {name} {type_}")
+            out.extend(samples)
+        # Introspection: how many tailscale peers were seen, how many k3s mesh
+        # nodes were resolved, how many series emitted (debugging mapping gaps).
+        out.append("# TYPE mesh_exporter_peers_seen gauge")
+        out.append(f"mesh_exporter_peers_seen {peer_count}")
+        out.append("# TYPE mesh_exporter_nodes_mapped gauge")
+        out.append(f"mesh_exporter_nodes_mapped {len(host_to_node)}")
+        out.append("# TYPE mesh_exporter_nodes_matched gauge")
+        out.append(f"mesh_exporter_nodes_matched {len(best)}")
+        return "\n".join(out) + "\n"
+
+
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                body = render_metrics()
+                body += ("# TYPE mesh_exporter_scrape_success gauge\n"
+                         "mesh_exporter_scrape_success 1\n")
+            except Exception as exc:  # tailscaled down/restarting
+                body = (f"# scrape failed: {exc}\n"
+                        "# TYPE mesh_exporter_scrape_success gauge\n"
+                        "mesh_exporter_scrape_success 0\n")
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass  # keep container logs quiet on every scrape
+
+
+    if __name__ == "__main__":
+        print(f"mesh metrics exporter listening on :{LISTEN_PORT}")
+        ThreadingHTTPServer(("", LISTEN_PORT), MetricsHandler).serve_forever()
+---
+# hostNetwork pods get no ClusterIP endpoint automatically — explicit Service
+# so the ServiceMonitor has something to select (same pattern as the admin
+# WireGuard exporter in src/wireguard.ts).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-gateway-metrics
+  namespace: headscale
+  labels:
+    app: mesh-gateway-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: mesh-gateway
+  ports:
+    - name: metrics
+      port: 9105
+      targetPort: 9105
+      protocol: TCP

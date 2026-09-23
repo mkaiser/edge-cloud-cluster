@@ -1,0 +1,57 @@
+# Longhorn operational config — deployed after wave1-barrier confirms Longhorn is ready.
+#
+# ⚠ Longhorn ITSELF (the chart) is installed by PULUMI, not ArgoCD — src/storage.ts holds
+# the only chart version pin. This app carries only the operational config that layers on
+# top, which is why the folder it reads is named for the DESTINATION NAMESPACE
+# (longhorn-system), the same convention as every other folder under argocd-infra/, and
+# not for the chart.
+#
+# Everything in deployment/argocd-infra/longhorn-system/:
+#   recurring-jobs.yaml           6 RecurringJobs: hourly snapshot + 6-hourly/daily/weekly/
+#                                 monthly/yearly backup
+#   backup-target.yaml            BackupTarget (the S3 destination those jobs write to)
+#   ingress.yaml                  HTTPRoute for the Longhorn UI, behind Authentik
+#   weekly-report.yaml            weekly report CronJob + its ConfigMap/SA/Role/RoleBinding
+#   smtp-credentials-sealed.yaml  SealedSecret the report sends through
+#   sealSecrets.sh /              operator tooling that GENERATES the sealed file above;
+#   removeSealedSecret.sh         not manifests, so ArgoCD's directory source skips them
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn-config
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/longhorn-system
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: longhorn-system
+  # The Gateway API server defaults backendRefs[].group/kind/weight and
+  # parentRefs[].group/kind. Under ServerSideApply ArgoCD compares against the
+  # fields it owns, so those API-owned defaults read as permanent drift and the
+  # app never leaves OutOfSync — which stalls the wave3 barrier even though the
+  # live object matches the manifest exactly (kubectl diff is empty).
+  # Narrow on purpose: only the defaulted scalars are ignored, so a real change
+  # to a hostname, path, backend name or port is still detected as drift.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,506 @@
+# vLLM — OpenAI-compatible LLM server on the Jetson-Thor GPU node (Plan B).
+# IN-CLUSTER ONLY: no Ingress. The only client is the LiteLLM gateway
+# (deployment/argocd-apps/litellm), which authenticates with the vLLM upstream
+# key (vllm-upstream secret, key api-key — same random token both sides share).
+# End users never see this key or this Service.
+#
+# Placement: runs on Thor GPU nodes only (nodeSelector ecc/gpu-model=jetson-thor — the
+# image is sm_110-specific, so it pins the model rather than the ecc/gpu=true capability),
+# tolerates the ecc/mesh AND ecc/gpu taints, requests one GPU via the nvidia RuntimeClass (node runtime pinned
+# mode=cdi so it injects the host's auto-refreshed nvidia.com/gpu CDI spec — Jetson's
+# intended path; see the pod spec + src/provisioning-scripts/20-install-gpu.sh).
+# Heterogeneous GPUs => serving is per-hardware: this is the Thor Deployment; the Orin is
+# a second one (deployment/argocd-apps/vllm-orin) sharing THIS image but serving a smaller
+# INT4 model, because sm_87 has neither FP8 nor NVFP4 and the box has 29 GiB, not 122.
+#
+# Model source: HuggingFace cache on a node-local `local-path` PVC.
+# NOT Longhorn: the Thor L4T Tegra kernel (6.8.12-tegra) ships without the iSCSI
+# initiator (no iscsi_tcp module, iscsid inactive), and Longhorn's v1 data engine
+# exposes every volume through a local iSCSI target — so any Longhorn RWO volume
+# whose engine must run on Thor is stuck `attaching` forever (engine "starting",
+# pod churns ContainerCreating→Terminating). The weights are a re-downloadable
+# cache, so replication buys nothing here; a node reimage just re-pulls them from
+# HuggingFace. (If reimage-survival is ever needed, back the cache with S3/SeaweedFS,
+# not Longhorn.) Model id / quantization / --max-model-len are sized to the SoC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm
+spec:
+  # ⚠ `replicas:` IS DELIBERATELY ABSENT — do NOT add it back.
+  #
+  # The runtime scale is owned by scripts/runtime/switchLLMBackend.sh, which flips this
+  # Deployment 0<->1 as the Thor's single GPU changes hands. While a literal lived here,
+  # EVERY sync of this app reset it — measured five times on 2026-09-18, each one silently
+  # stopping the served model and reporting nothing worse than
+  # `deployment.apps/vllm configured`.
+  #
+  # ignoreDifferences + RespectIgnoreDifferences (app-of-apps/vllm.yaml) do NOT prevent
+  # that, which is the trap: they cover selfHeal, but this app syncs with
+  # ServerSideApply=true and `argocd-controller` then OWNS spec.replicas as an SSA field
+  # manager (visible in .metadata.managedFields). An owned field is reasserted from git on
+  # every apply, ignore rules notwithstanding.
+  #
+  # Omitting the field entirely relinquishes that ownership: Kubernetes defaults replicas
+  # to 1 at CREATE time, and thereafter nothing in git competes with the switch script.
+  # ⚠ The default is 1, not 0, so a FRESH cluster starts this pod as soon as the app syncs.
+  # That is safe here only because ollama-thor is disabled (app-of-apps/ollama.yaml.disable)
+  # and nothing else claims the GPU. If a second GPU backend is ever re-enabled, the two
+  # must be sequenced by switchLLMBackend.sh, never by a literal in this file.
+  strategy:
+    # GPU is a single, non-shareable resource: a rolling update would deadlock
+    # (new pod Pending on nvidia.com/gpu the old pod still holds). Recreate first.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      priorityClassName: standard
+      # Stop k8s injecting legacy Docker-link env vars (e.g. VLLM_PORT=tcp://...:8000
+      # from the same-named `vllm` Service) — vLLM misreads VLLM_PORT as its listen
+      # port and crashes. We don't rely on any service-link vars here.
+      enableServiceLinks: false
+      # GPU injection via the nvidia container runtime in CDI mode. The Thor node's
+      # nvidia-container-runtime is pinned mode=cdi (src/provisioning-scripts/20-install-gpu.sh),
+      # so this handler injects the node's auto-refreshed /var/run/cdi/nvidia.yaml
+      # (kind nvidia.com/gpu, device 0 = the Thor iGPU) — the full Tegra device nodes +
+      # driver-lib mounts. We do NOT use the cdi.k8s.io/* pod annotation: containerd 2.x
+      # removed annotation-based CDI injection, so it is silently ignored (pod runs but
+      # torch sees no GPU → vLLM "Failed to infer device type").
+      runtimeClassName: nvidia
+      nodeSelector:
+        # ecc/gpu-model (not ecc/gpu=true): this image is built for Thor's Blackwell
+        # sm_110 / CUDA 13 and will NOT run on another GPU model, so it must pin the
+        # model, not merely "some GPU".
+        ecc/gpu-model: jetson-thor  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        # GPU nodes are mesh nodes, tainted ecc/mesh=true:NoSchedule.
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # GPU nodes are ALSO tainted ecc/gpu=true:NoSchedule so the scarce single-GPU box
+        # is opt-in only. Tolerating it is what makes this pod a deliberate GPU consumer.
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Private in-cluster GitLab registry PULL credential (the CI build pushes with
+      # CI_REGISTRY_*; this secret is only for pulling the image at deploy time).
+      imagePullSecrets:
+        - name: vllm-registry-cred
+      # ── Seed the node-local HF cache from the fileserver ──────────────────────────
+      # THE POINT: the serving cache below is a node-local local-path PVC, so a GPU-node
+      # reimage wipes it and vLLM re-downloads ~23.4 GiB from HuggingFace over the mesh
+      # link. datapool/ai-models on the appliance holds a durable copy; this step restores
+      # from there at LAN speed instead.
+      #
+      # ⚠ HYBRID ON PURPOSE — copy to local disk, do NOT serve from the mount. The NFS path
+      # measures fine on this node (2026-09-18, privileged pod on thor-eval: write
+      # 92.9 MB/s, read 111.4 MB/s, and a COLD mmap touching every 4K page of a 3 GiB file
+      # at 105.7 MiB/s, i.e. mmap costs nothing over sequential read). So serving straight
+      # off NFS is PLAUSIBLE and untested — what was measured is raw page-in, not a real
+      # vLLM load with its own access pattern, and the weights are also shared with the
+      # desktop and every other pod on the 1 GbE link. Measure a direct-NFS load before
+      # simplifying this away.
+      #
+      # Fail-OPEN by design: if the seed is missing or the mount is unavailable this logs
+      # and exits 0, and vLLM downloads from HuggingFace exactly as before. A seed store is
+      # an optimisation, never a new way for serving to fail.
+      initContainers:
+        - name: seed-model-cache
+          image: docker.io/library/alpine:3.22  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              SEED=/seed/hf
+              DEST=/models/hf
+              if [ ! -d "$SEED" ]; then
+                echo "[seed] $SEED absent — nothing to restore; vLLM will download from HuggingFace."
+                exit 0
+              fi
+              if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
+                echo "[seed] $DEST already populated — keeping the node-local copy."
+                exit 0
+              fi
+              echo "[seed] restoring weights from the fileserver: $SEED -> $DEST"
+              mkdir -p "$DEST"
+              # -a preserves times so HF's cache-validity checks still hold. Copy into a
+              # TEMP dir and rename, so an interrupted copy never leaves a half-populated
+              # cache that the check above would then treat as complete.
+              rm -rf "$DEST.partial"
+              cp -a "$SEED" "$DEST.partial"
+              rm -rf "$DEST"
+              mv "$DEST.partial" "$DEST"
+              echo "[seed] restore complete: $(du -sh "$DEST" 2>/dev/null | cut -f1)"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: ai-models-seed
+              mountPath: /seed
+              readOnly: true
+        # Stage the tuned fused-MoE kernel config under the exact filename the engine
+        # looks for. Without it vLLM logs `Using default MoE config. Performance might be
+        # sub-optimal!` and falls back to generic parameters — there is no shipped config
+        # for this device (327 in the wheel, none for a Thor).
+        #
+        # ⚠ The filename cannot be a ConfigMap key: Kubernetes restricts keys to
+        # [-._a-zA-Z0-9]+ and the name carries '=' and ','. So the key is sanitised in the
+        # ConfigMap and the real name restored here. Regenerate the config with
+        # scripts/runtime/optimizeModel.sh; it is NOT portable across a model or
+        # tensor-parallel change, because E and N are derived from the model shape.
+        - name: stage-moe-config
+          image: docker.io/library/alpine:3.22  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              DEST=/staged
+              cp /tuned/tuned-moe-config.json \
+                 "$DEST/E=256,N=512,device_name=NVIDIA_Thor.json"
+              echo "[moe] staged: $(ls "$DEST")"
+          volumeMounts:
+            - name: moe-tuned-config
+              mountPath: /tuned
+              readOnly: true
+            - name: moe-staged
+              mountPath: /staged
+      containers:
+        - name: vllm
+          # Built by GitLab CI (.gitlab-ci.yml, tags:[thor]) and pushed to the GitLab
+          # registry. Keep this tag in sync with .gitlab-ci.yml IMAGE_TAG.
+          #
+          # SHARED WITH THE ORIN (deployment/argocd-apps/vllm-orin) — ONE image for both
+          # Jetsons, which is why it is no longer named vllm-thor. The build compiles
+          # nothing arch-specific (released PyPI abi3 aarch64 wheel + official cu130
+          # torch), that wheel's fatbins carry sm_87 and sm_110 alike, and both nodes run
+          # the same L4T R39.2.1 / CUDA 13.2. What does NOT port is the MODEL: sm_87 has
+          # no FP8/NVFP4, so the Orin serves an INT4 checkpoint instead of this NVFP4 one.
+          # Registry paths are lowercased by GitLab: AI -> ai in the image path.
+          image: registry.gitlab.subdomain1.your-domain.tld/deployments/infrastructure/ai/vllm-jetson:v0.29.0-cu13-jetson-r1 # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["vllm", "serve"]
+          args:
+            # unsloth/Qwen3.6-35B-A3B-NVFP4-Fast — NVFP4 (Blackwell-native 4-bit) MoE:
+            # ~35B total / ~3B active, weights ~23.4 GiB. A REASONING model for agentic
+            # coding. NVFP4 is native to Thor's sm_110 Blackwell. vLLM 0.24.0 is the first
+            # release supporting its arch `Qwen3_5MoeForConditionalGeneration`.
+            #
+            # WHY THIS SERVES THE AGENT AT ALL: ollama's compiled-in `PARSER qwen3-coder`
+            # leaks tool calls into message content as literal
+            # `<function=…></function></tool_call>` when the model omits the opening
+            # <tool_call> tag (ollama/ollama#16686, open; fixes #17742/#16398/#17021 all
+            # unmerged), which left the eda-pcb-agent unable to call any tool. vLLM parses
+            # the SAME XML shape correctly with --tool-call-parser qwen3_xml below, so the
+            # move here is the fix, not a preference.
+            # Runs on the Thor's UNIFIED memory (122.82 GiB total, CPU+iGPU share ONE
+            # pool; ~90 GiB free with no other model).
+            - "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+            # ⚠ compressed-tensors, NOT modelopt. This is the unsloth NVFP4 build, whose
+            # config.json declares quant_method "compressed-tensors" with format
+            # "mixed-precision" — NVIDIA's own NVFP4 twin is the modelopt one, and passing
+            # modelopt here makes vLLM read the checkpoint with the wrong quant loader.
+            # Same architecture either way (Qwen3_5MoeForConditionalGeneration), so vLLM
+            # support is unchanged; only the quant loader differs.
+            - "--quantization"
+            - "compressed-tensors"
+            # Reasoning model: parse the <think> traces out of content into a separate
+            # reasoning channel so tool-calls/answers aren't polluted. qwen3 parser per
+            # NVIDIA's model card. vLLM 0.24 ships this parser.
+            - "--reasoning-parser"
+            - "qwen3"
+            # ⚠ NAMES THE MODEL, not its job. It was "coder", which said nothing about WHAT
+            # was served and silently outlived two different checkpoints. Keep the
+            # `<node>/<model>` shape the other LiteLLM routes use, so the picker groups it
+            # with its siblings and the node is readable at a glance.
+            # ⚠ Changing this is a THREE-PLACE edit: here, `model_name`/`model` in
+            # litellm/config.yaml, and ALLOWED_MODELS in
+            # eda-pcb-agent/postsync-litellm-key.yaml — a key that may not reach the route
+            # fails 403 key_model_access_denied, which reads as a broken model.
+            - "--served-model-name"
+            - "thor/qwen3.6-35b-a3b-nvfp4"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            # NVIDIA's card serves 262144; we size to the KV budget instead. With the
+            # measured 115.6 GiB free and util 0.65, KV gets ~56 GiB — ample for a much
+            # larger context than this, but MoE KV grows fast and the unified pool is
+            # shared with the desktop and every other pod on the node. 32768 is the
+            # conservative start; raise it per the pod's "Available KV cache" log line
+            # (that number, not the nominal total, is what bounds the context).
+            # ⚠ MUST BE >= 64000, OR HERMES REFUSES TO RUN AT ALL. Hermes Agent hard-gates
+            # on the served context window and fails the TURN, not the request:
+            #   "Model ... has a context window of 32,768 tokens, which is below the
+            #    minimum 64,000 required by Hermes Agent."
+            # It is an HTTP 500 from the gateway's own api_server, so it is invisible to a
+            # plain /v1/chat/completions probe against LiteLLM — that path answers fine at
+            # 32K. Measured 2026-09-18: the route, the key and tool-calling all passed while
+            # every real agent turn failed. Test through the AGENT, not the model.
+            #
+            # 262144 is the MODEL'S OWN trained window (config.json
+            # text_config.max_position_embeddings, rope_scaling null — so this is native
+            # context, NOT a RoPE-scaled extension, and there is no quality cliff to trade
+            # against). It is also the ceiling: do not raise it further without a
+            # rope_scaling config, which would be a different decision.
+            #
+            # The KV budget is not the constraint. MEASURED on this pod at startup:
+            #   Available KV cache memory: 54.38 GiB
+            #   GPU KV cache size:         5,381,895 tokens
+            # which is ~20x a single 262,144-token request. The earlier values (32768, then
+            # 131072) were conservative guesses about the KV budget, not measurements — and
+            # 32768 was actively broken, since Hermes hard-refuses anything under 64,000.
+            #
+            # ⚠ Keep in step with `context_length` in
+            # eda-pcb-agent/hermes-bootstrap-configmap.yaml. A client value ABOVE what the
+            # server accepts is the dangerous direction (compaction never fires in time).
+            - "--max-model-len"
+            - "262144"
+            # ⚠ --enforce-eager REMOVED 2026-09-18, on purpose. It was a conservative
+            # default from bring-up ("CUDA-graph capture on sm_110 under this jetson stack
+            # is unproven"), with a note to drop it for perf once serving was stable. It is
+            # stable, and the cost was measured: it disables torch.compile AND CUDA graphs
+            # (pod log: "Enforce eager set, disabling torch.compile and CUDAGraphs" and
+            # "0.0 GiB for CUDAGraph memory"), and single-stream decode sat at ~10 tok/s
+            # (9.8 / 10.0 / 9.4 across three prompt shapes) against the ~57 the ollama route
+            # used to claim on this node.
+            #
+            # MEASURED 2026-09-18, same harness both sides — this is a 5.5x speedup:
+            #   with --enforce-eager     9.8 / 10.0 /  9.4 tok/s
+            #   without (graphs on)     54.6 / 54.9 / 56.2 tok/s
+            # Capture succeeded on sm_110 with no errors and cost 3.03 GiB (the log line
+            # "0.0 GiB for CUDAGraph memory" is what the old config looked like). The
+            # original caution was reasonable at bring-up; it is simply not true here.
+            #
+            # ⚠ IF THE POD CRASH-LOOPS ON STARTUP after a change here, put the flag back
+            # first and re-measure second. Capture also lengthens startup (~10 min to Ready
+            # on this node), which matters because the liveness budget assumes cold init.
+            # gpu-memory-utilization is a fraction of the NOMINAL total, and vLLM asserts
+            # util*total <= the memory it can VALIDATE as free at startup.
+            #
+            # MEASURED on the R39.2.1 flash, via cudaMemGetInfo on the node with both LLM
+            # backends scaled to 0: free 115.60 GiB of total 122.86 → a hard ceiling of
+            # 0.94. ⚠ Re-measure after any reflash: the Tegra carveout is a property of the
+            # L4T baseline, not of the board, and a different baseline moves this number by
+            # tens of GiB.
+            #
+            # 0.65 = ~79.9 GiB: NVFP4 weights (~23.4 GiB) + ~56 GiB KV cache. Deliberately
+            # NOT near the 0.94 ceiling: this is
+            # UNIFIED memory, so the pool is shared with the GNOME desktop (~5 GiB), the 13
+            # other pods on the node, and the page cache — anything vLLM reserves is taken
+            # away from them, and a too-high value trades a startup crash-loop for a much
+            # worse OOM-under-load. Raise toward 0.75 only after watching the pod's
+            # "Available KV cache" line AND node MemAvailable under real load.
+            - "--gpu-memory-utilization"
+            - "0.65"
+            # Enable OpenAI-style tool/function calling. Open WebUI (and agent clients
+            # via LiteLLM) send tool_choice:"auto"; without these two flags vLLM 400s:
+            # '"auto" tool choice requires --enable-auto-tool-choice and
+            # --tool-call-parser to be set'. Parser is `qwen3_xml` per NVIDIA's model
+            # card (this is a Qwen3.5 MoE model, NOT Qwen2.5 → NOT the r16 `hermes`
+            # parser). Unlike the r16 Qwen2.5-AWQ, this model's OWN chat template emits
+            # the correct tool tags under `auto`, so we do NOT override --chat-template
+            # (the card serves without one). The hermes template is still baked into the
+            # image as a fallback if qwen3_xml + the native template misbehave in-pod.
+            # ⚠ DO NOT SET --moe-backend flashinfer_b12x ON THIS NODE. unsloth's model card
+            # for this checkpoint says "You must use the below or you will get 2x slower
+            # inference! export CUTE_DSL_ARCH=sm_121a; vllm serve ... --moe-backend
+            # flashinfer_b12x" — but that is written for the DGX SPARK (sm_121a). TESTED
+            # HERE 2026-09-18 and the engine REFUSES TO START on the Thor (sm_110):
+            #   ValueError: NvFp4 MoE backend 'FLASHINFER_B12X' does not support the
+            #   deployment configuration since kernel does not support current device cuda
+            # (vllm/model_executor/layers/fused_moe/oracle/nvfp4.py select_nvfp4_moe_backend)
+            # — a crash-loop, not a slowdown. sm_110 and sm_121a are siblings but not
+            # interchangeable for this kernel. Leave the backend on AUTO, which picks
+            # VLLM_CUTLASS out of [FLASHINFER_TRTLLM, FLASHINFER_CUTEDSL,
+            # FLASHINFER_CUTEDSL_BATCHED, FLASHINFER_CUTLASS, VLLM_CUTLASS, MARLIN,
+            # HUMMING, EMULATION]. Re-test only after a vLLM or FlashInfer bump.
+            # MTP speculative decoding. This checkpoint ships the MTP module, so it drafts
+            # for itself — unsloth's card: "can act as its own speculative draft for faster
+            # decoding, but somewhat less throughput". That tradeoff suits a SERIAL agent
+            # loop (one request in flight), which is this node's main consumer.
+            #
+            # MEASURED 2026-09-18, on top of the CUDA-graph fix above:
+            #   graphs only          54.6 / 54.9 / 56.2 tok/s
+            #   graphs + MTP         74.2 / 74.9 / 68.4 tok/s, and 5/5 requests at a
+            #                        76.4 tok/s mean with zero failures
+            # ~35% faster again, engine start clean (0 restarts). Combined with the
+            # --enforce-eager removal this is ~7.5x the 9.8 tok/s the pod served before.
+            #
+            # ⚠ num_speculative_tokens > 1 runs the MTP layer multiple times per step
+            # (vLLM warns about this). 2 is measured-good here; raising it is NOT free —
+            # re-measure rather than assuming more drafting is faster, and watch that
+            # acceptance rate does not collapse on long generations.
+            # ⚠ MTP IS DISABLED as of 2026-09-19 — it CRASHES THE ENGINE on vllm 0.29.0.
+            # Renovate walked VLLM_VERSION 0.27.1 -> 0.28.0 -> 0.29.0 while the image was not
+            # being rebuilt, so the break landed on the first rebuild after that (an unrelated
+            # IMAGE_TAG bump). 0.29.0's MTP path calls fused_gdn_decode_post_conv_mtp, and that
+            # kernel is not compiled for sm_110:
+            #   GDN decode MTP post-conv kernel launch failed: no kernel image is available
+            # The engine dies during init, so the pod never becomes Ready and the model is
+            # simply unavailable — it is not a slow path or a fallback.
+            #
+            # This costs the ~35% MTP measured on vllm 0.27.1 (74-76 vs 54-56 tok/s with
+            # CUDA graphs alone). Re-enable ONLY after checking in-pod that the kernel exists
+            # for this device; a VLLM_VERSION change is the thing that would fix it, so re-test
+            # on the next one rather than assuming it stays broken.
+            # RE-ENABLED 2026-09-19 alongside VLLM_GDN_DECODE_KERNEL=triton (see the env
+            # below). The crash is in the FUSED CUDA GDN kernel, which upstream does not
+            # compile for sm_110; forcing the Triton path avoids it entirely, so MTP runs.
+            # plans/vllm-mtp-sm110-gdn-kernel.md has the full analysis and the exit route.
+            - "--speculative-config"
+            - '{"method": "mtp", "num_speculative_tokens": 2}'
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "qwen3_xml"
+            # The single upstream credential LiteLLM presents (never handed to users).
+            - "--api-key"
+            - "$(VLLM_API_KEY)"
+          env:
+            # ⚠ Forces the Triton GDN decode path instead of the fused CUDA kernel. Upstream
+            # builds that kernel only for "8.0;8.6;8.9;9.0a;10.0f;12.0f" — Thor is 11.0, so
+            # no cubin exists for it and MTP dies at launch with "no kernel image is
+            # available", taking the engine down before it ever serves. The selection guard
+            # cannot catch this: it checks that the op SYMBOL exists, not which archs the
+            # cubin covers.
+            #
+            # REMOVE THIS once a vLLM release carries upstream PR #53835 (merged to main
+            # 2026-09-05, but NOT in 0.29.0 — it missed the release cut four days later).
+            # The fused kernel is faster than Triton, so this is a stopgap, not a fix.
+            # Re-test on the next VLLM_VERSION bump: plans/vllm-mtp-sm110-gdn-kernel.md.
+            - name: VLLM_GDN_DECODE_KERNEL
+              value: "triton"
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-upstream
+                  key: api-key
+            # HF cache lives on the node-local PVC mounted below.
+            - name: HF_HOME
+              value: /models/hf
+            # Jetson/L4T: the nvidia/cuda base image bakes a NVIDIA_REQUIRE_CUDA
+            # constraint (cuda>=13.3 + desktop driver 5xx ranges). On Tegra, CUDA
+            # compat comes from L4T/JetPack, not a desktop driver version, so the
+            # nvidia container runtime's requirement check fails at container
+            # create ("requirements not met: cuda>=13.0||...driver>=5xx...",
+            # StartError exit 128). Disable the check — the on-node build already
+            # targets this exact SoC (sm_110/CUDA 13).
+            - name: NVIDIA_DISABLE_REQUIRE
+              value: "true"
+            # triton can't find ptxas → "RuntimeError: Cannot find ptxas" at the first
+            # kernel compile, crashing the engine core. triton looks for ptxas ONLY in
+            # its own bundled backends/nvidia/bin/ (which on the aarch64 jetson wheel
+            # ships cuobjdump + nvdisasm but NOT ptxas) and does not fall back to PATH/
+            # CUDA_HOME. ptxas DOES exist in the CUDA base at /usr/local/cuda/bin/ptxas
+            # (v13.0). TRITON_PTXAS_PATH points triton straight at it (verified in-pod:
+            # get_ptxas() then resolves to ptxas 13.0). Env-only, no image rebuild.
+            - name: TRITON_PTXAS_PATH
+              value: /usr/local/cuda/bin/ptxas
+            # The Service is named `vllm` in namespace `vllm`, so k8s injects the
+            # legacy Docker-link var VLLM_PORT=tcp://<clusterIP>:8000 into the pod.
+            # vLLM reads VLLM_PORT as ITS OWN listen port (expects an int) and dies:
+            # "ValueError: VLLM_PORT 'tcp://10.43.x.x:8000' appears to be a URI".
+            # Pin it to the real port so vLLM's env read wins over the link var.
+            # (enableServiceLinks:false below also stops k8s injecting these at all.)
+            - name: VLLM_PORT
+              value: "8000"
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            # vLLM/torch need shared memory for NCCL/dataloader; the default 64Mi
+            # emptyDir /dev/shm is too small.
+            - name: dshm
+              mountPath: /dev/shm
+            # subPath, so this adds ONE file to the wheel's configs directory instead of
+            # replacing it — a plain mount would hide all 327 shipped configs.
+            - name: moe-staged
+              mountPath: /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_Thor.json
+              subPath: E=256,N=512,device_name=NVIDIA_Thor.json
+              readOnly: true
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            # First run downloads the ~23.4 GiB NVFP4 weights over WireGuard (few
+            # hundred kB/s) THEN does ~80s engine init — a cold start can take ~45 min.
+            # 180 × 15s = 45 min so readiness doesn't fail the pod mid-download.
+            failureThreshold: 180
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            # Must exceed the worst-case cold start (download + engine init) or liveness
+            # kills the pod before it ever serves. ~50 min > the 45 min readiness budget.
+            initialDelaySeconds: 3000
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-model-cache
+        # ⚠ readOnly — see nfs-ai-models-pv.yaml. A serving pod that could write here could
+        # corrupt the copy every future pod restores from.
+        - name: ai-models-seed
+          persistentVolumeClaim:
+            claimName: nfs-ai-models
+            readOnly: true
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: moe-tuned-config
+          configMap:
+            name: vllm-moe-tuned-config
+        # Written by the stage-moe-config initContainer, read by the serving container.
+        - name: moe-staged
+          emptyDir: {}
+---
+# HF weight cache on a node-local local-path PVC — the path vLLM actually loads from.
+# ReadWriteOnce is fine: a single pod (Recreate strategy) ever mounts it.
+#
+# A GPU-node reimage still wipes this, but no longer costs a HuggingFace download: the
+# seed initContainer restores it from datapool/ai-models on the appliance at LAN speed
+# (nfs-ai-models-pv.yaml). Node-local is kept for the LOAD path deliberately — see that
+# initContainer for the measurements and for why serving straight off NFS is plausible
+# but unproven.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-model-cache
+  namespace: vllm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # local-path (WaitForFirstConsumer) binds on whichever node the pod schedules to
+  # — here always the Thor GPU node via the ecc/gpu-model nodeSelector. Deliberately
+  # node-local: the model cache is large, disposable and re-downloadable, so replicating
+  # it in Longhorn would buy nothing. (Thor CAN attach Longhorn; this is a choice, not a
+  # limitation.)
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: vllm
+spec:
+  # ClusterIP only — no ingress. Reachable at http://vllm.vllm.svc:8000 from LiteLLM.
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000

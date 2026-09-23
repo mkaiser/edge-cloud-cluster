@@ -1,0 +1,390 @@
+# Zammad's GitLab issue-linking integration: provisioning + credential rotation.
+#
+# Lets an agent paste a GitLab issue URL into a ticket and see live issue
+# metadata (title, state, assignees, milestone, labels) in the sidebar.
+# READ-ONLY: lib/gitlab/linked_issue.rb runs one GraphQL query per issue URL.
+# It cannot create issues or sync ticket->issue.
+#
+# Zammad stores this in its DATABASE (settings `gitlab_integration` +
+# `gitlab_config`), not in env vars — so without this a human has to walk the
+# admin UI after every cluster recreate.
+#
+# TWO workloads run the SAME script (ConfigMap `-script`):
+#   * Job     — PostSync hook, weight 20, so a fresh cluster is wired immediately.
+#   * CronJob — daily, because the credential EXPIRES (see below) and nothing
+#               triggers an ArgoCD sync when it does.
+#
+# WHY ROTATION IS MANDATORY: GitLab 19 rejects a non-expiring PAT
+# ("Expiration date can't be blank") and a callback caps any lifetime at
+# PersonalAccessToken::MAX_PERSONAL_ACCESS_TOKEN_LIFETIME_IN_DAYS = 365 — even
+# though this instance's max_personal_access_token_lifetime setting is nil.
+# Verified on 19.2.0. The script renews once the token is within 30 days of
+# expiry, so a daily run has ~30 chances to rotate while the OLD token still
+# works: no outage window.
+#
+# Flow (idempotent — a steady-state run writes nothing):
+#   1. Wait for GitLab + the Zammad railsserver
+#   2. Read the token Zammad currently has stored
+#   3. Validate it: right service account AND not near expiry
+#   4. Ensure the `zammad-integration` service account + Reporter on `deployments`
+#   5. Mint a read_api PAT ONLY when step 3 said so
+#   6. Write gitlab_config/gitlab_integration into Zammad and verify! it
+#
+# hook-weight 20 → after zammad-authentik-provider (0) and zammad-oidc-settings
+# (10). ArgoCD orders hooks by hook-weight, NOT sync-wave. PostSync hooks only
+# run on a sync that actually CHANGES something — a no-op sync skips them.
+#
+# WHY alpine/k8s and not the Zammad image (unlike postsync-oidc.yaml): this needs
+# kubectl for the GitLab side regardless, and exec'ing the already-booted
+# railsserver avoids duplicating that job's POSTGRESQL_*/REDIS_URL/MEMCACHE_SERVERS
+# env block (without those, `rails r` exits 1 with EMPTY stderr).
+#
+# TOKEN HYGIENE: `set -eu` only, never `set -x`. The PAT is passed to both rails
+# processes via stdin+ARGV so it never appears in a command line (`ps`), and the
+# config hash is never printed.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zammad-gitlab-integration
+  namespace: zammad
+---
+# ClusterRole (not Role): the SA lives in ns `zammad` but must exec into a pod in
+# ns `gitlab`, which a namespaced Role cannot express.
+#
+# Deliberately NO `apps/deployments: get` — pods are resolved by label selector
+# instead of `kubectl exec deploy/...`, which would have to read the Deployment
+# first. See gitlab/cronjob-sync-admins.yaml:75-78 for the exact
+# "deployments.apps ... is forbidden" failure this avoids.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zammad-gitlab-integration
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zammad-gitlab-integration
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zammad-gitlab-integration
+subjects:
+- kind: ServiceAccount
+  name: zammad-gitlab-integration
+  namespace: zammad
+---
+# Env shared by the PostSync Job and the rotation CronJob.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zammad-gitlab-integration-env
+  namespace: zammad
+data:
+  # PUBLIC url, deliberately — NOT the internal Service URL used elsewhere in
+  # this repo. lib/gitlab/linked_issue.rb rejects an issue link unless
+  # `client.endpoint.include?(host)`, where host comes from the URL the user
+  # pasted (gitlab.<tld>). An internal endpoint would reject EVERY link.
+  # Requires gitlab.<tld> to resolve in-cluster (coredns-gitlab-internal).
+  GITLAB_ENDPOINT: "https://gitlab.subdomain1.your-domain.tld/api/graphql" # automatically updated from project-settings:{general.subdomain,general.domain}
+  # Internal URL is fine for readiness + token validation: the host check above
+  # applies only to issue links, not to these calls.
+  GITLAB_INTERNAL: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+  SA_USERNAME: "zammad-integration"
+  SA_NAME: "Zammad Integration"
+  # Top-level group: Reporter here is inherited by all current AND future
+  # projects. All projects are private, so a service account has no implicit
+  # read access; Guest is NOT enough to read issues via the API.
+  GROUP_PATH: "deployments"
+  PAT_NAME: "zammad-issue-linking"
+  # Rotate once the token is within this many days of expiring.
+  RENEW_BEFORE_DAYS: "30"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zammad-gitlab-integration-script
+  namespace: zammad
+data:
+  run.sh: |
+    set -eu
+    apk add --no-cache jq >/dev/null 2>&1 || true
+
+    # ---- 1. Wait for GitLab ------------------------------------------
+    echo "Waiting for GitLab..."
+    i=0
+    while [ "$i" -lt 60 ]; do
+      curl -sf "${GITLAB_INTERNAL}/-/readiness" >/dev/null 2>&1 && break
+      echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+    done
+    [ "$i" -ge 60 ] && { echo "ERROR: GitLab never became ready"; exit 1; }
+
+    GITLAB_POD=$(kubectl -n gitlab get pods -l app=toolbox \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{.items[0].metadata.name}')
+    [ -n "$GITLAB_POD" ] || { echo "ERROR: no running gitlab-toolbox pod"; exit 1; }
+    echo "gitlab toolbox pod: $GITLAB_POD"
+
+    # ---- 2. Wait for the Zammad railsserver --------------------------
+    # NOTE the component label is "zammad-railsserver", not "railsserver".
+    echo "Waiting for the Zammad railsserver..."
+    i=0
+    ZAMMAD_POD=""
+    while [ "$i" -lt 60 ]; do
+      ZAMMAD_POD=$(kubectl -n zammad get pods \
+        -l app.kubernetes.io/component=zammad-railsserver \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+      if [ -n "$ZAMMAD_POD" ] && kubectl -n zammad exec "$ZAMMAD_POD" -- \
+           bundle exec rails r "true" >/dev/null 2>&1; then
+        break
+      fi
+      echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+    done
+    [ "$i" -ge 60 ] && { echo "ERROR: Zammad railsserver never became ready"; exit 1; }
+    echo "zammad railsserver pod: $ZAMMAD_POD"
+
+    # ---- 3. Read the token Zammad currently has ----------------------
+    # `print` (not puts) + tail -1: Rails can emit boot/deprecation lines.
+    CURRENT_TOKEN=$(kubectl -n zammad exec "$ZAMMAD_POD" -- \
+      bundle exec rails r \
+      "print Setting.get('gitlab_config').to_h.symbolize_keys[:api_token].to_s" \
+      2>/dev/null | tail -1 | tr -d ' \r\n')
+
+    # ---- 4. Is it still usable? --------------------------------------
+    # Compare the USERNAME, not merely "the call succeeded" — that is what
+    # catches a hand-pasted personal token or a recreated service account.
+    # Also rotate BEFORE expiry, not just once already broken: GitLab caps
+    # PAT lifetime at 365d (see step 5), and nothing else would notice the
+    # token dying. RENEW_BEFORE_DAYS of headroom means a daily run has many
+    # chances to rotate while the old token still works — no outage window.
+    NEED_NEW=1
+    if [ -n "$CURRENT_TOKEN" ]; then
+      INFO=$(curl -s --max-time 10 -H "PRIVATE-TOKEN: ${CURRENT_TOKEN}" \
+        "${GITLAB_INTERNAL}/api/v4/personal_access_tokens/self" 2>/dev/null || true)
+      WHO=$(curl -s --max-time 10 -H "PRIVATE-TOKEN: ${CURRENT_TOKEN}" \
+        "${GITLAB_INTERNAL}/api/v4/user" 2>/dev/null | jq -r '.username // empty')
+      EXPIRES=$(echo "$INFO" | jq -r '.expires_at // empty')
+      if [ "$WHO" != "$SA_USERNAME" ]; then
+        echo "stored token unusable (resolved to '${WHO:-none}') — will mint."
+      elif [ -n "$EXPIRES" ] && \
+           [ "$(( ($(date -d "$EXPIRES" +%s) - $(date +%s)) / 86400 ))" -lt "$RENEW_BEFORE_DAYS" ]; then
+        echo "stored token expires ${EXPIRES} (< ${RENEW_BEFORE_DAYS}d) — rotating."
+      else
+        NEED_NEW=0
+        echo "stored token valid for '${SA_USERNAME}' until ${EXPIRES:-unknown} — no action."
+      fi
+    else
+      echo "no token stored in Zammad — will mint."
+    fi
+
+    # ---- 5. Service account + group membership (always, idempotent) ---
+    # Values go in as ARGV: `kubectl exec` does NOT forward our environment.
+    echo "Ensuring GitLab service account + membership..."
+    kubectl -n gitlab exec -i "$GITLAB_POD" -c toolbox -- \
+      gitlab-rails runner - "$SA_USERNAME" "$SA_NAME" "$GROUP_PATH" <<'RUBY'
+    username, display_name, group_path = ARGV[0], ARGV[1], ARGV[2]
+
+    user = User.find_by(username: username)
+    if user.nil?
+      admin = User.find_by(username: 'root') || User.admins.first
+      raise 'no admin user available to create the service account' if admin.nil?
+      org = Organizations::Organization.first
+      if defined?(Users::ServiceAccounts::CreateService)
+        params = { name: display_name, username: username }
+        params[:organization_id] = org.id if org
+        resp = Users::ServiceAccounts::CreateService.new(admin, params).execute
+        user = resp.respond_to?(:payload) ? resp.payload[:user] : nil
+        raise "service account creation failed: #{resp.inspect}" if user.nil?
+      else
+        # Fallback for older GitLab: build the service_account user directly.
+        user = User.new(
+          username:  username,
+          name:      display_name,
+          email:     "#{username}@noreply.#{Gitlab.config.gitlab.host}",
+          user_type: :service_account,
+          external:  false
+        )
+        user.password = SecureRandom.hex(32)
+        user.organization_id = org.id if org && user.respond_to?(:organization_id=)
+        user.skip_confirmation!
+        user.save!
+      end
+      puts "  created service account: #{user.username} (id=#{user.id})"
+    else
+      puts "  service account exists: #{user.username} (id=#{user.id})"
+    end
+
+    grp = Group.find_by_full_path(group_path)
+    raise "group '#{group_path}' does not exist yet (gitlab-bootstrap-groups creates it every 15min)" if grp.nil?
+
+    # Reporter (20) is the MINIMUM that can read issues on a private
+    # project via the API — Guest cannot. Never downgrade an existing,
+    # higher grant.
+    m = grp.members.find_by(user_id: user.id)
+    if m.nil?
+      grp.add_member(user, Gitlab::Access::REPORTER)
+      puts "  added Reporter on #{group_path}"
+    elsif m.access_level < Gitlab::Access::REPORTER
+      m.update!(access_level: Gitlab::Access::REPORTER)
+      puts "  raised to Reporter on #{group_path}"
+    else
+      puts "  membership ok (access_level=#{m.access_level})"
+    end
+    RUBY
+
+    # ---- 6. Mint a PAT, only if needed -------------------------------
+    if [ "$NEED_NEW" = "1" ]; then
+      echo "Minting a read_api PAT..."
+      NEW_TOKEN=$(kubectl -n gitlab exec -i "$GITLAB_POD" -c toolbox -- \
+        gitlab-rails runner - "$SA_USERNAME" "$PAT_NAME" <<'RUBY' 2>/dev/null | tail -1
+    username, pat_name = ARGV[0], ARGV[1]
+    user = User.find_by(username: username) or raise "no service account #{username}"
+
+    # Revoke same-named tokens so orphans don't accumulate across mints.
+    # Inside the mint branch only — never touches a token that still works.
+    user.personal_access_tokens.active.where(name: pat_name).each(&:revoke!)
+
+    # GitLab 19 does NOT allow a non-expiring PAT: expires_at: nil fails
+    # validation ("Expiration date can't be blank") and a callback caps any
+    # value at PersonalAccessToken::MAX_PERSONAL_ACCESS_TOKEN_LIFETIME_IN_DAYS
+    # (365), regardless of the instance's max_personal_access_token_lifetime
+    # being nil. So the token ALWAYS expires and MUST be rotated — which is
+    # why this runs as a CronJob, not a one-shot Job.
+    max_days = (PersonalAccessToken::MAX_PERSONAL_ACCESS_TOKEN_LIFETIME_IN_DAYS rescue 365)
+    pat = user.personal_access_tokens.create!(
+      name: pat_name, scopes: [:read_api], expires_at: Date.today + (max_days - 1)
+    )
+    print pat.token
+    RUBY
+      )
+      # Shape-check: turns a Rails traceback into a clear failure instead
+      # of writing garbage into Zammad's settings.
+      case "$NEW_TOKEN" in
+        glpat-*) ;;
+        *) echo "ERROR: unexpected token shape from GitLab"; exit 1 ;;
+      esac
+      TOKEN="$NEW_TOKEN"
+      echo "  minted."
+    else
+      TOKEN="$CURRENT_TOKEN"
+    fi
+
+    # ---- 7. Write the Zammad settings + prove they work --------------
+    echo "Applying Zammad GitLab settings..."
+    kubectl -n zammad exec -i "$ZAMMAD_POD" -- \
+      bundle exec rails r - "$GITLAB_ENDPOINT" "$TOKEN" <<'RUBY'
+    endpoint, token = ARGV[0], ARGV[1]
+
+    desired = { endpoint: endpoint, api_token: token, verify_ssl: true }
+    if Setting.get('gitlab_config').to_h.symbolize_keys != desired
+      Setting.set('gitlab_config', desired)
+      puts '  gitlab_config updated'
+    else
+      puts '  gitlab_config already correct'
+    end
+    Setting.set('gitlab_integration', true) unless Setting.get('gitlab_integration') == true
+
+    # Exercise the SAME code path a ticket view uses (GitLab::Credentials),
+    # through the stored config, over the public endpoint with verify_ssl.
+    # A wrong endpoint/token/cert fails the job here instead of silently
+    # shipping a broken integration.
+    GitLab.new(**Setting.get('gitlab_config').to_h.symbolize_keys).verify!
+    puts "  verified: endpoint=#{Setting.get('gitlab_config')['endpoint']} " \
+         "integration=#{Setting.get('gitlab_integration')}"
+    RUBY
+
+    echo "Zammad GitLab integration configured."
+---
+# PostSync: wire the integration as soon as the app syncs (e.g. after a recreate).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zammad-gitlab-integration
+  namespace: zammad
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  #
+  # The CronJob below keeps its own cleanup (successfulJobsHistoryLimit) — that is a
+  # recurring workload, not a hook, and must stay bounded.
+  template:
+    spec:
+      serviceAccountName: zammad-gitlab-integration
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+      - name: gitlab-integration
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        envFrom:
+        - configMapRef:
+            name: zammad-gitlab-integration-env
+        command: ["/bin/sh", "/scripts/run.sh"]
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+      volumes:
+      - name: script
+        configMap:
+          name: zammad-gitlab-integration-script
+          defaultMode: 0755
+---
+# Daily credential rotation. This CANNOT be left to the PostSync Job alone: the
+# PAT always expires (GitLab caps it at 365d) and nothing triggers a sync when it
+# does. A no-op unless the token is missing, wrong, or near expiry.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zammad-gitlab-integration
+  namespace: zammad
+spec:
+  schedule: "37 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 3
+      template:
+        spec:
+          serviceAccountName: zammad-gitlab-integration
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: gitlab-integration
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            envFrom:
+            - configMapRef:
+                name: zammad-gitlab-integration-env
+            command: ["/bin/sh", "/scripts/run.sh"]
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+          volumes:
+          - name: script
+            configMap:
+              name: zammad-gitlab-integration-script
+              defaultMode: 0755

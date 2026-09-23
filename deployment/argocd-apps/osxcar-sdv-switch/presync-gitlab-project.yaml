@@ -1,0 +1,528 @@
+# PreSync: ensure the in-cluster GitLab project exists and testuser owns it.
+#
+# The project is created in a GROUP, not in testuser's personal namespace. A group project
+# plus an explicit OWNER membership gives the same authority, keeps the path stable and
+# predictable (deployments/eda/...), and does not depend on the account's personal namespace
+# existing at the moment this hook runs.
+#
+# testuser is an Authentik/AD identity; GitLab learns of it via OIDC. The account does NOT
+# depend on a human logging in: gitlab/cronjob-sync-admins.yaml pre-creates a GitLab user
+# (with its openid_connect identity) every 5 min for each member of its Authentik
+# ADMIN ∪ USER group sets, and testuser is in `employees` via that group's `ecc/seed: all`.
+#
+# This job therefore WAITS for the account (up to 15m) rather than warning and carrying on.
+# The two CronJobs and this hook are independent, so on a fresh cluster the PreSync can land
+# in the ≤5 min window before the pre-creation run — but "warn and continue" is NOT
+# self-healing HERE: this app has no `automated` syncPolicy (a sync starts a long Vivado
+# build), so there is no next sync to grant ownership on. The project would simply stay
+# ownerless until a human noticed. Waiting two cron periods plus slack costs nothing on a
+# healthy cluster and fails loudly when the provisioning chain is genuinely broken.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osxcar-sdv-switch-gitlab
+  namespace: osxcar-sdv-switch
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: osxcar-sdv-switch-gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# pods + pods/exec reach the gitlab namespace's toolbox, which is where the root PAT is
+# minted (the same mechanism every EDA build-trigger uses — there is no sealed admin token,
+# because a PAT lives in GitLab's database and would not survive a recreate).
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+# The external token, read at RUN TIME to publish it as a masked CI variable.
+# ⚠ NOT via envFrom: external-git is a plain SealedSecret with no hook annotation, so the
+# controller unseals it in the SYNC phase — later than this PreSync hook. An envFrom would
+# wedge the pod in CreateContainerConfigError for the whole PreSync phase, so Sync never
+# runs and the secret is never created: an unconditional deadlock on a fresh cluster.
+# Reading it here degrades to a SKIP on the first sync instead, and self-heals on the next.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["external-git"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: osxcar-sdv-switch-gitlab
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: osxcar-sdv-switch-gitlab
+subjects:
+- kind: ServiceAccount
+  name: osxcar-sdv-switch-gitlab
+  namespace: osxcar-sdv-switch
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: osxcar-sdv-switch-gitlab-project
+  namespace: osxcar-sdv-switch
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # ⚠ Must exceed the SUM of the in-container waits — 30m for GitLab's cold start plus
+  # 15m for testuser to be pre-created from Authentik — else the deadline kills the Job
+  # mid-wait and the retry budget is never spent. 3600, not 2400: 40m does not cover both,
+  # and the failure mode is a Job killed with no diagnosis in its log.
+  activeDeadlineSeconds: 3600
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — the pod IS the log. A short-lived Job can finish and be
+  # deleted before Alloy's poll-based discovery ever scrapes it, so a TTL would delete the
+  # only post-mortem for a failed hook. hook-delete-policy already handles cleanup.
+  template:
+    spec:
+      serviceAccountName: osxcar-sdv-switch-gitlab
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      volumes:
+      - name: ci-config
+        configMap:
+          name: osxcar-sdv-switch-ci-config
+      containers:
+      - name: ensure-project
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: GITLAB_URL
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+        - name: GITLAB_API
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080/api/v4"
+        # ⚠ PORT 8181 = WORKHORSE, and it is REQUIRED for the commits API below. The
+        # file-write endpoints go through Workhorse, which pre-processes the raw body;
+        # posting the same JSON to puma on :8080 returns 400 "file is missing" (four
+        # request shapes were tried — only this one returns 201). Every other call in this
+        # script is an ordinary API call and uses GITLAB_API on :8080.
+        # ⚠ It was USED at the commits call and never DEFINED, so the hook died under
+        # `set -u` with `GITLAB_GIT: parameter not set` AFTER creating the project and
+        # granting ownership — i.e. the failure looked like a seeding problem but the whole
+        # PreSync phase failed, so no pipeline was ever created.
+        - name: GITLAB_GIT
+          value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+        # The project that will hold the deploy pipeline/scripts. Group chain is created on
+        # demand, exactly as the EDA module triggers do.
+        - name: PROJECT_PATH
+          value: "deployments/eda/osxcar-sdv-switch"
+        # The AD/Authentik account that owns it. Anchored to the seed user in
+        # argocd-infra/authentik/blueprint-initial-users.yaml.
+        - name: OWNER_USERNAME
+          value: "testuser"
+        # The pipeline config lives in its OWN project — the mirror force-pushes over
+        # project 8's tree, so a .gitlab-ci.yml there would not survive. See the seeding
+        # step below.
+        - name: CI_CONFIG_PROJECT
+          value: "deployments/eda/ci-configs"
+        - name: CI_CONFIG_FILE
+          value: "osxcar-sdv-switch.yml"
+        # ⚠ MUST MATCH BUILD_BRANCH in ci/osxcar-sdv-switch.yml — that is the branch that
+        # builds automatically, and this is what makes the UI, a manual "Run pipeline" and
+        # any clone land on it. `sdv-switch-bring-up` was the build branch until it was
+        # merged into main (2026-09-08); `pcie-bring-up` is a DIFFERENT board.
+        - name: DEFAULT_BRANCH
+          value: "main"
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        # The pipeline config, mirrored in from ci/ by the ConfigMap below.
+        - { name: ci-config, mountPath: /ci, readOnly: true }
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -eu
+            GROUP_PATH="${PROJECT_PATH%/*}"
+            PROJ_NAME="${PROJECT_PATH##*/}"
+            ENC_REPO=$(echo "$PROJECT_PATH" | sed 's#/#%2F#g')
+
+            # ⚠ MUST outlast GitLab's cold start on a recreate, and MUST FAIL rather than
+            # fall through when it does not — a loop that `break`s on timeout turns
+            # "GitLab never came up" into a misleading downstream error.
+            echo "Waiting for GitLab API (up to 30m)..."
+            i=1; ready=0
+            while [ "$i" -le 180 ]; do
+              # ⚠ `|| true` is what makes the wait real: under `set -eu` curl's non-zero
+              # exit on a refused connection would kill the job on the very first probe,
+              # which is precisely the case this loop exists for.
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness" || true)
+              if [ "$code" = "200" ]; then ready=1; break; fi
+              echo "Try ${i}/180: GitLab not ready (HTTP ${code}), retrying in 10s..."
+              i=$((i + 1)); sleep 10
+            done
+            [ "$ready" = "1" ] || { echo "ERROR: GitLab API not ready after 30m." >&2; exit 1; }
+
+            echo "Creating PAT via toolbox..."
+            PAT_NAME="osxcar-sdv-switch-$(date +%s)"
+            PAT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+              gitlab-rails runner \
+              "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'${PAT_NAME}',scopes:['api'],expires_at:1.year.from_now); puts t.token" \
+              2>/dev/null | tail -1)
+            [ -n "$PAT" ] || { echo "ERROR: could not obtain PAT"; exit 1; }
+            echo "PAT obtained."
+
+            # --- Ensure the group CHAIN exists ---
+            echo "Ensuring GitLab group chain ${GROUP_PATH}..."
+            GROUP_ID=""; ACCUM=""; PARENT_ID=""
+            IFS='/'
+            for SEG in $GROUP_PATH; do
+              IFS=' '
+              [ -z "$SEG" ] && continue
+              ACCUM="${ACCUM:+$ACCUM/}$SEG"
+              ENC_ACCUM=$(echo "$ACCUM" | sed 's#/#%2F#g')
+              GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/groups/${ENC_ACCUM}" || true)
+              GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              if [ -z "$GID" ]; then
+                echo "  creating group ${ACCUM}..."
+                GRP=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/groups" \
+                  --data-urlencode "name=${SEG}" --data-urlencode "path=${SEG}" \
+                  ${PARENT_ID:+--data "parent_id=${PARENT_ID}"} --data "visibility=private" || true)
+                GID=$(echo "$GRP" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                [ -z "$GID" ] && GID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                  "${GITLAB_API}/groups/${ENC_ACCUM}" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              fi
+              [ -n "$GID" ] || { echo "  ERROR: could not ensure group ${ACCUM}"; exit 1; }
+              PARENT_ID="$GID"; GROUP_ID="$GID"
+              IFS='/'
+            done
+            IFS=' '
+            echo "  leaf group ${GROUP_PATH} id=${GROUP_ID}."
+
+            # --- Ensure the project exists ---
+            echo "Ensuring GitLab project ${PROJECT_PATH}..."
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/projects/${ENC_REPO}" || true)
+            if [ "$code" != "200" ]; then
+              echo "  creating project ${PROJ_NAME}..."
+              curl -sS -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/projects" \
+                --data-urlencode "name=${PROJ_NAME}" --data-urlencode "path=${PROJ_NAME}" \
+                --data "namespace_id=${GROUP_ID}&visibility=private&initialize_with_readme=true" \
+                | grep -qE '"id":|already been taken' \
+                && echo "  project ensured." || { echo "  ERROR creating project"; exit 1; }
+            else
+              echo "  project exists."
+            fi
+
+            # --- Grant testuser OWNER on the project ---
+            # ⚠ The user may not exist YET — not because a human has to log in (the
+            # gitlab-sync-admins CronJob pre-creates it), but because that job runs on a
+            # 5 min cycle and may not have fired since the cluster came up. A warning,
+            # not a failure: the project is already usable and the next sync grants
+            # ownership. Making this fatal would block the app on that window.
+            # ⚠ WAIT for the account rather than warning and moving on. It is provisioned
+            # WITHOUT an OIDC login — gitlab/cronjob-sync-admins.yaml (every 5 min)
+            # pre-creates every member of the Authentik `employees` group and attaches the
+            # openid_connect identity, and testuser is in that group because it carries
+            # `ecc/seed: all` (authentik/blueprint-groups.yaml) and seed-user-group-sync
+            # (also every 5 min) reconciles the seed users into it.
+            #
+            # So on a RECREATE the account is guaranteed to appear — but not instantly, and
+            # the old behaviour (warn, carry on, exit 0) meant the very first sync left the
+            # project ownerless and needed a HUMAN to re-sync. Two cron periods plus slack
+            # covers it; failing after that is correct, because at that point something in
+            # the chain above is genuinely broken and a silent skip would hide it.
+            echo "Granting ${OWNER_USERNAME} OWNER on ${PROJECT_PATH}..."
+            echo "  (waiting up to 15m — gitlab-sync-admins pre-creates the account every 5m)"
+            OWNER_ID=""
+            u=1
+            while [ "$u" -le 30 ]; do
+              UID_JSON=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/users?username=${OWNER_USERNAME}" || true)
+              # ⚠ ANCHOR the id match. The usual greedy `.*"id":\([0-9]*\)` returns the LAST
+              # id on the line, which for a user payload is some nested object's id — the
+              # grant would then silently name the wrong account.
+              OWNER_ID=$(echo "$UID_JSON" | sed -n 's/^\[{"id":\([0-9]*\).*/\1/p' | head -1)
+              [ -n "$OWNER_ID" ] && break
+              echo "  try ${u}/30: ${OWNER_USERNAME} not in GitLab yet, retrying in 30s..."
+              u=$((u + 1)); sleep 30
+            done
+            if [ -z "$OWNER_ID" ]; then
+              echo "ERROR: user '${OWNER_USERNAME}' never appeared in GitLab after 15m." >&2
+              echo "       It is pre-created from Authentik WITHOUT any login — so check:" >&2
+              echo "         kubectl -n gitlab get cronjob gitlab-sync-admins" >&2
+              echo "         kubectl -n authentik logs job/<seed-user-group-sync-...>" >&2
+              echo "       and that ${OWNER_USERNAME} is in the Authentik 'employees' group" >&2
+              echo "       with a non-empty email (sync-admins skips members without one)." >&2
+              exit 1
+            else
+              # Idempotent: POST creates, 409 means already a member -> PUT the level instead.
+              m_code=$(curl -sS -o /tmp/member.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                -X POST "${GITLAB_API}/projects/${ENC_REPO}/members" \
+                --data "user_id=${OWNER_ID}&access_level=50" || echo 000)
+              case "$m_code" in
+                20*) echo "  ${OWNER_USERNAME} added as OWNER (id=${OWNER_ID})." ;;
+                409) curl -sS -o /dev/null -w '  membership already present, level PUT: HTTP %{http_code}\n' \
+                       -H "PRIVATE-TOKEN: ${PAT}" -X PUT \
+                       "${GITLAB_API}/projects/${ENC_REPO}/members/${OWNER_ID}" \
+                       --data "access_level=50" || true ;;
+                *)   echo "  WARNING: membership POST returned HTTP ${m_code}: $(head -c 200 /tmp/member.out)" ;;
+              esac
+            fi
+
+            # --- Make sure the mirror CAN push: `main` must stay UNPROTECTED ---
+            #
+            # ⚠ NO GitLab PULL MIRROR HERE. This instance is CE (`/version` reports
+            # `"enterprise": false`) and pull mirroring is EE/Premium: `PUT /projects/:id`
+            # with `mirror=true` returns **HTTP 400** ("mirror" is not an accepted
+            # parameter) and `POST /mirror/pull` does not exist. An earlier version of this
+            # hook configured a pull mirror and FAILED the whole PreSync phase on that 400.
+            # Mirroring is done by mirror-cronjob.yaml (clone --mirror + force push) instead.
+            #
+            # ⚠ THE MIRROR FORCE-PUSHES, so a protected `main` rejects it with
+            # `pre-receive hook declined` — every ref, not just main (measured on ecc204: 4
+            # branches + 1 tag all rejected). The external repo is authoritative and nothing
+            # is ever committed here directly, so protection buys nothing and breaks the
+            # mirror. Drop it if some earlier run or a group default added it.
+            #
+            # ⚠ `default_branch_protection` on the GROUP re-protects the default branch of
+            # every project created under it, so unprotecting once is not enough — this runs
+            # on every sync and re-asserts it.
+            # ⚠ Set the default branch BEFORE unprotecting: GitLab protects the DEFAULT
+            # branch by group policy, so switching the default can re-protect the new one.
+            # A branch that the mirror has not pushed yet cannot be made default, so a 400
+            # here on a first sync is expected and self-heals on the next.
+            # ⚠ THIS ALSO UNBLOCKS THE MIRROR, not just the UI. GitLab refuses to delete a
+            # project's DEFAULT branch ("The default branch of a project cannot be
+            # deleted"), and the mirror pushes with --prune — so once the upstream branch is
+            # gone, every mirror run fails on EVERY ref, not just that one:
+            #   ! [remote rejected] main -> main (pre-receive hook declined)
+            # Measured on ecc204 the moment sdv-switch-bring-up was merged upstream and
+            # deleted: the CronJob had been green for hours, then failed three runs in a row
+            # while the only visible symptom was the app going Degraded.
+            # Re-asserting it on every sync is what makes a renamed/merged upstream branch
+            # self-heal instead of wedging the mirror.
+            echo "Setting the default branch to ${DEFAULT_BRANCH}..."
+            db_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+              -X PUT "${GITLAB_API}/projects/${ENC_REPO}" \
+              --data-urlencode "default_branch=${DEFAULT_BRANCH}" || echo 000)
+            case "$db_code" in
+              20*) echo "  default branch is ${DEFAULT_BRANCH}." ;;
+              *)   echo "  NOTE: could not set it yet (HTTP ${db_code}) — the mirror has"
+                   echo "        probably not pushed ${DEFAULT_BRANCH} yet; the next sync retries." ;;
+            esac
+
+            echo "Allowing force-push to the mirrored branches..."
+            # ⚠ DELETING the protection is NOT ENOUGH, and on this instance it is a pure
+            # no-op. The rule that rejects the mirror is NOT a project protected_branches
+            # ENTRY: `GET .../protected_branches` returns `[]` while
+            # `ProtectedBranch.protected?(project, "main")` is still true, because it is
+            # INHERITED from the instance-wide default_branch_protection_defaults
+            # ({"allow_force_push"=>false, "allowed_to_push"=>[{"access_level"=>40}], ...}).
+            # A project-scoped DELETE cannot remove an inherited rule, so this loop used to
+            # iterate an EMPTY list, print nothing, and the next push still died with
+            #   GitLab: You are not allowed to force push code to a protected branch
+            #   ! [remote rejected] main -> main (pre-receive hook declined)
+            # taking EVERY ref with it, not just main. Measured 2026-09-18 on ecc217.
+            # The comment here used to blame the GROUP default; the real source is one
+            # layer further up, which is why unprotecting "once more" never helped.
+            #
+            # An inherited rule can only be overridden by an explicit PROJECT-level entry,
+            # so create one that permits force-push. This is exactly what every other
+            # mirrored app here already does — see eda/*/postsync-build-image.yaml.
+            #
+            # Safe for THIS project specifically: the external repository is authoritative,
+            # the mirror is pull-only (nothing is ever pushed back upstream), and nothing is
+            # ever committed here directly — a force-push from the mirror is the only write
+            # this project is meant to receive. Push stays restricted to root.
+            #
+            # `|| true` throughout: on a FRESH project no branch exists yet, so the POST can
+            # legitimately 404. mirror-cronjob.yaml runs the same half AFTER the refs exist.
+            ROOT_UID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/user" \
+              | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+            curl -sS -o /dev/null -w '  default_branch_protection=0: HTTP %{http_code}\n' \
+              -H "PRIVATE-TOKEN: ${PAT}" -X PUT \
+              "${GITLAB_API}/projects/${ENC_REPO}" --data "default_branch_protection=0" || true
+            # ⚠ ${DEFAULT_BRANCH} ONLY. The inherited rule applies to the DEFAULT branch,
+            # and that one ref rejecting the push is what fails every other ref with it. The
+            # remaining mirrored branches carry no protection and need no entry here.
+            curl -sS -o /dev/null -H "PRIVATE-TOKEN: ${PAT}" -X DELETE \
+              "${GITLAB_API}/projects/${ENC_REPO}/protected_branches/${DEFAULT_BRANCH}" || true
+            curl -sS -o /dev/null -w "  ${DEFAULT_BRANCH}: force-push allowed (HTTP %{http_code})\n" \
+              -H "PRIVATE-TOKEN: ${PAT}" -X POST \
+              "${GITLAB_API}/projects/${ENC_REPO}/protected_branches" \
+              --data "name=${DEFAULT_BRANCH}&allow_force_push=true&merge_access_level=40" \
+              --data "allowed_to_push[][user_id]=${ROOT_UID}" || true
+
+            # --- Seed the pipeline config into its OWN project + point project 8 at it ---
+            #
+            # ⚠ THE PIPELINE CANNOT LIVE IN THE MIRRORED PROJECT. mirror-cronjob.yaml
+            # force-pushes the external repo over project 8's tree, so a .gitlab-ci.yml
+            # committed there is wiped on the next mirror run — and the external repo has
+            # none. GitLab's external CI config is the supported way out:
+            #   project 8  ci_config_path = <file>@<config project>:<ref>
+            # Verified against the live API (PUT 200, value round-trips).
+            #
+            # The config project is ORDINARY and not mirrored, so this push is safe.
+            echo "Ensuring the CI config project ${CI_CONFIG_PROJECT}..."
+            CFG_GROUP="${CI_CONFIG_PROJECT%/*}"; CFG_NAME="${CI_CONFIG_PROJECT##*/}"
+            ENC_CFG=$(echo "$CI_CONFIG_PROJECT" | sed 's#/#%2F#g')
+            # ⚠ The files API takes the path URL-ENCODED. It is a bare filename today, so
+            # the sed is a no-op — but a nested path (ci/foo.yml) needs it, and leaving it
+            # out is how this broke once: the rewrite that introduced the commits API
+            # dropped this line and the hook died at `ENC_FILE: parameter not set` under
+            # `set -u`, AFTER creating the config project.
+            ENC_FILE=$(echo "$CI_CONFIG_FILE" | sed 's#/#%2F#g')
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/projects/${ENC_CFG}" || true)
+            if [ "$code" != "200" ]; then
+              # The group chain already exists (it is the same one as the mirror project's
+              # parent), so only the project itself has to be created.
+              GID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/groups/$(echo "$CFG_GROUP" | sed 's#/#%2F#g')" \
+                | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+              [ -n "$GID" ] || { echo "  ERROR: group ${CFG_GROUP} not found"; exit 1; }
+              curl -sS -o /dev/null -w '  created (HTTP %{http_code})\n' \
+                -H "PRIVATE-TOKEN: ${PAT}" -X POST "${GITLAB_API}/projects" \
+                --data-urlencode "name=${CFG_NAME}" --data-urlencode "path=${CFG_NAME}" \
+                --data "namespace_id=${GID}&visibility=private&initialize_with_readme=true" || true
+            else
+              echo "  exists."
+            fi
+
+            # Upsert the file with the COMMITS API, as a RAW JSON BODY THROUGH WORKHORSE.
+            #
+            # ⚠ THIS IS THE ONLY SHAPE THAT WORKS ON GitLab 19.x, and the three that do not
+            # all fail with misleading errors. Measured on ecc204:
+            #   POST .../repository/files/<path>  JSON {content:...}   -> 400 "file is missing"
+            #   ...the same, with file_path in the body                -> 400 "file is missing"
+            #   ...as -F form fields (multipart)                       -> 400 "file is invalid"
+            #   ...form fields through workhorse                       -> 400 "This endpoint
+            #                                    does not support form encoded file uploads"
+            # Both the files and the commits endpoints now declare
+            #   requires :file, type: WorkhorseFile   # "generated by Multipart middleware"
+            # and call `require_gitlab_workhorse!`, then read the request through
+            # `file_params_from_body_upload`, which takes params['file.path'] — the temp file
+            # WORKHORSE buffered the raw body into. So the JSON must be the raw body and the
+            # request must go through workhorse; puma on :8080 never sees a file.path.
+            #
+            # ⚠ HENCE PORT 8181, NOT 8080. 8080 is puma direct and returns the misleading
+            # "file is missing" no matter how the body is framed. Same port pin as the
+            # runner's clone_url, for the same underlying reason.
+            #
+            # ⚠ AND HENCE THE COMMITS API rather than the files API: it takes the path INSIDE
+            # the actions array, so one call covers create-or-update without first probing
+            # whether the file exists (`action: create` on an existing path fails, so we
+            # branch on the probe below).
+            echo "Seeding ${CI_CONFIG_FILE}..."
+            f_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/projects/${ENC_CFG}/repository/files/${ENC_FILE}?ref=main" || true)
+            if [ "$f_code" = "200" ]; then ACTION=update; else ACTION=create; fi
+
+            # Build the body with jq: the YAML carries quotes, backslashes and newlines
+            # that must be JSON-escaped, and no amount of shell quoting gets that right.
+            # `--rawfile` reads the file verbatim and jq does the escaping.
+            # (alpine/k8s ships both jq and python3; jq is the smaller tool for the job.)
+            jq -n --rawfile content "/ci/${CI_CONFIG_FILE}" \
+                  --arg path "${CI_CONFIG_FILE}" --arg action "${ACTION}" \
+                  '{branch:"main", commit_message:("seed " + $path + " from the infra repo"),
+                    actions:[{action:$action, file_path:$path, content:$content}]}' \
+              > /tmp/body.json
+
+            up=$(curl -sS -o /tmp/file.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+              -H 'Content-Type: application/json' \
+              -X POST "${GITLAB_GIT}/api/v4/projects/${ENC_CFG}/repository/commits" \
+              --data-binary @/tmp/body.json || echo 000)
+            case "$up" in
+              20*) echo "  seeded (${ACTION}, HTTP ${up})." ;;
+              # A no-op update is rejected; that IS the desired end state.
+              400) if grep -qE 'no changes|empty' /tmp/file.out 2>/dev/null; then
+                     echo "  unchanged."
+                   else
+                     echo "  ERROR: commit rejected: $(head -c 200 /tmp/file.out)" >&2
+                     exit 1
+                   fi ;;
+              *)   echo "  ERROR: commit returned HTTP ${up}: $(head -c 200 /tmp/file.out)" >&2; exit 1 ;;
+            esac
+
+            # ⚠ ASSERT IT IS REALLY THERE. Pointing ci_config_path at a file that does not
+            # exist is the failure this step exists to avoid, and it is invisible until
+            # someone runs a pipeline — which is exactly how the 400 above went unnoticed.
+            v_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+              "${GITLAB_API}/projects/${ENC_CFG}/repository/files/${ENC_FILE}?ref=main" || echo 000)
+            [ "$v_code" = "200" ] || {
+              echo "ERROR: ${CI_CONFIG_FILE} is not readable in ${CI_CONFIG_PROJECT} (HTTP ${v_code})" >&2
+              echo "       Refusing to point the project at a config that does not exist." >&2
+              exit 1
+            }
+            echo "  verified present in ${CI_CONFIG_PROJECT}."
+
+            # --- Publish the external token as a MASKED project CI variable ---
+            #
+            # ⚠ THE PIPELINE CANNOT FETCH THE SUBMODULE WITHOUT THIS. `deploy.sh` at the
+            # repo root is a SYMLINK into `scripts/shared`, a submodule hosted on the
+            # EXTERNAL instance — and nothing GitLab hands the job reaches it: CI_JOB_TOKEN
+            # authenticates against THIS instance only, and the mirror copied a gitlink, not
+            # the submodule's objects. Measured on ecc204: get_sources died with
+            # `could not read Username for 'https://<external host>'`.
+            #
+            # A PROJECT variable rather than a runner-level mount, for the same scoping
+            # reason the EDA build triggers give: a runner mount would hand this token to
+            # EVERY job on the [eda-run] runner, whereas a project variable is confined to
+            # this project's pipelines.
+            #
+            # ⚠ protected=false IS REQUIRED, and is the opposite of the EDA triggers.
+            # GitLab exposes a variable only when its protected flag MATCHES the ref, and
+            # the mirrored branches MUST stay unprotected for the mirror to force-push. A
+            # protected variable would therefore arrive EMPTY and the submodule clone would
+            # fail exactly as it does with no variable at all.
+            echo "Publishing EXT_TOKEN as a masked CI variable..."
+            ext_token=$(kubectl -n "$NAMESPACE" get secret external-git \
+                          -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)
+            if [ -z "$ext_token" ]; then
+              echo "  SKIPPED: secret external-git not readable yet — the next sync retries."
+            else
+              ev_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                "${GITLAB_API}/projects/${ENC_REPO}/variables/EXT_TOKEN" || true)
+              if [ "$ev_code" = "200" ]; then _em=PUT; _eu="${GITLAB_API}/projects/${ENC_REPO}/variables/EXT_TOKEN"; _ex=""
+              else _em=POST; _eu="${GITLAB_API}/projects/${ENC_REPO}/variables"; _ex="--data-urlencode key=EXT_TOKEN"; fi
+              # shellcheck disable=SC2086
+              ev=$(curl -sS -o /tmp/ev.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                -X "$_em" "$_eu" $_ex \
+                --data-urlencode "value=${ext_token}" \
+                --data "masked=true&protected=false" || echo 000)
+              case "$ev" in
+                20*) echo "  EXT_TOKEN published (${_em} ${ev}, masked)." ;;
+                *)   echo "  ERROR: EXT_TOKEN ${_em} returned HTTP ${ev}: $(head -c 200 /tmp/ev.out)" >&2
+                     echo "         the submodule clone will fail without it" >&2; exit 1 ;;
+              esac
+            fi
+
+            echo "Pointing ${PROJECT_PATH} at the external CI config..."
+            cc_code=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+              -X PUT "${GITLAB_API}/projects/${ENC_REPO}" \
+              --data-urlencode "ci_config_path=${CI_CONFIG_FILE}@${CI_CONFIG_PROJECT}:main" || echo 000)
+            case "$cc_code" in
+              20*) echo "  ci_config_path set." ;;
+              *)   echo "  ERROR: ci_config_path PUT returned HTTP ${cc_code}" >&2; exit 1 ;;
+            esac
+
+            # ⚠ The pipeline runs on [eda-run], whose runner is registered
+            # `access_level: ref_protected` like the others — so it only picks up jobs on
+            # PROTECTED refs. But `main` must stay UNPROTECTED here for the mirror to
+            # force-push. Those two pull in opposite directions, so the runner for this
+            # project must NOT be ref-protected; gitlab-runner-eda-run registers it
+            # accordingly. If a pipeline sits "stuck" with no runner, check that first.
+
+            echo "Done."

@@ -1,0 +1,133 @@
+# CloudNativePG cluster for GitLab — migrated from the previous plain
+# postgres:18 StatefulSet so GitLab's DB is a CNPG-managed Cluster (uniform with
+# the other apps): operator-run, gives replica instances (redundancy) + barman
+# PITR for free. GitLab chart 10.0+ requires an external PostgreSQL.
+#
+# App connects via the CNPG read-write service `gitlab-pg-rw` (see values.yaml
+# global.psql.host). Bootstrap creates the gitlabhq_production database + `gitlab`
+# owner from the gitlab-pg-user secret (username/password); password kept equal to
+# gitlab-db:db-password so the chart (global.psql.password → gitlab-db) authenticates
+# as the owner.
+#
+# Superuser: GitLab migrations CREATE required extensions (pg_trgm, btree_gist, …),
+# which needs a superuser role. postInitSQL grants it once at bootstrap.
+#
+# Backup: barman S3 WAL archiving + scheduled base backups (cadence in the ScheduledBackup
+# spec.schedule below) to the dedicated edgecloudinfra-gitlab-pg bucket. Credentials from
+# gitlab-s3-secret (ACCESS_KEY_ID/SECRET_ACCESS_KEY). PITR restore = new Cluster with
+# bootstrap.recovery + externalClusters — see doc/backup-restore.md.
+#
+# DO NOT EDIT directly for the user secret — gitlab-pg-user-sealed.yaml is generated
+# by sealSecrets.sh; this manifest only references it.
+# Image versions: https://github.com/cloudnative-pg/postgres-containers/releases
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitlab-pg
+  namespace: gitlab
+  annotations:
+    # gitlab-pg-user sealed secret syncs at wave -1 (see sealSecrets.sh) so it
+    # exists before CNPG reconciles this Cluster.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  priorityClassName: high
+  instances: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.gitlabPg}
+  # Spread instances across nodes when HA. enablePodAntiAffinity is flipped by
+  # updateConfigFromProjectSettings.sh from general.highAvailability; preferred (soft)
+  # so a single-node/HA-off cluster never wedges the extra instance Pending.
+  affinity:
+    enablePodAntiAffinity: false # automatically updated from project-settings:highAvailability.enabled
+    podAntiAffinityType: preferred
+    topologyKey: kubernetes.io/hostname
+  imageName: ghcr.io/cloudnative-pg/postgresql:18 # renovate: datasource=docker depName=ghcr.io/cloudnative-pg/postgresql
+
+  postgresql:
+    parameters:
+      # ⚠ PINNED BECAUSE THE DEFAULT IS NOT ENOUGH. CNPG defaults max_connections to 100,
+      # and this deployment has run out — "sorry, too many clients already", with
+      # even a LOCAL superuser psql refused, so `gitlab-rails` and every CI job that talks to
+      # the API failed while the web UI (holding established connections) still answered 302.
+      # That split is what makes it easy to misdiagnose: GitLab looks up, and only NEW
+      # connections fail.
+      #
+      # WHY 100 IS TIGHT HERE: GitLab opens a pool PER PROCESS (default 10), and there is NO
+      # PgBouncer in front of this cluster — webservice, sidekiq, registry, kas, toolbox and
+      # every migration/bootstrap Job connect directly. Two webservice pods (each with
+      # several Puma workers) plus two sidekiq pods already approach the limit before a
+      # rolling upgrade briefly doubles the pod count.
+      #
+      # 200 is headroom, not a measurement — the honest lower bound is unknown because the
+      # cluster was saturated when this was set, so nothing could be counted. If it is hit
+      # again, the right fix is a PgBouncer Pooler (CNPG supports one natively), not another
+      # doubling: each connection costs ~10 MB of backend memory.
+      #
+      # ⚠ Changing this RESTARTS Postgres — max_connections is not reloadable. Brief GitLab
+      # downtime is expected on apply.
+      max_connections: "200"
+
+  # Metrics for this Cluster. CNPG's instances always expose the exporter on :9187; this flag
+  # is what makes CNPG create the PodMonitor that gets it scraped. Without it the databases
+  # behind every app were entirely unmonitored — measured 2026-09-03: 7 live Clusters, 0
+  # PodMonitors, so a DB could be unreachable, failing to archive WAL, or missing every base
+  # backup with nothing to notice. Alert rules on these series live in the `cnpg` group in
+  # argocd-infra/prometheus/kube-prometheus-stack/prometheus.yaml.
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: longhorn-cloud-db
+    size: 20Gi
+
+  bootstrap:
+    initdb:
+      database: gitlabhq_production
+      owner: gitlab
+      secret:
+        name: gitlab-pg-user
+      # GitLab migrations CREATE extensions — the owner needs superuser.
+      postInitSQL:
+        - ALTER ROLE gitlab SUPERUSER
+
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://edgecloudinfra-gitlab-pg" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      endpointURL: "https://nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+      s3Credentials:
+        accessKeyId:
+          name: gitlab-s3-secret
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: gitlab-s3-secret
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+    retentionPolicy: "30d"
+
+---
+# Scheduled base backup daily (WAL archiving provides PITR between base backups)
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitlab-pg-backup
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  schedule: "0 0 2 * * *"
+  # Take a base backup as soon as this resource is CREATED, not only at the next scheduled
+  # hour. ⚠ At creation — adding this field to a ScheduledBackup that already exists does
+  # NOT retrofit one (verified 2026-09-03: the flag went live on all 8 clusters and no Backup
+  # object appeared), so it protects every future cluster and not the one you are looking at.
+  # For an existing cluster, create a Backup resource by hand.
+  # WAL archiving alone cannot restore anything — PITR replays WAL ON TOP of a base backup —
+  # so between cluster creation and the first scheduled run there is no recoverable copy at
+  # all. Measured 2026-09-03: this cluster was 2.5 h old with 7 ScheduledBackups, ZERO Backup
+  # objects and cnpg_collector_last_available_backup_timestamp at 0; the daily 02:00 schedule
+  # left a ~10 h hole, and at a ~3-day recreate cadence every recreate reopens it.
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: gitlab-pg

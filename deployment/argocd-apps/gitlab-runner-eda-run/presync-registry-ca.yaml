@@ -1,0 +1,118 @@
+# PreSync (of gitlab-runner-eda-run): publish the image-registry CA into gitlab-runner as
+# the ConfigMap `image-registry-ca`, so an [eda-run] build pod can verify the lab-local
+# registry it pulls module images from.
+#
+# ⚠ WHY A SECOND COPY. remote-desktop/presync-registry-ca.yaml does the same thing for the
+# remote-desktop namespace. A ConfigMap is namespaced and cannot be mounted across
+# namespaces, so each consumer needs its own — there is no sharing to factor out.
+#
+# ⚠ IT IS NOT SEALED, and must not be. The CA is regenerated per cluster by cert-manager,
+# so a sealed copy would name a certificate that no longer exists after a recreate: the
+# secret would apply, the build pod would start, and every module pull would fail the TLS
+# handshake in a way that reads as a registry outage. Reading it from the live issuer on
+# every sync is what makes a recreate need no manual step.
+#
+# ⚠ REGISTRY_CERT_DIR (app-of-apps/gitlab-runner-eda-run.yaml) must point at where this is
+# mounted. skopeo's --cert-dir takes a PLAIN directory of *.crt files, not an OpenSSL hash
+# directory.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-runner-eda-run-registry-ca
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-runner-eda-run-registry-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# read the CA secret in the image-registry ns; write the ConfigMap into our own.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-runner-eda-run-registry-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-runner-eda-run-registry-ca
+subjects:
+- kind: ServiceAccount
+  name: gitlab-runner-eda-run-registry-ca
+  namespace: gitlab-runner
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-runner-eda-run-registry-ca
+  namespace: gitlab-runner
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # After the namespace (-10) and the RBAC above (-1), before the desktop Deployment.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. hook-delete-policy: BeforeHookCreation
+  # already deletes this Job on the next sync, and a TTL would delete the pod with the
+  # only copy of the logs. Alloy/Loki does not save you: its pod discovery is a poll, so a
+  # short-lived Job can finish and vanish before it is ever scraped.
+  template:
+    spec:
+      serviceAccountName: gitlab-runner-eda-run-registry-ca
+      restartPolicy: OnFailure
+      containers:
+      - name: fetch-ca
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Fetching the image-registry CA..."
+          i=1
+          CA=""
+          while [ "$i" -le 60 ]; do
+            CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)
+            # A CA Certificate's secret carries ca.crt; fall back to tls.crt, which for an
+            # isCA cert is the same self-signed certificate.
+            [ -n "$CA" ] || CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)
+            [ -n "$CA" ] && break
+            echo "  try ${i}/60: not issued yet, retrying in 5s..."
+            i=$((i + 1)); sleep 5
+          done
+          [ -n "${CA:-}" ] || { echo "ERROR: image-registry-ca-tls never appeared"; exit 1; }
+
+          printf '%s' "$CA" | base64 -d > /tmp/ca.crt
+          # Sanity-check before writing: an empty or truncated bundle would be accepted here
+          # and then fail at TLS handshake time, far from the cause.
+          #
+          # ⚠ NOT `openssl x509` — this image (alpine/k8s) ships NO openssl. A PEM
+          # header/footer test needs no extra tooling and catches what actually matters.
+          head -1 /tmp/ca.crt | grep -q 'BEGIN CERTIFICATE' \
+            || { echo "ERROR: decoded CA has no PEM header"; head -3 /tmp/ca.crt; exit 1; }
+          grep -q 'END CERTIFICATE' /tmp/ca.crt \
+            || { echo "ERROR: decoded CA is truncated (no END marker)"; exit 1; }
+
+          kubectl -n gitlab-runner create configmap image-registry-ca \
+            --from-file=ca.crt=/tmp/ca.crt \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "image-registry-ca is present in gitlab-runner."

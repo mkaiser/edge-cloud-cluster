@@ -1,0 +1,278 @@
+# kube-vip: routed Virtual IP for the k3s API, HA across CONTROL-PLANE nodes.
+# The VIP (network.vip) is a /32 OUTSIDE both CP subnets, reached cross-segment via a
+# Hetzner network route → a cloud server-subnet CP (src/network.ts). ARP mode + Lease
+# leader election; exactly one HOLDER. Only cloud server-subnet CPs are eligible to hold
+# it (Hetzner won't route the VIP gateway onto the robot vSwitch L2); robot/edge/on-prem
+# CPs reach the API via the mesh endpoint k3s-api.ts.internal instead. The VIP is for
+# nodes ON the Hetzner private network (cloud + robot vSwitch), not edge/mesh clients.
+# Full rationale + the live cross-segment proof: doc/kube-vip-cross-segment.md.
+#
+# Two per-node concerns handled by the detect-interface initContainer below:
+#  1. Interface name differs per node (hcloud VMs: enp7s0; dedicated box: enp0s31f6.<vlan>);
+#     kube-vip ARP has no CP-interface auto-detect (verified against source), so we detect
+#     and pass --interface. Without this it crash-loops ("... Link not found") on the node
+#     where the hardcoded NIC doesn't exist — including the dedicated box as init/only CP.
+#  2. VIP-holder eligibility: only a cloud server-subnet (10.0.0.0/24) CP may hold the VIP.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-vip
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:kube-vip-role
+  annotations:
+    rbac.authorization.kubernetes.io/autoupdate: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["services", "services/status", "nodes", "endpoints"]
+    verbs: ["list", "get", "watch", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "get", "watch", "create", "update"]
+  # The eligibility-watch sidecar deletes its OWN pod when VIP-holder eligibility
+  # flips (e.g. a cloud CP joins/leaves), so the DaemonSet recreates it and the
+  # detect-interface initContainer re-evaluates. Scoped to pods/delete only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:kube-vip-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-vip-role
+subjects:
+  - kind: ServiceAccount
+    name: kube-vip
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-vip-ds
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: kube-vip-ds
+  template:
+    metadata:
+      labels:
+        name: kube-vip-ds
+    spec:
+      serviceAccountName: kube-vip
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      hostNetwork: true
+      initContainers:
+        # Detect this node's private-network interface and write it to /vip/interface.
+        # The kube-vip image is DISTROLESS (no shell/ip/awk), so we use busybox here and
+        # also stage the STATIC busybox binary into the shared volume so the (distroless)
+        # main container can exec a shell + cat the detected name. Must be the -musl
+        # (statically linked) tag: the default busybox is glibc-dynamic and the distroless
+        # kube-vip image has no ld-linux loader, so exec'ing it there fails with
+        # "no such file or directory". env vars win over the --interface flag in kube-vip,
+        # so we must NOT set vip_interface and instead pass the detected value as the flag.
+        #
+        # Detection: the iface owning an IPv4 in the private subnetRange (10.0.0.0/23 —
+        # covers the cloud server subnet 10.0.0.0/24 AND the robot vSwitch subnet
+        # 10.0.1.0/24), excluding the VIP /32 (10.0.0.100), WireGuard (10.0.2.x, outside
+        # the /23) and the CNI pod overlay (10.42.x). Resolves to enp7s0 on hcloud VMs
+        # and enp0s31f6.<vlan> on the dedicated box — so it works when the dedicated box
+        # is the init/only CP, on cloud CPs, and on any future heterogeneous CP.
+        - name: detect-interface
+          image: busybox:1.38-musl
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              VIP="10.0.3.100"          # automatically updated from project-settings:network.vip
+              # Interface: the iface owning an IPv4 in the CP private subnetRange (10.0.0.0/23
+              # — cloud server subnet 10.0.0.0/24 OR robot vSwitch 10.0.1.0/24), excluding the
+              # VIP /32 (now out-of-subnet, but harmless to exclude), wg0 (10.0.2.x) and
+              # the CNI pod overlay (10.42.x). enp7s0 on hcloud VMs, enp0s31f6.<vlan> on the dedicated box.
+              IFACE=$(ip -o -4 addr show | awk -v vip="$VIP" '
+                $4 !~ "^"vip"/" {
+                  split($4, a, "/");
+                  if (a[1] ~ /^10\.0\.[01]\./) { print $2; exit }
+                }')
+              if [ -z "$IFACE" ]; then
+                echo "ERROR: no interface with an address in the CP private subnet" >&2
+                ip -o -4 addr show >&2
+                exit 1
+              fi
+              printf '%s' "$IFACE" > /vip/interface
+              echo "Detected kube-vip interface: $IFACE" >&2
+
+              # ── VIP-holder eligibility (dynamic, cluster-aware) ──────────────────────────
+              # The routed VIP /32 is reached via a Hetzner network route whose gateway MUST be
+              # on the cloud server subnet (10.0.0.0/24) — Hetzner won't route a gateway onto the
+              # robot vSwitch L2. So:
+              #   • If a cloud server-subnet CP EXISTS, only server-subnet (10.0.0.x) nodes may
+              #     hold the VIP — a robot/vSwitch holder would black-hole it cross-segment
+              #     (proven: doc/kube-vip-cross-segment.md). Robot/edge/on-prem CPs use the mesh
+              #     endpoint k3s-api.ts.internal and just idle here.
+              #   • If NO cloud server-subnet CP exists (e.g. a lone Hetzner dedicated box as the
+              #     only CP), there is no cross-segment problem — the single CP holds the VIP on
+              #     its OWN segment, giving same-segment clients a stable API IP from day one. It
+              #     upgrades automatically: once a cloud CP joins, this re-detection moves the VIP
+              #     to the cloud segment (where the route can reach it).
+              # This node's CP-subnet IP (10.0.0.x cloud / 10.0.1.x vSwitch). Persisted to /vip/myip
+              # so the eligibility-watch sidecar re-uses the same value when it re-checks.
+              MY_IP=$(ip -o -4 addr show | awk -v vip="$VIP" '
+                $4 !~ "^"vip"/" { split($4, a, "/"); if (a[1] ~ /^10\.0\.[01]\./) { print a[1]; exit } }')
+              printf '%s' "$MY_IP" > /vip/myip
+              # Does a cloud server-subnet CP (10.0.0.x) exist? Ask the apiserver for node IPs.
+              # hostNetwork pod: cluster DNS (kubernetes.default.svc) returns NXDOMAIN, so reach the
+              # apiserver by ClusterIP from the injected env (always set).
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
+              NODE_IPS=$(wget -q --no-check-certificate --header="Authorization: Bearer $TOKEN" \
+                -O- "$API/api/v1/nodes" 2>/dev/null \
+                | grep -oE '10[.]0[.]0[.][0-9]+' | grep -v "^${VIP}\$" | sort -u || true)
+              CLOUD_CP_EXISTS=no; [ -n "$NODE_IPS" ] && CLOUD_CP_EXISTS=yes
+              ELIGIBLE=no
+              case "$MY_IP" in
+                10.0.0.*) ELIGIBLE=yes ;;                                  # cloud server subnet: always eligible
+                10.0.1.*) [ "$CLOUD_CP_EXISTS" = "no" ] && ELIGIBLE=yes ;;  # vSwitch: only if NO cloud CP exists
+              esac
+              printf '%s' "$ELIGIBLE" > /vip/eligible
+              echo "VIP eligibility: my_ip=${MY_IP:-none} cloud_cp_exists=$CLOUD_CP_EXISTS -> eligible=$ELIGIBLE" >&2
+              # Stage the static busybox so the distroless main container has a shell + cat.
+              cp /bin/busybox /vip/busybox
+          volumeMounts:
+            - name: vip-config
+              mountPath: /vip
+      containers:
+        - name: kube-vip
+          # renovate: datasource=docker depName=ghcr.io/kube-vip/kube-vip
+          image: ghcr.io/kube-vip/kube-vip:v1.2.3  # renovate: tracked by "Container image tags" regex (docker datasource)
+          imagePullPolicy: IfNotPresent
+          # Distroless image: no /bin/sh. Use the busybox staged by the initContainer to read
+          # the per-node detected interface + eligibility and either exec the kube-vip manager
+          # (cloud server-subnet CP) or idle (ineligible CP — does NOT hold the routed VIP).
+          command:
+            - /vip/busybox
+            - sh
+            - -c
+            - |
+              if [ "$(/vip/busybox cat /vip/eligible)" != "yes" ]; then
+                echo "Not on the cloud server subnet — not a VIP holder; idling (API HA via mesh endpoint)." >&2
+                exec /vip/busybox sleep infinity
+              fi
+              exec /kube-vip manager --interface "$(/vip/busybox cat /vip/interface)"
+          env:
+            - name: vip_arp
+              value: "true"
+            - name: port
+              value: "6443"
+            - name: vip_cidr
+              value: "32"
+            - name: cp_enable
+              value: "true"
+            - name: cp_namespace
+              value: "kube-system"
+            - name: vip_leaderelection
+              value: "true"
+            - name: vip_leaseduration
+              value: "5"
+            - name: vip_renewdeadline
+              value: "3"
+            - name: vip_retryperiod
+              value: "1"
+            - name: address
+              value: "10.0.3.100" # automatically updated from project-settings:network.vip
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - SYS_TIME
+          volumeMounts:
+            - name: localtime
+              mountPath: /etc/localtime
+              readOnly: true
+            - name: vip-config
+              mountPath: /vip
+              readOnly: true
+        # ── Eligibility watcher ──────────────────────────────────────────────────────────
+        # VIP-holder eligibility is decided once at pod start (initContainer), but it depends
+        # on cluster membership (whether a cloud server-subnet CP exists), which changes when
+        # CPs are added/removed. Without this, e.g. a lone dedicated box that started as the VIP
+        # holder would stay "eligible=yes" after a cloud CP joins and could grab the VIP onto its
+        # vSwitch segment — black-holing the routed VIP (the route points at the cloud CP). This
+        # sidecar re-runs the exact eligibility check every 30s; when the result differs from the
+        # value the pod started with, it DELETES its own pod so the DaemonSet recreates it and the
+        # initContainer re-evaluates (and the kube-vip container starts/stops holding the VIP
+        # accordingly). Self-healing on any CP add/remove; no external controller.
+        # Uses curl (not busybox wget — which can't do HTTP DELETE) so it can self-delete the
+        # pod. Self-contained: recomputes cloud_cp_exists the same way as the initContainer.
+        - name: eligibility-watch
+          # renovate: datasource=docker depName=curlimages/curl
+          image: curlimages/curl:8.22.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              VIP="10.0.3.100"   # automatically updated from project-settings:network.vip
+              MY_IP=$(cat /vip/myip)
+              WANT=$(cat /vip/eligible)
+              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
+              TOKENF=/var/run/secrets/kubernetes.io/serviceaccount/token
+              echo "eligibility-watch: started with my_ip=$MY_IP eligible=$WANT; polling…" >&2
+              eligible_now() {
+                NODE_IPS=$(curl -s -k -H "Authorization: Bearer $(cat $TOKENF)" \
+                  "$API/api/v1/nodes" 2>/dev/null \
+                  | grep -oE '10[.]0[.]0[.][0-9]+' | grep -v "^${VIP}\$" | sort -u)
+                CLOUD=no; [ -n "$NODE_IPS" ] && CLOUD=yes
+                case "$MY_IP" in
+                  10.0.0.*) echo yes ;;
+                  10.0.1.*) [ "$CLOUD" = no ] && echo yes || echo no ;;
+                  *) echo no ;;
+                esac
+              }
+              while true; do
+                sleep 30
+                NOW=$(eligible_now)
+                [ -z "$NOW" ] && continue
+                if [ "$NOW" != "$WANT" ]; then
+                  echo "eligibility-watch: changed ($WANT -> $NOW) — deleting own pod to re-evaluate." >&2
+                  curl -s -k -X DELETE -H "Authorization: Bearer $(cat $TOKENF)" \
+                    "$API/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME}?gracePeriodSeconds=5" >/dev/null 2>&1 || true
+                  sleep 15
+                fi
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: vip-config
+              mountPath: /vip
+              readOnly: true
+      volumes:
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+            type: File
+        - name: vip-config
+          emptyDir: {}

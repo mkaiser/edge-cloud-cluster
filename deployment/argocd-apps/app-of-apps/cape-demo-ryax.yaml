@@ -1,0 +1,60 @@
+# ArgoCD Application: Ryax workflow-automation engine (OCI Helm chart).
+# Served at https://ryax.<subdomain>.<domain> via Gateway API (ryax/httproute.yaml);
+# TLS terminates at the shared Gateway's wildcard listener. Config: ryax/.
+#
+# Ryax has no OIDC support, so Authentik integration is a link-only portal tile
+# created by the PostSync Job in ryax/authentik-provider.yaml. Login is Ryax's own
+# user/password from the sealed ryax-admin-credentials secret.
+#
+# Three sources: the OCI chart, a `ref` for $values, and the git directory holding
+# httproute, the sealed secrets and the Authentik Jobs.
+#
+# ⚠ THE FILENAME IS cape-demo-ryax.yaml BUT THE APPLICATION IS NAMED `ryax`. That is
+# deliberate, not an oversight — do not "fix" it. ArgoCD keys resource tracking on the
+# Application NAME (argocd.argoproj.io/tracking-id: ryax:/apps/Deployment:ryaxns/...),
+# not on the filename or the source path. Renaming the Application orphans all ~97
+# tracked resources at once, and with prune: true below that means they are DELETED and
+# recreated — including ryax-action-builder-nix-store (100Gi) and ryax-registry-pvc-0
+# (60Gi). The filename is free to change because apps-root renders every file in this
+# directory regardless of what it is called; the name inside is not.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ryax
+  namespace: argocd-apps
+spec:
+  project: default
+  sources:
+    - repoURL: oci://registry.ryax.org/release-charts/ryax-engine
+      chart: ryax-engine
+      targetRevision: "26.9.0" # renovate: datasource=docker depName=registry.ryax.org/release-charts/ryax-engine
+      helm:
+        releaseName: ryax
+        valueFiles:
+          - $values/deployment/argocd-apps/cape-demo/ryax/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/cape-demo/ryax
+      directory:
+        # `*values.yaml`, not `values.yaml`: worker-values.yaml is input to the
+        # separate ryax-worker-k8s release, not a manifest, and applying it fails.
+        # Subdirectories (example-action/, scripts/) are never scanned — this
+        # source is non-recursive.
+        exclude: "{*values.yaml,*.sh,*.template,README.md}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ryaxns
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

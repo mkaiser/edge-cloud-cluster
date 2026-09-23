@@ -1,0 +1,190 @@
+# Grafana — standalone app, NOT a kube-prometheus-stack subchart.
+#
+# Why it is separate: Grafana serves more
+# than one backend (Prometheus + Loki, more later). A Grafana OWNED by the
+# metrics stack, that the logging stack has to reach into to register a
+# datasource, has the dependency arrow backwards. Prometheus<->Alertmanager
+# stays bundled — the operator wires alerting.alertmanagers[] because they are
+# one release — but Grafana<->Prometheus is just a datasource URL.
+#
+# Deliberately NOT changed by the split, so nothing downstream had to move:
+#   * namespace stays `prometheus` — the datasource sidecar's searchNamespace is
+#     unset (release-namespace only), and SealedSecrets are encrypted scoped to
+#     name+namespace, so moving would force a re-seal of the admin secret.
+#   * Service name stays `kube-prometheus-stack-grafana` via fullnameOverride,
+#     so grafana-httproute.yaml and both sealed secrets need no edits.
+#
+# kube-prometheus-stack still renders the 29 built-in dashboards and the
+# Prometheus+Alertmanager datasource via forceDeployDashboards/Datasources
+# (see prometheus.yaml); this chart only consumes them through its sidecars.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana
+  namespace: argocd-infra
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: grafana
+    targetRevision: "10.5.15" # renovate: datasource=helm depName=grafana registryUrl=https://grafana.github.io/helm-charts
+    helm:
+      values: |
+        # Keep the Service/Deployment name the kube-prometheus-stack release used,
+        # so the existing HTTPRoute backendRef and the admin SealedSecret (which is
+        # bound to name+namespace) keep working untouched.
+        fullnameOverride: kube-prometheus-stack-grafana
+
+        replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.grafana}
+
+        admin:
+          existingSecret: kube-prometheus-stack-grafana
+          userKey: admin-user
+          passwordKey: admin-password
+        envFromSecret: grafana-oidc-secret
+
+        # Grafana's SQLite DB — OIDC-provisioned users and their roles, starred
+        # dashboards, ad-hoc panels. Was an emptyDir under kube-prometheus-stack,
+        # so all of that was silently lost on every pod restart. RWO + replicas
+        # pinned to 1 (see the headplane precedent in project_settings.ts: a 2nd
+        # replica on an RWO PVC fails Multi-Attach).
+        persistence:
+          enabled: true
+          type: pvc
+          size: 5Gi
+          storageClassName: longhorn-cloud
+          accessModes:
+            - ReadWriteOnce
+
+        # Recreate, NOT the chart default RollingUpdate. Pinning replicas to 1 (above)
+        # stops a STEADY-STATE Multi-Attach, but it does nothing for a ROLLOUT:
+        # RollingUpdate starts the replacement pod before terminating the old one, so
+        # during any image or config change two pods want the same RWO volume. If the
+        # scheduler places the new one on another node it blocks on FailedAttachVolume
+        # forever while the old pod waits for it to go Ready — no timeout breaks it.
+        # scripts/environment/checkRwoRolloutStrategy.py enforces this for Deployments
+        # declared as manifests here; a chart-templated one like this is invisible to
+        # it, so this value is the only thing holding the invariant.
+        deploymentStrategy:
+          type: Recreate
+
+        grafana.ini:
+          server:
+            root_url: https://grafana.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+          users:
+            allow_sign_up: false
+          auth:
+            disable_login_form: true
+            disable_initial_admin_creation: false
+            signout_redirect_url: https://id.subdomain1.your-domain.tld/application/o/grafana/end-session/ # automatically updated from project-settings:{general.subdomain,general.domain}
+          auth.generic_oauth:
+            enabled: true
+            auto_login: true
+            name: Authentik
+            allow_sign_up: true
+            client_id: grafana
+            client_secret: $__env{GRAFANA_OIDC_CLIENT_SECRET}
+            scopes: openid email profile
+            auth_url: https://id.subdomain1.your-domain.tld/application/o/authorize/ # automatically updated from project-settings:{general.subdomain,general.domain}
+            token_url: https://id.subdomain1.your-domain.tld/application/o/token/ # automatically updated from project-settings:{general.subdomain,general.domain}
+            api_url: https://id.subdomain1.your-domain.tld/application/o/userinfo/ # automatically updated from project-settings:{general.subdomain,general.domain}
+            # clusteradmins (our authentik-admins group, or the built-in superuser
+            # group) → Grafana Admin; everyone else (incl. employees-extended) → Viewer
+            # (infra view-only). Local login form is disabled above (OIDC-only);
+            # break-glass = temporarily set auth.disable_login_form=false here.
+            role_attribute_path: (contains(groups[*], 'authentik-admins') || contains(groups[*], 'authentik Admins')) && 'Admin' || 'Viewer'
+            use_pkce: true
+            # Authentik ingress uses the LE staging CA (untrusted) while testing,
+            # so Grafana's backend token/userinfo calls must skip TLS verify.
+            # updateConfigFromProjectSettings.sh flips this to false on prod certs.
+            tls_skip_verify_insecure: false # automatically updated from project-settings:{tls.certIssuerType,tls.grafanaSkipVerify}
+          security:
+            disable_initial_admin_password_change: true
+
+        sidecar:
+          # ⚠ REQUIRED because dashboards.searchNamespace is ALL (below). The sidecar names
+          # each file after the ConfigMap's DATA KEY, which is NOT unique across namespaces
+          # — Ryax ships two dashboards (ryaxns/ryax-datastore-… and ryaxns/ryax-registry-…)
+          # that both use the key `grafana-dashboard.json`. Without this they alternate into
+          # one /tmp/dashboards/grafana-dashboard.json twice a minute and Grafana rejects
+          # whichever lands second with "A dashboard with the same uid already exists" —
+          # their uids DIFFER, so the uid in the file never matches the incoming one. This
+          # prefixes namespace + ConfigMap name, giving the two separate files.
+          #
+          # ⚠ It is `sidecar.enableUniqueFilenames`, top-level and chart-wide. There is NO
+          # `sidecar.dashboards.uniqueFilenames`: the chart ignores unknown keys silently,
+          # so that spelling renders no UNIQUE_FILENAMES env at all and reads as applied
+          # while changing nothing. Verified against the deployed chart 10.5.15.
+          #
+          # The ~20 kube-prometheus-stack dashboards Ryax ALSO duplicates never errored:
+          # those share a uid AS WELL AS a filename, so the overwrite is a no-op update
+          # rather than a conflict. This only changes their filenames, not their uids.
+          enableUniqueFilenames: true
+          dashboards:
+            enabled: true
+            label: grafana_dashboard
+            searchNamespace: ALL  # discover dashboard ConfigMaps from all namespaces
+          datasources:
+            enabled: true
+            label: grafana_datasource
+            # Release-namespace only (matches the previous behaviour). The
+            # Prometheus+Alertmanager datasource CM that kube-prometheus-stack
+            # renders, and Loki's, both live in THIS namespace.
+            searchNamespace: null
+
+        # Dashboards imported from grafana.com — check each gnetId for latest revision
+        dashboards:
+          default:
+            argocd:
+              gnetId: 14584
+              revision: 10
+              datasource: Prometheus
+            external-dns:
+              gnetId: 15038
+              revision: 3
+              datasource: Prometheus
+            cert-manager:
+              gnetId: 20842
+              revision: 2
+              datasource: Prometheus
+            headscale:
+              gnetId: 20614
+              revision: 1
+              datasource: Prometheus
+            gitlab-overview:
+              gnetId: 2662
+              revision: 4
+              datasource: Prometheus
+            longhorn:
+              gnetId: 16888
+              revision: 9
+              datasource: Prometheus
+            nextcloud:
+              gnetId: 20347
+              revision: 1
+              datasource: Prometheus
+            authentik:
+              gnetId: 14837
+              revision: 2
+              datasource: Prometheus
+
+        # Routing is grafana-httproute.yaml (Gateway API) in the
+        # kube-prometheus-stack directory, not a chart-rendered Ingress.
+        ingress:
+          enabled: false
+
+        nodeSelector:
+          node-role.kubernetes.io/control-plane: "true"
+        tolerations:
+          - key: "node-role.kubernetes.io/control-plane"
+            operator: "Exists"
+            effect: "NoSchedule"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prometheus
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

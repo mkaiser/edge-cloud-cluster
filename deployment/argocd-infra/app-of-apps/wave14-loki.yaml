@@ -1,0 +1,29 @@
+# Loki log store. Wave 14: needs Longhorn (wave 2) for the small WAL/index PVCs
+# and its own Sync-hook Job for the S3 bucket. No Authentik dependency — Loki is
+# NOT publicly routed; it is reached only through Grafana's datasource.
+#
+# NB the wave-18 barrier only gates on apps annotated sync-wave=10, so nothing
+# waits for Loki before argocd-apps launches at wave 19. That is deliberate:
+# widening the barrier would stall every application app on a logging hiccup.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki-app
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "14"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/loki
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

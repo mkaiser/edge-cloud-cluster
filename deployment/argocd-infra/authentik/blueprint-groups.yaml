@@ -1,0 +1,105 @@
+# Authentik blueprint: permission groups (config-as-code).
+# Mounted into the worker via blueprints.configMaps and applied automatically.
+#
+# ⚠ DO NOT ADD AN APP-SPECIFIC GROUP HERE. This file holds ONLY the IdP's own role
+# model; every per-app group is created by the app that owns it, in its own folder, so
+# a DISABLED APP CREATES NOTHING. See the "owned by their app" list below for where
+# each one went, and copy that pattern
+# (deployment/argocd-apps/windows/authentik-provider.yaml is the canonical example).
+#
+# If a group ever has to come back here, migrating one out again is TWO commits, never
+# one: first add the idempotent create to the owning app and VERIFY the job resolves
+# it, THEN delete the entry here. Consumers fail OPEN — bind_group() logs "group not
+# found yet — skip" and still exits 0, and the groups__name= cronjob consumers just
+# get an empty result set — so a one-commit move loses access with a green sync.
+#
+# ⚠ Every group carries `attributes.ecc/seed`, which decides seed-user membership;
+# seed-user-group-sync.yaml reads it and an UNLABELLED group is never synced (and is
+# logged as a WARN). Values: all = both seed users, admin-only = testadmin only,
+# none = neither. An app creating its own group must set it in the POST body.
+#
+# The IdP's own role model — these five are referenced by the shared access policies in
+# blueprint-apps.yaml and belong to no single app, so they stay here:
+#   authentik-admins     — full Authentik platform admin (is_superuser); = "clusteradmin"
+#                          role: access to every app + full admin everywhere incl. Longhorn.
+#                          Every per-app access policy names it explicitly, which is why
+#                          testadmin needs no per-app group membership.
+#   employees            — standard staff; access to all NON-infra apps. No infra apps.
+#   employees-extended   — employees + admin on Nextcloud/GitLab/Rocket.Chat + infra
+#                          VIEW-only (ArgoCD readonly, Grafana Viewer, Prometheus). No Longhorn.
+#   external             — external users/contractors; authentication only. NO app access
+#                          until an admin binds them to an application (per-app policy binding).
+#   mfa-exempt           — skips forced MFA (bootstrap/test accounts only; remove to enforce).
+#
+# The one deliberate exception:
+#   argocd-admins        — ArgoCD role:admin (see argocd-infra-self/values.yaml rbac).
+#                          App-specific in name, but it gates the tool that deploys
+#                          everything else and ArgoCD has no Authentik PostSync job of its
+#                          own. Making the group that grants ArgoCD admin depend on an
+#                          ArgoCD-driven job is a bootstrap-order trap, so it stays.
+#
+# Groups owned by their own app — do NOT add them here:
+#   jitsi                -> argocd-apps/jitsi/authentik-provider.yaml
+#   zulip                -> argocd-apps/zulip/authentik-provider.yaml
+#   ai                   -> argocd-apps/open-webui/authentik-provider.yaml (shared w/ litellm)
+#   remote-desktop-users -> argocd-apps/remote-desktop/authentik-provider.yaml
+#   windows-users        -> argocd-apps/windows/authentik-provider.yaml
+#   ryax                 -> argocd-apps/cape-demo/ryax/authentik-provider.yaml
+#   xwiki-oidc-admins    -> argocd-apps/xwiki/authentik-provider.yaml
+#   rocketchat-admins    -> argocd-apps/rocketchat/authentik-provider.yaml
+#   gitlab-admins        -> argocd-apps/gitlab/authentik-blueprint.yaml (blueprint, not a Job)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-groups
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  groups.yaml: |
+    version: 1
+    metadata:
+      name: cluster-groups
+    entries:
+      - model: authentik_core.group
+        identifiers:
+          name: authentik-admins
+        attrs:
+          is_superuser: true
+          attributes:
+            ecc/seed: admin-only
+      - model: authentik_core.group
+        identifiers:
+          name: employees
+        attrs:
+          is_superuser: false
+          attributes:
+            ecc/seed: all
+      - model: authentik_core.group
+        identifiers:
+          name: employees-extended
+        attrs:
+          is_superuser: false
+          attributes:
+            ecc/seed: admin-only
+      - model: authentik_core.group
+        identifiers:
+          name: external
+        attrs:
+          is_superuser: false
+          attributes:
+            ecc/seed: none
+      - model: authentik_core.group
+        identifiers:
+          name: mfa-exempt
+        attrs:
+          is_superuser: false
+          attributes:
+            ecc/seed: all
+      - model: authentik_core.group
+        identifiers:
+          name: argocd-admins
+        attrs:
+          is_superuser: false
+          attributes:
+            ecc/seed: admin-only

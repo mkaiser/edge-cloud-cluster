@@ -1,0 +1,81 @@
+# A STATIC PV pinned to the EDA BUILD-OUTPUT export, plus the claim its consumers mount.
+#
+# What lands here: .xsa, bitstreams, BOOT.BIN, the packaged `deployment/` set and build
+# logs — written BOTH by the CI build pod and by users running a synthesis by hand on an
+# interactive machine. ONE SHARED export rather than per-user homes, because a bitstream is
+# a team output and a build on one machine must be visible from the others.
+#
+# ⚠ CONSUMERS MUST WRITE UNDER <project>/<branch>-<short-sha>/, never to a fixed path.
+# The export is shared, so two concurrent builds writing the same path silently interleave
+# their outputs and the loser's bitstream is the one you ship. The layout is also what lets
+# you tell which commit produced which artefact.
+#
+# ⚠ NAMED `builds`, NOT `artifacts`. "Artifacts" is GitLab CI's job-output mechanism, which
+# this repo deliberately does not use for bulk data — gitlab/check-ci-artifacts.sh enforces
+# that and records the measured cost (a lab-built output otherwise travels lab → Workhorse
+# in the CLOUD → back to the appliance: ~1h45m for 30 GB, to land on a disk 200 m away).
+# Bulk output goes to this export, or straight to the on-prem S3 endpoint. `artifacts:`
+# carries only small things — a log, a report, the URL of the big object.
+#
+# ⚠ THE SAME STATIC-PV RULES AS nfs-eda-modulefiles-pv.yaml APPLY, for the same reasons:
+#   • storageClassName is EMPTY STRING — naming a class would make the provisioner carve a
+#     per-PVC subdirectory (defeating "mount the export root"), and omitting the field
+#     entirely lets the DEFAULT class (longhorn-cloud) claim it, silently handing the pod a
+#     Longhorn volume instead of the appliance export.
+#   • `server:` only takes effect on a FRESH cluster — a PV's source is IMMUTABLE, so on a
+#     cluster whose PV already exists ArgoCD reports OutOfSync and keeps the old value. That
+#     drift is EXPECTED; do NOT delete a Bound PV to force it.
+#
+# ⚠ reclaimPolicy Retain, NOT Delete. Build outputs are regenerable, but a user's synthesis
+# result should not vanish because a claim was pruned — and Delete would hand the CSI driver
+# permission to remove the whole shared tree.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-eda-builds
+  labels:
+    # The claim below selects on this, so the pairing cannot bind to the wrong volume.
+    ecc/volume: nfs-eda-builds
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size. The real limit is the ZFS quota on
+    # datapool/eda/builds, which is where to enforce one.
+    storage: 2Ti
+  accessModes:
+    # Genuinely multi-writer: the CI build pod and every interactive machine mount it rw.
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as the other EDA claims; see gitlab-runner-eda/nfs-installers-pv.yaml for why
+    # each is pinned.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # Must be unique cluster-wide.
+    volumeHandle: fs-1-datapool-eda-builds
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/eda/builds # automatically updated from project-settings:storage.fileserver.datasets.eda.builds
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-eda-builds
+  namespace: eda-fileserver
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 2Ti
+  selector:
+    matchLabels:
+      ecc/volume: nfs-eda-builds

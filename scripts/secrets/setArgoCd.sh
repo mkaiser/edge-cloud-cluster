@@ -18,7 +18,7 @@ if [[ "$REGEN" == "--regenerate" ]]; then
   echo "  Generated ArgoCD admin password: $argocd_admin_password"
   echo "  Generated ArgoCD server secret key."
 else
-  read -rp "Generate ArgoCD admin password [g] or enter manually [e]? " pw_choice
+  read -rp "Generate ArgoCD admin password for user \"admin\" [g] or enter manually [e]? " pw_choice
   if [[ "$pw_choice" =~ ^[Gg] ]]; then
     argocd_admin_password=$(openssl rand -base64 16 | tr -d '=+/')
     echo "  Generated ArgoCD admin password: $argocd_admin_password"

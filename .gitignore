@@ -8,4 +8,30 @@ wg-admin.conf
 config
 .install/
 /tmp/
+# Per-invocation make logs, written automatically by scripts/environment/runLogged.sh
+/logs/
 /external/
+# Large vendor installer media — NEVER git. Kept out of deployment/ on purpose:
+# a 117 GB tree under deployment/ makes every full-tree walk
+# (updateConfigFromProjectSettings.sh, ArgoCD repo scans) crawl on the 9p mount.
+# Installer media now lives on the TrueNAS artifacts export, beside the archive built
+# from it; this rule only guards against a local staging copy being committed.
+/install/
+# Public-release builds (scripts/environment/prepareRelease.sh). A throwaway shadow tree:
+# the release is built HERE so the source repo is never mutated.
+/release/
+
+# Python bytecode from local tool syntax checks
+__pycache__/
+*.pyc
+
+*_bak
+secret/
+
+# Claude Code per-developer session memory (not shared)
+.claude/memory/
+
+# DNS zone dumps: a full zone carries DKIM keys and the mail topology — keep them
+# outside this shared repo (see doc/setup-instructions.md, bare-apex section).
+dns-zone-*
+zone-*.json

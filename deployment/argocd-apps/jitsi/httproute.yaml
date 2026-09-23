@@ -1,0 +1,41 @@
+# Hand-written HTTPRoute for the Jitsi web UI.
+#
+# NB: the jitsi-meet chart DOES have Gateway API templates (web.gateway.enabled),
+# but they are unusable here: templates/web/gateway.yaml creates its OWN Gateway
+# and gateway-route.yaml hardwires parentRefs to it. A second Gateway would try
+# to bind :80/:443 on the same control-plane nodes as the shared one. So the
+# chart's gateway stays disabled and the route is written by hand against the
+# shared Gateway instead.
+#
+# This is the "/" route for meet.<tld>. Two more specific routes share the host:
+# /oidc (oidc-adapter.yaml) and /invite (invite-minter.yaml). Gateway API
+# resolves the overlap by path specificity, so those win over this one.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway).
+#
+# Backend: jitsi-meet.web.fullname = <release>-web = jitsi-meet-web, port 8000.
+# ⚠ The chart moved this port 80 -> 8000 in 3.x (it now names a targetPort too).
+# A stale 80 here does not fail loudly: the Gateway reports
+#   'TCP Port 80 not found on Service jitsi/jitsi-meet-web'
+# on the HTTPRoute only, so every pod stays Running and the app reads Synced
+# while the site is unreachable. Re-check this port on any jitsi chart bump.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: jitsi-web
+  namespace: jitsi
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - meet.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: jitsi-meet-web
+          port: 8000

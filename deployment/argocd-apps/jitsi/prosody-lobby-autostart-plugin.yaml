@@ -1,0 +1,46 @@
+# Prosody plugin: lobby_autostart — auto-activates the lobby for EVERY room.
+#
+# Why: ENABLE_LOBBY=1 only loads muc_lobby_rooms (lobby *available*), but a room
+# has no lobby until a moderator manually enables it — so the first guest into an
+# empty room walks straight in (no auth, no waiting room). This plugin hooks
+# muc-room-pre-create and fires "create-persistent-lobby-room" so the lobby is on
+# from room creation. JWT-authenticated users are moderators and bypass the lobby
+# (whitelisted auth domain), so they admit the waiting guests.
+#
+# Source: github.com/jitsi-contrib/prosody-plugins/lobby_autostart (verbatim).
+# Mounted into prosody at /prosody-plugins-custom/mod_lobby_autostart.lua and
+# enabled on the main MUC component via XMPP_MUC_MODULES=...,lobby_autostart
+# (see values.yaml). persistent_lobby (in the same module list) handles the
+# fired event; both ship on the image plugin path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jitsi-prosody-plugins
+  namespace: jitsi
+  labels:
+    app.kubernetes.io/name: jitsi-prosody-plugins
+data:
+  mod_lobby_autostart.lua: |
+    -- This module auto-activates lobby for all rooms.
+    --
+    -- IMPORTANT:
+    --   Do not use this unless you have some mechanism for moderators to bypass the
+    --   lobby. Otherwise everybody stops at the lobby with nobody to admit them.
+    --
+    -- This module should be added to the main muc component.
+    --
+
+    local util = module:require "util";
+    local is_healthcheck_room = util.is_healthcheck_room;
+
+    module:log("info", "loaded")
+
+    module:hook("muc-room-pre-create", function (event)
+       local room = event.room;
+
+        if is_healthcheck_room(room.jid) then
+            return;
+        end
+
+        prosody.events.fire_event("create-persistent-lobby-room", { room = room; });
+    end);

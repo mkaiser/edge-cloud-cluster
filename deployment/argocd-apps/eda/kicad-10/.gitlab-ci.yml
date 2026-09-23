@@ -1,0 +1,136 @@
+stages: [build]
+
+# A newer commit supersedes an in-flight build of the same ref.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
+build-kicad-10:
+  stage: build
+  tags: [eda]                     # -> pcie-tb-s [eda] runner (gitlab-runner-token-eda)
+  image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+  resource_group: kicad-10-build
+  interruptible: true
+  # ⚠ Much shorter than the other modules' 4h. There is no installer media to stage and no
+  # .run to execute — this is an apt install over a PPA, measured in minutes. A long timeout
+  # here would only delay the diagnosis of a hung apt.
+  timeout: 1h
+  variables:
+    # ⚠ ONE-SHOT lever, normally "0". The module tag IS the user-facing version
+    # (`module load kicad/10.0.6`) so it must not be bumped for a Dockerfile fix; set this to
+    # "1" to push such a fix past the registry gate, then reset it in the SAME branch once the
+    # image is published. Enforced by scripts/environment/checkForceRebuildReset.py.
+    FORCE_REBUILD: "0"
+    IMAGE_TAG: "10.0.6"                # the MODULE version (module load kicad/10.0.6)
+    IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    IMAGE_REPO: $CI_PROJECT_PATH
+    MODULE_NAME: "kicad"
+    MODULE_VERSION: "10.0.6"
+    REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+    STORAGE_DRIVER: overlay
+    BUILDAH_ROOT: /build-scratch/buildah-storage
+    BUILDAH_RUNROOT: /build-scratch/buildah-run
+    INTERNAL_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+  script:
+    - |
+      mkdir -p "/etc/containers/certs.d/${INTERNAL_REGISTRY}"
+      printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt"
+      python3 - "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt" <<'CACHECK' \
+        || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+      import base64, re, sys
+      raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+      m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S)
+      if not m:
+          sys.exit("no PEM CERTIFICATE block")
+      try:
+          der = base64.b64decode("".join(m.group(1).split()), validate=True)
+      except Exception as exc:
+          sys.exit(f"base64 decode failed: {exc}")
+      if len(der) < 64 or der[0] != 0x30:
+          sys.exit("does not parse as a DER certificate")
+      print(f"image-registry CA OK ({len(der)} bytes DER)")
+      CACHECK
+    # The recover-or-rebuild gate. It asks the LAB-LOCAL registry, never GitLab's own API:
+    # GitLab reports these tags absent forever, which would rebuild on every pipeline. The
+    # gate fails OPEN (any non-200, including 401, means rebuild), so it can cost a needless
+    # rebuild but never a wrong image. Read the reason it prints — that line is the diagnosis.
+    - |
+      if [ "${FORCE_REBUILD:-0}" = "1" ]; then
+        echo "FORCE_REBUILD=1 — rebuilding $IMAGE even though it may already exist."
+      else
+        if [ -z "${IMAGE_REGISTRY_USER:-}" ] || [ -z "${IMAGE_REGISTRY_PASSWORD:-}" ]; then
+          echo "ERROR: IMAGE_REGISTRY_USER/PASSWORD are empty in this pipeline."
+          echo "       The registry gate cannot run, so this build would restore nothing and"
+          echo "       rebuild on EVERY run."
+          echo "       Cause: the CI variables are published unprotected while this ref is"
+          echo "       protected (CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-unset})."
+          echo "       Fix: publish them with protected=true in this app's build trigger."
+          exit 1
+        fi
+        _gate_ref="${INTERNAL_REGISTRY}/${IMAGE#*/}"
+        set +e
+        _gate_out=$(skopeo inspect --raw \
+                 --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                 "docker://${_gate_ref}" 2>&1)
+        _gate_rc=$?
+        set -e
+        if [ "$_gate_rc" -eq 0 ]; then
+          echo "$_gate_ref already exists — skipping build."
+          exit 0
+        fi
+        case "$_gate_out" in
+          *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+            echo "registry gate: tag not present in $INTERNAL_REGISTRY — building." ;;
+          *"authentication required"*|*"unauthorized"*)
+            echo "registry gate: AUTH REJECTED by $INTERNAL_REGISTRY. The credential is wrong,"
+            echo "  not the tag. Building anyway (fail-open), but the recreate-survival path is"
+            echo "  NOT working — fix the credential."
+            echo "  skopeo: $_gate_out" ;;
+          *x509*|*certificate*)
+            echo "registry gate: TLS verification failed against $INTERNAL_REGISTRY. Is"
+            echo "  IMAGE_REGISTRY_CA the CA of the CURRENT cluster? A recreate mints a new one."
+            echo "  skopeo: $_gate_out" ;;
+          *)
+            echo "registry gate: unexpected failure — treating as absent, building."
+            echo "  skopeo: $_gate_out" ;;
+        esac
+      fi
+      echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+    - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+    - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+    # No -v bind mount: there is no installer media for this module. The whole build is the
+    # PPA install in the Dockerfile.
+    - echo "[$(date -u +%F' '%T)] buildah bud starting (apt over the KiCad PPA)..."
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+      bud --isolation chroot --format docker
+      -t "$IMAGE" .
+    - |
+      DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+      set +e
+      n=0
+      until [ "$n" -ge 6 ]; do
+        echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+        timeout 10800 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+          push --retry 20 --retry-delay 10s \
+          "$IMAGE" "$DEST"
+        rc=$?
+        echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+        [ "$rc" -eq 0 ] && break
+        n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+      done
+      set -e
+      [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+    - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+    - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+  after_script:
+    - |
+      echo "[$(date -u +%F' '%T)] scratch reclaim (job status: ${CI_JOB_STATUS:-unknown})"
+      df -h /build-scratch || true
+      BA="buildah --root $BUILDAH_ROOT --runroot $BUILDAH_RUNROOT --storage-driver $STORAGE_DRIVER"
+      $BA rm -a || true
+      $BA rmi -a -f || true
+      $BA prune -a -f || true
+      echo "[$(date -u +%F' '%T)] after reclaim:"
+      df -h /build-scratch || true
+      du -sh /build-scratch/* 2>/dev/null | sort -h || true

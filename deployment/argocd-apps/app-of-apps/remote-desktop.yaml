@@ -1,0 +1,139 @@
+# ArgoCD Application: generic EDA desktop (Ubuntu/Xfce over RDP + Guacamole) with
+# RUNTIME-LOADABLE applications ("module load" style), instead of baking one EDA
+# tool into the image (xilinx-2026-1) or installing it into a PVC (hyperlynx).
+#
+# Applications are published as OCI images in the lab-local registry under
+# deployments/infrastructure/eda/modules/<name>:<version>; a privileged broker
+# sidecar pulls each one and podman runs it inside the desktop pod. See
+# deployment/argocd-apps/remote-desktop/README.md for the full design.
+#
+# ONE desktop, reached at https://desktop.<subdomain>.<domain> (Guacamole, Authentik
+# OIDC) as the tile "EDA Workstation", or with a native RDP client on
+# 3389 over the headscale VPN. It serves per-user LDAP sessions only — no shared
+# session, no shared password, no NodePort.
+#
+# BEFORE FIRST DEPLOY:
+#   deployment/argocd-apps/remote-desktop/sealSecrets.sh   (generate *-sealed.yaml)
+#
+# Multi-source (like xilinx-2026-1 / hyperlynx):
+#   1. HelmForge guacamole Helm chart
+#   2. ref source for $values
+#   3. Git directory for raw manifests (the Deployment, vnc-services, pvc,
+#      registry-cred, postgres, connection-seed, authentik-provider, broker/GC)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: remote-desktop
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: the desktop pod runs on lab mesh nodes only, and everything
+    # it mounts is lab-local — the module registry, /home and the EDA artifact store
+    # (all NFSv4 from the TrueNAS appliance, reachable only from the lab LAN). Skip on
+    # cloud restore.
+    placement.ecc/tier: mesh
+spec:
+  # Shown as an info panel on the Application in the ArgoCD UI, so whoever finds this app
+  # OutOfSync learns WHY without reading this file.
+  info:
+    - name: Rollout policy
+      value: >-
+        MANUAL SYNC ONLY — press Sync in the ArgoCD UI. There is no automated sync: a change
+        waits here as OutOfSync until a human applies it, because applying it restarts the
+        desktop (single replica, strategy Recreate) and every logged-in session dies with it.
+    - name: Before you press Sync
+      value: >-
+        kubectl -n remote-desktop exec deploy/remote-desktop-gvisor -c desktop -- who
+  project: default
+  sources:
+    - repoURL: https://repo.helmforge.dev
+      chart: guacamole
+      targetRevision: "1.5.2" # renovate: datasource=helm depName=guacamole registryUrl=https://repo.helmforge.dev
+      helm:
+        releaseName: guacamole
+        valueFiles:
+          - $values/deployment/argocd-apps/remote-desktop/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/remote-desktop
+      directory:
+        # recurse: the directory is FLAT today — the per-module build machinery lives in
+        # deployment/argocd-apps/eda/<module>/ and is synced by eda-modules-appset. This is
+        # kept so that a subdirectory added here later is synced rather than silently
+        # ignored, which is the ArgoCD default and once cost a module trigger that never ran.
+        recurse: true
+        # Build inputs reach GitLab via the *-build-files ConfigMaps, not as manifests:
+        # exclude the raw Dockerfiles/CI/config so ArgoCD does not try to apply them.
+        exclude: "{values.yaml,*.sh,README.md,Dockerfile,Dockerfile.*,.gitlab-ci.yml,ci-*.yml}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: remote-desktop
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    # ⚠ NO `automated:` — DELIBERATE, and the one app here without it.
+    # Applying a change to this app restarts the desktop: one replica, strategy Recreate,
+    # so the pod is killed before the new one starts and every interactive session goes with
+    # it. That cost lands on a person mid-work, not on a request that retries, so the
+    # decision of WHEN belongs to a human: the app sits OutOfSync until someone presses Sync
+    # in the ArgoCD UI (`argocd app sync remote-desktop` does the same).
+    #
+    # ⚠ CONSEQUENCE ON A CLUSTER RECREATE: the desktop does NOT come up on its own. It is
+    # created, reports OutOfSync, and waits. Sync it once when the new cluster is up — the
+    # base image restores from image-archives in seconds, so it is a click, not a rebuild.
+    #
+    # A sync window was tried first and rejected: it ties the rollout to the clock rather
+    # than to whether anyone is actually logged in, and it leaves auto-sync spinning on a
+    # blocked operation that a human then has to terminate before syncing.
+    #
+    # `prune` and `selfHeal` are gone with it: both only mean anything for automated syncs.
+    # A manual Sync prunes what git no longer renders, which is the same behaviour on the
+    # only path that now exists.
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # ⚠ RETRY FOREVER — this app's hooks depend on OTHER components finishing bring-up,
+    # and on a recreate they are not ready yet. Two independent cases, both observed:
+    #
+    # 1. presync-registry-cred and build-trigger poll GitLab /-/readiness AND require the
+    #    `deployments` group that the gitlab bootstrap-groups CronJob creates. On ecc183
+    #    that CronJob was still settling ~25 min in, so both hooks failed, the PreSync
+    #    abort left the namespace EMPTY, and the app still reported Healthy. These pin the
+    #    CONTROL-PLANE, so node scheduling was never the issue — do not assume a
+    #    control-plane hook is safe from recreate races.
+    # 2. postsync-shared-tools pins ecc/fileserver-lan and mounts pvc/nfs-shared-data, so
+    #    it needs a lab mesh node joined AND eda-fileserver to have provisioned the export.
+    #    Milder: a PostSync failure does not abort the Sync phase, so the desktop comes up
+    #    and only the published /shared/tools scripts are missing.
+    #
+    # a plain re-sync fixed both once the dependencies were up, with
+    # no manifest change — which is exactly what this retry automates.
+    #
+    # Do NOT enlarge the hooks' own budgets instead (activeDeadlineSeconds 900,
+    # backoffLimit 2): a pending PreSync hook holds the Application open and blocks
+    # everything behind it. The outer loop is the right lever.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

@@ -1,0 +1,445 @@
+# Startup for the shared KiCad workstation: AD identity, xrdp, and the shared tmux session.
+#
+# Deliberately NOT a copy of remote-desktop/startup-configmap.yaml. That script serves many
+# LDAP users with per-user X sessions, podman module runtimes, Lmod and a license pin; none
+# of that applies here. What IS copied — and must stay in step — is the sssd `[domain/ad]`
+# block, because the identity chain it implements is the reason this pod can use its NFS home
+# at all (doc/ad-identity-chain.md).
+#
+# ⚠ ONE COPY, no mirrored source: this is not a build input and never reaches GitLab.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-pcb-agent-startup
+  namespace: eda-pcb-agent
+data:
+  startup.sh: |
+    set -eu
+    echo "startup: $(date -u +%F' '%T) booting eda-pcb-agent"
+
+    # ── LE staging CA -> the SYSTEM trust store, ADDITIVELY ───────────────────────
+    # On letsencrypt-staging every in-cluster HTTPS host (id.<tld>, the registry) is signed
+    # by a root this image does not ship, so anything the AGENT runs fails at TLS — and it
+    # reports as a bad key or a dead endpoint rather than a trust problem.
+    #
+    # ⚠ ADDITIVE, via update-ca-certificates — NOT a subPath mount over /etc/ssl/certs.
+    # That would SHADOW the whole system bundle, and this container also needs PUBLIC roots
+    # (the Ubuntu archives, PyPI, GitHub) for the agent to install anything at all.
+    # Inert on letsencrypt-prod: an extra unused root.
+    if [ -s /run/staging-ca/ca-bundle.pem ]; then
+      cp /run/staging-ca/ca-bundle.pem /usr/local/share/ca-certificates/le-staging.crt
+      update-ca-certificates >/dev/null 2>&1 \
+        && echo "startup: LE staging CA added to the system trust store" \
+        || echo "startup: WARNING update-ca-certificates failed — in-cluster TLS will fail"
+    fi
+
+    # ── Kerberos ──────────────────────────────────────────────────────────────────
+    # ⚠ /etc/krb5.conf MUST EXIST and MUST BE WRITABLE (not a read-only mount): sssd writes
+    # realm/domain mappings into it. Without the file, the GSSAPI bind fails "Authentication
+    # Failed" / "going offline" even when the keytab is provably fine (`kinit -kt` gets a TGT),
+    # and the only hint is a line about being unable to change krb5.conf's mtime.
+    cat > /etc/krb5.conf <<EOF
+    [libdefaults]
+      default_realm = ${AD_REALM}
+      # The AD zone resolves in-cluster via the CoreDNS forward (dns-config-job.yaml), but
+      # SRV discovery only adds a failure mode when the DC is named explicitly below.
+      dns_lookup_realm = false
+      dns_lookup_kdc = false
+      rdns = false
+    [realms]
+      ${AD_REALM} = {
+        kdc = ${AD_DC_FQDN}
+        admin_server = ${AD_DC_FQDN}
+      }
+    [domain_realm]
+      .${AD_DOMAIN} = ${AD_REALM}
+      ${AD_DOMAIN} = ${AD_REALM}
+    EOF
+    chmod 644 /etc/krb5.conf
+
+    # ── SSSD against SAMBA AD DIRECTLY ────────────────────────────────────────────
+    # ⚠ NO BACKTICKS BELOW, IN COMMENTS EITHER. This heredoc is UNQUOTED (<<EOF, not <<'EOF')
+    # because it must expand ${AD_*}, and an unquoted heredoc also runs `...` — comment lines
+    # included, since the shell has no comments inside a heredoc. Two prose backticks here
+    # executed `getent passwd eda-pcb-agent` and `domain users` on every boot, splicing their
+    # stdout into sssd.conf and printing `line 45: domain: command not found` (bash reports it
+    # at the heredoc's OPENING line, which names nothing). Quote prose with '...' instead.
+    cat > /etc/sssd/sssd.conf <<EOF
+    [sssd]
+    config_file_version = 2
+    services = nss, pam
+    domains = ad
+    # ⚠ NO disable_netlink HERE, deliberately. That line exists in remote-desktop ONLY
+    # because gVisor's netlink has no group-membership subscription, which makes sssd exit at
+    # startup. This pod is PLAIN RUNC, so netlink works and the workaround is unnecessary.
+    # Do not copy it reflexively — but DO check 'getent passwd eda-pcb-agent' after a change,
+    # because a silent sssd death is the documented failure shape here.
+    [nss]
+    filter_users = root
+    [pam]
+    offline_credentials_expiration = 7
+    # ⚠ ACTIVE DIRECTORY, not the Authentik LDAP outpost. The outpost COMPUTES
+    # uid = 5000 + Authentik pk; AD (and the fileserver via idmap_backend: AD) STORES
+    # uidNumber. Those diverge the moment a pk changes, and this pod would then be unable to
+    # read its own home. See doc/ad-identity-chain.md.
+    [domain/ad]
+    id_provider = ad
+    auth_provider = ad
+    access_provider = simple
+    # ⚠ NOT ANCHORED, and that is a deliberate trade — see the drift guard below.
+    # updateConfigFromProjectSettings.sh only rewrites a value when the anchor comment is on
+    # the SAME line, which here would append a trailing comment to a domain name and a
+    # Kerberos realm. sssd's own config-check does not validate VALUES, so it could not tell
+    # us whether sssd strips the comment or reads it as part of the domain. Guessing wrong
+    # breaks every login, so these are hardcoded and guarded at runtime instead.
+    ad_domain = ad.base.internal
+    krb5_realm = AD.BASE.INTERNAL
+    # ⚠ THE MOST IMPORTANT LINE HERE. With the default (true) SSSD HASHES THE SID into a uid
+    # range of its own, recreating exactly the divergence this design exists to remove.
+    # false makes SSSD read the real uidNumber out of the directory — the same value the
+    # fileserver reads — so the two cannot disagree about who owns /home/eda-pcb-agent.
+    ldap_id_mapping = false
+    ldap_schema = rfc2307bis
+    # ⚠ THE KEYTAB IS MANDATORY. sssd's ad provider authenticates with GSSAPI and has NO
+    # simple-bind fallback: without it the provider fails at startup and every lookup returns
+    # "no such user" while the pod reports Running. Minted for pcb-agent$ by keytab-job.yaml.
+    krb5_keytab = /etc/krb5.keytab
+    ldap_sasl_mech = GSSAPI
+    ldap_sasl_authid = ${AD_MACHINE_ACCOUNT}
+    # ⚠ 0 DISABLES SSSD-SIDE MACHINE PASSWORD RENEWAL — a stopgap, matching remote-desktop.
+    # An EXPORTED keytab does not follow a rotation: with renewal on, sssd would change the
+    # account's password, the mounted keytab would go stale, and every login would break a
+    # week later with no deploy having happened. See keytab-job.yaml's TODO(rotation).
+    ad_maximum_machine_account_password_age = 0
+    # ⚠ THE DC MUST BE NAMED BY ITS AD NAME, NOT ITS KUBERNETES SERVICE NAME. Kerberos derives
+    # the target SPN from whatever name is used here, so a *.svc.cluster.local name asks for a
+    # principal that is "not found in Kerberos database". It surfaces as
+    # "ldap_sasl_interactive_bind_s failed (-2)[Local error]", which names nothing.
+    ad_server = ${AD_DC_FQDN}
+    krb5_server = ${AD_DC_FQDN}
+    # ⚠ NARROWED TO THIS ONE ACCOUNT, unlike remote-desktop's 'domain users'. This is a
+    # single-purpose shared workstation with root-capable sudo baked in; every other AD user
+    # must be refused even though they exist in the same directory.
+    simple_allow_users = ${AGENT_USER}
+    fallback_homedir = /home/%u
+    default_shell = /bin/bash
+    cache_credentials = true
+    enumerate = false
+    EOF
+    chmod 600 /etc/sssd/sssd.conf
+
+    # ⚠ DRIFT GUARD for the two hardcoded identity values above (they cannot carry anchors —
+    # see the note in the heredoc). Fail hard rather than start with a wrong realm: sssd would
+    # come up, bind nowhere, and present as "Authentication failure" for correct passwords.
+    for _pair in "ad_domain:${AD_DOMAIN:-}" "krb5_realm:${AD_REALM:-}"; do
+      _key="${_pair%%:*}"; _want="${_pair#*:}"
+      [ -n "$_want" ] || continue
+      _have=$(sed -n "s|^${_key} = ||p" /etc/sssd/sssd.conf | head -1)
+      if [ "$_have" != "$_want" ]; then
+        echo "FATAL: sssd.conf ${_key}='${_have}' but the anchored env says '${_want}'." >&2
+        echo "  startup-configmap.yaml hardcodes it; update it to match project_settings." >&2
+        exit 1
+      fi
+    done
+    echo "startup: sssd ad_domain/krb5_realm match the anchored values"
+
+    # ⚠ FAIL FAST IF THE KEYTAB IS MISSING. The Secret is mounted optional so a first bring-up
+    # can schedule before keytab-job.yaml has minted it. But starting sssd without it produces
+    # the WORST outcome: every user becomes "no such user" while the pod reports Running and
+    # xrdp happily accepts connections it can never authenticate.
+    # ⚠ `-f` FIRST, and it is the whole point of this test. The Secret is mounted `optional`
+    # WITH a subPath, and when it is absent the kubelet creates the subPath target as a
+    # DIRECTORY. `-s` is TRUE for a directory, so a bare `[ ! -s ... ]` waved the missing
+    # keytab straight through: `wc -c` then printed "'standard input': Is a directory", this
+    # script reported "keytab present (0 bytes)", and the only error left was sssd's
+    # uninformative death. Measured on ecc208.
+    if [ ! -f /etc/krb5.keytab ] || [ ! -s /etc/krb5.keytab ]; then
+      echo "FATAL: /etc/krb5.keytab is missing, empty, or a directory." >&2
+      echo "  sssd's ad provider needs it (GSSAPI only, no simple-bind fallback)." >&2
+      echo "  It is minted by this app's keytab-job.yaml, a PRESYNC hook — so if it is" >&2
+      echo "  missing here, that hook failed; read its Job log, not this one." >&2
+      echo "  On a first bring-up this is EXPECTED until samba-ad (wave 13) has synced." >&2
+      exit 1
+    fi
+    echo "startup: keytab present ($(wc -c < /etc/krb5.keytab) bytes)"
+
+    mkdir -p /var/lib/sss/db /var/lib/sss/mc /var/lib/sss/pipes/private
+    # ⚠ Do NOT silence sssd's stderr. "FATAL: sssd failed to start" on its own names nothing,
+    # and sssd's one line ("No suitable principal found in keytab", a krb5.conf complaint) is
+    # normally the entire diagnosis.
+    sssd -D || { echo "FATAL: sssd failed to start (its own error is above)" >&2; exit 1; }
+
+    # ⚠ ASSERT THE IDENTITY RESOLVES, do not assume it. A silent sssd death or a missing AD
+    # account both present as a perfectly healthy-looking pod, and the first symptom would be
+    # the agent writing files nobody owns onto the shared homes export.
+    i=1
+    until getent passwd "$AGENT_USER" >/dev/null 2>&1; do
+      if [ "$i" -ge 30 ]; then
+        echo "FATAL: '$AGENT_USER' does not resolve after 60s." >&2
+        echo "  The Authentik user must exist and be in 'employees' (authentik-user-job.yaml)," >&2
+        echo "  samba-ad must have provisioned the AD account, and this pod's keytab must be" >&2
+        echo "  valid. Without a directory uid the NFS home cannot be used." >&2
+        exit 1
+      fi
+      echo "  try ${i}/30: waiting for '$AGENT_USER' to resolve via sssd..."
+      i=$((i+1)); sleep 2
+    done
+    AGENT_UID=$(id -u "$AGENT_USER")
+    echo "startup: $AGENT_USER resolves, uid=$AGENT_UID"
+    # ⚠ Assert it came from the DIRECTORY, never a literal: the uid is 5000 + Authentik pk and
+    # moves on every recreate, so only the RANGE is a stable invariant.
+    if [ "$AGENT_UID" -lt 5000 ]; then
+      echo "FATAL: uid $AGENT_UID is below 5000 — that is a LOCAL account, not the directory's." >&2
+      echo "  Files written to the homes export would land with the wrong owner." >&2
+      exit 1
+    fi
+
+    # ── The home on the NFS export ────────────────────────────────────────────────
+    # ⚠ NOT created here. /home is the homes export ROOT and the per-user directory is made by
+    # truenas/configure-job.yaml from the Authentik `employees` group. pam_mkhomedir is
+    # deliberately absent for the same reason: a locally-created directory would mask the real
+    # one and the agent's work would live somewhere nothing backs up.
+    if [ ! -d "/home/$AGENT_USER" ]; then
+      echo "FATAL: /home/$AGENT_USER does not exist on the homes export." >&2
+      echo "  It is created by truenas/configure-job.yaml (wave 16) from the Authentik" >&2
+      echo "  'employees' group. On a fresh cluster this pod can start before that has run —" >&2
+      echo "  the app's retry covers it, so expect one failed start rather than a fault." >&2
+      exit 1
+    fi
+    echo "startup: home present ($(stat -c '%U %a' "/home/$AGENT_USER"))"
+
+    # ⚠ EXISTING IS NOT ENOUGH — IT MUST BE OURS, CONTENTS INCLUDED.
+    # uid = 5000 + Authentik pk and the pk MOVES ON EVERY RECREATE, while this home lives on a
+    # Retain dataset and survives. So a recreate routinely leaves a home full of files owned by
+    # the PREVIOUS uid. Measured on ecc208: the directory was 5022 while the account was 5025,
+    # mode 0700, so `stat -c %U` printed UNKNOWN and the pod came up ANYWAY, serving sessions
+    # that could not read their own home:
+    #   su: warning: cannot change directory to /home/eda-pcb-agent: Permission denied
+    #   error connecting to /home/eda-pcb-agent/.agent.sock (Permission denied)
+    #
+    # ⚠ THE DIRECTORY ALONE IS NOT THE PROBLEM — truenas/configure-job.yaml step_homes already
+    # chowns THAT to the current uid, and after it ran the top level read 5025 while
+    # `Altium Project`, .cache, Desktop, .ICEauthority, kicad, project and the tmux socket were
+    # all still 5022. So this check must look INSIDE, not just at the mount point.
+    #
+    # Repair rather than refuse: this home belongs to exactly one account, we are root in this
+    # container, and the export permits root chown (verified). Refusing would leave a cluster
+    # that only a human with appliance access could fix.
+    # ⚠ GATED ON A MARKER, NOT ON A SCAN. The obvious check — `find` for any file not owned
+    # by us — walks the WHOLE home over NFS on EVERY boot, and this home is not small (kicad
+    # trees, .hermes). Measured on ecc208: the walk plus chown ran for MINUTES. xrdp does not
+    # start until this returns, so that cost would land on every single pod start, forever,
+    # to detect a condition that arises only when the uid actually moves.
+    # So: record the uid we reclaimed FOR, and compare two stats. The marker is written only
+    # after a COMPLETE successful reclaim, so a half-finished one is retried rather than
+    # remembered as done.
+    HOME_UID=$(stat -c '%u' "/home/$AGENT_USER")
+    HOME_MARK="/home/$AGENT_USER/.ecc-home-uid"
+    MARKED=$(cat "$HOME_MARK" 2>/dev/null || true)
+    if [ "$HOME_UID" != "$AGENT_UID" ] || [ "$MARKED" != "$AGENT_UID" ]; then
+      echo "startup: home was last reclaimed for uid '${MARKED:-<none>}', we are $AGENT_UID"
+      echo "startup:   reclaiming /home/$AGENT_USER (recursive, over NFS — this can take minutes)"
+      # Group is deliberately left alone: gid 6000 (domain users) is assigned by the directory
+      # and does not move with the pk.
+      if ! chown -R "$AGENT_UID" "/home/$AGENT_USER"; then
+        echo "FATAL: could not chown /home/$AGENT_USER to $AGENT_UID." >&2
+        echo "  The export may be mapping root (root_squash); without it every session opens" >&2
+        echo "  into a home it cannot read. Fix ownership on the appliance." >&2
+        exit 1
+      fi
+      printf '%s\n' "$AGENT_UID" > "$HOME_MARK"
+      chown "$AGENT_UID" "$HOME_MARK"
+      echo "startup:   reclaimed, marker written."
+    fi
+
+    # ⚠ A STALE tmux SOCKET IS NOT A LIVE ONE. `.agent.sock` survives on the NFS home across
+    # pod restarts and recreates; the server that owned it is long gone. Now that it is ours
+    # tmux can unlink it, but only if it is genuinely dead — so probe before removing, never
+    # delete a socket a running server is serving.
+    AGENT_SOCK="/home/$AGENT_USER/.agent.sock"
+    if [ -S "$AGENT_SOCK" ] && ! su - "$AGENT_USER" -c "tmux -S '$AGENT_SOCK' has-session 2>/dev/null"; then
+      echo "startup: removing a stale tmux socket (no server answers on it)"
+      rm -f "$AGENT_SOCK"
+    fi
+
+    # ── xrdp ──────────────────────────────────────────────────────────────────────
+    # Only [Xorg] works properly here; the stock greeter's other backends are broken in a
+    # container and only offer users a way to fail. autorun picks it unattended and hides the
+    # Session row entirely, leaving username + password.
+    if [ -f /etc/xrdp/xrdp.ini ]; then
+      for _sec in Xvnc vnc-any neutrinordp-any sesman-any; do
+        sed -i "/^\[${_sec}\]/,/^\[/{ /^\[${_sec}\]/d; /^\[/!d }" /etc/xrdp/xrdp.ini
+      done
+      if grep -q '^\[Xorg\]' /etc/xrdp/xrdp.ini; then
+        if grep -q '^autorun=' /etc/xrdp/xrdp.ini; then
+          sed -i 's/^autorun=.*/autorun=Xorg/' /etc/xrdp/xrdp.ini
+        else
+          sed -i '/^\[Globals\]/a autorun=Xorg' /etc/xrdp/xrdp.ini
+        fi
+      fi
+      # The login box is captioned with ls_title, which stocks to the pod's hostname — i.e. a
+      # ReplicaSet hash the two humans have no reason to see.
+      if grep -q '^ls_title=' /etc/xrdp/xrdp.ini; then
+        sed -i 's/^ls_title=.*/ls_title=EDA PCB Agent/' /etc/xrdp/xrdp.ini
+      fi
+    fi
+
+    # ⚠ PIN THE DISCONNECT BEHAVIOUR EXPLICITLY. Session-survives-disconnect is the entire
+    # point of this app: both humans detach and reattach to a session the agent keeps working
+    # in. remote-desktop only gets this by inheriting stock defaults, which is not a guarantee
+    # — a package update that changed them would silently start killing the agent's session on
+    # every disconnect, and it would read as a crash rather than a config change.
+    if [ -f /etc/xrdp/sesman.ini ]; then
+      for _kv in "KillDisconnected=false" "DisconnectedTimeLimit=0" "MaxIdleTimeLimit=0"; do
+        _k="${_kv%%=*}"
+        if grep -q "^${_k}=" /etc/xrdp/sesman.ini; then
+          sed -i "s/^${_k}=.*/${_kv}/" /etc/xrdp/sesman.ini
+        else
+          sed -i "/^\[Sessions\]/a ${_kv}" /etc/xrdp/sesman.ini
+        fi
+      done
+      echo "startup: sesman pinned ($(grep -c '^KillDisconnected=false' /etc/xrdp/sesman.ini) of 1)"
+    fi
+
+    # The X session for this account: plain xfce.
+    printf 'startxfce4\n' > "/home/$AGENT_USER/.xsession"
+    chown "$AGENT_USER" "/home/$AGENT_USER/.xsession" 2>/dev/null || true
+
+    # ── The SHARED tmux session ───────────────────────────────────────────────────
+    # A socket at a FIXED path on the persistent home, so both RDP viewers attach the very
+    # same server and see the same pane and cursor. Started as the agent user, not root, or
+    # the sockets' ownership makes the attach fail.
+    #
+    # ⚠ tmux makes the session RE-ATTACHABLE, not immortal. This pod is Recreate + Reloader-
+    # rolled, so any config change ends it; only the NFS-backed home and the Kanban board are
+    # durable. Do not read this as persistence.
+    su - "$AGENT_USER" -c "tmux -S /home/$AGENT_USER/.agent.sock has-session -t agent 2>/dev/null \
+      || tmux -S /home/$AGENT_USER/.agent.sock new-session -d -s agent" \
+      && echo "startup: shared tmux session 'agent' ready" \
+      || echo "startup: WARNING could not start the shared tmux session" >&2
+
+    # Auto-attach on login, so both humans land in the same pane without typing anything.
+    # `|| true` so a broken tmux can never lock the account out of a shell.
+    cat > /etc/profile.d/zz-agent-tmux.sh <<'PROFEOF'
+    # Attach every interactive login of the agent account to the ONE shared session.
+    if [ -n "${PS1:-}" ] && [ -z "${TMUX:-}" ] && [ "$(id -un)" = "eda-pcb-agent" ]; then
+      tmux -S "$HOME/.agent.sock" attach -t agent 2>/dev/null || true
+    fi
+    PROFEOF
+    chmod 644 /etc/profile.d/zz-agent-tmux.sh
+
+    # ── The KiCad job runner ──────────────────────────────────────────────────────
+    # ⚠ WHY THIS EXISTS: KiCad lives in THIS container, the agent lives in `hermes`.
+    # The two share /home (the NFS export) and NOTHING else — no process namespace, no
+    # /usr. The hermes image is Debian 13 and the KiCad PPA publishes for Ubuntu only
+    # (dists/trixie is a 404), so KiCad cannot simply be apt-installed next to the agent;
+    # Ubuntu .debs would also land on the wrong glibc (2.41 Debian vs 2.43 here).
+    #
+    # So the agent submits a shell script into a queue on the shared home and this loop
+    # runs it against the real KiCad. What makes it work at all is that BOTH containers
+    # resolve to the SAME AD identity, uid 5021 / gid 6000 — the agent's file is readable
+    # and its output writable without any uid mapping.
+    #
+    # ⚠ THE QUEUE DIRECTORIES ARE CREATED BY THE AGENT, NOT HERE. Creating them from this
+    # container (which runs as root before dropping to the agent user) leaves them
+    # root-owned, and the agent's writes then fail with EACCES — measured 2026-09-14. This
+    # loop therefore WAITS for the directory rather than creating it.
+    #
+    # ⚠ NOT A SANDBOX. Anything the agent writes here is executed with the agent account's
+    # full rights in this container. That is the same trust level the agent already has —
+    # it runs arbitrary shell in `hermes` — so this widens WHICH binaries it can reach, not
+    # WHOSE identity it acts as. Do not mount this queue anywhere else.
+    KICAD_Q="/home/$AGENT_USER/.kicad-jobs"
+    cat > /usr/local/bin/kicad-job-runner <<'RUNEOF'
+    #!/bin/bash
+    # Runs queued jobs from $1/in, writing <id>.out and <id>.rc into $1/out.
+    Q="$1"
+    while true; do
+      if [ -d "$Q/in" ] && [ -d "$Q/out" ]; then
+        for f in "$Q"/in/*.job; do
+          [ -e "$f" ] || continue
+          id=$(basename "$f" .job)
+          # Move before running: a job is claimed exactly once even if this loop overlaps.
+          if mv "$f" "$Q/.$id.running" 2>/dev/null; then
+            timeout 1800 bash "$Q/.$id.running" > "$Q/out/$id.out" 2>&1
+            echo "$?" > "$Q/out/$id.rc"
+            rm -f "$Q/.$id.running"
+          fi
+        done
+      fi
+      sleep 2
+    done
+    RUNEOF
+    chmod 755 /usr/local/bin/kicad-job-runner
+    su - "$AGENT_USER" -c "setsid nohup /usr/local/bin/kicad-job-runner '$KICAD_Q' >/dev/null 2>&1 &" \
+      && echo "startup: kicad job runner watching $KICAD_Q" \
+      || echo "startup: WARNING could not start the kicad job runner" >&2
+
+    # ── kicad-mcp-pro: TWO servers, because neither profile is complete alone ──────
+    #
+    # Runs HERE, not beside the agent: it drives `kicad-cli` (/usr/bin/kicad-cli) and
+    # kicad-sch-api, neither of which exists in the `hermes` container. Both containers
+    # share the pod's network namespace, so the agent reaches them on loopback with NO
+    # NetworkPolicy change.
+    #
+    # ⚠ AS $AGENT_USER, NOT root. It writes into the AD home the agent also writes, so root
+    # here would leave root-owned files in a user's home (the same trap module entrypoints
+    # have).
+    #
+    # ⚠ WHY TWO PORTS. The profiles are DISJOINT, and each is missing what the other has:
+    #
+    #   :3400  build  / write     17 tools — sch_plan_from_spec -> preview -> apply ->
+    #                             verify -> rollback. The ONLY authoring path.
+    #   :3401  review / readonly  24 tools — run_erc, validate_design,
+    #                             sch_get_connectivity_graph,
+    #                             validate_footprints_vs_schematic. The ONLY verification.
+    #
+    # `build` HAS NO run_erc. That is not a detail: it means an agent authoring through
+    # :3400 alone cannot check its own work, and sch_apply_plan returns isError=False on a
+    # write it never validates. Running build alone is what let a whole night of authoring
+    # produce 6 symbols across 5 sheets with an empty main sheet, unnoticed (2026-09-22).
+    #
+    # ⚠ Running REVIEW alone is equally wrong: it has no write tools at all, so the agent
+    # falls back to hand-writing s-expressions — which is what actually produced the
+    # unloadable sheets in that incident. Those files stamp `(generator "kicad-cli")`, a
+    # string NO installed package emits; kicad-mcp-pro stamps "kicad-mcp-pro" and
+    # kicad-sch-api stamps "eeschema". They were hand-rolled by the agent
+    # (~/bak/DR_Relay_KiCad/mainboard/build_children_v5.py and friends), carrying `(id N)`
+    # in properties and `(wire (start ...) (end ...))`, neither of which KiCad 10 accepts.
+    #
+    # ⇒ Both, always. Authoring on :3400, verification on :3401, and the `kicad` skill
+    # requires an ERC pass after every apply. Remove either one and the loop reopens.
+    #
+    # ⚠ kicad-sch-api is NOT the culprit and must not be "fixed": it writes
+    # `(version 20250114)` against this KiCad's `20260206`, and its files load and pass ERC
+    # anyway (verified 2026-09-22 — `Found 0 violations`). KiCad 10 reads the older format.
+    # Judge a writer by whether KiCad LOADS its output, never by the version it stamps.
+    #
+    # ⚠ --profile/--mode MUST be CLI FLAGS. The env vars are read only by the library's own
+    # settings loader; passing the profile through the environment alone silently yields the
+    # DEFAULT profile, which serves 11 tools — a missing capability that reads as "the
+    # server does not support this" rather than as a config error. Measured 2026-09-21/22:
+    # review=24 tools, build=17, default=11.
+    #
+    # ⚠ NO AUTH TOKEN, deliberately. kicad-mcp-pro demands a >=32-char token only when the
+    # bind is exposed or the boundary is tls-proxy; a loopback bind inside one pod is
+    # neither, and a token here would be a secret to seal and rotate protecting a socket no
+    # other pod can reach.
+    #
+    # ⚠ WORKSPACE_ROOT is a containment boundary — the server refuses paths outside it.
+    # Set it, do not leave it unset.
+    # One log per server: a single shared file interleaves two uvicorn streams and makes
+    # "which server answered" unanswerable when only one of them is misbehaving.
+    for _spec in "3400 build write" "3401 review readonly"; do
+      set -- $_spec
+      _port="$1"; _prof="$2"; _mode="$3"
+      _log="/home/$AGENT_USER/.kicad-mcp-pro-${_prof}.log"
+      su - "$AGENT_USER" -c "KICAD_MCP_KICAD_CLI=/usr/bin/kicad-cli         KICAD_MCP_WORKSPACE_ROOT='/home/$AGENT_USER'         setsid nohup /opt/kicad-py/bin/kicad-mcp-pro           --transport streamable-http --host 127.0.0.1 --port ${_port}           --profile ${_prof} --mode ${_mode}           >> '${_log}' 2>&1 &"         && echo "startup: kicad-mcp-pro on 127.0.0.1:${_port} (profile=${_prof}, mode=${_mode})"         || echo "startup: WARNING could not start kicad-mcp-pro ${_prof}" >&2
+    done
+
+    echo "startup: starting xrdp"
+    /usr/sbin/xrdp-sesman
+    trap 'echo "shutting down"; pkill -TERM xrdp-sesman 2>/dev/null; pkill -TERM xrdp 2>/dev/null; exit 0' TERM INT
+    # xrdp in the foreground IS this container's process: if it dies the container must die
+    # with it so Kubernetes restarts the pod, rather than lingering with a dead greeter.
+    exec /usr/sbin/xrdp --nodaemon

@@ -1,0 +1,177 @@
+# Configure Rocket.Chat's "Custom OAuth" provider for Authentik via the REST API.
+# Custom-oauth setting IDs contain dashes (e.g. Accounts_OAuth_Custom-Authentik-url)
+# which are invalid as Kubernetes env names, so they cannot be set through the
+# chart's extraEnv — they must be applied via the API. Runs PostSync, idempotent.
+#
+# Admin credentials come from the rocketchat-admin secret (same one that seeds the
+# admin on first boot); the OIDC client secret from rocketchat-oidc-client-secret.
+# Callback registered in Authentik: https://rocketchat.<tld>/_oauth/authentik
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rocketchat-oauth-config
+  namespace: rocketchat
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 1200
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: oauth-config
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # RC_URL stays public — written into the Site_Url setting (links/redirects).
+            # RC_API is the in-cluster Service used for the REST calls below, so this job
+            # never depends on public DNS for rocketchat.<tld>. ID_URL stays public — it
+            # is stored as the OAuth provider URL the browser redirects to.
+            - name: RC_URL
+              value: "https://rocketchat.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: RC_API
+              value: "http://rocketchat-rocketchat.rocketchat.svc.cluster.local"
+            - name: ID_URL
+              value: "https://id.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # Untrusted CA on staging → curl needs "-k". updateConfigFromProjectSettings.sh
+            # clears this to "" (verify) when certIssuerType is letsencrypt-prod.
+            - name: CURL_INSECURE
+              value: "" # automatically updated from project-settings:{tls.certIssuerType,tls.curlInsecure}
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rocketchat-admin
+                  key: ADMIN_USERNAME
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rocketchat-admin
+                  key: ADMIN_PASS
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rocketchat-oidc-client-secret
+                  key: OIDC_CLIENT_SECRET
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              echo "Waiting for Rocket.Chat API..."
+              i=0
+              while [ "$i" -lt 90 ]; do
+                code=$(curl $CURL_INSECURE -sS -o /dev/null -m 5 -w "%{http_code}" "$RC_API/api/info" || true)
+                [ "$code" = "200" ] && { echo "Rocket.Chat API up."; break; }
+                echo "  waiting... ($i/90) http=$code"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 90 ] && { echo "ERROR: Rocket.Chat API never ready"; exit 1; }
+
+              echo "Logging in as ${ADMIN_USERNAME}..."
+              LOGIN=$(curl $CURL_INSECURE -sS -X POST "$RC_API/api/v1/login" \
+                -d "user=${ADMIN_USERNAME}&password=${ADMIN_PASS}")
+              TOKEN=$(echo "$LOGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['authToken'])")
+              UID=$(echo "$LOGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['userId'])")
+              [ -z "$TOKEN" ] && { echo "ERROR: login failed: $LOGIN"; exit 1; }
+
+              # Rocket.Chat enforces 2FA on admin write actions; with no TOTP set up
+              # the API returns {"error":"totp-required"} and silently no-ops the
+              # write. Use the password fallback: send the SHA-256 of the admin
+              # password as x-2fa-code with x-2fa-method=password on every mutation.
+              PWHASH=$(printf '%s' "$ADMIN_PASS" | sha256sum | cut -d' ' -f1)
+
+              # set_setting POSTs a value and FAILS LOUDLY if RC reports success=false
+              # (e.g. unknown setting id or rejected 2FA) — the old version discarded
+              # the body and reported success on no-ops.
+              set_setting() {
+                ID="$1"; VAL="$2"
+                BODY=$(VAL="$VAL" python3 -c "import json,os; print(json.dumps({'value': os.environ['VAL']}))")
+                RESP=$(curl $CURL_INSECURE -sS -X POST "$RC_API/api/v1/settings/${ID}" \
+                  -H "X-Auth-Token: $TOKEN" -H "X-User-Id: $UID" \
+                  -H "x-2fa-code: $PWHASH" -H "x-2fa-method: password" \
+                  -H "Content-Type: application/json" -d "$BODY")
+                echo "$RESP" | grep -q '"success":true' \
+                  || { echo "ERROR: set ${ID} failed: $RESP"; exit 1; }
+                echo "  set ${ID}"
+              }
+              set_setting_bool() {
+                RESP=$(curl $CURL_INSECURE -sS -X POST "$RC_API/api/v1/settings/$1" \
+                  -H "X-Auth-Token: $TOKEN" -H "X-User-Id: $UID" \
+                  -H "x-2fa-code: $PWHASH" -H "x-2fa-method: password" \
+                  -H "Content-Type: application/json" -d "{\"value\": $2}")
+                echo "$RESP" | grep -q '"success":true' \
+                  || { echo "ERROR: set $1 failed: $RESP"; exit 1; }
+                echo "  set $1=$2"
+              }
+
+              # Create the custom OAuth service FIRST. Rocket.Chat only
+              # materialises the Accounts_OAuth_Custom-* settings when the service is
+              # added via the addOAuthService method; POSTing to those setting IDs
+              # before they exist is silently ignored (no settings, no login button).
+              # NOTE: RC capitalises the service name, so passing "authentik" creates
+              # setting IDs "Accounts_OAuth_Custom-Authentik-*" (capital A) — the
+              # configuration below must use that exact casing or every write no-ops.
+              # Idempotent: re-adding an existing service is a no-op error we tolerate.
+              echo "Ensuring custom OAuth service 'authentik' exists..."
+              curl $CURL_INSECURE -sS -X POST "$RC_API/api/v1/method.call/addOAuthService" \
+                -H "X-Auth-Token: $TOKEN" -H "X-User-Id: $UID" \
+                -H "Content-Type: application/json" \
+                -d '{"message":"{\"msg\":\"method\",\"id\":\"add-oauth\",\"method\":\"addOAuthService\",\"params\":[\"authentik\"]}"}' >/dev/null || true
+              # Let RC persist the generated settings before configuring them.
+              sleep 5
+
+              echo "Configuring Authentik custom OAuth..."
+              set_setting     "Site_Url"                                  "$RC_URL"
+              set_setting_bool "Accounts_OAuth_Custom-Authentik"          "true"
+              set_setting      "Accounts_OAuth_Custom-Authentik-url"                   "$ID_URL"
+              set_setting      "Accounts_OAuth_Custom-Authentik-token_path"            "/application/o/token/"
+              set_setting      "Accounts_OAuth_Custom-Authentik-token_sent_via"        "header"
+              set_setting      "Accounts_OAuth_Custom-Authentik-identity_token_sent_via" "default"
+              set_setting      "Accounts_OAuth_Custom-Authentik-identity_path"         "/application/o/userinfo/"
+              set_setting      "Accounts_OAuth_Custom-Authentik-authorize_path"        "/application/o/authorize/"
+              set_setting      "Accounts_OAuth_Custom-Authentik-scope"                 "openid profile email groups"
+              set_setting      "Accounts_OAuth_Custom-Authentik-id"                    "rocketchat"
+              set_setting      "Accounts_OAuth_Custom-Authentik-secret"                "$OIDC_CLIENT_SECRET"
+              set_setting      "Accounts_OAuth_Custom-Authentik-login_style"           "redirect"
+              set_setting      "Accounts_OAuth_Custom-Authentik-button_label_text"     "Login with Authentik"
+              set_setting      "Accounts_OAuth_Custom-Authentik-button_label_color"    "#FFFFFF"
+              set_setting      "Accounts_OAuth_Custom-Authentik-button_color"          "#1d74f5"
+              set_setting      "Accounts_OAuth_Custom-Authentik-username_field"        "preferred_username"
+              set_setting      "Accounts_OAuth_Custom-Authentik-email_field"           "email"
+              set_setting      "Accounts_OAuth_Custom-Authentik-name_field"            "name"
+              set_setting_bool "Accounts_OAuth_Custom-Authentik-merge_users"           "true"
+              set_setting_bool "Accounts_OAuth_Custom-Authentik-show_button"           "true"
+
+              # Role sync: map the Authentik rc_roles claim → Rocket.Chat roles.
+              # rocketchat-admins / employees-extended members carry rc_roles=["admin"];
+              # everyone else ["user"]. roles_to_sync limits managed roles to "admin"
+              # so the mapping only ever grants/revokes admin (never touches others).
+              # NOTE: RC role-mapping setting IDs vary slightly across versions — verify
+              # on first boot (Admin → Settings → OAuth → Custom Authentik) if admins
+              # aren't promoted; fallback is a per-user setUserActiveStatus/role job.
+              set_setting_bool "Accounts_OAuth_Custom-Authentik-merge_roles"           "true"
+              set_setting      "Accounts_OAuth_Custom-Authentik-roles_claim"           "rc_roles"
+              set_setting      "Accounts_OAuth_Custom-Authentik-roles_to_sync"         "admin"
+
+              # OIDC-only: hide the local username/password login form. The OAuth
+              # button stays. Break-glass: re-enable via the admin REST API
+              # (Accounts_ShowFormLogin=true) using the rocketchat-admin secret.
+              set_setting_bool "Accounts_ShowFormLogin"                                "false"
+
+              # No self sign-up: disable the public email/password registration
+              # form so users can't create their own accounts. OIDC/OAuth
+              # auto-provisioning stays ON (Authentik-known users still get an
+              # account on first SSO login) — that's controlled by the auth-service
+              # settings above, NOT by the registration form.
+              set_setting "Accounts_RegistrationForm" "Disabled"
+
+              # Disable RC's own email 2FA. Authentication is fully handled by
+              # Authentik (including MFA for privileged users). RC's email 2FA
+              # would interrupt the SSO flow with a redundant code prompt.
+              set_setting_bool "Accounts_TwoFactorAuthentication_By_Email_Enabled"        "false"
+              set_setting_bool "Accounts_TwoFactorAuthentication_By_Email_Auto_Opt_In"    "false"
+
+              echo "Rocket.Chat Authentik OAuth configured."

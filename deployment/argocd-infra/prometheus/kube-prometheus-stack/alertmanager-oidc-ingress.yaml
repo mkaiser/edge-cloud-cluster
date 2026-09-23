@@ -1,0 +1,44 @@
+# Public route for the Alertmanager UI, protected by Authentik OIDC.
+# Alertmanager has no native auth, so — exactly like Prometheus — this routes to
+# the Authentik embedded outpost (proxy provider "alertmanager", see
+# authentik/blueprint-apps.yaml), which enforces login then proxies to the
+# alertmanager service via the provider's internal_host.
+#
+# The backend is the outpost Service in the `authentik` namespace, reached via
+# the cross-namespace ReferenceGrant in authentik/outpost-referencegrant.yaml.
+# (Do NOT reintroduce an ExternalName alias here — Envoy Gateway will not build
+# an upstream cluster for one and every request 500s while the HTTPRoute still
+# reports Accepted/ResolvedRefs. See that file's comment.)
+#
+# Why this exists at all: alert emails render a "View in AlertManager" button
+# from alertmanagerSpec.externalUrl (set in prometheus.yaml). Without a public
+# route that URL can only ever be the in-cluster Service DNS, which resolves
+# nowhere from a mail client.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once, cluster-wide, by
+# argocd-infra/gateway/redirect-to-https.yaml.
+#
+# Chicken/egg: kube-prometheus-stack is sync-wave 2, authentik is wave 6 — until
+# Authentik is up this backend returns 503, then self-heals.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: alertmanager-oidc
+  namespace: prometheus
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - alertmanager.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: authentik-server
+          namespace: authentik
+          port: 80

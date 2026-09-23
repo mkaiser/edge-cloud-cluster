@@ -1,26 +1,77 @@
-encryptionsalt: v1:cQCRhFJobts=:v1:ICMOci1J/UOFShsb:GLOjxZz3k5psJ+sXZuR25BqT8aBmjw==
+encryptionsalt: ""
 config:
   edgecloudinfra:hcloudToken:
-    secure: v1:a0ioKY+iqovgKUcm:lUzW7zR6Pl8zLgivECR1/zkBmTUCsw==
+    secure: ""
+  edgecloudinfra:hetznerRobotUser:
+    secure: ""
+  edgecloudinfra:hetznerRobotPass:
+    secure: ""
   edgecloudinfra:hetznerS3AccessKey:
-    secure: v1:qQ7v72HhvNuaaXiU:eFso0ktW095MSO64r8/qFgYutgFle7v3
+    secure: ""
   edgecloudinfra:hetznerS3SecretKey:
-    secure: v1:5xuN18MTrnTQCHxm:EKora3EOE2SA9Za6ufeFGnVnhvNldwk=
+    secure: ""
   edgecloudinfra:smtpServer:
-    secure: v1:jiAXI+44nE2kCFNW:Q+/QJtOYblm+jDRUKfJzBLpvUYZingLD0JnnzXFlfw==
+    secure: ""
   edgecloudinfra:smtpPort:
-    secure: v1:5kwujmuh1YE4agME:QU2TwMIQxmFqOrav5ByJA0sU7w==
+    secure: ""
   edgecloudinfra:smtpUsername:
-    secure: v1:N9bB1OLWl8Qoj8sY:UYrRFdW9QpGNGJNNzNS3xeBrRhNom+IBV24=
+    secure: ""
   edgecloudinfra:smtpPassword:
-    secure: v1:OTFSPsGCcFHaHOXf:4KpSrxYo9cyBOqC7xEvIfWXmgyzvxA==
+    secure: ""
   edgecloudinfra:smtpNotifyRecipient:
-    secure: v1:trdLgezzRJ4Mn+4E:K4jO2DJmH9sYYQkl56mjbfFeaK44Yr+8x3Su1t/eTN8=
+    secure: ""
   edgecloudinfra:wgServerPrivateKey:
-    secure: v1:JSYe6hr3TFg98h+J:u5PeJpydUv3++NTv6BIdS9vNO2W4Ya/CoPHF+U78f/VwUz+WIbus5++tsm/2GZrLhvymBRdGUtxSLnzc
+    secure: ""
   edgecloudinfra:wgServerPublicKey:
-    secure: v1:oCAwBQt4zthka64W:LA0oQhgR1xY5hs3m+Qgywxf+9cVmXZBt0HY0bY1S1wMqX09+/ZkJ/bNmqybpCZA3C9GW5S9xwRPGe4Ht
+    secure: ""
   edgecloudinfra:wgAdminPrivateKey:
-    secure: v1:u4QLE7xfo0XUlBCV:Pv1uvztX42GAENBpmMzFRRs/q9gbHBdB4O94y902DO19C6K/apoC/iV5RSRltn/qj+10PG0/PA2gNLT6
+    secure: ""
   edgecloudinfra:wgAdminPublicKey:
-    secure: v1:EpVJIn4+KlQVbb+2:RpvXrDFwGkG+eNnvmdSggHqU1S6lz4usRwG2nDQgZw5SMKHUrLFz/G506NP8TsUsdVN6OuTynI5fwzXN
+    secure: ""
+  edgecloudinfra:argocdAdminPasswordPlain:
+    secure: ""
+  edgecloudinfra:argocdAdminPasswordHash:
+    secure: ""
+  edgecloudinfra:argocdAdminPasswordMtime:
+    secure: ""
+  edgecloudinfra:argocdServerSecretKey:
+    secure: ""
+  edgecloudinfra:argocdGithubDeployKey:
+    secure: ""
+  edgecloudinfra:sshkey-ecc-cloud:
+    secure: ""
+  edgecloudinfra:sshkey-ecc-dedicated:
+    secure: ""
+  edgecloudinfra:sealedSecretsTlsCrt:
+    secure: ""
+  edgecloudinfra:sealedSecretsTlsKey:
+    secure: ""
+  edgecloudinfra:ssh-trecs-gateway-cape-fwd:
+    secure: ""
+  edgecloudinfra:sshkey-ecc-mesh:
+    secure: ""
+  edgecloudinfra:edgeSshPrivateKey:
+    secure: ""
+  edgecloudinfra:githubPatToken:
+    secure: ""
+  edgecloudinfra:robotForceReinstall: "1789690552"
+  edgecloudinfra:adminContactEmail:
+    secure: ""
+  edgecloudinfra:meshVpnReady: "true"
+  edgecloudinfra:meshNodeProvisionFilter: "unibi-hclab-orin-eval"
+  edgecloudinfra:meshNodeProvisionForce: "true"
+  edgecloudinfra:meshNodeProvisionSkip: ""
+  edgecloudinfra:meshNodeProvisionForceNonce: "20260921T161039Z-162037"
+  edgecloudinfra:truenasAdminUser:
+    secure: ""
+  edgecloudinfra:truenasAdminPassword:
+    secure: ""
+  edgecloudinfra:truenasVmDisplayPassword:
+    secure: ""
+  edgecloudinfra:argocdSelfManaged: "true"
+  edgecloudinfra:wgAdmin2PrivateKey:
+    secure: ""
+  edgecloudinfra:wgAdmin2PublicKey:
+    secure: ""
+  edgecloudinfra:k3sClusterToken:
+    secure: ""

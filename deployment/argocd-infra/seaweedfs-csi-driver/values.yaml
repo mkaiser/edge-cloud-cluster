@@ -1,0 +1,36 @@
+# SeaweedFS CSI driver — provides the `seaweedfs` StorageClass for mobile-app file PVCs.
+# Talks to the SeaweedFS filer deployed by the seaweedfs chart (wave 13).
+# See doc/cloud-mesh-architecture.md.
+
+# Filer endpoint (HTTP port 8888; the driver derives the gRPC port). Service name
+# is "<release>-filer" in the seaweedfs namespace.
+seaweedfsFiler: "seaweedfs-filer.seaweedfs:8888"
+
+# Creates a StorageClass named "seaweedfs" (NOT default — longhorn-cloud stays default).
+storageClassName: seaweedfs
+storageClassVolumeBindingMode: Immediate
+isDefaultStorageClass: false
+
+security:
+  enabled: false
+
+# Controller pod anti-affinity: the chart hardcodes a REQUIRED host anti-affinity
+# for the controller. With replicas:1 + RollingUpdate (maxSurge 1) and only one
+# schedulable cloud node (mesh nodes are tainted ecc/mesh, no toleration here), the
+# surge pod on any image bump can never place -> rollout wedges -> ArgoCD Degraded.
+# Override to a SOFT (preferred) rule: keeps HA spreading intent for when a 2nd
+# cloud node exists, but lets the rollover co-locate on the single node so it
+# always completes. See doc/cloud-mesh-architecture.md.
+controller:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                    - seaweedfs-csi-driver-controller
+            topologyKey: kubernetes.io/hostname

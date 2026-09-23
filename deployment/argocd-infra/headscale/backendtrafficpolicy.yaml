@@ -1,0 +1,57 @@
+# Allow the Tailscale "Noise" control-protocol upgrade through Envoy.
+#
+# WHY THIS EXISTS: tailscale clients register by POSTing to /ts2021 with
+#   Connection: Upgrade
+#   Upgrade: tailscale-control-protocol
+# Envoy ALLOW-LISTS upgrade tokens, and per the BackendTrafficPolicy CRD:
+# "If not specified, the default upgrade configuration(websocket) will be used."
+# Without this policy every /ts2021 POST is rejected BY ENVOY with 403
+# upgrade_failed and upstream_host=null — headscale never sees the request and
+# logs nothing.
+#
+# The symptom is badly misleading: `tailscale status` in the mesh-gateway
+# sidecar just says "Logged out", the pod stays 2/2 Running, and the client log
+# blames "/machine/register" (the legacy path it reports) rather than /ts2021.
+# `make production` then fails much later at
+# 00-fetch-cluster-inputs.sh -> "CP0 has no tailscale VPN IP (mesh not ready?)",
+# which reads like a mesh timing problem rather than an ingress one.
+# The tell is in the Envoy access log: response_code_details=upgrade_failed
+# with x-envoy-origin-path=/ts2021.
+#
+# websocket MUST be restated: specifying httpUpgrade REPLACES the default list
+# rather than appending to it, so omitting it here would silently break
+# websockets on this route.
+#
+# ⚠ TWO DIFFERENT UPGRADE TOKENS, TWO DIFFERENT PATHS. /ts2021 above does NOT
+# cover the DERP relay: clients open that with `Upgrade: DERP` on /derp, a
+# separate token. Drop it from this list and Envoy rejects it the same way
+# (403 upgrade_failed, upstream_host=null, x-envoy-origin-path=/derp) while
+# headscale answers 101 on 127.0.0.1:8080.
+#
+# The symptom is far worse than "relay down", because DERP is the FALLBACK path:
+# sites with a working direct WireGuard path never touch it and look perfectly
+# healthy, so only the sites that need a relay break — their nodes go NotReady
+# while the rest stay Ready. Peers
+# read `relay "headscale", tx N rx 0` (packets out, nothing EVER back) and the
+# node logs `derphttp.Client.Send ... GET failed: <nil>` — the client's
+# rendering of the 403. Meanwhile `tailscale netcheck` reports the relay at a
+# healthy 13 ms, because latency is probed over /derp/latency-check, a plain GET
+# with NO upgrade header that Envoy passes happily. netcheck is therefore NOT
+# evidence that DERP works.
+#
+# headscale accepts `websocket` or `derp` (hscontrol/derp/server/derp_server.go:157);
+# the token is case-insensitive there but must be listed here as sent.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: headscale-noise-upgrade
+  namespace: headscale
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: headscale
+  httpUpgrade:
+    - type: websocket
+    - type: tailscale-control-protocol
+    - type: DERP

@@ -1,0 +1,290 @@
+# Publish the on-prem AD DCs to VPN CLIENTS as a split-DNS resolver, and keep that list
+# tracking the live topology.
+#
+# WHY THIS EXISTS. A person on the tailnet could reach the lab fileserver only by IP
+# (\\192.168.1.237\eda); `\\fs-1.ad.base.internal\eda` did not resolve. Nothing was wrong
+# with AD DNS — the record is correct and the DCs answer for it on their mesh addresses.
+# What was missing is that headscale never TOLD clients a resolver for that zone exists, so
+# a laptop asked its own local DNS, which knows nothing about ad.base.internal.
+#
+# ⚠ NOTHING IS GENERATED INTO A MANIFEST FOR THIS, and it CANNOT be. A mesh IP is assigned
+# by headscale at JOIN time (`prefixes.allocation: sequential`), so it is not derivable from
+# project_settings the way network.cpMeshIps is — that one only works because the init CP
+# always joins first. The set is therefore read from the live cluster on every tick, the
+# same way argocd-infra/truenas/dc-set-watch.yaml does it, and there is no anchored value in
+# any manifest to keep in step.
+#
+# ⚠ THE ecc/ad-dc NODE LABELS, NOT THE RUNNING PODS. Identical reasoning to dc-set-watch: a
+# pod set answers "which DCs are up right now", which is the wrong question. A DC that is
+# rebooting or NotReady is still part of the topology and must keep serving as a declared
+# resolver — dropping it would be a config change (and a control-plane roll) triggered by a
+# transient outage. Removing a DC is a deliberate act that includes
+# `kubectl label node <n> ecc/ad-dc-` (see CLAUDE.md).
+#
+# ⚠ THE NODE'S InternalIP **IS** ITS MESH IP on a mesh node (k3s joins over the tailnet, so
+# `--node-ip` is the tailscale address; verified: both DC nodes report an InternalIP inside
+# network.meshRange 10.0.10.0/23). That is what makes this discoverable at all.
+#
+# ─── WHY MESH IPs AND NOT THE OBVIOUS ALTERNATIVES ──────────────────────────────────────
+#
+#   * NOT the DCs' LAN addresses (ecc/lan-ip, 192.168.1.x). The ACL policy grants
+#     autogroup:member -> 192.168.1.0/24 on port **445 only**; tcp/udp 53 is granted to
+#     tag:k8s-node, which is exactly what these nodes carry. A LAN address here would be
+#     silently unreachable for DNS.
+#   * NOT the pinned ad-cloud-dns ClusterIP (network.adDnsClusterIp) that the node-local
+#     dnsmasq uses (src/provisioning-scripts/30-connect-vpn.sh). That is the better target
+#     ON A NODE — it follows the DC pod and cannot go stale — but it is deliberately NOT
+#     routable from the tailnet: policy-configmap.yaml refuses to advertise 10.43.0.0/16
+#     because that would make EVERY ClusterIP in the cluster reachable from a laptop.
+#   * NOT a tailnet hostname. headscale ignores a nameserver that is neither an IP nor a URL
+#     (hscontrol/types/config.go splitResolvers: "invalid split dns nameserver, ignoring"),
+#     so a name would fail silently.
+#
+# ─── WHY dns.nameservers.split AND NOT A GLOBAL RESOLVER ────────────────────────────────
+#
+# ⚠ NEVER `nameservers.global` / `override_local_dns: true` with these addresses. The AD DCs
+# forward public names fine but are NOT authoritative for ts.internal and cannot resolve it
+# (measured: `nslookup k3s-api.ts.internal <dc>` -> "No answer"). Making them the global
+# resolver would break every MagicDNS name, including the k3s-api.ts.internal record that
+# mesh nodes use to find the apiserver. `split` scopes them to the AD zone only; upstream
+# sets cfg.Routes from it independently of override_local_dns, so this works with the
+# current `false` and changes nothing else about a client's DNS.
+#
+# ─── WHY IT PATCHES THE CHART'S CONFIG SECRET ───────────────────────────────────────────
+#
+# The dns block cannot simply be written into wave8-headscale.yaml's `headscale.config`,
+# because the VALUES ARE NOT KNOWN THERE (see the join-order note above). So this patches
+# the rendered config Secret instead, which has two consequences that are both already
+# established in this app:
+#   * The Secret is a Helm pre-install/pre-upgrade hook, so ArgoCD re-renders it from the
+#     chart on every sync and selfHeal would revert the patch. wave8-headscale.yaml lists
+#     /data/config.yaml for this Secret in ignoreDifferences for exactly that reason.
+#   * headscale does NOT hot-reload DNS. SIGHUP reloads the ACL POLICY ONLY
+#     (hscontrol/app.go: "Received SIGHUP, reloading ACL policy" -> state.ReloadPolicy),
+#     so a dns change needs the pod to restart. Nothing here restarts it: the pod MOUNTS
+#     this Secret, and args-patch.yaml step 2c has already handed "roll on content change"
+#     to Reloader. Patching the Secret is therefore sufficient AND is the documented
+#     mechanism in this app (see the config-hash note in wave8-headscale.yaml).
+#
+# ⚠ ONLY ON A REAL CHANGE. Every patch that alters the content rolls the headscale
+# Deployment, which drops every client's control connection for a few seconds. So this
+# compares against a ConfigMap it owns and exits without touching anything when the set is
+# unchanged — the common case by far.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-ad-dns-watch
+  namespace: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-ad-dns-watch
+  namespace: headscale
+rules:
+# The chart's config Secret (read + patch), and the ConfigMap holding the last-applied set.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-ad-dns-watch
+  namespace: headscale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: headscale-ad-dns-watch
+subjects:
+- kind: ServiceAccount
+  name: headscale-ad-dns-watch
+  namespace: headscale
+---
+# Nodes are cluster-scoped: the ecc/ad-dc label and the InternalIP both live there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headscale-ad-dns-watch
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headscale-ad-dns-watch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headscale-ad-dns-watch
+subjects:
+- kind: ServiceAccount
+  name: headscale-ad-dns-watch
+  namespace: headscale
+---
+# Sync hook: apply the split-DNS block as part of every sync, so a fresh cluster gets it
+# without waiting up to 10 minutes for the first CronJob tick. Same script as the CronJob.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-ad-dns-watch-init
+  namespace: headscale
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # No ttlSecondsAfterFinished, for the reason args-patch.yaml gives: BeforeHookCreation
+  # already cleans up, and a TTL would delete the only copy of the logs.
+  template:
+    spec:
+      serviceAccountName: headscale-ad-dns-watch
+      restartPolicy: OnFailure
+      containers:
+      - name: patch
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args: ["exec /bin/sh /script/reconcile.sh"]
+        volumeMounts:
+        - {name: script, mountPath: /script}
+      volumes:
+      - name: script
+        configMap:
+          name: headscale-ad-dns-watch
+          defaultMode: 0555
+---
+# The reconcile script, shared by the Sync hook Job and the CronJob above so there is ONE
+# copy of the logic. Mounted rather than inlined twice: two copies of a script that patches
+# the VPN control plane's config is exactly the kind of duplicate that drifts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headscale-ad-dns-watch
+  namespace: headscale
+data:
+  reconcile.sh: |
+    #!/bin/sh
+    set -eu
+
+    NS=headscale
+    SECRET=headscale
+    CM=headscale-ad-dns-seen
+    AD_DOMAIN="ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+
+    # The declared DC set, by MESH address: every node LABELLED ecc/ad-dc, by its InternalIP.
+    #
+    # ⚠ THE LABEL, NOT THE RUNNING PODS — see the header. A DC that is down is still part of
+    # the topology; only a deliberate removal (which includes removing the label) should
+    # change what clients are told.
+    #
+    # ⚠ InternalIP, not ecc/lan-ip. On a mesh node the InternalIP IS the tailscale address,
+    # which is what a VPN client can actually reach on port 53 (the LAN grant is 445 only).
+    # Sorted, so ordering can never look like a change.
+    DC_SELECTOR="ecc/ad-dc=true"  # automatically updated from project-settings:applicationPlacements.labels.adDc
+    DESIRED=$(kubectl get nodes -l "$DC_SELECTOR" \
+                -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+              | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+
+    if [ -z "$DESIRED" ]; then
+      # An empty set is never a legitimate configuration: it is what a transient outage or a
+      # half-provisioned cluster looks like, and writing it would delete the resolver clients
+      # are using. Same guard, same reasoning, as truenas/dc-set-watch.yaml.
+      echo "No nodes labelled ecc/ad-dc with an InternalIP — refusing to act."  # automatically updated from project-settings:applicationPlacements.labels.adDc
+      exit 0
+    fi
+
+    SEEN=$(kubectl -n "$NS" get cm "$CM" -o jsonpath='{.data.dcSet}' 2>/dev/null || true)
+    echo "live DC set  : ${DESIRED}"
+    echo "last applied : ${SEEN:-<none>}"
+
+    # ⚠ Compare against the SECRET's live content too, not only the ConfigMap. ArgoCD
+    # re-renders this Secret from the chart on every sync; if the ignoreDifferences entry is
+    # ever removed or mis-scoped, the patch is silently reverted while our ConfigMap still
+    # says "applied". Checking both means we notice and re-apply instead of trusting a
+    # bookkeeping value.
+    LIVE_OK=$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.config\.yaml}' \
+              | base64 -d | DESIRED="$DESIRED" AD_DOMAIN="$AD_DOMAIN" python3 -c '
+    import os, sys, yaml
+    cfg = yaml.safe_load(sys.stdin) or {}
+    want = os.environ["DESIRED"].split()
+    got = (((cfg.get("dns") or {}).get("nameservers") or {}).get("split") or {}).get(os.environ["AD_DOMAIN"])
+    print("yes" if got == want else "no")
+    ')
+
+    if [ "$DESIRED" = "$SEEN" ] && [ "$LIVE_OK" = "yes" ]; then
+      echo "unchanged and live config agrees — nothing to do."
+      exit 0
+    fi
+    [ "$LIVE_OK" = "no" ] && echo "live config does NOT match — re-applying."
+
+    # Patch the rendered config: add/replace ONLY dns.nameservers.split for the AD zone and
+    # dns.search_domains. Everything else in the document is preserved as-is.
+    #
+    # ⚠ search_domains lets a client type \\fs-1 instead of the FQDN. headscale appends it to
+    # cfg.Domains alongside base_domain (hscontrol/types/config.go dnsToTailcfgDNS), so
+    # ts.internal keeps working — this ADDS a search suffix, it does not replace one.
+    NEW=$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.config\.yaml}' \
+          | base64 -d | DESIRED="$DESIRED" AD_DOMAIN="$AD_DOMAIN" python3 -c '
+    import os, sys, yaml
+    cfg = yaml.safe_load(sys.stdin) or {}
+    dns = cfg.setdefault("dns", {})
+    ns = dns.setdefault("nameservers", {})
+    split = ns.setdefault("split", {})
+    split[os.environ["AD_DOMAIN"]] = os.environ["DESIRED"].split()
+    sd = dns.setdefault("search_domains", [])
+    if os.environ["AD_DOMAIN"] not in sd:
+        sd.append(os.environ["AD_DOMAIN"])
+    # default_flow_style=False keeps the block style the chart rendered, so a human diffing
+    # the Secret sees a one-line change rather than a reformat of the whole document.
+    yaml.safe_dump(cfg, sys.stdout, default_flow_style=False, sort_keys=True)
+    ' | base64 -w0)
+
+    kubectl -n "$NS" patch secret "$SECRET" --type merge \
+      -p "{\"data\":{\"config.yaml\":\"$NEW\"}}"
+
+    # Record ONLY after the patch succeeded, so a failure is retried on the next tick rather
+    # than remembered as done.
+    kubectl -n "$NS" create configmap "$CM" --from-literal=dcSet="$DESIRED" \
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+    echo "published ${AD_DOMAIN} -> ${DESIRED}"
+    # No restart here ON PURPOSE: the pod mounts this Secret and args-patch.yaml step 2c has
+    # already annotated the Deployment for Reloader, which rolls it when the content changes.
+    echo "Reloader will roll the headscale Deployment (it mounts this Secret)."
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: headscale-ad-dns-watch
+  namespace: headscale
+spec:
+  # Every 10 minutes, matching truenas-dc-set-watch. A DC moving nodes is a rare,
+  # deliberate act; this only has to notice it eventually.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: headscale-ad-dns-watch
+          restartPolicy: Never
+          containers:
+          - name: watch
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            command: ["/bin/sh", "-c"]
+            args: ["exec /bin/sh /script/reconcile.sh"]
+            volumeMounts:
+            - {name: script, mountPath: /script}
+          volumes:
+          - name: script
+            configMap:
+              name: headscale-ad-dns-watch
+              defaultMode: 0555

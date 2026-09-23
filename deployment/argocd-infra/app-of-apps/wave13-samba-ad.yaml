@@ -1,0 +1,125 @@
+# ArgoCD Application: Samba Active Directory domain controllers.
+#
+# The technical AD layer TrueNAS SCALE Community requires: it has no OIDC directory
+# service, and Authentik's LDAP outpost cannot serve SMB (it stores no NT hash and
+# exposes no unicodePwd). Authentik remains the identity source of truth and provisions
+# into this domain; Samba holds the password material SMB and Kerberos need.
+#
+# TWO DCs, deliberately:
+#   ad-cloud — FSMO role holder, co-located with Authentik. Target of the
+#                    LDAPSource password write-back, so a password change never
+#                    traverses the mesh link. ClusterIP is enough: no LAN client
+#                    authenticates against it.
+#   ad-onprem   — hostNetwork on the lab nodes. Serves TrueNAS, laptops and the
+#                    desktop pod on the LAN. A Samba DC is a full multi-master replica
+#                    and authenticates entirely from its local copy, so lab users keep
+#                    working through a mesh↔cloud partition.
+#
+# Wave 13: same reasoning as wave12-csi-driver-smb — the lab DC is pinned to a mesh node
+# that joins ~15 min after Pulumi finishes, so an early wave would leave this Progressing
+# and gate a barrier for the whole cluster. Wave 13 is after the wave-9 barrier (mesh
+# overlay up, mesh nodes reachable) and before the wave-18 barrier.
+#
+# See the app-of-apps header for the design
+# and the "Authentik is the ONLY password write source" rule that keeps multi-master
+# replication from producing divergent password writes.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: samba-ad
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+  labels:
+    # Spans both tiers: the cloud DC is a cloud workload, the lab DC is mesh-pinned.
+    placement.ecc/tier: flex
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/samba-ad
+    directory:
+      # Enumerate what ArgoCD applies so sealSecrets.sh is never mistaken for a manifest.
+      # NOTE there is deliberately no provision-job / join-job: the image's own
+      # `--setup=provision` and `--setup=wait-domain,join` steps do that work and are
+      # idempotent, so hand-rolled Jobs would only duplicate them.
+      # replication-job.yaml is NOT such a duplicate: the join creates a machine account but
+      # no replication agreement, and nothing in the image asserts that one exists — both
+      # DCs can join, both authenticate, and NOTHING replicates, silently. See that file's
+      # header.
+      # replication-guard.yaml is its PERIODIC counterpart, and is also not a duplicate: the
+      # Job is a Sync hook, so it only runs when this app syncs, while the failure it repairs
+      # is triggered by a mesh-node REPROVISION on an unrelated schedule. Crucially there is
+      # no desync to hook — both DCs stay Running and every manifest still matches git, so
+      # this Application reports Synced/Healthy for hours while replication is dead.
+      # A CronJob is the only thing that observes external state on a schedule.
+      include: "{samba-ad-secrets-sealed.yaml,samba-ad-authentik-sealed.yaml,tls-cert.yaml,statefulset-cloud.yaml,statefulset-onprem.yaml,service.yaml,dns-config-job.yaml,sites-job.yaml,replication-job.yaml,replication-guard.yaml,postsync-provision-users.yaml,desktop-keytab-job.yaml,authentik-blueprint-ad-provisioner.yaml,authentik-blueprint-ad-source.yaml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: samba-ad
+  # dns-config-job.yaml patches the lab DC's second nameserver with the cloud DC's live
+  # address at sync time (it cannot be a literal — ClusterIPs change on every recreate —
+  # and dnsConfig.nameservers takes IPs, not Service names). Without this exclusion,
+  # selfHeal would revert the patch on the next reconcile and the lab DC would lose its
+  # bootstrap resolver.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      name: ad-onprem
+      jsonPointers:
+        - /spec/template/spec/dnsConfig/nameservers
+    # volumeClaimTemplates are API-DEFAULTED: the server adds apiVersion, kind,
+    # spec.volumeMode=Filesystem and status.phase=Pending, none of which a hand-written
+    # manifest carries. Under ServerSideApply that reads as permanent drift, so both DCs
+    # sat OutOfSync forever with nothing actually wrong. Same exclusion, same reason, as
+    # wave6-authentik.yaml — and `volumeClaimTemplates` is immutable on a live StatefulSet
+    # anyway, so ignoring it costs no real drift detection.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # RespectIgnoreDifferences is what makes the ignoreDifferences above apply to the
+      # SYNC decision and not merely to the rendered diff — without it the app reports
+      # OutOfSync while `argocd app diff` prints nothing, which is unactionable.
+      #
+      # ⚠ Do NOT add ServerSideDiff=true here. It makes this symptom PERMANENT instead of
+      # fixing it: server-side diff asks the API server for a dry-run merge, which returns
+      # the object WITH all defaults applied, so the volumeClaimTemplates defaults above
+      # become a diff that no ignore rule removes. samba-ad is the only app in this repo
+      # that would carry that option, and the only one stuck
+      # OutOfSync. The client-side differ normalizes those defaults on its own.
+      #
+      # A permanently-OutOfSync app is not cosmetic: ArgoCDAppNotSynced fires on it and
+      # emails every 24h, which trains people to ignore the alert.
+      - RespectIgnoreDifferences=true
+    # ⚠ limit -1 (RETRY FOREVER), not a finite count, and it is load-bearing on a RECREATE.
+    #
+    # desktop-keytab-job.yaml is a PostSync hook that writes the keytab Secret and its RBAC
+    # into the `remote-desktop` namespace. That namespace belongs to an app in the OTHER
+    # ArgoCD instance which is deliberately manual-sync, so at wave 13 it does not exist yet
+    # and those manifests fail to apply — measured on the ecc196 recreate, three times.
+    #
+    # Nothing recovers that on its own: a PostSync hook is never re-run once the sync
+    # completes, and a no-op sync runs no hooks at all, so selfHeal cannot reach it either
+    # (the same trap replication-guard.yaml and postsync-provision-users.yaml both document).
+    # Without a retry the hook fails once and stays failed for the life of the cluster.
+    #
+    # A finite budget is spent against WALL-CLOCK, and the precondition here is another
+    # app's FIRST sync — driven by the desktop-rollout CronJob on a 5-minute tick, after the
+    # wave-19 argocd-apps instance is up. That is unbounded from this app's point of view,
+    # which is the same reason wave16-truenas.yaml uses -1.
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m

@@ -1,0 +1,458 @@
+# ConfigMap embedding the ollama build inputs (Dockerfile + .gitlab-ci.yml) so the
+# PreSync build-trigger Job (postsync-build-image.yaml) can mirror them into GitLab.
+# The infra GitHub repo is private, so a Job pod can't git-clone it — the files ride
+# in this ConfigMap instead. KEEP IN SYNC BY HAND with the sibling ./Dockerfile and
+# ./.gitlab-ci.yml (they are the source of truth; this is a mirror). PreSync hook so
+# it exists before the trigger Job reads it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-build-files
+  namespace: ollama
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  Dockerfile: |
+    # Ollama v0.34.2 for the Jetson Thor (Blackwell sm_110 / arch 11.0), L4T R38 /
+    # JetPack 7 / CUDA 13.0. Built on-node by GitLab CI (.gitlab-ci.yml, tags:[thor])
+    # and pushed to registry.gitlab.<tld> — sm_110/CUDA-13 kernels can't cross-build.
+    #
+    # WHY BUILD AT ALL (the prebuilt image is right there): the prebuilt jetson image
+    # ghcr.io/nvidia-ai-iot/ollama:r38.2... is ollama **v0.11.6**, whose engine does
+    # NOT know the `qwen35moe` architecture (Qwen3.5/3.6 MoE) — the target model
+    # (Qwen3.6-35B-A3B, the GGUF twin of what vLLM serves) fails to load with
+    # `unknown model architecture: 'qwen35moe'`. That arch landed in ollama v0.32.1.
+    # So we build v0.32.1 FROM the prebuilt image, which already carries the whole
+    # CUDA-13 build+runtime stack (nvcc 13.0, cmake, the /opt/ollama git checkout,
+    # start_ollama, the runtime libs, IS_SBSA=True, ld.so.conf → the payload dir).
+    #
+    # renovate: managed by the "Container image tags" regex manager (docker datasource)
+    FROM ghcr.io/nvidia-ai-iot/ollama:r38.2.arm64-sbsa-cu130-24.04
+
+    # Ollama version to build. v0.32.1 is the first RELEASE tag whose engine supports
+    # `qwen35moe` (added upstream in commit da70c322; present in
+    # fs/ggml/ggml.go at this tag). Bump to rebuild.
+    # renovate: datasource=github-releases depName=ollama/ollama versioning=semver
+    # CRITICAL name-collision trap: the base image sets ENV OLLAMA_VERSION=0.11.6. If we
+    # named this ARG OLLAMA_VERSION, then EVERYWHERE `${OLLAMA_VERSION}` expands — incl.
+    # the RHS of `ENV OLLAMA_VERSION=${OLLAMA_VERSION}` — Docker resolves it to the
+    # inherited ENV (0.11.6), NOT the ARG: an inherited ENV always wins over a same-named
+    # ARG. So the build silently checked out v0.11.6 twice (CUDA lib landed in
+    # build/lib/ollama/ not cuda_v13/ → final test -f failed). Fix: use a DIFFERENTLY
+    # named ARG (OLLAMA_BUILD_VERSION) and assign the ENV from it — no collision, our
+    # value wins.
+    # BUMPED 0.32.15 -> 0.34.2 (latest, 2026-09-15). Carries the qwen3_5 MTP
+    # speculative-draft work that motivated the previous bump, plus 0.33's prefill-cache
+    # correctness fixes (a cancelled prefill now keeps its restore points instead of
+    # reprocessing from zero). Go 1.26.0 is required by v0.34.2's go.mod; GO_VERSION below
+    # is 1.27.1, so the pinned toolchain already satisfies it.
+    #
+    # ⚠ THIS BUMP DOES NOT FIX TOOL CALLING, and was not expected to. qwen3-coder:30b leaks
+    # its tool calls into message content as literal
+    #     <function=NAME><parameter=KEY>…</parameter></function></tool_call>
+    # (note the orphan closing tag with no opener) because Ollama's compiled-in
+    # `PARSER qwen3-coder` never engages when the model omits the opening <tool_call> tag —
+    # a known model flub. That is ollama/ollama#16686, OPEN since 2026-06-12, and all three
+    # candidate fixes (#17742, #16398, #17021) are open and UNMERGED as of this bump. So do
+    # not read "we are current" as "tool calling is fixed"; the fix here is the Modelfile
+    # override that replaces that parser. Re-check those PRs before assuming otherwise.
+    ARG OLLAMA_BUILD_VERSION=0.34.2
+    #
+    # ⚠ THE IMAGE FOR THIS TAG HAS NEVER BEEN BUILT — the build is BLOCKED UPSTREAM, and
+    # not by anything in this file. Three attempts on 2026-09-18 (pipeline 13, jobs 14/16/17)
+    # all died at the same Go module, from three different IPs:
+    #     github.com/klauspost/compress@v1.18.3: Get
+    #     "https://storage.googleapis.com/proxy-golang-org-prod/…": connection reset by peer
+    # proxy.golang.org answers that zip with a 302 whose target then resets the TLS
+    # connection. Reproduced from OUTSIDE the cluster too (3/3 from the devcontainer,
+    # `curl: (35) TLS connect error: unexpected eof while reading`), so it is NOT the mesh
+    # link, NOT the [thor] runner and NOT this bump: v0.32.15's go.mod requires the SAME
+    # module version, so rebuilding the PREVIOUS tag would fail identically today.
+    #
+    # Consequence: `ollama` in namespace `ollama` sits in ImagePullBackOff for
+    # v0.34.2-cu13-sm110-r1. That is expected, not a misconfiguration. The previously built
+    # v0.32.15-cu13-sm110-r2 image still exists in image-archives if a rollback is ever
+    # wanted — only the REBUILD is blocked, not the old artifact.
+    #
+    # Deliberately NOT worked around (decision 2026-09-18): Thor is moving to vLLM, which
+    # scales ollama-thor to 0 anyway. If this image is ever needed again, first re-test that
+    # module fetch; if it still fails, build with GOPROXY=direct (fetch from GitHub instead
+    # of Google's proxy) rather than retrying the pipeline.
+    ENV OLLAMA_VERSION=${OLLAMA_BUILD_VERSION}
+
+    # Two toolchain gaps in the base image block a v0.32.1 build (both verified on-node):
+    #  1. Go: base has 1.22.7; v0.32.1 go.mod requires 1.26.0.
+    #  2. GCC: base has gcc-13.3, but v0.32.1's llama.cpp GGML_CPU_ALL_VARIANTS compiles
+    #     an armv9.2 CPU variant with `-march=...+sme` (Scalable Matrix Extension) that
+    #     gcc-13 rejects ("invalid feature modifier 'sme'"). gcc-14 (Ubuntu 24.04 apt)
+    #     knows sme. We build C/C++ AND the CUDA host compiler with gcc-14.
+    # renovate: datasource=golang-version depName=go
+    ARG GO_VERSION=1.27.1
+
+    # Thor GPU compute capabilities to emit. 110 = sm_110 (Thor Blackwell); 87 (Orin)
+    # and 121 kept to match the base image's own CUDA_ARCHITECTURES so one image also
+    # runs on sibling Jetsons if ever needed. The GPU BACKEND itself is selected by
+    # OLLAMA_LLAMA_BACKENDS below — WITHOUT that the build is CPU-only (see the build RUN).
+    # (The base also sets ENV CUDA_ARCHITECTURES=87;110;121 — same name-collision trap as
+    # OLLAMA_VERSION above; use a differently-named ARG so our value wins.)
+    ARG CUDA_ARCH=87;110;121
+    ENV CUDA_ARCHITECTURES=${CUDA_ARCH}
+
+    RUN set -eux; \
+        # --- gcc-14 for the SME CPU variant ---
+        apt-get update; \
+        apt-get install -y --no-install-recommends gcc-14 g++-14; \
+        rm -rf /var/lib/apt/lists/*; \
+        # --- Go 1.26 (base's 1.22 is too old); install alongside, prepend to PATH ---
+        arch="$(dpkg --print-architecture)"; \
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o /tmp/go.tgz; \
+        rm -rf /opt/go && mkdir -p /opt/go; \
+        tar -C /opt/go --strip-components=1 -xzf /tmp/go.tgz; \
+        rm /tmp/go.tgz; \
+        /opt/go/bin/go version
+
+    ENV PATH=/opt/go/bin:${PATH} \
+        CC=gcc-14 \
+        CXX=g++-14
+
+    # Build ollama v0.32.1 with the CUDA-13 GGML backend.
+    #
+    # THE CRITICAL FLAG — OLLAMA_LLAMA_BACKENDS=cuda_v13: v0.32.1 restructured the build
+    # so the GGML CUDA backend is a superbuild sub-project gated by this cache var, which
+    # defaults to EMPTY = CPU-only (no libggml-cuda.so → model runs on CPU). cuda_v13 is
+    # the CUDA-13 backend (NOT cuda_jetpack6, which targets JetPack-6/CUDA-12.6). This is
+    # NOT in jetson-containers' build.sh — that predates the restructure.
+    # -j4 (not $(nproc)): the ~365MB CUDA lib compile can OOM-kill nvcc on the Thor's
+    # ~15GiB usable RAM at full parallelism.
+    RUN set -eux; \
+        cd "${OLLAMA_HOME}"; \
+        git fetch --depth 1 origin "refs/tags/v${OLLAMA_VERSION}:refs/tags/v${OLLAMA_VERSION}"; \
+        git checkout -f "v${OLLAMA_VERSION}"; \
+        rm -rf build; \
+        cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DOLLAMA_LLAMA_BACKENDS=cuda_v13 \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+            -DCMAKE_CUDA_HOST_COMPILER=gcc-14 \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+            -DOLLAMA_VERSION="${OLLAMA_VERSION}"; \
+        cmake --build build -j4; \
+        go build -ldflags "-X github.com/ollama/ollama/version.Version=${OLLAMA_VERSION}" -o "${OLLAMA_HOME}/ollama" .; \
+        # Re-point the symlinks (build.sh's targets) at the freshly built binary, and
+        # register the payload dir with the dynamic linker.
+        ln -sf "${OLLAMA_HOME}/ollama" /usr/local/bin/ollama; \
+        ln -sf /usr/local/bin/ollama /usr/bin/ollama; \
+        ln -sf /usr/local/bin/ollama /bin/ollama; \
+        echo "${OLLAMA_HOME}/build/lib/ollama" > /etc/ld.so.conf.d/ollama.conf; \
+        ldconfig; \
+        # Sanity: the CUDA backend lib must exist, else the build silently went CPU-only.
+        test -f "${OLLAMA_HOME}/build/lib/ollama/cuda_v13/libggml-cuda.so"; \
+        ollama --version || true
+
+    # CMD/ENTRYPOINT inherited from the base (start_ollama). The k8s Deployment
+    # overrides command to run `ollama serve` in the foreground anyway.
+  .gitlab-ci.yml: |
+    # Ollama v0.34.2 Thor image build — recover-or-rebuild. Mirrors the vLLM pipeline.
+    #
+    # SOURCE OF TRUTH: this file lives in the infra repo
+    # (deployment/argocd-apps/ollama/.gitlab-ci.yml). A bootstrap job MIRRORS it (+ the
+    # Dockerfile) into the in-cluster GitLab project deployments/infrastructure/ai/ollama-thor
+    # via a git push; ArgoCD then TRIGGERS this pipeline on cluster creation. Do NOT
+    # hand-edit it in GitLab — changes there are overwritten on the next mirror.
+    #
+    # The job SKIPS itself if the tag already exists in the registry. Bump IMAGE_TAG to
+    # force a rebuild. Runs on the Thor GPU node via tags:[thor] — sm_110 (Blackwell)
+    # CUDA-13 kernels can't be cross-built on x86. buildah builds in a PRIVILEGED in-pod
+    # (vfs + chroot), no docker daemon; rootless does NOT work on this node.
+    stages: [build]
+
+    workflow:
+      auto_cancel:
+        on_new_commit: interruptible
+
+    build-ollama-thor:
+      stage: build
+      tags: [thor]                       # -> Thor GPU runner (gitlab-runner-token-thor)
+      # ⚠ THE SHARED CI BUILD IMAGE, not quay.io/buildah/stable: buildah to BUILD plus skopeo
+      # for the registry gate below, which quay's image has never shipped. Built by
+      # deployment/argocd-apps/ci-build-image — read its README before changing this line.
+      # ⚠ `-arm64`, because this job runs on [thor] — a Jetson. The amd64 image built on the
+      # [eda] nodes cannot start there: the pod comes up, the `build` container never becomes
+      # ready, and the job fails in "prepare environment: waiting for pod running" without ever
+      # naming architecture (measured 2026-09-03, ollama pipelines 10-12, which left ollama in
+      # ImagePullBackOff for over an hour).
+      # ⚠ The tag must be that app's IMAGE_TAG plus this suffix;
+      # remote-desktop/check-image-invariants.sh fails the commit if they drift. A consumer
+      # pinned to a tag that was never built simply never starts its build pod.
+      image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1-arm64
+      # Serialize builds on the single Thor node; auto-cancel superseded pipelines.
+      resource_group: thor-ollama-build
+      interruptible: true
+      # The CUDA build (~365MB libggml-cuda.so for 3 arches at -j4) plus the
+      # multi-GB image push over WireGuard exceed the 1h default. 3h gives headroom.
+      timeout: 3h
+      variables:
+        # Bump when OLLAMA_VERSION in the Dockerfile changes. r1 = first v0.34.2 build.
+        IMAGE_TAG: v0.34.2-cu13-sm110-r1   # renovate: keep in sync with Dockerfile OLLAMA_VERSION
+        IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+        # ⚠ REPO PATH ONLY — no host, and NO :TAG. `${IMAGE#*/}` strips the host but LEAVES
+        # the tag, so a /v2/<repo>/manifests/<tag> URL built from it asks for a repository
+        # literally named "…/<name>:<tag>", which cannot exist -> 404 forever. The gate is
+        # fail-open, so that 404 reads as "not in the registry" and rebuilds from installer
+        # media every single time, silently. Measured on ecc188: the buggy form returned 404
+        # and this form returned 200 against the same tag.
+        # A `docker://` push destination is the opposite case — it MUST keep the tag, so those
+        # still use ${IMAGE#*/}.
+        IMAGE_REPO: $CI_PROJECT_PATH
+        REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+        STORAGE_DRIVER: vfs
+        # Push the multi-GB image to the in-cluster registry service DIRECTLY, bypassing
+        # the public ingress (which drops mid-upload on large blobs). Plain HTTP; the
+        # stored image is identical, so the Deployment still PULLs via the ingress name.
+        # PreferClose Service hits a LAN-local registry replica when the build is on a
+        # mesh node. See vllm/.gitlab-ci.yml for the full rationale.
+        INTERNAL_REGISTRY: registry-preferclose.gitlab.svc.cluster.local:5000
+        # ── Recreate-surviving archive ───────────────────────────────────────────────
+        # GitLab's registry is backed by Hetzner S3 and DIES WITH THE CLUSTER, so after a
+        # recreate this tag is absent and the gate above falls through to a full rebuild —
+        # hours of CUDA compilation, which is what makes a fresh cluster's apps instance
+        # stall on CI rather than on bootstrap.
+        #
+        # image-registry is backed by the TrueNAS export datapool/images
+        # (image-registry/nfs-images-pv.yaml, Retain), which does not go away. So the same
+        # image is archived there and restored from there instead of rebuilt. Same store,
+        # same credential and same mechanism the EDA module builds and remote-desktop already
+        # use — nothing new.
+        #
+        # ⚠ LAN-LOCAL, not a WireGuard hop. This runner and the image-registry pod are both on
+        # the unibi-hclab site, and the registry's CiliumNetworkPolicy already admits the
+        # gitlab-runner namespace: no policy edit and no new credential. `clusterLink: "vpn"`
+        # in project_settings describes how the node JOINED the cluster, not the data path
+        # between two pods on one LAN.
+        #
+        # ⚠ image-registry has NO GARBAGE COLLECTION (deliberate — see its README). Every
+        # IMAGE_TAG bump adds several GB here PERMANENTLY; the old tag's blobs are orphaned
+        # and nothing reclaims them. Prune by hand.
+        IMAGE_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+        # ⚠ image-archives/, NOT deployments/... — this registry also holds the EDA module
+        # images under deployments/, and those are pulled BY THE BROKER AND RUN AS ROOT,
+        # authorised by <repo>:<tag> in broker.sh allowed(). A separate repository namespace
+        # means this image can never be confused for a module in either direction.
+        SURVIVING_IMAGE: $IMAGE_REGISTRY/image-archives/ollama:$IMAGE_TAG
+        SURVIVING_IMAGE_REPO: image-archives/ollama
+      script:
+        # Trust the image-registry CA BEFORE anything talks to it. It serves TLS from a PRIVATE
+        # in-cluster CA, so the build pod cannot verify it from the system trust store.
+        # containers/image reads /etc/containers/certs.d/<host>/ca.crt, so skopeo and buildah
+        # both pick it up with no per-call flag. Writing the CA (rather than
+        # --tls-verify=false) means a wrong or missing CA fails loudly at the handshake
+        # instead of silently downgrading.
+        #
+        # ⚠ THIS MUST STAY ABOVE BOTH GATES — the archive-on-skip branch of the first one and
+        # the restore gate below. Both read this exact file and both are deliberately
+        # FAIL-OPEN, so with the write ordered after them the read fails on the missing CA,
+        # the gate concludes "not archived", and it can NEVER short-circuit. That is precisely
+        # the bug the three EDA pipelines shipped with. Enforced by
+        # remote-desktop/check-image-invariants.sh in precommit.
+        - |
+          if [ -n "${IMAGE_REGISTRY_CA:-}" ]; then
+            mkdir -p "/etc/containers/certs.d/${IMAGE_REGISTRY}"
+            printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${IMAGE_REGISTRY}/ca.crt"
+            echo "image-registry CA installed."
+          else
+            echo "WARN: IMAGE_REGISTRY_CA is empty — the recreate-surviving copy is unavailable."
+            echo "      The build still works; it just cannot restore or archive."
+          fi
+        - |
+          # Recover-or-rebuild: skip if the tag already exists in the registry.
+          #
+          # `skopeo inspect --raw` — NOT curl, and this is a REPAIR, not a refactor.
+          # ⚠ MEASURED ON ecc193 (2026-09-02): the curl form this replaces could never have
+          # worked. GitLab's registry answers /v2/ with `401 + WWW-Authenticate: Bearer
+          # realm="https://gitlab.<tld>/jwt/auth"`, so a BASIC-auth request returns 401 even
+          # for a tag that EXISTS — verified against remote-desktop:base-r40 (basic 401, bearer
+          # 200, same URL, same second). The gate is fail-open, so that 401 read as "absent"
+          # and this pipeline has never once skipped a build it could have skipped. skopeo
+          # performs the bearer token exchange and sends every manifest Accept header itself.
+          #
+          # --tls-verify=false replaces the old `-k`: under letsencrypt-staging the registry
+          # certificate is untrusted inside the build pod. This is a presence check, not a
+          # content fetch — bytes are digest-verified when they are actually pulled.
+          #
+          # Nor buildah: `inspect` only reads LOCAL storage and `pull` would fetch GB merely
+          # to test presence. skopeo is available because this job now runs on the CI build
+          # image (deployment/argocd-apps/ci-build-image).
+          set +e
+          _gate_out=$(skopeo inspect --raw --tls-verify=false \
+                   --creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" "docker://$IMAGE" 2>&1)
+          _gate_rc=$?
+          set -e
+          if [ "$_gate_rc" -eq 0 ]; then
+            echo "$IMAGE already exists — skipping build."
+            # ── Archive-on-skip ────────────────────────────────────────────────────────
+            # ⚠ "in GitLab's registry" does NOT imply "archived". base-r41 was built on
+            # ecc193 while the archive credential was broken (image-registry-auth's `password`
+            # key had been renamed to `push-password`), so it published fine and was never
+            # archived — and this gate then exits 0 on every later run, so nothing would ever
+            # notice until a recreate rebuilt it from scratch. Repair it here instead of
+            # waiting for the next tag bump.
+            # Cheap: registry-to-registry, and a no-op once the copy exists.
+            # ⚠ NEVER FATAL — the image is published and the app already works.
+            if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+              set +e
+              skopeo inspect --raw --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" >/dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                echo "  the recreate-surviving copy is MISSING — archiving it now..."
+                skopeo copy --retry-times 10 \
+                  --src-tls-verify=false --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                  --dest-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                  "docker://$IMAGE" "docker://$SURVIVING_IMAGE"
+                if [ $? -eq 0 ]; then
+                  echo "  archived $SURVIVING_IMAGE — this tag now survives a recreate."
+                else
+                  echo "  WARN: could not archive — the next recreate will rebuild this tag."
+                fi
+              else
+                echo "  recreate-surviving copy is present."
+              fi
+              set -e
+            else
+              echo "  WARN: no image-registry credential — cannot confirm the surviving copy."
+            fi
+            exit 0
+          fi
+          case "$_gate_out" in
+            *"manifest unknown"*|*"name unknown"*|*"was not found"*) : ;;
+            *) echo "registry gate: $IMAGE not readable (fail-open, continuing):"
+               echo "  skopeo: $_gate_out" ;;
+          esac
+          echo "$IMAGE not found — building on $(uname -m)..."
+        - |
+          # ── Restore from the recreate-surviving registry ─────────────────────────────
+          # Reached only when the tag is absent from GitLab's registry (the gate above), i.e.
+          # after a cluster recreate. Copying it back takes seconds against hours of rebuild.
+          #
+          # ⚠ NEVER FATAL. If anything here fails we fall through to the rebuild, which is
+          # slow but always correct. A backup path must not be able to redden a pipeline that
+          # would otherwise have produced a working image.
+          #
+          # No digest/completeness protocol is needed (unlike a tar archive on a filesystem):
+          # a registry is content-addressed, so a partial push never becomes a resolvable tag,
+          # and skopeo verifies each blob's digest as it goes.
+          #
+          # ⚠ ONE `skopeo copy`, REGISTRY TO REGISTRY. It replaces buildah pull + tag + push,
+          # and the difference is not stylistic:
+          #   - nothing is staged locally. `buildah pull` UNPACKED every layer into the node's
+          #     container store only to push the same bytes straight back out; skopeo streams
+          #     blob by blob and never materialises the image.
+          #   - ONE command carries BOTH credentials (--src-creds / --dest-creds). The
+          #     "credential missing on the second half" failure that cost ecc189 a full rebuild
+          #     of ollama AND remote-desktop cannot recur, because there is no second half —
+          #     and neither can the `#`-comment-inside-a-`\`-continued-`&&`-chain break that
+          #     silently dropped the `push` SUBCOMMAND and ran `push` as a command (rc=127).
+          # TLS: the SOURCE is verified against the image-registry CA in certs.d, written by the
+          # step above (which is why that step must stay first); the DESTINATION is the
+          # in-cluster registry Service on plain HTTP, hence --dest-tls-verify=false — exactly
+          # what the buildah push did.
+          if [ -n "${IMAGE_REGISTRY_CA:-}" ] && [ -n "${IMAGE_REGISTRY_USER:-}" ]; then
+            echo "Checking the recreate-surviving registry for $SURVIVING_IMAGE ..."
+            set +e
+            _arc_out=$(skopeo inspect --raw \
+                     --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                     "docker://$SURVIVING_IMAGE" 2>&1)
+            _arc_rc=$?
+            set -e
+            if [ "$_arc_rc" -eq 0 ]; then
+              echo "[$(date -u +%F' '%T)] found it — copying it back instead of rebuilding..."
+              set +e
+              skopeo copy --retry-times 10 \
+                --src-creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                --dest-tls-verify=false \
+                --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+                "docker://$SURVIVING_IMAGE" "docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+              _restore_rc=$?
+              set -e
+              if [ "$_restore_rc" -eq 0 ]; then
+                echo "[$(date -u +%F' '%T)] restored $IMAGE from the surviving registry."
+                exit 0
+              fi
+              echo "WARN: restore failed (rc=$_restore_rc) — falling through to a full rebuild."
+            else
+              case "$_arc_out" in
+                *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+                  echo "  not there either — this tag has never been archived." ;;
+                *)
+                  echo "  archive not readable — rebuilding (fail-open):"
+                  echo "  skopeo: $_arc_out" ;;
+              esac
+            fi
+          fi
+        - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        - buildah login --tls-verify=false -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+        - buildah bud --isolation chroot --storage-driver "$STORAGE_DRIVER" --format docker -t "$IMAGE" .
+        - |
+          # Push to the internal endpoint under the SAME repo path as $IMAGE. Retry:
+          # a multi-GB push over WireGuard can hit transient resets (buildah resumes
+          # from cached blobs). Same hardening as the vLLM push.
+          DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+          net_sampler() {
+            IFACE=$(awk -F'[: ]+' '/:/{if($2!="lo")print $2}' /proc/net/dev | head -1)
+            prev=$(awk -v i="$IFACE" '$0 ~ i":"{print $10}' /proc/net/dev); t0=$(date +%s); tprev=$t0
+            while :; do
+              sleep 20
+              now=$(awk -v i="$IFACE" '$0 ~ i":"{print $10}' /proc/net/dev); tnow=$(date +%s)
+              d=$(( now - prev )); dt=$(( tnow - tprev )); el=$(( tnow - t0 ))
+              [ "$dt" -gt 0 ] && rate=$(awk "BEGIN{printf \"%.2f\", $d/1048576/$dt}") || rate=0
+              tot=$(awk "BEGIN{printf \"%.0f\", $now/1048576}")
+              echo "[push-net $(date -u +%H:%M:%S)] elapsed=${el}s ${IFACE}=${rate} MB/s total_tx=${tot} MB"
+              prev=$now; tprev=$tnow
+            done
+          }
+          set +e
+          n=0
+          until [ "$n" -ge 6 ]; do
+            echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+            astart=$(date +%s)
+            net_sampler & SAMPLER=$!
+            timeout 10800 buildah push --tls-verify=false --storage-driver "$STORAGE_DRIVER" \
+              --retry 20 --retry-delay 10s \
+              "$IMAGE" "$DEST"
+            rc=$?
+            kill "$SAMPLER" 2>/dev/null
+            echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc duration=$(( $(date +%s) - astart ))s ==="
+            if [ "$rc" -eq 0 ]; then break; fi
+            n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+          done
+          set -e
+          [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+        - |
+          # ── Archive to the recreate-surviving registry ───────────────────────────────
+          # ⚠ NEVER FATAL. The image is already pushed and the app already works; a failure
+          # here costs a rebuild after the NEXT recreate, which is exactly the status quo
+          # before this existed. Reddening the pipeline for it would be a regression.
+          #
+          # buildah, not skopeo — the image is still in LOCAL STORAGE from the build, so this
+          # is a plain push out of that store. skopeo's advantage is registry-to-registry (see
+          # the restore block above); it would buy nothing here.
+          if [ -n "${IMAGE_REGISTRY_USER:-}" ] && [ -n "${IMAGE_REGISTRY_CA:-}" ]; then
+            echo "[$(date -u +%F' '%T)] archiving $SURVIVING_IMAGE ..."
+            set +e
+            buildah --storage-driver "$STORAGE_DRIVER" login \
+              --tls-verify=true -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$IMAGE_REGISTRY" \
+            && buildah --storage-driver "$STORAGE_DRIVER" push \
+                 --retry 20 --retry-delay 10s "$IMAGE" "docker://$SURVIVING_IMAGE"
+            _arc_rc=$?
+            set -e
+            if [ "$_arc_rc" -eq 0 ]; then
+              echo "Archived $SURVIVING_IMAGE — this tag now survives a cluster recreate."
+            else
+              echo "WARN: could not archive to the surviving registry (rc=$_arc_rc). The build"
+              echo "      is still GOOD; the next recreate will just have to rebuild this tag."
+            fi
+          else
+            echo "WARN: no image-registry credential — skipping the recreate-surviving copy."
+          fi
+        - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY)"

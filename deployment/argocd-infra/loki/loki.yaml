@@ -1,0 +1,204 @@
+# Loki — cluster log store. Chunks + index live in Hetzner Object Storage.
+#
+# Storage choice: NOT a PVC. The cloud tier pins storage.longhorn.replicaCount=1, so a PVC
+# would leave logs unreplicated on a disk that already carries ~270Gi; logs also
+# grow without bound, and a PVC does not survive an eccN recreate whereas an S3
+# bucket keyed on general.name does. SimpleScalable requires shared object
+# storage anyway.
+#
+# Chart version trap, worth knowing before bumping: the grafana helm index lists
+# several DIFFERENT entries whose `version:` reads 5.4.0 — that is the bundled
+# minio SUBCHART version, not Loki's. Read `version:` at 4-space indent, and
+# confirm Chart.yaml after pulling. `helm pull loki --version 5.4.0` silently
+# fetches a 2023 chart (appVersion 2.8.2) with no deploymentMode key at all.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd-infra
+  annotations:
+    # After the namespace (-2), the S3 sealed secret (-1) and the bucket Job (0)
+    # in this same directory — the ingester's first flush fails if the bucket is
+    # not there yet.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: loki
+    targetRevision: "7.3.0" # renovate: datasource=helm depName=loki registryUrl=https://grafana.github.io/helm-charts
+    helm:
+      values: |
+        deploymentMode: SimpleScalable
+
+        loki:
+          auth_enabled: false
+          commonConfig:
+            # Chart default is 3. With one write replica every push fails
+            # "at least 2 live replicas required". Raise this ONLY together with
+            # write.replicas — it is not driven by the HA anchors (the rewrite
+            # pass only touches lines whose key is literally `replicas:`).
+            replication_factor: 1
+          # Chart default is {} and Loki will not run without it. `from` must be a
+          # PAST date at first deploy and must NEVER be edited afterwards —
+          # changing it corrupts index lookups for data already written.
+          schemaConfig:
+            configs:
+              - from: "2026-08-01"
+                store: tsdb
+                object_store: s3
+                schema: v13
+                index:
+                  prefix: loki_index_
+                  period: 24h
+          storage:
+            type: s3
+            bucketNames:
+              chunks: edgecloudinfra-loki # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+              ruler: edgecloudinfra-loki # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+            s3:
+              endpoint: https://nbg1.your-objectstorage.com # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+              region: nbg1 # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+              # Hetzner RGW: virtual-host style needs per-bucket DNS, path style always works.
+              s3ForcePathStyle: true
+              insecure: false
+              # Hetzner Object Storage (Ceph RGW) answers request storms with
+              # 503 SlowDown; the AWS SDK then drains its retry quota and the
+              # caller sees a bare 500 (this is the documented GitLab-registry
+              # failure, see deployment/argocd-apps/gitlab/sealSecrets.sh).
+              # Back off slower and longer than the SDK defaults.
+              backoff_config:
+                min_period: 500ms
+                max_period: 30s
+                max_retries: 8
+          limits_config:
+            retention_period: 720h # 30d
+            # Stream cardinality is the main cost driver: one chunk per stream.
+            max_global_streams_per_user: 10000
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+            volume_enabled: true
+          ingester:
+            # chunk_target_size only binds on BUSY streams. In practice chunks average
+            # ~105 KB against this 8 MB target, because the large majority of flushes
+            # are reason="idle" — on a sparse stream the idle timer
+            # always fires first and the target is never reached. Kept at 8 MB
+            # (correct for busy streams, harmless for idle ones), but the levers that
+            # actually cut object count are the idle timer below and stream count
+            # (see the alloy config: dropping the `node` label cut streams 76%).
+            chunk_target_size: 8388608
+            chunk_encoding: snappy
+            # 2h -> 4h: halves the idle-flush rate, which was ~370 objects/hour.
+            # Cost is query latency on very recent logs from idle streams (they sit
+            # in the ingester longer) and a larger WAL — both fine at this volume.
+            chunk_idle_period: 4h
+            max_chunk_age: 6h
+            # Hetzner is slower than AWS; the 10s default turns a slow flush into
+            # a retry storm.
+            flush_op_timeout: 10m
+          compactor:
+            working_directory: /var/loki/compactor
+            # retention_period above is SILENTLY IGNORED without this.
+            retention_enabled: true
+            retention_delete_delay: 2h
+            # Defaults (10m interval / 150 workers) make the compactor the
+            # chattiest S3 client in the cluster — it lists and rewrites the
+            # index continuously. Slow it down to stay under the RGW limits.
+            compaction_interval: 30m
+            retention_delete_worker_count: 50
+            delete_request_store: s3
+
+        # S3 credentials come from the sealed loki-s3-secret (sealSecrets.sh)
+        # rather than being inlined into the chart values.
+        global:
+          extraEnvFrom:
+            - secretRef:
+                name: loki-s3-secret
+          extraEnv:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: loki-s3-secret
+                  key: ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: loki-s3-secret
+                  key: SECRET_ACCESS_KEY
+
+        # The memberlist service must publish NOT-READY addresses, or bring-up
+        # deadlocks. Every component discovers the scheduler/ingester rings only
+        # through this headless service (frontend.scheduler_address and
+        # frontend_worker.scheduler_address are both empty), and read is unready
+        # until it finds a scheduler. With the chart default (false) a read pod
+        # that starts before any peer is ready resolves NXDOMAIN, burns all 10
+        # join attempts in ~3.5 min, then STOPS RETRYING for the life of the
+        # process — Loki does not exit on that failure. Result: loki-read sits
+        # 0/1 forever logging `empty ring`, and every query hangs or 503s while
+        # ingest keeps working. Measured 2026-09-07: unready 2h11m, fixed by a
+        # pod restart. See doc/logging.md.
+        #
+        # ⚠ A SECOND, DISTINCT failure also ends in "every query hangs", and this setting does
+        # NOT prevent it: loki-read comes up 1/1 Ready with 0 restarts, the scheduler ring is
+        # healthy and the startup ring errors stop normally, yet queries are accepted
+        # (`roundtrip.go:415 executing query`) and never reach the scheduler. Seen on ecc203
+        # and again on ecc215 (~6h24m, ingest unaffected). Root cause unknown — do not read a
+        # hanging query as this memberlist bug. tests/lokiQueryChecks.sh check C detects it
+        # and carries the goroutine-dump capture that must be taken BEFORE the restart that
+        # fixes it; plans/recreate-check-loki-read-hangs-after-recreate.md tracks it.
+        memberlist:
+          service:
+            publishNotReadyAddresses: true
+
+        # SimpleScalable at 1/1/1 today. The anchors pre-stage the HA counts, so
+        # flipping highAvailability.enabled scales all three out in one pass.
+        # NOTE read/write/backend default to HARD (required...) pod anti-affinity,
+        # so replicas>1 needs that many schedulable nodes — see doc/logging.md.
+        write:
+          replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.lokiWrite}
+          persistence:
+            storageClass: longhorn-cloud
+            size: 10Gi
+        read:
+          replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.lokiRead}
+          persistence:
+            storageClass: longhorn-cloud
+            size: 10Gi
+        backend:
+          replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.lokiBackend}
+          persistence:
+            storageClass: longhorn-cloud
+            size: 10Gi
+        gateway:
+          replicas: 1 # automatically updated from project-settings:{highAvailability.enabled,highAvailability.replicas.lokiGateway}
+
+        # Chart defaults that must be off here.
+        # chunksCache alone defaults to allocatedMemory 8192 (8 GB) and
+        # resultsCache to 1 GB — absurd for a single-tenant Loki on a cloud CP
+        # that is already at ~90% CPU. Revisit if/when the cluster scales out.
+        chunksCache:
+          enabled: false
+        resultsCache:
+          enabled: false
+        # Default true: a Helm-test Pod and a canary DaemonSet ArgoCD would track.
+        test:
+          enabled: false
+        lokiCanary:
+          enabled: false
+        minio:
+          enabled: false
+        monitoring:
+          selfMonitoring:
+            enabled: false
+            grafanaAgent:
+              installOperator: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: loki
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

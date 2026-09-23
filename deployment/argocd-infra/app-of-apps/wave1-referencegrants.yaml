@@ -1,0 +1,48 @@
+# ArgoCD Application: cross-namespace Gateway API ReferenceGrants.
+#
+# Gateway API forbids a backendRef that crosses namespaces unless the TARGET
+# namespace opts in with a ReferenceGrant. The grants live in the target
+# namespace but are shipped HERE, early, rather than by the app that owns that
+# namespace.
+#
+# WHY: a grant is a routing permission, not a component of the app it points at,
+# and it is valid before that app's Service exists. Shipping the authentik
+# outpost grant inside the authentik app (wave 6) produced a circular deadlock —
+# longhorn-config (wave 3) and kube-prometheus-stack (wave 2) both carry OIDC
+# HTTPRoutes backed by authentik-server, so without the grant they sat at
+# ResolvedRefs=False/RefNotPermitted, reported Degraded, and blocked
+# wave3-barrier. Wave 6 could then never run to create the grant that would
+# have released them.
+#
+# Wave 1: after the Gateway itself (wave 0), before every consumer. It must stay
+# below the LOWEST wave that references a grant — today that is
+# kube-prometheus-stack at wave 2.
+#
+# CreateNamespace=true: the grant must exist in `authentik` before the authentik
+# app (wave 6) creates that namespace itself. ArgoCD creating it early is
+# harmless — the authentik app adopts the existing namespace.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: referencegrants
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/referencegrants
+  destination:
+    server: https://kubernetes.default.svc
+    # The grant object carries its own `namespace: authentik`; this is only the
+    # app's default for namespaced resources that omit one.
+    namespace: authentik
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

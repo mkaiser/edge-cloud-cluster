@@ -1,0 +1,22 @@
+# Namespace for the IPTO SCADA anomaly-detector demo.
+#
+# A PreSync HOOK, not a plain manifest: postgres-secret-sealed.yaml is itself a
+# PreSync hook, and CreateNamespace=true only creates the namespace in the SYNC
+# phase — so a namespaced PreSync hook would fail `namespaces not found` and abort
+# the phase before the namespace is ever created. Deadlock, unconditional on a
+# fresh cluster. sync-wave -10 orders it ahead of the sealed secret's -1.
+#
+# NO hook-delete-policy: HookSucceeded here — that would delete the namespace and
+# every object in it, including the PVC, after each sync.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ryaxns-tools
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-10"
+  labels:
+    # Ryax's MutatingAdmissionPolicy scopes to ryaxns / ryaxns-execs by name, so it
+    # does NOT reach this namespace. Placement here is stated explicitly in
+    # postgres.yaml instead.
+    app.kubernetes.io/part-of: cape-demo

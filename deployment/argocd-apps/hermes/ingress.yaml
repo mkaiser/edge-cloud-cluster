@@ -1,0 +1,67 @@
+# Two hosts, two very different auth models.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway),
+# so there is no tls block here and no ssl-redirect — the HTTP→HTTPS redirect is
+# handled once, cluster-wide, by argocd-infra/gateway/redirect-to-https.yaml.
+#
+# 1. hermes.<tld>       → the agent API, straight to the pod. Auth is the bearer
+#                         key, NOT OIDC: VSCode extensions send a static API key
+#                         and cannot complete an interactive login, so putting
+#                         the outpost in front would break every client.
+# 2. hermes-admin.<tld> → the dashboard, straight to :9119. Hermes gates it itself
+#                         with the Authentik OIDC provider created by
+#                         authentik-provider.yaml (access-admin-only), so there is
+#                         no forward-auth hop and no second login prompt.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hermes
+  namespace: hermes
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - hermes.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # An agentic turn is a tool loop, not a single completion: it can run for
+      # many minutes before the first byte of the answer. The default timeout
+      # would sever the connection mid-task and the client would see a truncated
+      # stream with no error. Matches the LiteLLM route's reasoning.
+      timeouts:
+        request: 1800s
+        backendRequest: 1800s
+      backendRefs:
+        - name: hermes
+          port: 8642
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hermes-admin
+  namespace: hermes
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - hermes-admin.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # Same-namespace backendRef, so no ReferenceGrant is involved. The dashboard's
+      # own OIDC gate is the authorization boundary — see the bootstrap ConfigMap's
+      # dashboard.oauth.self_hosted block. web_server.py fails CLOSED if no auth
+      # provider registers, so a broken OIDC config yields a dead dashboard rather
+      # than an open one.
+      backendRefs:
+        - name: hermes
+          port: 9119

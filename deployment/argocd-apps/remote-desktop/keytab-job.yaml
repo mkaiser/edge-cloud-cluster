@@ -1,0 +1,301 @@
+# PreSync: give this desktop its OWN AD machine account and Kerberos keytab.
+#
+# ⚠ ONE OF THREE NEAR-IDENTICAL COPIES (this one, remote-desktop-bender/keytab-job.yaml,
+# eda-pcb-agent/keytab-job.yaml), all carrying the same TODO(rotation). Copied rather than
+# shared because each hardcodes one account in one namespace. If the mechanism changes,
+# change it in ALL THREE. plans/keytab-job-consolidation.md holds the plan to collapse them.
+#
+# ⚠ THIS USED TO LIVE IN argocd-infra/samba-ad/desktop-keytab-job.yaml, and moving it here is
+# what makes remote-desktop self-contained. As an infra PostSync hook it:
+#   - created the rdesk-gvisor$ machine account and a keytab Secret even when this app was
+#     disabled, leaving AD objects behind for something that does not exist;
+#   - wrote the Secret INTO ns remote-desktop from samba-ad, which needs a Role in a namespace
+#     the infra app does not own — and that Role cannot be created before the namespace
+#     exists. On ecc214 2026-09-17 the job failed every run with
+#       secrets "remote-desktop-keytab" is forbidden: ... in the namespace "remote-desktop"
+#     having exported the keytab successfully; only the publish failed;
+#   - and ran `kubectl rollout restart` on this app's Deployment from another namespace,
+#     which remote-desktop's deliberate lack of an automated syncPolicy exists to prevent
+#     (a restart kills every logged-in session, so it is a human's decision).
+# The RBAC direction is now inverted, as it is for bender and eda-pcb-agent: THIS app
+# declares a narrow pods/exec Role in samba-ad for its OWN ServiceAccount, so disabling the
+# app removes every trace of it.
+#
+# ⚠ PRESYNC, NOT PostSync — and that is not a preference, it is the only phase that works.
+# The desktop container REFUSES TO START without /etc/krb5.keytab (startup-configmap.yaml
+# exits FATAL on purpose). As a PostSync hook this deadlocked itself on every fresh cluster:
+# the Deployment never went healthy, so the Sync phase failed with `Deployment
+# "<the deployment>" exceeded its progress deadline`, so the PostSync phase NEVER RAN, so the
+# Secret was never minted. Retrying does not break the cycle — ecc208 sat in it until the
+# phase was changed. A prerequisite of the workload belongs BEFORE the workload.
+#
+# WHY THIS EXISTS. SSSD's `id_provider = ad` authenticates to the DC with GSSAPI and has NO
+# simple-bind fallback — without a keytab it fails at startup with
+#   Module [ad] constructor failed: No suitable principal found in keytab
+# and then EVERY lookup returns "no such user" while the pod still reports Running. Since
+# this app's whole storage design depends on resolving the directory's uidNumber, an
+# unauthenticated sssd is not a degraded mode, it is a broken pod.
+#
+# ⚠ WHY `ad` AND NOT THE AUTHENTIK LDAP OUTPOST. The outpost COMPUTES uid = 5000 + Authentik
+# pk; AD — and the fileserver via idmap_backend: AD — STORES uidNumber. Those diverge the
+# moment a pk changes, and this pod would then be unable to read its own home. See
+# doc/ad-identity-chain.md.
+#
+# ⚠ WHY THIS IS A COPY OF remote-desktop/keytab-job.yaml RATHER THAN A SHARED JOB.
+# That job is hardcoded to ONE machine account and one target namespace. Generalising it
+# would be the tidier engineering, but it lives outside this app and this app is deliberately
+# self-contained: disabling it must leave nothing behind in another folder. The duplication
+# is the price, and it is bounded — the logic below is small and its traps are all recorded
+# in the comments. ⚠ If you change the mechanism in either file, change it in BOTH.
+#
+# ⚠ THE MACHINE ACCOUNT IS ITS OWN. It must NOT reuse rdesk-gvisor$, pcb-agent$ or FS-1$: two members
+# sharing one account would fight over its password and each rotation would break the other.
+#
+# ⚠ `samba-tool computer create` leaves the account with NO Kerberos keys — exportkeytab then
+# fails "No keys found while exporting", which reads like a permissions problem and is not.
+# Setting a password is what mints the keys.
+#
+# ⚠ exportkeytab MUST get `-H /var/lib/samba/private/sam.ldb`. Over LDAP samba refuses with
+# "only gMSA accounts can be exported over LDAP" — also readable as an authorization problem.
+#
+# ⚠ `--principal` scopes the export to ONE account. A bare export dumps EVERY key in the
+# domain, including krbtgt — a domain-wide compromise sitting in a Secret.
+#
+# ⚠ TODO(rotation) — same open item as the remote-desktop job: machine-password rotation is
+# DISABLED on the client (ad_maximum_machine_account_password_age = 0 in
+# startup-configmap.yaml) because an exported keytab does not follow a rotation. sssd would
+# change the password, this keytab would go stale, and every login would break a week later
+# with no deploy having happened. Re-enabling needs this to become a CronJob triggered on the
+# account's KVNO (`samba-tool user show <acct>$` exposes msDS-KeyVersionNumber), not a timer.
+# Until that exists, renewal stays off — leaving it on without the re-export is strictly worse.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-keytab
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+# ⚠ THE ONE GENUINELY WIDE GRANT IN THIS APP, and it is why the Job's ServiceAccount is not
+# the pod's. Minting a keytab requires the DC's LOCAL sam.ldb, which is only reachable by
+# exec'ing into the DC pod — there is no API for it. Scoped as tightly as exec allows:
+# `create` on pods/exec in the samba-ad namespace only.
+#
+# ⚠ NEVER bind this to the workload pod's ServiceAccount. The desktop/hermes pod runs
+# automountServiceAccountToken: false and has no API identity at all; only this short-lived
+# Job can exec into the DC. An agent that could exec into the DC would be domain-admin
+# adjacent.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remote-desktop-keytab-dc-exec
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remote-desktop-keytab-dc-exec
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: remote-desktop-keytab-dc-exec
+subjects:
+  - kind: ServiceAccount
+    name: remote-desktop-keytab
+    namespace: remote-desktop
+---
+# Writing the keytab Secret and rolling the Deployment — both in THIS namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remote-desktop-keytab
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  # ⚠ `patch` matters: without it `kubectl apply` fails only on the SECOND run, so the first
+  # cluster looks fine and a later re-export silently does not propagate.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+  # Roll the pod so it picks up a new keytab. Without this the Secret updates and the running
+  # pod keeps using the old one until something else restarts it.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remote-desktop-keytab
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: remote-desktop-keytab
+subjects:
+  - kind: ServiceAccount
+    name: remote-desktop-keytab
+    namespace: remote-desktop
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-keytab
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # -1: the SAME weight as the build/registry PreSync hooks, so they run CONCURRENTLY.
+    # Nothing orders them — this Job only needs the samba-ad DC — and serialising it ahead of
+    # them would add its DC wait to every first sync for no benefit.
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: remote-desktop-keytab
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: keytab
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # ⚠ ≤15 chars (NetBIOS limit) and distinct from rdesk-bender / pcb-agent / FS-1.
+            # Two members sharing one account fight over its password and each rotation
+            # breaks the other.
+            - name: MACHINE
+              value: "rdesk-gvisor"
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            - name: TARGET_NS
+              value: "remote-desktop"
+            - name: TARGET_SECRET
+              value: "remote-desktop-keytab"
+            - name: TARGET_DEPLOY
+              value: "remote-desktop-gvisor"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              # ⚠ The CLOUD DC, by pod name. Any DC can mint this — the account is a domain
+              # object, not a per-DC one — but exportkeytab needs that DC's LOCAL sam.ldb,
+              # so the exec target and the sam.ldb must be the same pod.
+              DC=ad-cloud-0
+              dc() { kubectl exec -n samba-ad "$DC" -c samba -- "$@"; }
+
+              i=1
+              until kubectl get pod -n samba-ad "$DC" >/dev/null 2>&1; do
+                [ "$i" -ge 60 ] && {
+                  echo "ERROR: $DC not found after 10m — cannot mint a keytab." >&2
+                  echo "  On a first bring-up this is EXPECTED until wave13-samba-ad has synced;" >&2
+                  echo "  the app's retry brings us back." >&2
+                  exit 1
+                }
+                echo "  try ${i}/60: waiting for $DC..."; i=$((i+1)); sleep 10
+              done
+
+              # --- 1. the machine account, create-once -------------------------------
+              # ⚠ IDEMPOTENT ON PURPOSE. Re-creating it (or resetting its password) would
+              # invalidate the keytab the running pod already holds, so every login would
+              # break until the pod rolled. Only mint keys when the account is NEW.
+              if dc samba-tool computer show "$MACHINE" >/dev/null 2>&1; then
+                echo "machine account ${MACHINE}\$ exists — leaving its password alone"
+                FRESH=""
+              else
+                echo "creating machine account ${MACHINE}\$"
+                dc samba-tool computer create "$MACHINE" >/dev/null
+                # ⚠ REQUIRED: `computer create` leaves the account with NO Kerberos keys, and
+                # exportkeytab then fails "No keys found while exporting".
+                RANDPW="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 28)Aa1!"
+                dc samba-tool user setpassword "${MACHINE}\$" --newpassword="$RANDPW" >/dev/null
+                echo "  password set (keys minted)"
+                FRESH=y
+              fi
+
+              # --- 2. export the keytab ----------------------------------------------
+              # ⚠ -H local sam.ldb, and ⚠ --principal to scope it to ONE account (see header).
+              dc sh -c "rm -f /tmp/pcb.keytab && samba-tool domain exportkeytab /tmp/pcb.keytab \
+                -H /var/lib/samba/private/sam.ldb --principal='${MACHINE}\$' --only-current-keys" >/dev/null
+              KT_B64=$(dc base64 -w0 /tmp/pcb.keytab)
+              dc rm -f /tmp/pcb.keytab
+              if [ -z "$KT_B64" ]; then
+                echo "ERROR: exported keytab is EMPTY — refusing to publish it." >&2
+                echo "  A zero-length keytab would make sssd fail 'No suitable principal'," >&2
+                echo "  i.e. exactly the failure this Job exists to prevent." >&2
+                exit 1
+              fi
+              echo "keytab exported (${#KT_B64} b64 chars)"
+
+              # --- 3. publish, and roll the pod only if it CHANGED --------------------
+              OLD=$(kubectl get secret -n "$TARGET_NS" "$TARGET_SECRET" \
+                      -o jsonpath='{.data.krb5\.keytab}' 2>/dev/null || true)
+              if [ "$OLD" = "$KT_B64" ]; then
+                echo "secret ${TARGET_SECRET} already current — no restart needed"
+                exit 0
+              fi
+
+              # ⚠ Built with printf, not an inline python heredoc. This is a YAML block
+              # scalar: inline python inherits the manifest indentation and dies with
+              # IndentationError, and dedenting it to column 0 ends the block scalar and
+              # breaks the YAML. A literal Secret manifest sidesteps both — and the keytab is
+              # ALREADY base64, which is exactly what `data:` wants, so no re-encoding.
+              printf '%s\n' \
+                "apiVersion: v1" \
+                "kind: Secret" \
+                "metadata:" \
+                "  name: $TARGET_SECRET" \
+                "  namespace: $TARGET_NS" \
+                "type: Opaque" \
+                "data:" \
+                "  krb5.keytab: $KT_B64" \
+                | kubectl apply -f - >/dev/null
+              echo "secret ${TARGET_SECRET} updated in ${TARGET_NS}"
+
+              # A changed keytab is useless to a pod that already mounted the old one.
+              # ⚠ Running in PreSync, the Deployment may not EXIST yet on a first sync — it is
+              # applied by the Sync phase that follows, and will mount this Secret from the
+              # start. Rolling a deployment that is not there is not a warning-worthy event,
+              # so test for it rather than reporting "restart it by hand" on every bring-up.
+              if [ -n "${FRESH:-}" ] || [ -n "$OLD" ]; then
+                if ! kubectl get deploy -n "$TARGET_NS" "$TARGET_DEPLOY" >/dev/null 2>&1; then
+                  echo "$TARGET_DEPLOY does not exist yet — the Sync phase will create it"
+                elif kubectl rollout restart -n "$TARGET_NS" "deploy/$TARGET_DEPLOY" >/dev/null 2>&1; then
+                  echo "rolled $TARGET_DEPLOY to pick up the new keytab"
+                else
+                  echo "  WARNING: could not roll $TARGET_DEPLOY — restart it by hand" >&2
+                fi
+              fi
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }

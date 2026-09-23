@@ -1,0 +1,73 @@
+# A STATIC PV pinned to the homes export ROOT, plus the claim this pod mounts at /home.
+#
+# ⚠ THE `server:` VALUE ONLY TAKES EFFECT ON A FRESH CLUSTER. A PersistentVolume's
+# `spec.persistentvolumesource` is IMMUTABLE after creation, so on a cluster whose PV already
+# exists this change cannot be applied — ArgoCD reports the PV OutOfSync and keeps serving the
+# old value. That drift is EXPECTED and harmless. Do NOT "fix" it by deleting a Bound PV.
+#
+# ⚠ WHY THE EXPORT ROOT AND NOT A SUBDIRECTORY. The per-user home this pod needs
+# (/mnt/datapool/homes/eda-pcb-agent) is created by truenas/configure-job.yaml from the
+# Authentik `employees` group — NOT by this app. A dynamically provisioned NFS volume would
+# get its own `subDir` and silently mount an empty directory next to the real homes, with
+# nothing erroring. So the volume has to be the export root itself, which means a static PV.
+#
+# ⚠ volumeHandle DIFFERS from remote-desktop's `fs-1-datapool-homes` even though both point at
+# the SAME export. The driver treats volumeHandle as the volume's IDENTITY, so reusing it for a
+# second PV is what orphans a binding. Same share, different handle — deliberate.
+#
+# ⚠ storageClassName is EMPTY STRING, not omitted. Empty explicitly means "no dynamic
+# provisioning"; omitting the field lets the DEFAULT class (longhorn-cloud) claim it, which
+# would hand this pod a Longhorn volume instead of the homes export.
+#
+# ⚠ persistentVolumeReclaimPolicy: Retain. This PV points at every user's home directory, not
+# just this agent's. Delete would let the CSI driver remove them when the claim goes away.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-homes-pcb-agent
+  labels:
+    # The claim below selects on this, so the pairing cannot bind to remote-desktop's PV.
+    ecc/volume: nfs-homes-pcb-agent
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size; the real limit is the datapool.
+    storage: 500Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    # ⚠ Keep in step with the other static NFS PVs — there is no StorageClass to inherit
+    # mountOptions from, so every PV repeats the set. nfsvers is load-bearing here: the export
+    # still offers NFSv3, and a client left to negotiate could land on v3, which has no real id
+    # mapping and maps every uid to nobody — which would defeat the whole AD-identity design.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: fs-1-datapool-homes-pcb-agent
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/homes # automatically updated from project-settings:storage.fileserver.datasets.homes.dataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-homes-pcb-agent
+  namespace: eda-pcb-agent
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Empty string, for the same reason as the PV above: no dynamic provisioning.
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 500Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-homes-pcb-agent

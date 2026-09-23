@@ -1,0 +1,82 @@
+# ⚠ `server:`, `share:` AND `volumeHandle:` ONLY TAKE EFFECT ON A FRESH CLUSTER. A
+# PersistentVolume's `spec.persistentvolumesource` is IMMUTABLE after creation, so on a
+# cluster whose PVs already exist these changes cannot be applied — ArgoCD reports the PV
+# OutOfSync and keeps serving the old values. That drift is EXPECTED and harmless: the
+# existing PV still mounts, and the next recreate builds it from scratch. Do NOT "fix" it
+# by deleting a Bound PV to force the update — that detaches live data.
+#
+# EDA installer media + built module archives on the TrueNAS fileserver — NFSv4, STATIC PV.
+#
+# WHY NFS: this export measures 126 MB/s read / 92 MB/s write
+# (csi-driver-nfs/values.yaml), so reading the 115 GB SDI tarball costs minutes. ALL
+# installer media lives here. There are no image archives — the registry blob store on
+# datapool/images is what survives a recreate.
+#
+# ⚠ READ-WRITE — do not "fix" this to ro. Installer media is staged in by hand (there is
+# no upstream to re-fetch it from), and builds extract media through this mount.
+#
+# ⚠ `share` must be the dataset's MOUNTPOINT, not the dataset name: TrueNAS exports
+# /mnt/<pool>/<dataset>. This is a dataset of its own (datapool/eda/installers, provisioned
+# by deployment/argocd-apps/eda/fileserver), NOT a subdirectory of a shared one — so do
+# NOT append another eda/ here.
+#
+# ⚠ STATIC, not a nfs-homes claim: that StorageClass templates a per-PVC subdirectory
+# (subDir: <ns>-<pvc>-<pv>), so a dynamic claim can only ever address its OWN generated
+# directory — never a pre-existing dataset.
+#
+# ⚠ Retain: this holds hand-staged vendor media and recreate-survival archives. Delete would
+# try to remove the directory on the appliance.
+#
+# ⚠ Only appliance-LAN nodes can mount this — the csi-driver-nfs node DaemonSet is pinned to
+# ecc/fileserver-lan and cloud nodes have no route to 192.168.1.0/24. The [eda] runner is
+# constrained to that site, so this is fine; a build scheduled anywhere else fails with
+# "driver name nfs.csi.k8s.io not found in the list of registered CSI drivers".
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-eda-installers
+spec:
+  capacity:
+    # Nominal: an NFS "volume" is a directory, so there is no quota to enforce. The real
+    # limit is the datapool (4 TB) or a ZFS quota on the dataset. Must be >= the PVC request.
+    storage: 500Gi
+  accessModes:
+    # RWX and genuinely multi-writer: the copy Job, the CI build and the broker all mount it.
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as remote-desktop/nfs-homes-pv.yaml, and pinned for the same reasons: the export
+    # has NFSV3 enabled too, so a client left to negotiate could land on v3 (no real id
+    # mapping); hard so an I/O error mid-write on a multi-GB archive blocks rather than
+    # silently truncating; the large rsize/wsize are what sustained 92/126 MB/s.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # Must be unique cluster-wide; not parsed by the driver for a static PV.
+    volumeHandle: fs-1-datapool-eda-installers
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/eda/installers # automatically updated from project-settings:storage.fileserver.datasets.eda.installers
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-eda-installers
+  # Build pods run in the runner's namespace, so the claim must live here.
+  namespace: gitlab-runner
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  # Bind to that exact PV (not to whatever a provisioner might hand out).
+  volumeName: nfs-eda-installers
+  resources:
+    requests:
+      storage: 500Gi

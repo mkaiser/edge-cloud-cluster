@@ -1,0 +1,75 @@
+# ArgoCD Application: the shared Gateway API Gateway + the cluster-wide
+# HTTP→HTTPS redirect route.
+#
+# Wave 0, and deliberately the earliest routing resource: every app's HTTPRoute
+# attaches to this Gateway by name, and a route whose parent does not exist sits
+# unattached (Accepted=False) until it does. The Envoy proxy DaemonSet is only
+# created once this Gateway exists — the Envoy Gateway controller itself is
+# installed by Pulumi (src/ingress.ts), before ArgoCD.
+#
+# The https-wildcard listener references argocd-infra/wildcard-tls, which is
+# issued by argocd-infra-self. Until that Secret exists the listener reports
+# ResolvedRefs=False and only HTTP serves; it self-heals once cert-manager
+# finishes.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/gateway
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+  # group/kind) are owned by the API server. Under ServerSideApply ArgoCD reads
+  # them as permanent drift, leaving the app OutOfSync forever and stalling the
+  # wave barriers — even though kubectl diff against the manifest is empty.
+  # Narrow on purpose: a real hostname/path/backend/port change still shows up.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+        # The WHOLE matches array, not just .path.type inside it. A rule that
+        # declares no matches (the redirect route) gets the entire default
+        # `[{path:{type:PathPrefix,value:/}}]` injected by the API server, so
+        # there is no in-array path to ignore — ignoring .matches[].path.type
+        # alone never fires and the app stays OutOfSync forever, stalling the
+        # wave1 barrier and every wave above it.
+        - .spec.rules[].matches
+    # The only real SSA drift on the Gateway is the API server defaulting
+    # `group: ""` inside each certificateRef. certificateRefs is an ATOMIC list,
+    # so a jq path *inside* it (…certificateRefs[].group) does not normalize —
+    # the whole list has to be ignored, which is why the narrower expression
+    # left the app OutOfSync forever.
+    #
+    # Do NOT add .spec.listeners[].allowedRoutes here. ignoreDifferences strips
+    # the path from the normalized LIVE state; allowedRoutes IS declared in
+    # gateway.yaml, so stripping it makes live differ from target and CREATES
+    # the drift it was meant to hide. Only ever ignore fields the manifest does
+    # not declare.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      jqPathExpressions:
+        - .spec.listeners[].tls.certificateRefs
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      # Required for the ignoreDifferences above to affect the SYNC comparison,
+      # not just the displayed diff — without it the app stays OutOfSync.
+      - RespectIgnoreDifferences=true

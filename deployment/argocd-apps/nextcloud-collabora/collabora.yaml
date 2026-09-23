@@ -1,0 +1,94 @@
+# Collabora Online (CODE) — document editing backend for Nextcloud richdocuments.
+# Accessible at https://collabora.subdomain.domain.tld (referenced as wopi_url).
+# Stateless; TLS terminated at the Gateway (ssl.termination=true).
+#
+# Deployed by its OWN Application (app-of-apps/nextcloud-collabora.yaml), not by the
+# nextcloud one. Collabora is a separate product (Collabora Productivity, on
+# LibreOffice) that Nextcloud reaches over the WOPI protocol via the richdocuments
+# app — NOT a subchart of the nextcloud umbrella chart, so bumping that chart never
+# moves this image; it is tracked independently by Renovate (docker datasource).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collabora
+  namespace: nextcloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: collabora
+  template:
+    metadata:
+      labels:
+        app: collabora
+    spec:
+      containers:
+        - name: collabora
+          image: collabora/code:26.04.3.2.1  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 9980
+          env:
+            # Allowed WOPI hosts (the Nextcloud domain). Collabora treats this as a
+            # regex, but the dots are left UNESCAPED on purpose: a literal dot still
+            # matches, and the escaped form (nextcloud\.eccNNN\.…) does NOT match the
+            # hostname-rewrite pass in updateConfigFromProjectSettings.sh. Escape them
+            # and this value silently sticks at the old subdomain across cluster
+            # recreates, allowlisting the wrong WOPI host.
+            - name: aliasgroup1
+              value: "https://nextcloud.subdomain1.your-domain.tld:443" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: DONT_GEN_SSL_CERT
+              value: "true"
+            - name: extra_params
+              value: "--o:ssl.enable=false --o:ssl.termination=true"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9980
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9980
+            initialDelaySeconds: 30
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: collabora
+  namespace: nextcloud
+spec:
+  selector:
+    app: collabora
+  ports:
+    - port: 9980
+      targetPort: 9980
+---
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once by argocd-infra/gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: collabora
+  namespace: nextcloud
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - collabora.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # WOPI/websocket sessions stay open while a document is being edited —
+      # replaces the former timeout-server/timeout-client: 3600s annotations.
+      timeouts:
+        request: 3600s
+        backendRequest: 3600s
+      backendRefs:
+        - name: collabora
+          port: 9980

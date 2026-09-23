@@ -1,0 +1,193 @@
+# "Browse logs" dashboard — the one you open to READ logs, as opposed to
+# loki-overview which watches ingest cost.
+#
+# Cascading template variables: namespace -> app -> container, each populated from
+# Loki's own label API so the dropdowns only ever offer values that exist, and
+# narrowing one narrows the next. All three include an All option so the dashboard
+# is useful before you know what you are looking for.
+#
+# The All option is `.+`, NOT `.*`. Loki rejects a selector whose matchers are all
+# empty-compatible: `{namespace=~".*"}` fails with "queries require at least one
+# regexp or equality matcher that does not have an empty-compatible value". With
+# `.*` every panel errors on first open, before anyone touches a dropdown.
+#
+# The `search` variable is a free-text box wired to a `|~` regex filter. Left empty
+# it matches everything (the default is `.*`), so an empty box is not a special case.
+#
+# The rate window is a FIXED [1m], not $__auto. $__auto (and $__interval) size the
+# window from the panel width, which on a 1h view resolves to [2s] — and a 2s window
+# over log lines does not merely look spiky, it DROPS SERIES: a container whose lines
+# fall outside every 2s bucket returns nothing at all — [2s] shows barely half the
+# containers [1m] does. Never let a Loki rate() window be view-derived.
+#
+# NB the available stream labels are namespace / app / container / cluster only —
+# `pod` and `node` are deliberately NOT labels (each would multiply stream count,
+# which sets the floor on S3 object count; see the alloy config). The pod name is
+# still on every line as structured metadata from loki.source.kubernetes, so the
+# Logs panel can show it via "Expand log message" without paying the cardinality.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-browse-dashboard
+  namespace: prometheus
+  labels:
+    grafana_dashboard: "1"
+data:
+  loki-browse.json: |
+    {
+      "title": "Logs — browse by app",
+      "uid": "loki-browse",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "label": "Namespace",
+            "type": "query",
+            "datasource": { "type": "loki", "uid": "loki" },
+            "query": { "label": "namespace", "refId": "namespaceVar" },
+            "refresh": 2,
+            "includeAll": true,
+            "allValue": ".+",
+            "multi": false,
+            "current": { "text": "All", "value": "$__all" },
+            "sort": 1
+          },
+          {
+            "name": "app",
+            "label": "App",
+            "type": "query",
+            "datasource": { "type": "loki", "uid": "loki" },
+            "query": {
+              "label": "app",
+              "stream": "{namespace=~\"$namespace\"}",
+              "refId": "appVar"
+            },
+            "refresh": 2,
+            "includeAll": true,
+            "allValue": ".+",
+            "multi": false,
+            "current": { "text": "All", "value": "$__all" },
+            "sort": 1
+          },
+          {
+            "name": "container",
+            "label": "Container",
+            "type": "query",
+            "datasource": { "type": "loki", "uid": "loki" },
+            "query": {
+              "label": "container",
+              "stream": "{namespace=~\"$namespace\", app=~\"$app\"}",
+              "refId": "containerVar"
+            },
+            "refresh": 2,
+            "includeAll": true,
+            "allValue": ".+",
+            "multi": false,
+            "current": { "text": "All", "value": "$__all" },
+            "sort": 1
+          },
+          {
+            "name": "search",
+            "label": "Search (regex)",
+            "type": "textbox",
+            "query": ".*",
+            "current": { "text": ".*", "value": ".*" }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Lines / s — matching the current filter",
+          "description": "Shape of the traffic you are about to read. A spike here is where to point the time picker.",
+          "gridPos": { "h": 6, "w": 18, "x": 0, "y": 0 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "sum by (container) (rate({namespace=~\"$namespace\", app=~\"$app\", container=~\"$container\"} |~ \"$search\" [1m]))",
+              "legendFormat": "{{container}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+        },
+        {
+          "type": "stat",
+          "title": "Error-ish lines",
+          "description": "Case-insensitive error|fatal|panic within the current filter and time range. Blunt, but it tells you whether the thing you are reading is angry.",
+          "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "sum(count_over_time({namespace=~\"$namespace\", app=~\"$app\", container=~\"$container\"} |~ \"(?i)(error|fatal|panic)\" [$__range]))",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "orange", "value": 1 },
+                  { "color": "red", "value": 100 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "type": "logs",
+          "title": "Logs",
+          "description": "Newest first. Use 'Expand log message' on a line to see the pod name and other structured metadata — pod is not a stream label, so it is not in the header.",
+          "gridPos": { "h": 20, "w": 24, "x": 0, "y": 6 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "{namespace=~\"$namespace\", app=~\"$app\", container=~\"$container\"} |~ \"$search\"",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": false,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false,
+            "enableLogDetails": true,
+            "dedupStrategy": "none",
+            "sortOrder": "Descending"
+          }
+        },
+        {
+          "type": "logs",
+          "title": "Errors only",
+          "description": "Same filter, narrowed to error|fatal|panic. Kept separate so a noisy service does not bury them.",
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 26 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "{namespace=~\"$namespace\", app=~\"$app\", container=~\"$container\"} |~ \"(?i)(error|fatal|panic)\"",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": false,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false,
+            "enableLogDetails": true,
+            "dedupStrategy": "none",
+            "sortOrder": "Descending"
+          }
+        }
+      ]
+    }

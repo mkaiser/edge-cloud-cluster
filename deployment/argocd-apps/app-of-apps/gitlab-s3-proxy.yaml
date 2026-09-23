@@ -1,0 +1,52 @@
+# ArgoCD Application: lab-pinned TCP proxy to the appliance's S3 endpoint.
+#
+# WHY: GitLab runs in the cloud (so it stays available when the mesh link drops), but its CI
+# artifacts are stored on the TrueNAS appliance in the Bielefeld lab. Cloud pods have no
+# route to 192.168.1.0/24 — measured, their packets leave via the public gateway — so a
+# lab-pinned pod behind a normal ClusterIP is the only supported way across. Fixing this by
+# routing instead needs `--accept-routes` on the cloud CPs, which also installs 10.0.0.0/23
+# over tailscale0 and moves etcd peer traffic onto the mesh.
+#
+# ⚠ Layer 4 only. S3 is SigV4-signed over the Host header, so nothing here may parse or
+# rewrite HTTP. TLS is passed through to the appliance, which means the appliance's
+# certificate must carry this Service's DNS name and GitLab must trust its CA
+# (global.certificates.customCAs). Details in the app's README.md.
+#
+# ⚠ This app being Healthy says nothing about artifacts working: the probe only proves nginx
+# is listening, never that the appliance answers. Alert on the artifacts endpoint separately.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab-s3-proxy
+  namespace: argocd-apps
+  annotations:
+    # mesh tier: hard-pinned to the appliance LAN by design — on a cloud-only cluster there is
+    # nothing for this to proxy to.
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/gitlab-s3-proxy
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab-s3-proxy
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # On a cluster recreate this app can sync before the mesh nodes have joined, leaving the
+    # pod Pending on the ecc/site selector. Retrying without a limit lets it settle on its
+    # own instead of parking Failed until someone re-syncs.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

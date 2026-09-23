@@ -1,0 +1,254 @@
+# Authentik OAuth2 provider + application tile for Open WebUI — managed entirely
+# from this folder via the Authentik API (Part B: self-contained per-app OIDC),
+# so nothing open-webui-specific lives in the authentik folder.
+#
+#   PostSync  job → create/update the "open-webui" OAuth2 provider + "Open WebUI"
+#                   application (tile, group "Office") + bind the central
+#                   access-ai policy.
+#   PreDelete job → delete the application + provider on app removal.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace) — NOT the superuser bootstrap token. The OIDC client secret
+# (key client-secret) comes from open-webui-oidc-client-secret in this namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: open-webui-authentik
+  namespace: open-webui
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: open-webui-authentik-token-read
+  namespace: open-webui
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: open-webui-authentik-token-read
+  namespace: open-webui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: open-webui-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: open-webui-authentik
+    namespace: open-webui
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-authentik-provider
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: open-webui-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-oidc-client-secret
+                  key: client-secret
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n open-webui \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # ---- the "ai" group (idempotent) ----
+              # Owned HERE rather than in argocd-infra/authentik/blueprint-groups.yaml.
+              # SHARED with litellm: both apps bind the central access-ai policy, which
+              # tests membership of "ai". There is no single owner, so creation lives in
+              # open-webui (the primary user-facing tile) and litellm relies on it. The
+              # create is idempotent, so duplicating it there later would also be safe;
+              # what is NOT safe is neither app creating it — litellm:206 warns-and-skips
+              # on a missing policy/app and leaves its tiles unbound, i.e. open to all.
+              #
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              AI_GRP_PK=$(first_pk "core/groups/?name=ai")
+              if [ -z "$AI_GRP_PK" ]; then
+                echo "Creating group 'ai'..."
+                AI_GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"ai","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "ai group pk=$AI_GRP_PK"
+
+              MAP_PKS="[]"
+              for s in openid profile email; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'open-webui',
+                'client_type': 'confidential',
+                'client_id': 'open-webui',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict', 'url': 'https://ai.subdomain1.your-domain.tld/oauth/oidc/callback'}], # automatically updated from project-settings:{general.subdomain,general.domain}
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=open-webui")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'open-webui'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'open-webui' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Open WebUI',
+                'slug': 'open-webui',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'AI',
+                'meta_launch_url': 'https://ai.subdomain1.your-domain.tld', # automatically updated from project-settings:{general.subdomain,general.domain}
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/open-webui.svg',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app open-webui "Open WebUI" "$APP_PAYLOAD"
+
+              # Bind the central access-ai expression policy (defined in
+              # blueprint-apps.yaml). Idempotent — skip if already bound.
+              APP_PK=$(first_pk "core/applications/?slug=open-webui")
+              POL_PK=$(first_pk "policies/expression/?name=access-ai")
+              if [ -n "$APP_PK" ] && [ -n "$POL_PK" ]; then
+                BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                  echo "  binding access-ai policy to Open WebUI"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              else
+                echo "  WARN: app or access-ai policy not found — skipping access binding"
+              fi
+
+              echo "Open WebUI Authentik provider + tile + access binding configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-authentik-provider-cleanup
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: open-webui-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n open-webui \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'open-webui'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/open-webui/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=open-webui" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'open-webui' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "Open WebUI Authentik cleanup done."

@@ -1,0 +1,39 @@
+# nested-runtime — cluster-side plumbing that makes nested-container nodes usable:
+#   - RuntimeClass `runsc` (cluster-scoped) → the containerd `runsc` (gVisor) runtime handler
+#     that src/provisioning-scripts/50-install-nested-runtime.sh sets up on nodes with
+#     project_settings nestedRuntime:"gvisor". A pod with runtimeClassName:runsc then runs
+#     under a userspace kernel and can host inner OCI containers unprivileged
+#     (remote-desktop Model-B).
+#
+# gVisor (runsc) is the only nested runtime: it is what 50-install-nested-runtime.sh
+# installs and the only RuntimeClass here.
+#
+# Placed early (wave 2, like nvidia-gpu): depends on NOTHING from mesh nodes. Deliberately
+# NON-BLOCKING and node-independent — the RuntimeClass is cluster-scoped, so ArgoCD reports
+# it Healthy immediately even with zero capable nodes; a pod only lands on a capable node via
+# nodeAffinity (ecc/nested-runtime-gvisor=true). No barrier: nothing downstream requires such
+# a node to exist, and gating on one would deadlock until it joins.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nested-runtime
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/nested-runtime
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

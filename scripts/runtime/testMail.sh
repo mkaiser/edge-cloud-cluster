@@ -1,21 +1,34 @@
 #!/bin/bash
 set -euo pipefail
 
-if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
-    echo "Usage: $0 <sender-email> <recipient-email>"
-    echo "Example: $0 no-reply@cape-project.eu user@example.com"
+# Sender/recipient both default to project_settings.ts `senderEmail` (the canonical
+# from/admin address, e.g. no-reply@mydomain.tld). Positional args override either.
+#   Usage: $0 [sender-email] [recipient-email]
+
+THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$THIS_DIR/../.." && pwd)"
+
+sender_email=$(sed -nE 's/^[[:space:]]*senderEmail[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$REPO_DIR/project_settings.ts" | head -n1)
+
+ADDR_SENDER="${1:-$sender_email}"
+ADDR_RECIPIENT="${2:-$sender_email}"
+
+if [ -z "$ADDR_SENDER" ] || [ -z "$ADDR_RECIPIENT" ]; then
+    echo "Usage: $0 [sender-email] [recipient-email]"
+    echo "Defaults are read from project_settings.ts (senderEmail)."
+    echo "Example: $0 no-reply@mydomain.tld user@example.com"
     exit 1
 fi
 
-ADDR_SENDER="$1"
-ADDR_RECIPIENT="$2"
+echo "Sender:    $ADDR_SENDER"
+echo "Recipient: $ADDR_RECIPIENT"
 
 # Extract SMTP credentials from Kubernetes secret
 echo "Retrieving SMTP credentials from Kubernetes secret 'smtp-credentials'..."
-SMTP_HOST=$(kubectl get secret smtp-credentials -n argocd -o jsonpath='{.data.host}' | base64 -d 2>/dev/null || echo "")
-SMTP_PORT=$(kubectl get secret smtp-credentials -n argocd -o jsonpath='{.data.port}' | base64 -d 2>/dev/null || echo "")
-SMTP_USERNAME=$(kubectl get secret smtp-credentials -n argocd -o jsonpath='{.data.username}' | base64 -d 2>/dev/null || echo "")
-SMTP_PASSWORD=$(kubectl get secret smtp-credentials -n argocd -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || echo "")
+SMTP_HOST=$(kubectl get secret smtp-credentials -n argocd-infra -o jsonpath='{.data.host}' | base64 -d 2>/dev/null || echo "")
+SMTP_PORT=$(kubectl get secret smtp-credentials -n argocd-infra -o jsonpath='{.data.port}' | base64 -d 2>/dev/null || echo "")
+SMTP_USERNAME=$(kubectl get secret smtp-credentials -n argocd-infra -o jsonpath='{.data.username}' | base64 -d 2>/dev/null || echo "")
+SMTP_PASSWORD=$(kubectl get secret smtp-credentials -n argocd-infra -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || echo "")
 
 if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_PORT" ] || [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ]; then
     echo "Error: Could not retrieve SMTP credentials from Kubernetes secret"

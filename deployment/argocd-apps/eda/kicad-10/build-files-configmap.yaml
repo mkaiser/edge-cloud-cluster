@@ -1,0 +1,562 @@
+# Build inputs for the KiCad 10 module image, mirrored into this module's GitLab project by
+# the PreSync build trigger and read there by the [eda] runner.
+#
+# ⚠ KEPT IN SYNC BY HAND with the sibling files in this directory (Dockerfile, module.yaml)
+# and with the .gitlab-ci.yml that exists ONLY here. Editing Dockerfile or module.yaml
+# without editing the copy below changes nothing that reaches GitLab — the trigger mirrors
+# THIS ConfigMap, not the directory. The ApplicationSet's `exclude` glob keeps the raw files
+# out of the cluster, so the ConfigMap is the only path they travel.
+#
+# ⚠ module.yaml is embedded here for a SECOND reason: the PostSync register Job reads it
+# straight out of this ConfigMap to register the module with the broker, without pulling the
+# image just to read /module.yaml out of it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eda-kicad-10-build-files
+  namespace: eda-kicad-10
+  annotations:
+    # PreSync at -2: the trigger Job (wave 0) mounts this, so it must exist first.
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-2"
+data:
+  Dockerfile: |
+    # KiCad 10.0.6 as a runnable EDA module container.
+    #
+    # Unlike every other module in this directory there is NO installer media and NO license
+    # server: KiCad is FOSS and comes from its own apt PPA. So this Dockerfile has no /installer
+    # bind mount, no .run extraction and no entrypoint that materialises a credential — only an
+    # apt install and the runtime plumbing a GUI needs inside a podman container.
+    #
+    # Ubuntu, not the centos:stream9 the other modules use, because the KiCad project publishes
+    # its releases as a Launchpad PPA and that is the only first-party binary channel with the
+    # matching library packages. Fedora's copr equivalent lags the release.
+    #
+    # ⚠ THE BASE RELEASE AND THE PPA ARE COUPLED. A PPA publishes per Ubuntu series, so the base
+    # tag below must be a series the KiCad PPA actually builds for — `add-apt-repository` happily
+    # adds a suite that 404s and the failure surfaces later, as "kicad has no installation
+    # candidate". Verified 2026-09-20 against
+    # ppa.launchpadcontent.net/kicad/kicad-10.0-releases/ubuntu/dists/: `resolute` (26.04) is
+    # published and carries kicad 10.0.6~ubuntu26.04.1 for every package installed below.
+    # Check the same path before moving this tag.
+    FROM docker.io/library/ubuntu:26.04
+
+    # ⚠ THE PPA MAJOR IS PINNED (`kicad-10.0-releases`), never a rolling `kicad-releases`.
+    # IMAGE_TAG is the SOLE cache key for the recover-or-rebuild gate, so an unpinned source lets
+    # two builds of the same tag be different images — the gate would then say "10.0.6 already
+    # exists" over an image that is no longer 10.0.6. The exact patch level is asserted below, so
+    # a PPA that moves 10.0.6 -> 10.0.7 under us FAILS THE BUILD instead of shipping silently.
+    #
+    # ⚠ kicad-symbols, kicad-footprints and kicad-templates are NOT optional. Without them a
+    # schematic opens with every symbol unresolved — a page of question marks, which reads as a
+    # corrupt file rather than a missing package, and is exactly the failure a human opening the
+    # agent's board would hit first. kicad-libraries is the metapackage that pulls the set; the
+    # individual names are listed too so a metapackage rename cannot silently drop one.
+    #
+    # Runtime deps for the GUI inside podman:
+    #   dbus-x11      — `dbus-launch` for the entrypoint. KiCad is wxWidgets/GTK and its
+    #                   embedded views retry a missing session bus; the desktop base image ships
+    #                   dbus and a module image does not inherit it. See kicad-entry below.
+    #   libgl/libglu  — 3D viewer and the OpenGL canvas both editors default to.
+    #   xauth         — the launcher re-keys the X cookie into the container; without the binary
+    #                   the GUI cannot authenticate to xrdp's X server.
+    #
+    # ⚠ THE SVG DECODER IS A HARD GUI CRASH, and the fix is NOT what it looks like. On 26.04
+    # the GUI aborts the moment it draws an SVG icon — opening the File menu, or loading a
+    # project:
+    #   Gtk:ERROR ensure_surface_for_gicon: assertion failed (error == NULL):
+    #     Failed to load .../Adwaita/scalable/status/image-missing.svg ... Bail out!
+    #
+    # gdk-pixbuf on 26.04 links libglycin-2 and routes SVG through GNOME's `glycin`, which
+    # sandboxes every decode by spawning `bwrap --unshare-all`. Under gVisor that cannot work:
+    #     $ bwrap --unshare-net ... /bin/true
+    #     bwrap: Creating new namespace failed: Operation not permitted
+    #     (with --cap-add SYS_ADMIN it gets further and dies on
+    #      "loopback: Failed RTM_NEWADDR" — gVisor's netstack cannot bring up lo in a nested
+    #      netns. --privileged does NOT help either; all three were measured.)
+    #
+    # ⚠ REMOVING THE GLYCIN SVG LOADER DOES NOT WORK, AND BOTH ATTEMPTS SHIPPED BROKEN.
+    # Deleting the binary left glycin-svg.conf claiming image/svg+xml, so glycin still spawned
+    # bwrap and failed on the missing exec — identical trace. Deleting the .conf too then gave
+    #     Failed to load ...: Unsupported image format
+    # because gdk-pixbuf offers SVG *only* through glycin here: with all glycin loaders removed
+    # it reports "No image loaders are configured", and librsvg2-common's classic
+    # libpixbufloader_svg.so is never consulted even when correctly registered in loaders.cache.
+    # Measured directly with gdk_pixbuf_new_from_file() — `gdk-pixbuf-query-loaders` lists the
+    # classic loader, and gdk-pixbuf still will not use it.
+    #
+    # ⇒ KEEP glycin, and neutralise its SANDBOX instead. glycin's sandbox mode is the GObject
+    # property `sandbox-selector` (Auto|Bwrap|FlatpakSpawn|NotSandboxed), set by the APPLICATION
+    # in code — KiCad does not set it and there is no environment variable, so it cannot be
+    # configured from here. What CAN be changed is the `bwrap` it invokes: the shim installed
+    # below drops the namespace flags (which are unavailable in this sandbox anyway) and execs
+    # the loader directly. Verified: gdk_pixbuf_new_from_file() on the exact icon in the crash
+    # trace returns a pixbuf.
+    #
+    # ⚠ This trades away glycin's kernel sandbox for the decoder. That sandbox is ALREADY
+    # unavailable here — bwrap cannot create the namespaces at all — so the choice is a working
+    # GUI or none. The decoder still runs as a separate short-lived process under the calling
+    # user, inside a gVisor-sandboxed pod, inside a container.
+    #
+    # ⚠ The CLI is unaffected — kicad-cli renders SVGs happily, including a 209-symbol library
+    # export — so NO CLI check can catch this. It needs a GUI launch, and the crash is
+    # INTERACTION-triggered: 40 s with a project open produced nothing, because nothing drew a
+    # menu.
+
+    #   adwaita-icon-theme / hicolor-icon-theme — the icons themselves. The crash above is GTK
+    #   failing to load its own fallback icon, so the theme must be present as well as loadable.
+    #
+    # ⚠ `universe` is enabled EXPLICITLY. The stock ubuntu:26.04 image carries only `main`, and
+    # libglu1-mesa lives in universe on 26.04 (verified 2026-09-20 against the archive's
+    # Packages.gz; the other ten packages here are all in main). Relying on add-apt-repository's
+    # PPA call to pull universe in as a side effect is not something to depend on.
+    #   fonts/locales — otherwise the UI renders with fallback metrics and boxes for glyphs.
+    # The PPA signing key, vendored — see the note inside the RUN below.
+    COPY kicad-ppa-key.asc /tmp/kicad-ppa-key.asc
+
+    RUN set -eux; \
+        apt-get update; \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          software-properties-common gpg-agent ca-certificates; \
+        add-apt-repository -y universe; \
+        # ⚠ The PPA is added BY HAND, not with `add-apt-repository ppa:...`. That command asks
+        # Launchpad's key service for the signing key on every build, and that service fails
+        # independently of the archive: measured twice on 2026-09-21 (pipelines 41 and 45, nine
+        # minutes apart) with
+        #   lazr.restfulclient.errors.ServerError: HTTP Error 500
+        #   b'GPGKeyTemporarilyNotFoundError'
+        # while ppa.launchpadcontent.net itself answered 200 the whole time. A third-party
+        # outage must not be able to fail this build, so the key is vendored beside the
+        # Dockerfile (kicad-ppa-key.asc) and only the ARCHIVE is fetched at build time.
+        #
+        # The vendored key was read out of the previously built image and its fingerprint
+        # checked against Launchpad's own API (signing_key_fingerprint):
+        #   FDA854F61C4D0D9572BB95E5245D5502FAD7A805
+        # Re-verify against that field if the PPA ever rotates its key.
+        install -m 0644 /tmp/kicad-ppa-key.asc /etc/apt/keyrings/kicad-ppa.asc; \
+        printf '%s\n' \
+          'Types: deb' \
+          'URIs: https://ppa.launchpadcontent.net/kicad/kicad-10.0-releases/ubuntu/' \
+          'Suites: resolute' \
+          'Components: main' \
+          'Signed-By: /etc/apt/keyrings/kicad-ppa.asc' \
+          > /etc/apt/sources.list.d/kicad-ppa.sources; \
+        apt-get update; \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          kicad \
+          kicad-libraries \
+          kicad-symbols \
+          kicad-footprints \
+          kicad-templates \
+          kicad-packages3d \
+          dbus-x11 \
+          libgl1 libglu1-mesa libglx-mesa0 \
+          xauth \
+          librsvg2-common \
+          adwaita-icon-theme hicolor-icon-theme \
+          fonts-dejavu-core locales \
+          xdg-utils; \
+        rm -f /tmp/kicad-ppa-key.asc; \
+        apt-get purge -y software-properties-common gpg-agent; \
+        apt-get autoremove -y; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/*
+
+    # ⚠ Installing `locales` does NOT generate any. Ubuntu ships the package with every locale
+    # COMMENTED OUT in /etc/locale.gen, so a container that only sets LANG gets
+    #   bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+    # on every single launch, and wxWidgets then falls back to the C locale — which silently
+    # changes DECIMAL SEPARATOR handling in a PCB tool. Generate it explicitly.
+    #
+    # en_US.UTF-8 specifically, because module-podman.sh passes `-e LC_ALL="${LC_ALL:-en_US.UTF-8}"`
+    # into every module container — so that is the value this image is actually run with.
+    RUN set -eux; \
+        sed -i -E 's/^# *(en_US\.UTF-8 UTF-8)/\1/' /etc/locale.gen; \
+        locale-gen; \
+        locale -a | grep -q '^en_US.utf8$' \
+          || { echo "ERROR: en_US.UTF-8 was not generated" >&2; exit 1; }
+
+    # Assert the EXACT version this module claims. module.yaml says 10.0.6 and the broker pins the
+    # image by digest under that name, so a PPA that has moved on must fail HERE — at build time,
+    # where it is one line in a pipeline log — rather than at a user's `module load`, where the
+    # only symptom is a version string nobody reads.
+    RUN set -eux; \
+        v="$(kicad-cli version)"; \
+        echo "kicad-cli version: $v"; \
+        case "$v" in \
+          10.0.6*) : ;; \
+          *) echo "ERROR: expected KiCad 10.0.6, PPA delivered '$v'." >&2; \
+             echo "       Either pin module.yaml + IMAGE_TAG to the new patch level, or pin the" >&2; \
+             echo "       package version here. Do NOT ship a mismatched tag." >&2; \
+             exit 1 ;; \
+        esac
+
+    # Assert the in-process SVG loader is present AND registered. gdk-pixbuf only uses a loader
+    # that appears in loaders.cache, and if it is absent GTK falls back to the glycin/bwrap path
+    # that crashes here. This is invisible until someone launches the GUI, so make it a build
+    # failure instead.
+    #
+    # ⚠ Do NOT call `gdk-pixbuf-query-loaders --update-cache` to "make sure". librsvg2-common's
+    # postinst already fires a dpkg trigger that regenerates the cache once its library is
+    # configured, so the cache is correct by the time this runs. The binary is also NOT on PATH
+    # (it lives at /usr/lib/<triplet>/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders), so calling it by
+    # bare name fails the build with exit 127 — which is exactly what happened on 2026-09-21.
+    RUN set -eux; \
+        ls /usr/lib/*/gdk-pixbuf-2.0/*/loaders/libpixbufloader_svg.so >/dev/null \
+          || { echo "ERROR: libpixbufloader_svg.so missing — the GUI will abort on its first SVG icon" >&2; exit 1; }; \
+        if ! grep -q 'svg' /usr/lib/*/gdk-pixbuf-2.0/*/loaders.cache 2>/dev/null; then \
+          echo "loaders.cache has no svg entry — regenerating"; \
+          QL=$(ls /usr/lib/*/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders 2>/dev/null | head -1); \
+          [ -x "$QL" ] || { echo "ERROR: gdk-pixbuf-query-loaders not found to regenerate the cache" >&2; exit 1; }; \
+          "$QL" --update-cache; \
+        fi; \
+        grep -q 'svg' /usr/lib/*/gdk-pixbuf-2.0/*/loaders.cache \
+          || { echo "ERROR: svg loader not registered in loaders.cache" >&2; exit 1; }; \
+        ls /usr/share/icons/Adwaita/scalable/status/image-missing.svg >/dev/null \
+          || echo "NOTE: Adwaita image-missing.svg not at the expected path (theme layout changed?)"; \
+        \
+        # Neutralise glycin's bwrap sandbox (see the long note above). The namespace flags it
+        # asks for are unavailable under gVisor, so the shim drops them and execs the payload.
+        # ⚠ Argument-consuming flags must be skipped with the RIGHT ARITY or the payload argv is
+        # corrupted: --chdir/--seccomp/--dbus-fd take 1, --setenv takes 2 (and is re-exported so
+        # the loader still sees XDG_RUNTIME_DIR etc.), the bind/symlink forms take 2.
+        mv /usr/bin/bwrap /usr/bin/bwrap.real; \
+        printf '%s\n' \
+          '#!/bin/sh' \
+          '# glycin sandbox shim — see the note in the kicad-10 Dockerfile.' \
+          'while [ $# -gt 0 ]; do' \
+          '  case "$1" in' \
+          '    --unshare-all|--unshare-net|--unshare-user|--unshare-ipc|--unshare-pid|--unshare-uts|--unshare-cgroup|--die-with-parent|--clearenv) shift ;;' \
+          '    --chdir|--seccomp|--dbus-fd) shift 2 ;;' \
+          '    --setenv) export "$2"="$3"; shift 3 ;;' \
+          '    --ro-bind|--ro-bind-try|--bind|--bind-try|--symlink) shift 3 ;;' \
+          '    --dev|--tmpfs|--proc) shift 2 ;;' \
+          '    --) shift; break ;;' \
+          '    -*) shift ;;' \
+          '    *) break ;;' \
+          '  esac' \
+          'done' \
+          'exec "$@"' \
+          > /usr/bin/bwrap; \
+        chmod 0755 /usr/bin/bwrap; \
+        sh -n /usr/bin/bwrap; \
+        [ -x /usr/bin/bwrap.real ] \
+          || { echo "ERROR: the real bwrap was not preserved" >&2; exit 1; }; \
+        ls /usr/libexec/glycin-loaders/*/glycin-svg >/dev/null \
+          || { echo "ERROR: glycin-svg is missing — gdk-pixbuf offers SVG only through glycin here" >&2; exit 1; }; \
+        ls /usr/share/glycin-loaders/*/conf.d/glycin-svg.conf >/dev/null \
+          || { echo "ERROR: glycin-svg.conf is missing — nothing will claim image/svg+xml" >&2; exit 1; }
+
+    # Assert every binary module.yaml points at. A renamed or unpackaged tool must fail the build,
+    # not generate a launcher that dies with "No such file or directory" for one user, months
+    # later. The list is the union of desktop_entries and cli_entries.
+    RUN set -eux; \
+        for b in kicad kicad-cli eeschema pcbnew gerbview pcb_calculator bitmap2component; do \
+          [ -x "/usr/bin/$b" ] || { echo "ERROR: /usr/bin/$b missing from the built image" >&2; exit 1; }; \
+        done
+
+    # Assert the symbol and footprint libraries actually landed. The packages can install while
+    # the tables they populate are empty, and that is indistinguishable from a corrupt project
+    # once a user opens a schematic — so check for real content, not just the directory.
+    RUN set -eux; \
+        ls /usr/share/kicad/symbols/*.kicad_sym >/dev/null \
+          || { echo "ERROR: no symbol libraries in /usr/share/kicad/symbols" >&2; exit 1; }; \
+        ls -d /usr/share/kicad/footprints/*.pretty >/dev/null \
+          || { echo "ERROR: no footprint libraries in /usr/share/kicad/footprints" >&2; exit 1; }; \
+        echo "symbols: $(ls /usr/share/kicad/symbols/*.kicad_sym | wc -l) libs, footprints: $(ls -d /usr/share/kicad/footprints/*.pretty | wc -l) libs"
+
+    COPY module.yaml /module.yaml
+
+    # Entrypoint shim: start a session bus, then exec the requested command.
+    #
+    # ⚠ THIS CONTAINER RUNS AS THE CALLING USER (`podman run --user $uid`, see
+    # remote-desktop/module-podman.sh), and HOME is the caller's AD home on NFS — not the image's
+    # build-time HOME. So the shim must never write into the root-owned install tree; KiCad's own
+    # config lands under the user's real $HOME, which is what we want (settings and library tables
+    # persist across launches).
+    #
+    # The bus is best-effort: `kicad-cli` in a batch job must still run if dbus is unavailable.
+    #
+    # printf, not a heredoc — the build-files ConfigMap carries this file as a YAML block scalar
+    # and a nested heredoc is a reliable way to break it. Single-quoted lines keep "$@" literal so
+    # it is evaluated when the container starts.
+    RUN printf '%s\n' \
+          '#!/bin/bash' \
+          '# Session bus for the GTK/wxWidgets GUI. Start one unless the caller shared theirs.' \
+          'set -euo pipefail' \
+          'if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-launch >/dev/null 2>&1; then' \
+          '  eval "$(dbus-launch --sh-syntax 2>/dev/null)" || true' \
+          '  export DBUS_SESSION_BUS_ADDRESS' \
+          'fi' \
+          '# Force the in-process gdk-pixbuf SVG path. KiCad is GTK3/wxWidgets, and its SVG icons' \
+          '# go through gdk-pixbuf, which on 26.04 can dispatch to the newer glycin loader. That' \
+          '# one sandboxes each decode with `bwrap --unshare-all`, which cannot work inside the' \
+          '# gVisor-sandboxed desktop pod, and GTK turns that failure into a FATAL assertion on' \
+          '# its first SVG icon.' \
+          '# librsvg2-common is installed so the classic loader exists; this makes sure it is used.' \
+          'export GDK_PIXBUF_MODULE_FILE="${GDK_PIXBUF_MODULE_FILE:-$(ls /usr/lib/*/gdk-pixbuf-2.0/*/loaders.cache 2>/dev/null | head -1)}"' \
+          '# KiCad writes settings under $HOME; on a shared desktop that is the caller AD home.' \
+          '# XDG_RUNTIME_DIR is not set inside the container and GTK warns loudly without it.' \
+          'if [ -z "${XDG_RUNTIME_DIR:-}" ]; then' \
+          '  XDG_RUNTIME_DIR="${TMPDIR:-/tmp}/kicad-runtime-$(id -u)"' \
+          '  mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"' \
+          '  export XDG_RUNTIME_DIR' \
+          'fi' \
+          'exec "$@"' \
+          > /usr/local/bin/kicad-entry \
+        && chmod +x /usr/local/bin/kicad-entry \
+        && bash -n /usr/local/bin/kicad-entry
+
+    ENV LANG=en_US.UTF-8
+    # The module.yaml `command`s point straight at /usr/bin/<tool>; the entrypoint wraps whichever
+    # one is launched so the bus exists before the GUI starts.
+    ENTRYPOINT ["/usr/local/bin/kicad-entry"]
+  .gitlab-ci.yml: |
+    stages: [build]
+
+    # A newer commit supersedes an in-flight build of the same ref.
+    workflow:
+      auto_cancel:
+        on_new_commit: interruptible
+
+    build-kicad-10:
+      stage: build
+      tags: [eda]                     # -> pcie-tb-s [eda] runner (gitlab-runner-token-eda)
+      image: $CI_REGISTRY/deployments/infrastructure/ci/build-image:v1.43.2-skopeo-r1
+      resource_group: kicad-10-build
+      interruptible: true
+      # ⚠ Much shorter than the other modules' 4h. There is no installer media to stage and no
+      # .run to execute — this is an apt install over a PPA, measured in minutes. A long timeout
+      # here would only delay the diagnosis of a hung apt.
+      timeout: 1h
+      variables:
+        # ⚠ ONE-SHOT lever, normally "0". The module tag IS the user-facing version
+        # (`module load kicad/10.0.6`) so it must not be bumped for a Dockerfile fix; set this to
+        # "1" to push such a fix past the registry gate, then reset it in the SAME branch once the
+        # image is published. Enforced by scripts/environment/checkForceRebuildReset.py.
+        FORCE_REBUILD: "0"
+        IMAGE_TAG: "10.0.6"                # the MODULE version (module load kicad/10.0.6)
+        IMAGE: $CI_REGISTRY_IMAGE:$IMAGE_TAG
+        IMAGE_REPO: $CI_PROJECT_PATH
+        MODULE_NAME: "kicad"
+        MODULE_VERSION: "10.0.6"
+        REGISTRY_TLS_VERIFY: "true" # automatically updated from project-settings:{tls.certIssuerType,tls.registryTlsVerify}
+        STORAGE_DRIVER: overlay
+        BUILDAH_ROOT: /build-scratch/buildah-storage
+        BUILDAH_RUNROOT: /build-scratch/buildah-run
+        INTERNAL_REGISTRY: image-registry.image-registry.svc.cluster.local:5000
+      script:
+        - |
+          mkdir -p "/etc/containers/certs.d/${INTERNAL_REGISTRY}"
+          printf '%s\n' "$IMAGE_REGISTRY_CA" > "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt"
+          python3 - "/etc/containers/certs.d/${INTERNAL_REGISTRY}/ca.crt" <<'CACHECK' \
+            || { echo "ERROR: IMAGE_REGISTRY_CA is not a valid certificate"; exit 1; }
+          import base64, re, sys
+          raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+          m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", raw, re.S)
+          if not m:
+              sys.exit("no PEM CERTIFICATE block")
+          try:
+              der = base64.b64decode("".join(m.group(1).split()), validate=True)
+          except Exception as exc:
+              sys.exit(f"base64 decode failed: {exc}")
+          if len(der) < 64 or der[0] != 0x30:
+              sys.exit("does not parse as a DER certificate")
+          print(f"image-registry CA OK ({len(der)} bytes DER)")
+          CACHECK
+        # The recover-or-rebuild gate. It asks the LAB-LOCAL registry, never GitLab's own API:
+        # GitLab reports these tags absent forever, which would rebuild on every pipeline. The
+        # gate fails OPEN (any non-200, including 401, means rebuild), so it can cost a needless
+        # rebuild but never a wrong image. Read the reason it prints — that line is the diagnosis.
+        - |
+          if [ "${FORCE_REBUILD:-0}" = "1" ]; then
+            echo "FORCE_REBUILD=1 — rebuilding $IMAGE even though it may already exist."
+          else
+            if [ -z "${IMAGE_REGISTRY_USER:-}" ] || [ -z "${IMAGE_REGISTRY_PASSWORD:-}" ]; then
+              echo "ERROR: IMAGE_REGISTRY_USER/PASSWORD are empty in this pipeline."
+              echo "       The registry gate cannot run, so this build would restore nothing and"
+              echo "       rebuild on EVERY run."
+              echo "       Cause: the CI variables are published unprotected while this ref is"
+              echo "       protected (CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-unset})."
+              echo "       Fix: publish them with protected=true in this app's build trigger."
+              exit 1
+            fi
+            _gate_ref="${INTERNAL_REGISTRY}/${IMAGE#*/}"
+            set +e
+            _gate_out=$(skopeo inspect --raw \
+                     --creds "$IMAGE_REGISTRY_USER:$IMAGE_REGISTRY_PASSWORD" \
+                     "docker://${_gate_ref}" 2>&1)
+            _gate_rc=$?
+            set -e
+            if [ "$_gate_rc" -eq 0 ]; then
+              echo "$_gate_ref already exists — skipping build."
+              exit 0
+            fi
+            case "$_gate_out" in
+              *"manifest unknown"*|*"name unknown"*|*"was not found"*)
+                echo "registry gate: tag not present in $INTERNAL_REGISTRY — building." ;;
+              *"authentication required"*|*"unauthorized"*)
+                echo "registry gate: AUTH REJECTED by $INTERNAL_REGISTRY. The credential is wrong,"
+                echo "  not the tag. Building anyway (fail-open), but the recreate-survival path is"
+                echo "  NOT working — fix the credential."
+                echo "  skopeo: $_gate_out" ;;
+              *x509*|*certificate*)
+                echo "registry gate: TLS verification failed against $INTERNAL_REGISTRY. Is"
+                echo "  IMAGE_REGISTRY_CA the CA of the CURRENT cluster? A recreate mints a new one."
+                echo "  skopeo: $_gate_out" ;;
+              *)
+                echo "registry gate: unexpected failure — treating as absent, building."
+                echo "  skopeo: $_gate_out" ;;
+            esac
+          fi
+          echo "Building $IMAGE on $(uname -m) at $(date -u +%F' '%T)..."
+        - buildah login --tls-verify=$REGISTRY_TLS_VERIFY -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        - buildah login -u "$IMAGE_REGISTRY_USER" -p "$IMAGE_REGISTRY_PASSWORD" "$INTERNAL_REGISTRY"
+        - mkdir -p "$BUILDAH_ROOT" "$BUILDAH_RUNROOT"
+        # No -v bind mount: there is no installer media for this module. The whole build is the
+        # PPA install in the Dockerfile.
+        - echo "[$(date -u +%F' '%T)] buildah bud starting (apt over the KiCad PPA)..."
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER"
+          bud --isolation chroot --format docker
+          -t "$IMAGE" .
+        - |
+          DEST="docker://${INTERNAL_REGISTRY}/${IMAGE#*/}"
+          set +e
+          n=0
+          until [ "$n" -ge 6 ]; do
+            echo "=== push attempt $((n+1)) START $(date -u +%H:%M:%S) ==="
+            timeout 10800 buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" \
+              push --retry 20 --retry-delay 10s \
+              "$IMAGE" "$DEST"
+            rc=$?
+            echo "=== push attempt $((n+1)) END $(date -u +%H:%M:%S) rc=$rc ==="
+            [ "$rc" -eq 0 ] && break
+            n=$((n+1)); echo "push attempt $n failed (rc=$rc) — retrying in 30s (buildah resumes from uploaded blobs)..."; sleep 30
+          done
+          set -e
+          [ "$n" -lt 6 ] || { echo "ERROR: push failed after 6 attempts"; exit 1; }
+        - buildah --root "$BUILDAH_ROOT" --runroot "$BUILDAH_RUNROOT" --storage-driver "$STORAGE_DRIVER" rmi --prune || true
+        - echo "Pushed $IMAGE (via $INTERNAL_REGISTRY) at $(date -u +%F' '%T)"
+      after_script:
+        - |
+          echo "[$(date -u +%F' '%T)] scratch reclaim (job status: ${CI_JOB_STATUS:-unknown})"
+          df -h /build-scratch || true
+          BA="buildah --root $BUILDAH_ROOT --runroot $BUILDAH_RUNROOT --storage-driver $STORAGE_DRIVER"
+          $BA rm -a || true
+          $BA rmi -a -f || true
+          $BA prune -a -f || true
+          echo "[$(date -u +%F' '%T)] after reclaim:"
+          df -h /build-scratch || true
+          du -sh /build-scratch/* 2>/dev/null | sort -h || true
+  module.yaml: |
+    # KiCad 10.0.6 CONTAINER module manifest — baked into the runnable module image at
+    # /module.yaml. Read by the remote-desktop broker (which publishes it) and the module CLI
+    # (which generates `podman run` launchers from it).
+    #
+    # `runtime: container` marks it: the tool runs in ITS OWN container via podman inside the
+    # sandboxed desktop pod, NOT natively on PATH.
+    #
+    # WHY THIS MODULE EXISTS AT ALL. The eda-pcb-agent generates KiCad projects into its NFS
+    # home, and the remote-desktop humans log into has NO KiCad — so the boards were unopenable
+    # in a GUI. The agent keeps its own baked-in KiCad and the `kicad` bridge; nothing about the
+    # agent's path goes through this module. This is the human-facing GUI.
+    #
+    # NAMED `kicad`, version `10.0.6`, so the user-facing form matches the other modules:
+    # `module load kicad/10.0.6`. The DASHED spelling (kicad-10) is only ever an identifier —
+    # the app directory, the k8s namespace and the GitLab project — because those may not
+    # contain a dot or a slash. It carries the MAJOR only, so 10.0.7 replaces 10.0.6 in place
+    # rather than orphaning a project per patch release.
+    #
+    # ⚠ TWO MAJORS ARE EXPECTED TO COEXIST. A schematic written by 10 cannot be opened by 9, and
+    # 9.0.9 cannot read libraries authored by a newer KiCad — this project has hit the
+    # incompatibility in both directions. A second app (kicad-9) alongside this one is the
+    # intended way to serve a board frozen on 9.x; that is precisely what modules are for, and it
+    # is why KiCad is not simply baked into the desktop image.
+    #
+    # ⚠ NO `env:` BLOCK, and unlike hyperlynx no `set_from_secret`: KiCad is FOSS, so there is no
+    # license server and no credential to inject. petalinux-2024-1 is the right template to copy
+    # here, not hyperlynx.
+    name: kicad
+    version: "10.0.6"
+    runtime: container
+    # Publish/pull from THIS app's own GitLab project rather than the default
+    # <IMAGE_BASE>/<name>. Keeps the image independently deletable and independently
+    # rebuildable, and leaves room for a second KiCad major beside it.
+    # Honoured by broker.sh module_image() + module-cli.sh (base-r14+).
+    image: deployments/infrastructure/eda/modules/kicad-10
+    # GUI tiles in the desktop's Applications menu — the point of the module. Each generates
+    # $HOME/.local/bin/module-kicad-<exec>, which is ALWAYS on PATH (hence the `module-<name>-`
+    # prefix: unprefixed, `pcbnew` would shadow a system binary in every shell, loaded or not).
+    #
+    # `kicad` (the project manager) is the usual entry point — it opens a .kicad_pro and launches
+    # the editors itself. The other three are here because a user often wants to open a single
+    # .kicad_sch / .kicad_pcb / gerber directly without going through a project.
+    desktop_entries:
+      - name: "KiCad"
+        exec: kicad
+        command: /usr/bin/kicad
+        categories: "Development;Engineering;Electronics;"
+      - name: "KiCad Schematic Editor"
+        exec: eeschema
+        command: /usr/bin/eeschema
+        categories: "Development;Engineering;Electronics;"
+      - name: "KiCad PCB Editor"
+        exec: pcbnew
+        command: /usr/bin/pcbnew
+        categories: "Development;Engineering;Electronics;"
+      - name: "KiCad Gerber Viewer"
+        exec: gerbview
+        command: /usr/bin/gerbview
+        categories: "Development;Engineering;Electronics;"
+    # CLI entries — for BATCH/scripted use. Each generates a wrapper named after the REAL binary
+    # into a per-module shim dir ($HOME/.local/module-bin/kicad/10.0.6/) which `module load`
+    # prepends to PATH, so an existing script runs unchanged:
+    #   kicad-cli sch export pdf board.kicad_sch
+    #
+    # ⚠ `kicad-cli` is the only one of these that is genuinely non-interactive. The other five
+    # are GUIs listed here for typing convenience while the module is loaded — they still need a
+    # DISPLAY and will not work in a batch job. The launcher protocol has no stdin and no TTY.
+    cli_entries:
+      - name: kicad-cli
+        command: /usr/bin/kicad-cli
+      - name: kicad
+        command: /usr/bin/kicad
+      - name: eeschema
+        command: /usr/bin/eeschema
+      - name: pcbnew
+        command: /usr/bin/pcbnew
+      - name: gerbview
+        command: /usr/bin/gerbview
+      - name: pcb_calculator
+        command: /usr/bin/pcb_calculator
+      - name: bitmap2component
+        command: /usr/bin/bitmap2component
+  kicad-ppa-key.asc: |
+    -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+    mQINBF8ER7cBEACXkTz5mUfH9JYNDLLPZqpXrkHSIKu8HDJX79CTKsABAyE4Fl3s
+    mERIIEQnwvGTuodey9IU5vH/FQowTzkXt6OeAx8R3pVueqsavrn3ddKMPovP9os/
+    hWFEzwVDojRxZBhXHfiGIK30VhbDxuhvnIkIqOaYCtI/qv4pAOYYJfkg5PopyZlA
+    P0u3TKXUI6mVUioWxraZYUuNyx1MPpY7plaqt8ft8RbHja2Rp6xtg89Vtyk/jFfy
+    HvHi0aRd54Zzf+37jg7+diWt1MD76ABka/X1f2xoz5ZZtZ7+Q3GUTfVBRl4PiMYd
+    CauOOnReVuYJs/XoagSFIzJ+m0nn2KPIYoXoY+3VbVLMxup/BPPMrgY8fLKxmtos
+    GTJIPqgeiYjGfOKObhWAv0POtNFdzWx9fAuVhlHi1jp0vi8jy/SWL9Qvg50u9Cqp
+    8nVywWPen5CF3hO6vgta7Y6hG6aqQOLzkf3Xe+xbaAod6Nez+9ZhSAMc9VlhxujY
+    0y3q7zniZjXxoQlUwSkBQLUW6sel2VhUGhb/ceET2ivOiZB/pVOzJDLk0MNA6lvu
+    pF9h4klKKvzpxHWkvm2fuLo0aAgfq2ZdWAWzwwui55G/nWJldFN2ruz7X8hFMRFN
+    nQipNNeuR+llhnmLPeG/wyqTV++B6YAltvfdvnDXWb4HaMxGyejNh2oH3QARAQAB
+    tBdMYXVuY2hwYWQgUFBBIGZvciBLaUNhZIkCOAQTAQIAIgUCXwRHtwIbAwYLCQgH
+    AwIGFQgCCQoLBBYCAwECHgECF4AACgkQJF1VAvrXqAVowA//RKk8J5wdwy8Rfa4O
+    qiQc05VJItpIyCtj48o1eCPJmdkCBwwx63tSIC7vg8CPKs7bB1E4hUGs7EHYYbmu
+    sLT24BecgHLxPmTC/r40B+pxwpePorTTDvukDFOU889srovEtm2lwfBSeewdheLz
+    IjNDCjsp9t6LMLt5m16pRzCJhTM+crumETA12g1XUvRJ3chCcjjGmHoYdOr5ybQC
+    Xq4FAEXW2A6BEEKQFRIaoVHs9AoGtpa5ZFNhLbc7u9JJr0THna7V01Te4LK+JIJI
+    sqo+31f5NpziRWZ5ByK6YmvEmShj/I5dieNEg9OM/Pt6+zzjWefyHtW244BtD9Y5
+    nIntG5nPo+1Vbgwv2ULfyfbHAK0x7drLD4VWnJ/iIEp4GKIEgaEQn4AzBmR29B9d
+    LMjL4YHbyKvlG4gEhK1f4d7AfhvDZmVchAom01lUkJI0hU5Mjzn6diUJ1d6iGOW1
+    19mwdmthEMaEPbkDQaymeOnaqk6fumu7S3sOaCC1Vt5fLyeWc5PLTBgFJ7GlldNo
+    i5JhzTjMgolJkSfw0XaJq0fMu8SIKtsAhXL0LkfLWdcGiWpMbwyr5dXnPMvIYd75
+    7bMcEhBr3aPEamO8AB5zZ/FfZWV4JXcRXNVyQefpl7SeagkDGu3uPhQFpyKIb/bp
+    kCAxlotbXJ0rAcMNAW9+wgGteRo=
+    =Oz8U
+    -----END PGP PUBLIC KEY BLOCK-----

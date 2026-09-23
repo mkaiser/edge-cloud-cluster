@@ -1,0 +1,245 @@
+# Open WebUI (Plan B) — web chat at https://ai.<tld>, behind Authentik SSO.
+# Calls models through the LiteLLM gateway (OPENAI_API_BASE_URL below), NOT vLLM
+# directly, so its traffic is per-user-attributed. No GPU (placement tier: cloud).
+#
+# OIDC: OAUTH_/OPENID_ env below (verified against upstream config.py). Browser
+# users authenticate with Authentik and are auto-provisioned; group→role mapping
+# via OAUTH_ROLES_CLAIM=groups. Chat history in CNPG Postgres open-webui-pg.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: open-webui
+  annotations:
+    # Open WebUI reads its env and the mounted CA bundle at startup only. Reloader
+    # (argocd-infra/reloader) rolls the pod when staging-ca-bundle, open-webui-secrets or
+    # the OIDC client secret change — the staging→prod issuer switch and any re-seal
+    # otherwise leave the running pod on the old values with ArgoCD green.
+    reloader.stakater.com/auto: "true"
+    # Replace=true is REQUIRED to switch strategy RollingUpdate -> Recreate on an
+    # ALREADY-RUNNING Deployment, and only for that transition.
+    #
+    # kube-controller-manager DEFAULTS spec.strategy.rollingUpdate (maxSurge/
+    # maxUnavailable) into every RollingUpdate Deployment and becomes its field
+    # owner. This app syncs with ServerSideApply, which merges per-field and so
+    # leaves a field owned by another manager alone — producing Recreate WITH a
+    # leftover rollingUpdate block, which the API rejects outright:
+    #
+    #   Deployment.apps "open-webui" is invalid: spec.strategy.rollingUpdate:
+    #   Forbidden: may not be specified when strategy `type` is 'Recreate'
+    #
+    # ArgoCD then retries that same invalid apply forever (measured 2026-09-04:
+    # SyncFailed, app Degraded, the deadlocked pod still in ContainerCreating).
+    # Replace=true deletes and recreates the object, dropping the stale field.
+    # Safe here precisely because this Deployment is Recreate/1-replica on a RWO
+    # volume — it already accepts a full stop between pods.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  replicas: 1
+  # Recreate, NOT the default RollingUpdate: open-webui-data is a ReadWriteOnce
+  # Longhorn volume. RollingUpdate starts the new pod before terminating the old
+  # one, and this Deployment is unpinned (flex placement, cloud OR mesh), so the
+  # new pod routinely lands on a DIFFERENT node than the volume's current
+  # attachment. It then blocks forever on
+  #   FailedAttachVolume: Volume is already used by pod(s) <old pod>
+  # while the old pod waits for the new one to become Ready — a deadlock that no
+  # timeout breaks. Measured 2026-09-04 on the v0.11.1 -> v0.11.3 bump: 10 minutes
+  # in ContainerCreating, app Degraded, until the strategy was changed.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      priorityClassName: standard
+      # Flex placement: schedulable on cloud OR mesh. Tolerate the mesh taint so it
+      # CAN run on mesh nodes, but no site pin — a cloud-scheduled pod reaches its
+      # state (Postgres + data PVC on unibi-hclab mesh storage) cross-tier over WireGuard.
+      # Kept off the GPU node by NOT tolerating ecc/gpu=true:NoSchedule below (a
+      # web UI has no business consuming the scarce single-GPU box). Thor itself can
+      # attach Longhorn fine since the kernel rebuild; this is a placement
+      # choice, not a storage limitation.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:v0.11.3  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 8080
+          env:
+            # --- Database (CNPG read-write service) ---
+            - name: OWUI_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              value: "postgresql://open-webui:$(OWUI_DB_PASSWORD)@open-webui-pg-rw:5432/open-webui"
+            # Signing key for sessions/JWT — must be stable.
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: secret-key
+            - name: WEBUI_URL
+              value: "https://ai.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # --- Model backend: the LiteLLM gateway ---
+            - name: OPENAI_API_BASE_URL
+              value: "http://litellm.litellm.svc:4000/v1"
+            # Service key Open WebUI presents to LiteLLM (a LiteLLM virtual/master
+            # key). Individual browser users are identified by Open WebUI's own
+            # OIDC login; this is the single upstream credential to the gateway.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: litellm-key
+            # Local self-hosted models only — no external inference.
+            - name: ENABLE_OLLAMA_API
+              value: "false"
+            # Send the logged-in user's identity upstream, so LiteLLM attributes spend to the
+            # PERSON rather than to this pod's single service key. Defaults to False upstream,
+            # which is why every spend row read `litellm_proxy_master_key` with an empty
+            # end_user until now (measured). Emits X-OpenWebUI-User-{Name,Id,Email,Role};
+            # LiteLLM is configured to read the Email one (litellm/config.yaml
+            # general_settings.user_header_name). Both halves are required — verified that the
+            # header alone, without that setting, leaves end_user empty.
+            - name: ENABLE_FORWARD_USER_INFO_HEADERS
+              value: "true"
+            # --- Authentik OIDC SSO ---
+            # OIDC-ONLY: hide the email/password + "Create Admin Account" form so the ONLY
+            # way in is "Continue with Authentik". Verified against upstream:
+            #   - src/routes/auth/+page.svelte: the password form is gated on
+            #     features.enable_login_form; the OAuth button renders regardless (incl. the
+            #     empty-DB onboarding screen). The button is only SKIPPED when
+            #     OAUTH_AUTO_REDIRECT=true — the page then jumps straight to
+            #     /oauth/oidc/login, but only if exactly one provider is configured,
+            #     enable_login_form=false, no LDAP, no trusted-header auth, DB not in
+            #     onboarding, and no existing token. ?form= or ?error= suppresses the
+            #     jump, so the login form stays reachable at /auth?form=1 for recovery.
+            #   - backend/utils/oauth.py: the FIRST OAuth user (user_count==0) is bootstrapped;
+            #     with ENABLE_OAUTH_ROLE_MANAGEMENT + membership in OAUTH_ADMIN_ROLES
+            #     (authentik-admins) they are promoted to admin — so no manual admin is needed.
+            - name: ENABLE_LOGIN_FORM
+              value: "false"
+            # Skip the "Continue with Authentik" click: go to the IdP immediately.
+            - name: OAUTH_AUTO_REDIRECT
+              value: "true"
+            - name: ENABLE_OAUTH_SIGNUP
+              value: "true"
+            - name: OAUTH_CLIENT_ID
+              value: "open-webui"
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-oidc-client-secret
+                  key: client-secret
+            - name: OPENID_PROVIDER_URL
+              value: "https://id.subdomain1.your-domain.tld/application/o/open-webui/.well-known/openid-configuration" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OPENID_REDIRECT_URI
+              value: "https://ai.subdomain1.your-domain.tld/oauth/oidc/callback" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OAUTH_PROVIDER_NAME
+              value: "Authentik"
+            - name: OAUTH_SCOPES
+              value: "openid profile email groups"
+            - name: OAUTH_USERNAME_CLAIM
+              value: "preferred_username"
+            - name: OAUTH_EMAIL_CLAIM
+              value: "email"
+            # Group→role mapping so Authentik groups drive admin/user roles.
+            - name: ENABLE_OAUTH_ROLE_MANAGEMENT
+              value: "true"
+            - name: OAUTH_ROLES_CLAIM
+              value: "groups"
+            # Group names as emitted in the OIDC groups claim (lowercase, matching
+            # Authentik blueprint-groups.yaml). "ai" gates login; "authentik-admins"
+            # get the Open WebUI admin role.
+            - name: OAUTH_ALLOWED_ROLES
+              value: "ai,authentik-admins"
+            - name: OAUTH_ADMIN_ROLES
+              value: "authentik-admins"
+            # CA trust for the SERVER-SIDE OIDC calls to id.<tld>. Two runtimes do
+            # these: Node/undici (token exchange) reads NODE_EXTRA_CA_CERTS; Python
+            # httpx/authlib (the /oauth/oidc/login metadata fetch) reads SSL_CERT_FILE.
+            #
+            # letsencrypt-prod: the id.<tld> cert chains to ISRG Root X1, already in
+            # the image's system trust store — so point BOTH at the system bundle
+            # (/etc/ssl/certs/ca-certificates.crt). The staging-ca mount is unused.
+            # WARNING: SSL_CERT_FILE *replaces* Python's trust store (it is NOT
+            # additive like NODE_EXTRA_CA_CERTS). Pointing it at the staging-only
+            # bundle on prod made httpx unable to verify the prod cert →
+            # CERTIFICATE_VERIFY_FAILED → 500 on /oauth/oidc/login (the /error page).
+            #
+            # letsencrypt-staging: swap both to /etc/ssl/staging-ca/ca-bundle.pem so
+            # the untrusted staging chain is trusted. Toggled by
+            # updateConfigFromProjectSettings.sh via the anchor below.
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: open-webui-data
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+---
+# Small RWO PVC for Open WebUI's local state (uploads, config cache). Chat history
+# and users live in Postgres; this holds file artifacts. longhorn-unibi-hclab (mesh site).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-data
+  namespace: open-webui
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshStorageClass
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: open-webui
+spec:
+  selector:
+    app: open-webui
+  ports:
+    - port: 8080
+      targetPort: 8080

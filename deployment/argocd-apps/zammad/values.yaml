@@ -1,0 +1,133 @@
+# Zammad helm chart values.
+#
+# Every subchart is DISABLED. Zammad's chart bundles postgresql/redis/memcached
+# (cloudpirates) plus elasticsearch/minio (still bitnamilegacy — see NOTES.md);
+# we run all of them ourselves instead:
+#   postgres    -> CNPG cluster in postgres.yaml (barman/S3 PITR backups)
+#   redis       -> datastores.yaml
+#   memcached   -> datastores.yaml
+#   elasticsearch -> datastores.yaml (official Elastic image, not bitnamilegacy)
+#   minio       -> not used at all; attachments go to Hetzner S3 via secrets.s3
+#
+# Chart source of truth: external/git_zammad_zammad-helm (chart 17.0.1).
+
+image:
+  repository: ghcr.io/zammad/zammad
+
+# The chart ships 4 Deployments (railsserver/nginx/scheduler/websocket) and
+# supports NO priorityClassName. Zammad pods therefore run at priority 0.
+# See NOTES.md.
+securityContext:
+  fsGroup: 1000
+  runAsUser: 1000
+  runAsNonRoot: true
+
+zammadConfig:
+  postgresql:
+    enabled: false
+    host: zammad-pg-rw
+    port: 5432
+    db: zammad
+    user: zammad
+    options: "pool=50"
+
+  redis:
+    enabled: false
+    host: zammad-redis
+    port: 6379
+    # Redis MUST have a password here, unlike the repo's other redis instances.
+    # The chart hardcodes REDIS_URL as "redis://:$(REDIS_PASSWORD)@host:port" but
+    # only emits REDIS_PASSWORD when a pass/existing-secret is configured
+    # (_helpers.tpl "zammad.env.redisVariables"). With an empty password Rails
+    # receives the literal string "$(REDIS_PASSWORD)". So: sealed secret below,
+    # and `requirepass` on the redis server in datastores.yaml.
+    pass: ""
+
+  memcached:
+    enabled: false
+    host: zammad-memcached
+    port: 11211
+
+  elasticsearch:
+    enabled: false
+    host: zammad-elasticsearch
+    port: 9200
+    schema: http
+    initialisation: true
+
+  minio:
+    enabled: false
+
+  # Attachments live in S3 (secrets.s3 below), not on an RWX volume.
+  storageVolume:
+    enabled: false
+
+  # LE staging CA chain, mounted into every Zammad pod (see staging-ca.yaml).
+  # Consumed via SSL_CERT_FILE in extraEnv below.
+  customVolumes:
+    - name: staging-ca
+      configMap:
+        name: staging-ca-bundle
+
+  customVolumeMounts:
+    - name: staging-ca
+      mountPath: /etc/ssl/staging-ca
+      readOnly: true
+
+  railsserver:
+    replicas: 1
+
+  nginx:
+    replicas: 1
+    clientMaxBodySize: 50M
+
+  # scheduler and websocket are cluster-wide singletons — do NOT raise above 1.
+  scheduler:
+    replicas: 1
+
+  websocket:
+    replicas: 1
+    # The chart defaults to "::" (IPv6 any). This cluster is IPv4-ONLY
+    # (node podCIDR 10.42.0.0/24, pods get a single v4 address), so binding ::
+    # fails with eventmachine "no acceptor (port is in use or requires root
+    # privileges)" and the pod crashloops. Bind v4 any instead.
+    listenAddress: "0.0.0.0"
+
+secrets:
+  postgresql:
+    useExisting: true
+    secretName: zammad-db
+    secretKey: db-password
+  redis:
+    useExisting: true
+    secretName: zammad-redis-auth
+    secretKey: redis-password
+  s3:
+    useExisting: true
+    secretName: zammad-s3-url
+    secretKey: s3-url
+  autowizard:
+    useExisting: true
+    secretName: zammad-autowizard
+    secretKey: autowizard
+
+# NOTE: camelCase `autoWizard` is SEPARATE from `secrets.autowizard` above.
+# It gates the volume mount; because secrets.autowizard.useExisting is true the
+# chart renders no Secret of its own (templates/secrets.yaml:1) and consumes our
+# sealed zammad-autowizard instead.
+autoWizard:
+  enabled: true
+
+# Routing is Gateway API (httproute.yaml), never Ingress.
+ingress:
+  enabled: false
+
+# CA trust for Zammad's server-side GitLab API calls (Ruby/OpenSSL).
+# lib/user_agent.rb never sets ca_file, so verification falls back to OpenSSL's
+# default trust store. SSL_CERT_FILE *replaces* that store (not additive), so on
+# letsencrypt-prod it MUST point at the system bundle (which has ISRG Root X1) —
+# pointing it at the staging-only chain would break verification instead of
+# fixing it. On staging the toggle swaps it to the mounted staging-ca bundle.
+extraEnv:
+  - name: SSL_CERT_FILE
+    value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}

@@ -1,0 +1,39 @@
+# Hand-written HTTPRoute: the guacamole chart has no Gateway API support — only
+# an Ingress template — so its ingress is disabled in values.yaml and the route
+# lives here instead.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once by argocd-infra/gateway.
+#
+# Backend: guacamole.fullname = <release>-<chart> = guacamole, service port 80.
+# The chart's Ingress used the NAMED port "http"; Gateway API backendRefs take a
+# numeric port only.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: remote-desktop
+  namespace: remote-desktop
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - remote-desktop.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # A Guacamole session is one long-lived websocket stream — replaces the
+      # former timeout-client/timeout-server: 600s annotations.
+      timeouts:
+        request: 600s
+        backendRequest: 600s
+      backendRefs:
+        # guacamole-guacamole, NOT guacamole: the chart prefixes the release name.
+        # A wrong backend name is NOT a sync error — the route reports
+        # Accepted=True with ResolvedRefs=False ("service not found"), so it
+        # surfaces as a 500 at request time rather than a red app.
+        - name: guacamole-guacamole
+          port: 80

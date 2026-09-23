@@ -1,0 +1,55 @@
+# nginx in `stream` mode — a byte pump, not an HTTP proxy.
+#
+# ⚠ THERE IS DELIBERATELY NO `http {}` BLOCK. S3 requests are SigV4-signed and the signature
+# covers the Host header; anything that parses and re-emits HTTP risks invalidating every
+# request. Keep this file free of `http`, `proxy_set_header`, and rewrites.
+#
+# TLS is NOT terminated here — the session runs end-to-end between GitLab and the appliance.
+# See README.md for the two requirements that places on the appliance certificate.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitlab-s3-proxy
+  namespace: gitlab-s3-proxy
+data:
+  nginx.conf: |
+    worker_processes  auto;
+    error_log         /dev/stderr warn;
+    # Non-root with a read-only root filesystem: both of these must live on the writable
+    # emptyDir at /tmp, not in /var/run or /var/lib/nginx.
+    pid               /tmp/nginx.pid;
+
+    events {
+      worker_connections  4096;
+    }
+
+    stream {
+      # ⚠ Resolved ONCE, at startup. If the name does not resolve, nginx exits and the pod
+      # crash-loops — correct as a signal, but it reads as a proxy fault rather than a DNS
+      # one. The name is the same one the NFS PVs use, so a failure here means the appliance
+      # is unreachable for far more than this proxy.
+      upstream appliance_s3 {
+        server fs-1.ad.base.internal:30304; # automatically updated from project-settings:storage.fileserver.fqdn
+      }
+
+      server {
+        listen 30304;
+        proxy_pass appliance_s3;
+
+        # ⚠ LOAD-BEARING TIMEOUT. Multi-GB multipart parts cross a link whose lab→cloud
+        # direction measures ~4.9 MB/s (2026-09-02). nginx's stream default is 10 minutes,
+        # which truncates a large part mid-transfer and surfaces as a failed upload with no
+        # error on either end. Do not lower this without testing an EDA-sized artifact.
+        proxy_timeout          3600s;
+        proxy_connect_timeout  10s;
+        # Detect a silently dead peer instead of holding a half-open connection for the
+        # whole hour above.
+        proxy_socket_keepalive on;
+      }
+
+      # One line per connection, so a failed upload can be traced to a connect error here
+      # rather than guessing between GitLab, the proxy and the appliance.
+      log_format basic '$remote_addr $protocol $status $bytes_sent $bytes_received '
+                       '$session_time $upstream_addr';
+      access_log /dev/stdout basic;
+    }

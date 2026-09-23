@@ -1,0 +1,101 @@
+# NFS CSI driver — the NODE driver POD workloads use to mount the TrueNAS exports (fs-1,
+# datapool/* over NFSv4): /home, /shared, /artifacts and the module registry.
+#
+# ⚠ No StorageClass ships with this app. Every NFS volume is a STATIC PV declared by the
+# app that mounts it (nfs-*-pv.yaml); the chart's dynamic provisioner is deliberately
+# unused. See deployment/argocd-apps/remote-desktop/nfs-homes-pv.yaml for why.
+#
+# WHY NFS: /home is NFSv4, not SMB, and that was a deliberate change. SMB derives
+# uid/gid/mode from MOUNT OPTIONS rather than the filesystem, so per-user ownership and
+# 0700 isolation cannot be expressed — every file would appear owned by whatever the mount
+# options say. NFSv4 carries real owner uids and real mode bits, which is exactly what the
+# AD-sourced identity model needs. This driver now serves the EDA stores too (registry
+# blob store, modulefiles, artifacts); there is no SMB driver in the cluster any more.
+#
+# Measured against this export as an AD user:
+#   4 GiB write  44.4s  92.3 MB/s   (conv=fsync — real, not page cache)
+#   4 GiB read   32.5s 126.2 MB/s
+#   uid 5007 reading uid 5008's file -> Permission denied  (0700 isolation holds)
+# 92 MB/s is at the wire limit: the lab node's NIC is 1 GbE (1000baseT/Full, a hard cap,
+# ~112 MB/s theoretical), so the bottleneck is the link and not ZFS. Read exceeds write
+# because ARC serves it from RAM.
+#
+# ⚠ Notably the sustained write did NOT abort. [[smb-share-aborts-long-multigb-writes]]
+# records this node/link class failing on exactly this workload over SMB/CIFS. NFS behaves differently here, and that measurement is the
+# reason data may move at all — do not carry the SMB result over to this path, in either
+# direction, without re-measuring.
+
+# No Windows nodes in this cluster; the chart enables that DaemonSet by default.
+windows:
+  enabled: false
+
+linux:
+  enabled: true
+
+# ⚠ THE MESH TOLERATION IS MANDATORY. Mesh nodes carry ecc/mesh=true:NoSchedule (set in the
+# k3s join), so without it the node DaemonSet schedules NOWHERE on mesh nodes — i.e. the
+# driver is absent precisely where the export is reachable, and every mount fails while the
+# app still reports Healthy.
+node:
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    # ⚠ BOTH taints are required to reach the GPU node. thor-eval carries ecc/gpu=true
+    # *in addition to* ecc/mesh, so a mesh-only toleration silently excludes it — the
+    # DaemonSet just never lands there and every mount on that node fails while this app
+    # still reports Healthy. Re-added 2026-09-18 so the Thor can mount the ai-models seed
+    # store; see the measurements below.
+    - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # Only nodes carrying ecc/fileserver-lan can reach 192.168.1.0/24 — the label is stamped
+  # on every node at storage.fileserver.site. The route IS advertised and approved
+  # (pcie-tb-s advertises it; _local-fetch-cluster-inputs.sh approves it), but the cloud CPs
+  # never INSTALL it: mesh-gateway/daemonset.yaml runs `tailscale up` without
+  # --accept-routes, because the flag is all-or-nothing and would also install 10.0.0.0/23
+  # over tailscale0 and break etcd peer TLS. Mesh nodes do accept routes
+  # (30-connect-vpn.sh), so only they reach the appliance. Cloud nodes have no need for
+  # homes either.
+  # ⚠ thor-eval IS included, deliberately — it carries ecc/fileserver-lan and both taints
+  # are tolerated above. An earlier revision of this file excluded it and claimed that was
+  # intentional; MEASURED ON THE NODE 2026-09-18, that claim does not hold. From a
+  # privileged pod on thor-eval, using these PVs' exact mount options:
+  #   NFSv4.2 mount of /mnt/datapool/images          OK
+  #   write 2 GiB conv=fsync                          92.9 MB/s
+  #   read  2 GiB after drop_caches                  111.4 MB/s
+  #   COLD mmap, every 4K page of a 3 GiB file       105.7 MiB/s
+  # i.e. at the same 1 GbE wire limit as the other lab nodes, and mmap costs nothing over
+  # sequential read. Thor also sits DIRECTLY on the lab LAN (192.168.1.114 on enP2p1s0), so
+  # it does not even depend on the mesh route the paragraph above describes.
+  # The likely origin of the old exclusion is that it predates the custom Tegra kernel — the
+  # same rebuild that gave this node CONFIG_ISCSI_TCP (see vllm/deployment.yaml on Longhorn).
+  # Do not re-exclude the node on the strength of a comment; re-measure first.
+  nodeSelector:
+    ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+
+# The controller must sit where the export is reachable for the same reason as the SMB
+# driver's: the NFS provisioner does not merely mint a k8s object, it mounts the export and
+# creates the per-volume subdirectory. On a cloud node that CreateVolume RPC times out
+# (DeadlineExceeded) and every PVC stays Pending — with nothing pointing at DNS or routing.
+controller:
+  replicas: 1
+  nodeSelector:
+    ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+  # ⚠ NO ecc/gpu toleration here, unlike the node DaemonSet above — deliberate, and not an
+  # oversight this time. This is ONE replica that only has to reach the export from
+  # somewhere; the other fileserver-LAN nodes already satisfy that (it runs on pcie-tb-s).
+  # Tolerating ecc/gpu would let a non-GPU workload occupy the scarce, opt-in GPU box for
+  # nothing. The NODE driver is different: it must run ON whichever node mounts a volume,
+  # so for the Thor to mount anything the pod has to be there.
+  tolerations:
+    - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # The default is to run the snapshotter sidecar; there is no VolumeSnapshotClass for NFS
+  # here and ZFS snapshots on the appliance are the real mechanism, so leave it off rather
+  # than shipping a sidecar that can never be used.
+  runOnControlPlane: false

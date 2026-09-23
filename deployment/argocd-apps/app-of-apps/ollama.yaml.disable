@@ -1,0 +1,92 @@
+# DISABLED 2026-09-18 (.disable suffix — the app-of-apps directory ignores it).
+#
+# WHY: ollama's compiled-in `PARSER qwen3-coder` never engages when the model omits the
+# opening <tool_call> tag, so the whole tool call leaks into message content as literal
+#     <function=NAME><parameter=K>…</parameter></function></tool_call>
+# (note the orphan closing tag) and the agent executes NOTHING — every turn ends
+# finish_reason=stop, tool_turns=0, with the call printed as prose. That is
+# ollama/ollama#16686, OPEN since 2026-06-12, with fixes #17742/#16398/#17021 all
+# unmerged; no ollama release fixes it. Measured with the eda-pcb-agent's real 38 tool
+# schemas: ollama 4/4 FAILED, vLLM 0/4 failed.
+#
+# Thor now serves `thor/qwen3.6-35b-a3b-nvfp4` from vLLM instead (app-of-apps/vllm.yaml),
+# which parses the same XML shape correctly via --tool-call-parser qwen3_xml. The two are
+# EXCLUSIVE on the single non-shareable GPU anyway, so only one can run.
+#
+# ⚠ SEPARATE FROM ollama-turing, which is a DIFFERENT app in a different namespace on the
+# discrete-GPU node and is NOT affected by this. `turing/*` routes keep working.
+#
+# ⚠ ITS IMAGE CANNOT CURRENTLY BE REBUILT even if re-enabled: the build dies fetching
+# github.com/klauspost/compress@v1.18.3 (proxy.golang.org 302 -> a target that resets the
+# TLS connection, reproduced from outside the cluster). See ollama/build-files-configmap.yaml.
+#
+# TO RE-ENABLE: `git mv ollama.yaml.disable ollama.yaml`, push, then
+# `scripts/runtime/switchLLMBackend.sh ollama` — which scales vLLM to 0 first, because the
+# GPU cannot hold both. Re-check #16686 before trusting it with a tool-calling agent, and
+# repoint the consumers that were moved to the vLLM route (hermes, open-webui).
+#
+# ArgoCD Application: Ollama (GGUF/llama.cpp server on the Jetson-Thor GPU).
+# IN-CLUSTER ONLY — no Ingress; the sole client is the LiteLLM gateway
+# (route `coder-ollama`).
+#
+# EXCLUSIVE with vLLM: one Thor GPU, one backend at a time. The Deployment ships
+# replicas: 0 (vLLM owns the GPU by default); scripts/runtime/switchLLMBackend.sh
+# flips which backend runs. ignoreDifferences below keeps ArgoCD's selfHeal from
+# reverting the runtime scale (the twin ignore lives in vllm.yaml).
+#
+# Manifests: deployment.yaml + build-files-configmap.yaml + postsync-build-image.yaml
+# (the CI build seed/trigger, a PreSync hook despite the name) + presync-registry-cred.yaml
+# (mints the image pull secret BEFORE the Deployment — PreSync, else ImagePullBackOff
+# deadlocks). The image is built by GitLab CI (ollama v0.32.1 for Thor), not ArgoCD.
+#
+# placement.ecc/tier: mesh — the pod runs on the mesh GPU node (not cloud).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ollama
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/ollama
+    directory:
+      # Only k8s manifests sync. The Dockerfile/.gitlab-ci.yml are CI build inputs
+      # (mirrored into GitLab by the build-trigger via build-files-configmap.yaml),
+      # not cluster objects; *.sh + README are dev docs.
+      exclude: "{*.sh,README.md,Dockerfile,.gitlab-ci.yml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ollama
+  # The switch script scales this Deployment 0↔1 at runtime. Without this ignore,
+  # automated selfHeal would snap replicas back to the git value (0) minutes after
+  # every switch-up, killing the running backend.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: ollama
+      namespace: ollama
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # ignoreDifferences only affects diffing by default; this makes the SYNC
+      # itself respect the ignored field (don't overwrite live replicas on sync).
+      - RespectIgnoreDifferences=true
+    # Retry forever: on recreate the PreSync hooks (build-trigger + registry-cred)
+    # race GitLab bring-up. Without retry a single hook failure leaves the app Failed
+    # until a git change. Same as vLLM.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

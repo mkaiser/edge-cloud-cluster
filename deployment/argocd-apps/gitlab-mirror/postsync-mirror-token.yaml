@@ -1,0 +1,208 @@
+# PostSync: mint the mirror's GitLab API token in the RUNNING GitLab, every sync.
+#
+# ⚠ WHY THIS IS NOT A SEALED SECRET, WHICH IS WHAT IT WAS FIRST. A personal access token
+# lives in GitLab's DATABASE. Sealing one puts a durable copy in git — but a cluster recreate
+# brings up a GitLab with an empty database, so the sealed value then names a token that has
+# never existed. The secret would still be applied, the mirror would still start, and it
+# would fail every run with a 401 that looks like a permissions problem rather than a stale
+# credential. Sealing is right for values this repo OWNS (the S3 keys); it is wrong for a
+# credential GitLab issues.
+#
+# ⚠ IT ALSO FIXES THE EXPIRY PROBLEM. GitLab PATs cap at 365 days and cannot be made
+# non-expiring. Because this re-runs on every sync and re-mints when the token is missing or
+# no longer accepted, the rotation is automatic. GitLabMirrorStale remains the backstop for
+# the case where syncs themselves have stopped.
+#
+# ⚠ THE TOKEN MUST BE ADMIN-SCOPED, AND THAT IS NOT ABOUT PRIVILEGE FOR ITS OWN SAKE:
+# /api/v4/projects returns only what the caller can see, so a non-admin token produces a
+# silently PARTIAL mirror that still exits 0.
+#
+# Same shape as gitlab/postsync-bootstrap-gitlab-runner-secrets.yaml, which mints runner
+# tokens the same way and for the same reason.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+# Read the root password and exec the toolbox, both in the gitlab namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["gitlab-root-password"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-mirror-token
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-mirror-token
+    namespace: gitlab
+---
+# Write the token into the mirror's namespace. Scoped to that one secret name: this is a
+# write into another app's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab-mirror
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["gitlab-mirror-token"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab-mirror
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-mirror-token
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-mirror-token
+    namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-mirror-token
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # Must outlast GitLab's cold start on a recreate (the in-container wait is 30m).
+  activeDeadlineSeconds: 2400
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished: hook-delete-policy already cleans up, and a TTL would delete
+  # the pod and with it the only copy of the logs — which is exactly what you need after a
+  # failed recreate.
+  template:
+    spec:
+      serviceAccountName: gitlab-mirror-token
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: mint
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: GITLAB_URL
+              value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080"
+            - name: DST_NS
+              value: "gitlab-mirror"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              # ⚠ NO `kubectl get namespace` HERE. This ServiceAccount is scoped to secrets,
+              # pods and pods/exec — it cannot READ namespaces, so `get namespace` returns 403,
+              # the `|| create` fallback also 403s, and under `set -e` the Job dies before it
+              # does anything. The namespace is created by the gitlab-mirror app itself
+              # (syncOptions: CreateNamespace=true), so there is nothing to ensure here.
+
+              # ⚠ MUST FAIL rather than fall through when GitLab never comes up. An earlier
+              # version of the sibling bootstrap `break`ed out of this loop and carried on,
+              # which turned "GitLab never started" into a misleading downstream error.
+              echo "Waiting for GitLab API (up to 30m)..."
+              i=1; ready=0
+              while [ "$i" -le 180 ]; do
+                # `|| true`, not `|| echo 000`: curl's own -w already prints 000 on a
+                # failure, so the echo concatenates into a nonsense "HTTP 000000" in the
+                # log below. The guard itself is required — `set -e` would otherwise kill
+                # this Job on the first probe against a GitLab that is still starting.
+                code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/-/readiness" || true)
+                [ "$code" = "200" ] && { ready=1; break; }
+                echo "  try ${i}/180: HTTP ${code}"
+                i=$((i + 1)); sleep 10
+              done
+              [ "$ready" = "1" ] || { echo "ERROR: GitLab not ready after 30m" >&2; exit 1; }
+
+              # Is the token we already hold still accepted? This is what makes the Job
+              # idempotent AND self-healing: a valid token is left alone, a missing or
+              # expired one is replaced. Checking the SECRET's existence alone would keep a
+              # dead token forever.
+              EXISTING=$(kubectl -n "${DST_NS}" get secret gitlab-mirror-token \
+                -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)
+              if [ -n "$EXISTING" ]; then
+                code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+                  -H "PRIVATE-TOKEN: ${EXISTING}" "${GITLAB_URL}/api/v4/projects?per_page=1" || echo 000)
+                if [ "$code" = "200" ]; then
+                  echo "existing token still valid — nothing to do."
+                  exit 0
+                fi
+                echo "existing token rejected (HTTP ${code}) — minting a replacement."
+              fi
+
+              # ⚠ read_api + read_repository, NOT `api`. The mirror only lists projects and
+              # clones; a write-capable token in a CronJob that runs hourly is a standing
+              # risk for no benefit.
+              echo "Minting a token via the toolbox..."
+              PAT_NAME="gitlab-mirror-$(date +%s)"
+              TOKEN=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+                gitlab-rails runner \
+                "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'${PAT_NAME}',scopes:['read_api','read_repository'],expires_at:1.year.from_now); puts t.token" \
+                2>/dev/null | tail -1 | tr -d ' \r\n')
+
+              case "$TOKEN" in
+                glpat-*) : ;;
+                *) echo "ERROR: no usable token returned from the toolbox" >&2; exit 1 ;;
+              esac
+
+              # Prove it works before storing it: a token that cannot list projects would
+              # otherwise be discovered an hour later, by the mirror, as a partial run.
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+                -H "PRIVATE-TOKEN: ${TOKEN}" "${GITLAB_URL}/api/v4/projects?per_page=1" || echo 000)
+              [ "$code" = "200" ] || { echo "ERROR: minted token rejected (HTTP ${code})" >&2; exit 1; }
+
+              kubectl -n "${DST_NS}" create secret generic gitlab-mirror-token \
+                --from-literal=token="${TOKEN}" \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "Stored ${DST_NS}/gitlab-mirror-token (${PAT_NAME})."
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }

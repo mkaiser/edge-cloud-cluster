@@ -1,0 +1,45 @@
+# ArgoCD Application: SearXNG — self-hosted metasearch, the web-search backend for Hermes.
+#
+# IN-CLUSTER ONLY. No Ingress, no Gateway route: a reachable SearXNG is effectively an open
+# fetch-proxy, so access is restricted to the Hermes pod by NetworkPolicy. The pairing is
+# deliberate — Hermes' `searxng` provider needs only a URL and no API key, unlike every other
+# provider in its fallback chain (exa/brave/tavily/firecrawl/parallel), all of which require a
+# paid or rate-limited external account.
+#
+# Stateless: no PVC and no database, so nothing here needs a storage wave or a backup policy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: searxng
+  namespace: argocd-apps
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: cloud
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/searxng
+    directory:
+      exclude: "{*.sh,README.md}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: searxng
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # Retry forever, matching the other app-of-apps entries: a transient failure should not
+    # leave the app Failed until the next git change.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

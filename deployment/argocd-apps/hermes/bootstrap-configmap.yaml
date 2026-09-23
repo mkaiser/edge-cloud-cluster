@@ -1,0 +1,322 @@
+# Seed content for HERMES_HOME (/opt/data, the 20Gi PVC).
+#
+# WHY A CONFIGMAP + initContainer AND NOT A VOLUME MOUNT: a ConfigMap mounted at
+# /opt/data/config.yaml would need /opt/data to be the ConfigMap's mount point,
+# and a subPath mount into a populated PVC directory does not track ConfigMap
+# updates. The initContainer in statefulset.yaml copies these files onto the PVC
+# instead: config.yaml is overwritten on EVERY start (git is the source of truth
+# for it) while SOUL.md is seeded ONCE (the agent rewrites its own SOUL over time
+# and we must not stomp that).
+#
+# Hermes reads config only at process start — there is no hot reload — so the StatefulSet
+# carries reloader.stakater.com/auto. Editing a value here rolls the pod, which is the only
+# way the change takes effect. (Reloader looks at pod VOLUMES, so it sees this ConfigMap
+# even though only the initContainer mounts it.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-bootstrap
+  namespace: hermes
+data:
+  # ---------------------------------------------------------------------------
+  # Default profile config — HERMES_HOME/config.yaml
+  # ---------------------------------------------------------------------------
+  # ⚠ `_config_version` IS DELIBERATELY ABSENT, and the startup warning telling you to set
+  # it to 12 must NOT be followed — an absent key coerces to 0, which is below
+  # SUPPORT_FLOOR_VERSION = 12 and so leaves this file untouched with defaults deep-merged;
+  # the current version is 38, not 12; and the seed initContainer rewrites config.yaml from
+  # this ConfigMap on every start anyway, so nothing Hermes migrated could persist. Full
+  # analysis against the vendored source is in
+  # eda-pcb-agent/hermes-bootstrap-configmap.yaml, which carries the same comment.
+  config.yaml: |
+    # Managed by ArgoCD (deployment/argocd-apps/hermes/bootstrap-configmap.yaml).
+    # Overwritten on every pod start — edit it in git, not in the pod.
+
+    # --- Inference backend -----------------------------------------------------
+    # Everything goes through the LiteLLM gateway so Hermes' token spend is
+    # attributed to its own virtual key, exactly like Open WebUI. "custom" is the
+    # provider id for any OpenAI-compatible endpoint (aliases: vllm, ollama).
+    # The API key itself is NOT here — it comes from the sealed .env as
+    # OPENAI_API_KEY (see statefulset.yaml), so this file stays secret-free.
+    model:
+      provider: "custom"
+      base_url: "http://litellm.litellm.svc:4000/v1"
+      # MUST be set explicitly. without it every chat completion came
+      # back `HTTP 401: LiteLLM Virtual Key expected. Received=no-k****ired` — Hermes resolves
+      # the custom-provider credential as
+      #   explicit api_key  ->  $OPENAI_API_KEY  ->  literal "no-key-required"
+      # (agent/auxiliary_client.py). The init container DOES write OPENAI_API_KEY into
+      # $HERMES_HOME/.env, and that file is correct, but PID 1's environment does not carry it
+      # (`tr \0 \n < /proc/1/environ | grep OPENAI` is empty), so the env step is skipped and
+      # it falls through to the placeholder. An explicit value short-circuits the chain.
+      #
+      # ${LITELLM_KEY} is expanded by the init container's heredoc when it seeds this file
+      # onto the PVC — the ConfigMap in git holds the literal, never the secret.
+      api_key: "${LITELLM_KEY}"
+      # LiteLLM route (litellm/config.yaml model_list). MEASURED CHOICE:
+      #
+      #   thor/qwen3-coder:30b  56.8 tok/s  purpose-built coder, tool-calling verified
+      #   coder-ollama          35.7 tok/s  Qwen3.6-35B-A3B GGUF, same node
+      #   coder (vLLM)           9.0 tok/s  same base model, Marlin FP4 emulation
+      #
+      # An agent loop is SERIAL — one in-flight request per step — so single-stream decode
+      # is the number that matters and vLLM's continuous batching never engages. `coder`
+      # would make every tool-loop step ~6x slower. It also requires vLLM to hold Thor's
+      # one non-shareable GPU, which takes ollama's three models offline.
+      #
+      # ⚠ Do NOT "fix" this by pointing at a `turing/*` id without checking the provider:
+      # a LiteLLM route on the plain `ollama/` provider SILENTLY DROPS tool_calls (returns
+      # tool_calls:null + finish_reason:stop while billing the tokens). Both wildcards are
+      # on `ollama_chat/`, which is why this is safe now — see
+      # For a tool-loop agent
+      # that failure is fatal AND invisible: it looks like a model that thinks and does
+      # nothing.
+      # ⚠ MOVED OFF thor/qwen3-coder:30b 2026-09-18: ollama-thor is DISABLED
+      # (app-of-apps/ollama.yaml.disable) because its compiled-in `PARSER qwen3-coder`
+      # leaks tool calls into message content as literal <function=…></tool_call> and the
+      # agent executes nothing (ollama/ollama#16686, open, fixes unmerged). This is the
+      # vLLM route on the same node, which parses that XML correctly via qwen3_xml.
+      # ⚠ Hermes hard-refuses any model whose served window is < 64,000 tokens; the vLLM
+      # route serves 131072, so it satisfies that gate.
+      # ⚠ SLOWER: measured ~10 tok/s single-stream against the old route's claimed 56.8.
+      # Accepted deliberately — an agent that cannot call a tool at all is worth 0 tok/s.
+      # `--enforce-eager` in vllm/deployment.yaml is the main suspect for the gap.
+      default: "thor/qwen3.6-35b-a3b-nvfp4"
+      # ⚠ Keep in step with `num_ctx` / `model_info.max_input_tokens` on the
+      # thor/qwen3-coder:30b route in ../litellm/config.yaml.
+      #
+      # A BELT-AND-BRACES pin: that route advertises max_input_tokens on /v1/models, so
+      # Hermes auto-detects 131072 on its own now. It is kept because detection depends on
+      # the gateway continuing to advertise it — LiteLLM does NOT populate the field by
+      # default for Ollama/OpenAI-compatible backends (BerriAI/litellm#27830, OPEN) and a
+      # wildcard route cannot carry it (#13643, closed as not planned). Drop that concrete
+      # route and detection silently reverts to the model card's 262,144.
+      #
+      # ⚠ The comment that stood here before — "deliberately unset: Hermes auto-detects it
+      # from /v1/models" — was WRONG at the time: /v1/models advertised no window at all,
+      # and the startup log said so ("probe-down") on every boot.
+      #
+      # WHY IT MATTERS: compression triggers at threshold x context_length, floored at 0.75
+      # for sub-512K models. At 262,144 the trigger is 196,608 — past the real window, so
+      # llama.cpp discards the oldest half of the context (system prompt + tool definitions)
+      # before Hermes compacts. At 131,072 it fires at 98,304, below the wall.
+      context_length: 131072
+      #
+      # ⚠ REQUIRED for this model family. asked to use web search, the
+      # agent replied with the tool call as PLAIN TEXT and stopped —
+      #     <function=web_search><parameter=query>…</parameter>
+      # finish_reason "stop", no tool executed. That is Qwen3-Coder's own XML dialect leaking
+      # into content. Hermes strips/executes `<tool_call>{json}</tool_call>` and the Gemma
+      # `<function name="…">` form, but has NO parser for `<function=name>`
+      # (agent/agent_runtime_helpers.py), so the call is silently dropped.
+      #
+      # NOT a gateway or model fault — verified the same request straight to LiteLLM returns a
+      # properly structured tool_calls array (name=web_search, arguments={"query":…},
+      # finish_reason=tool_calls). The model CAN call natively; it just sometimes narrates
+      # instead, and `tool_use_enforcement: "auto"` only targets gpt/codex models, so a Qwen
+      # model gets no guidance at all. The upstream default's own doc-comment offers "qwen" as
+      # an example value for exactly this.
+      #
+      # ⚠ The two settings that fix this live under the top-level `agent:` block, NOT here —
+      # verified against config_defaults.py rather than assumed. See `agent:` below.
+
+    # --- Fallbacks -------------------------------------------------------------
+    # Scaffolded but pointing at the SAME gateway: LiteLLM itself owns real
+    # routing/fallback across backends (vLLM on Thor, Ollama). If an external
+    # provider is ever approved, it is added in LiteLLM's config, NOT here.
+    fallback_providers: []
+
+    # --- Tool sandbox ----------------------------------------------------------
+    # backend "local" = the agent's shell/file tools run IN THIS CONTAINER.
+    # There is no docker/ssh backend available to the pod (no docker socket).
+    # SECURITY: this is arbitrary code execution inside the cluster pod network.
+    # networkpolicy.yaml is what bounds it; automountServiceAccountToken: false
+    # keeps it away from the Kubernetes API. See doc/hermes-agent.md.
+    terminal:
+      backend: "local"
+      cwd: "/opt/data/work"
+      timeout: 180
+      lifetime_seconds: 300
+      # profile: each profile's tool subprocesses get their OWN HOME under that
+      # profile's HERMES_HOME, so per-user CLI config (git, npm, ssh) does not
+      # collide. It does NOT isolate the rest of the filesystem — see the
+      # shared-sandbox caveat in doc/hermes-agent.md.
+      home_mode: "profile"
+
+    # --- Gateway ---------------------------------------------------------------
+    gateway:
+      # ONE process serves the default profile plus every directory under
+      # profiles/. The default profile owns the single listener on 8642 and
+      # answers /v1/*; each named profile answers /p/<name>/v1/* under its own
+      # bearer key (its profiles/<name>/.env API_SERVER_KEY).
+      multiplex_profiles: true
+
+    # --- Platforms -------------------------------------------------------------
+    # api_server is the ONLY inbound platform. No Telegram/Discord/Slack: this
+    # deployment is reached over HTTPS through the shared Gateway, and (later)
+    # over the tailnet for ACP.
+    #
+    # `key` and `host` are NOT set here — API_SERVER_KEY (sealed) and
+    # API_SERVER_HOST=0.0.0.0 come from the environment and override this block.
+    # A key committed to git would be an RCE credential in a public repo.
+    platforms:
+      api_server:
+        enabled: true
+        extra:
+          port: 8642
+
+    # --- Agent behaviour -------------------------------------------------------
+    # Both target the same failure described in the model.default comment above: the model
+    # narrating a tool call as text instead of emitting one. Upstream defaults are "auto",
+    # which matches ONLY gpt/codex model names — a Qwen model gets neither. Each accepts a
+    # list of model-name substrings, and the upstream doc-comment offers "qwen" as its own
+    # example.
+    #
+    # enforcement = PREVENTIVE (system-prompt guidance to call tools rather than describe
+    # them). intent_ack_continuation = CORRECTIVE (intercepts a turn that ends after only
+    # stating intent and nudges the model to execute; capped at 2 nudges per turn).
+    agent:
+      tool_use_enforcement:
+        - "qwen"
+      intent_ack_continuation:
+        - "qwen"
+
+    # --- Web search ------------------------------------------------------------
+    # Pin the backend explicitly rather than relying on the fallback walk. Per
+    # agent/web_search_registry.py `_resolve()`, an explicit `web.search_backend` wins
+    # "ignoring availability" — so if SearXNG is ever down or misconfigured the agent reports
+    # a precise error instead of silently routing to ddgs/brave-free (which would look like it
+    # is working while quietly using a rate-limited third party).
+    #
+    # The provider needs only SEARXNG_URL and no API key. ⚠ That variable must reach the agent
+    # via $HERMES_HOME/.env — the container env does NOT (see the SEARXNG_URL comment in
+    # statefulset.yaml).
+    # ⚠ extract_backend is deliberately UNSET. SearXNG is search-ONLY: its provider
+    # reports supports_extract() == False, so naming it here made every web_extract call
+    # hard-fail with "SearXNG is a search-only backend and cannot extract URL content"
+    # on every attempt. Upstream refuses to silently switch
+    # backends for an explicitly-named provider (tools/web_tools.py), so the wrong name is
+    # strictly worse than none: unset, it falls through to the active-provider walk and
+    # degrades instead of erroring. Real extraction needs firecrawl/tavily/exa/parallel,
+    # all of which require a paid account — so web_extract stays unavailable here by choice.
+    web:
+      search_backend: "searxng"
+
+    # --- Admin dashboard auth --------------------------------------------------
+    # ⚠ MUST be set here, in config. with only the
+    # HERMES_DASHBOARD_BASIC_AUTH_* env vars declared on the container, the dashboard served
+    # its OWN username/password form ("Sign in — Hermes Agent") and answered
+    # `GET /` on loopback with **200 and no credentials at all** — i.e. the gate was a NO-OP,
+    # not a second factor. Same root cause as model.api_key above: PID 1's environment does
+    # not carry them (`tr \0 \n < /proc/1/environ | grep DASHBOARD` -> empty), and the
+    # bundled dashboard_auth/basic plugin treats a blank `username` as "register no password
+    # provider".
+    #
+    # Basic auth is now the FALLBACK gate, kept for in-cluster callers that cannot do an
+    # OIDC browser flow. The primary gate is the `oauth.self_hosted` block below.
+    #
+    # `secret` signs the stateless session tokens; blank means a random per-process key, so
+    # sessions would not survive a pod restart. Reusing the profile key here gives a stable,
+    # already-sealed 32-byte value rather than inventing a sixth secret.
+    dashboard:
+      # The redirect_uri handed to Authentik is built from this, verbatim, with
+      # "/auth/callback" appended (dashboard_auth/routes.py _redirect_uri, tier 1).
+      #
+      # ⚠ REQUIRED, not cosmetic. Without it the plugin falls back to
+      # reconstructing the URL from the request (tier 3), which trusts
+      # X-Forwarded-Proto. The Gateway does not set it, so the scheme came back
+      # as "http" and Authentik rejected the redirect_uri — its provider is
+      # registered with the https URL and matching_mode is strict.
+      public_url: "https://hermes-admin.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+
+      # DISABLED as a login method — see plugins.disabled at the bottom of this file.
+      # The block stays because the credentials are still the documented break-glass
+      # path: drop `dashboard_auth/basic` from plugins.disabled and push — Reloader rolls
+      # the pod and the password login is back. Deleting this block instead would mean
+      # resealing secrets to recover.
+      basic_auth:
+        username: "${DASHBOARD_USERNAME}"
+        password: "${DASHBOARD_PASSWORD}"
+        secret: "${PROFILE_API_SERVER_KEY}"
+
+      # --- Dashboard OIDC (Authentik) ------------------------------------------
+      # The primary gate on hermes-admin.<tld>. The provider + application are created
+      # from this folder by authentik-provider.yaml (PostSync job) — nothing
+      # hermes-specific lives in the authentik folder.
+      #
+      # The plugin registers itself when BOTH issuer and client_id resolve
+      # (plugins/dashboard_auth/self_hosted/__init__.py `register()`); on a miss it records
+      # a skip reason and web_server.py fails CLOSED rather than serving unauthenticated.
+      # There is no `provider:` selector key — presence of this block is the switch.
+      #
+      # client_secret is deliberately ABSENT here: config.yaml lands in cleartext on the
+      # PVC. It arrives as HERMES_DASHBOARD_OIDC_CLIENT_SECRET via $HERMES_HOME/.env,
+      # which _resolve_setting() reads with env-wins-config precedence. PKCE S256 is sent
+      # in both public and confidential mode — the secret layers on, it does not replace it.
+      #
+      # ⚠ The issuer path segment is the APPLICATION SLUG ("hermes"), not the provider
+      # name ("hermes-dashboard") — Authentik publishes the discovery document under
+      # /application/o/<app-slug>/. client_id must match the provider's client_id.
+      oauth:
+        self_hosted:
+          issuer: "https://id.subdomain1.your-domain.tld/application/o/hermes/" # automatically updated from project-settings:{general.subdomain,general.domain}
+          client_id: "hermes-dashboard"
+
+    # --- Database --------------------------------------------------------------
+    # /opt/data is a Longhorn RWO block volume with a real local filesystem, so
+    # SQLite WAL is safe here (the delete-mode fallback is for NFS/SMB/virtiofs).
+    database:
+      journal_mode: "wal"
+
+    # --- Dashboard login: OIDC ONLY ---------------------------------------------
+    # Without this the login page offers BOTH "Sign In" (password) and "Sign In With
+    # Self-Hosted OIDC", so reaching the dashboard through Authentik takes an extra
+    # click on a page whose primary button is the wrong one. Disabling the bundled
+    # basic provider leaves Authentik as the only registered provider.
+    #
+    # This does NOT weaken the gate. web_server.py refuses to bind at all when no auth
+    # provider registers (SystemExit, "There is no unauthenticated public-dashboard
+    # option"), so a broken OIDC config yields a DEAD dashboard, never an open one.
+    #
+    # ⚠ It does remove the fallback that works while Authentik is down. Break-glass, in
+    # order of preference:
+    #   1. Delete this key and push — Reloader rolls the pod on the ConfigMap change and
+    #      password login returns (dashboard.basic_auth credentials are deliberately
+    #      still set).
+    #   2. `kubectl port-forward -n hermes hermes-0 9119:9119` — loopback still needs a
+    #      provider, so this only helps once (1) is applied.
+    # The bearer API on :8642 is unaffected by any of this and stays reachable.
+    #
+    # Key names accepted: "basic" or "dashboard_auth/basic"
+    # (hermes_cli/plugins_cmd.py:1282 _BASIC_AUTH_PLUGIN_KEYS).
+    plugins:
+      disabled:
+        - "dashboard_auth/basic"
+
+  # ---------------------------------------------------------------------------
+  # Seed persona — HERMES_HOME/SOUL.md. Copied ONLY when absent; after that the
+  # agent owns the file and edits made here are ignored (by design).
+  # ---------------------------------------------------------------------------
+  SOUL.md: |
+    # SOUL
+
+    You are the Hermes agent running inside the edge-cloud cluster. You are
+    reached over an OpenAI-compatible HTTP API by VSCode extensions, and your
+    inference runs on self-hosted models behind the cluster's LiteLLM gateway.
+
+    ## Environment
+
+    - You run in a Kubernetes pod. Your shell and file tools act INSIDE that pod,
+      not on the user's laptop. Say so when a user asks you to touch "their" files.
+    - Your persistent state lives under /opt/data and survives pod restarts.
+      Anything you write elsewhere in the container is lost on restart.
+    - Your egress is restricted by a NetworkPolicy: the LLM gateway, DNS and the
+      public internet. You cannot reach other in-cluster services, and you have
+      no Kubernetes API credentials.
+
+    ## Style
+
+    - Be concise and direct. Skip pleasantries and filler.
+    - Say plainly when you do not know something or cannot reach it, rather than
+      guessing at cluster state.
+    - Prefer showing a command and its real output over describing what it would do.

@@ -1,0 +1,15 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  name: gitlab-s3-connection
+  namespace: gitlab
+spec:
+  encryptedData:
+    connection: ""
+  template:
+    metadata:
+      name: gitlab-s3-connection
+      namespace: gitlab

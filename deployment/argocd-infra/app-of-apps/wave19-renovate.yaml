@@ -1,0 +1,35 @@
+# Renovate — a CronJob in its own namespace that opens dependency PRs against GitHub.
+#
+# LAST WAVE, on purpose. Nothing in the cluster consumes it and it consumes nothing beyond
+# its own SealedSecret (the GitHub PAT, decryptable from wave 0 onward) and egress, so
+# placing it early only widened what the wave-3 barrier had to wait for during bring-up
+# without making anything available sooner.
+#
+# ⚠ KEEP IT IN THE wave1x RANGE. renovate.json groups PRs by the app-of-apps FILENAME:
+# wave[0-9]-* and wave1[0-9]-* are "Kubernetes infrastructure", wave[2-9][0-9]-* are "Apps".
+# Renaming this to wave20-* or later would silently move Renovate's own updates into the
+# Apps groups — a config change made by a filename, with nothing to flag it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: renovate
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "19"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/renovate
+    directory:
+      exclude: '*.sh'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: renovate
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

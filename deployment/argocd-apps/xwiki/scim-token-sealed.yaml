@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: xwiki-scim-token
+  namespace: xwiki
+spec:
+  encryptedData:
+    scim-token: ""
+  template:
+    metadata:
+      name: xwiki-scim-token
+      namespace: xwiki

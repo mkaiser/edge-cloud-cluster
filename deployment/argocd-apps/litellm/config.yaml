@@ -1,0 +1,261 @@
+# LiteLLM proxy config, mounted at /etc/litellm/config.yaml (see deployment.yaml).
+# Upstream routes + gateway settings. Secrets come from env (os.environ/<VAR>),
+# never inlined here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: litellm
+data:
+  config.yaml: |
+    # One route per served model, plus one live wildcard per Ollama node.
+    #
+    # THE TURING AND THOR NODES serve many models from one always-on backend each, loading
+    # and evicting on demand, so their routes are wildcards rather than one-per-model — see
+    # the `turing/*` and `thor/*` blocks below. That is what makes user-driven model
+    # selection work: a user picking a model in Open WebUI IS the deploy action, no git
+    # change required.
+    model_list:
+      # `coder` = the Thor vLLM. RE-ENABLED 2026-09-18 together with
+      # app-of-apps/vllm.yaml: this is now the tool-calling route for the eda-pcb-agent,
+      # because ollama's compiled-in `PARSER qwen3-coder` leaks tool calls into message
+      # content as literal `<function=…></function></tool_call>` (ollama/ollama#16686,
+      # open). vLLM parses the same XML shape correctly via --tool-call-parser qwen3_xml.
+      #
+      # `openai/` provider, not `ollama_chat/`: vLLM speaks the OpenAI API natively.
+      - model_name: thor/qwen3.6-35b-a3b-nvfp4
+        litellm_params:
+          model: openai/thor/qwen3.6-35b-a3b-nvfp4   # openai/<vLLM --served-model-name>
+          api_base: http://vllm.vllm.svc:8000/v1
+          api_key: os.environ/VLLM_API_KEY
+      #
+      # The Orin's vLLM — a SECOND, independent backend (deployment/argocd-apps/vllm-orin),
+      # not a replica of the Thor's. Qwen3.5-4B INT4, 32k context, tool calling via
+      # qwen3_xml. Its reason to exist is HOME ASSISTANT: agentic control of the home
+      # wants low latency far more than it wants a big model.
+      #
+      # ⚠ Its own api_key. Each vLLM backend owns its upstream credential
+      # (vllm-orin/vllm-orin-upstream), so rotating or compromising one cannot reach the
+      # other. VLLM_ORIN_API_KEY is wired in deployment.yaml.
+      #
+      # ⚠ The prefix names the NODE, not the backend — `orin/`, never `vllm/`. Swapping
+      # what serves this box later must not invalidate saved Home Assistant configs.
+      - model_name: orin/qwen3.5-4b-w4a16
+        litellm_params:
+          model: openai/orin/qwen3.5-4b-w4a16   # openai/<vLLM --served-model-name>
+          api_base: http://vllm.vllm-orin.svc:8000/v1
+          api_key: os.environ/VLLM_ORIN_API_KEY
+      #
+      # KEPT for doc/benchmark continuity, NOT because anything depends on it: `thor/*`
+      # below already enumerates this same model live. Nothing routes traffic here by name —
+      # both hermes defaults are `thor/qwen3-coder:30b` and doc/llm-agents.md says to prefer
+      # `thor/*`. It stays because doc/llm-performance.md carries a `coder-ollama` row and a
+      # wildcard-derived id changes when the pinned quant does, which would orphan that row.
+      - model_name: coder-ollama
+        litellm_params:
+          # Ollama auto-pulls this hf.co ref as the model id on first request
+          # (GGUF twin of the NVFP4 model vLLM serves). Served via Ollama's
+          # OpenAI-compat endpoint, hence the openai/ provider prefix.
+          # UD-IQ3_XXS (~14.1 GiB): the largest quant that fits the Thor's
+          # ~15.9 GiB GPU-visible memory GPU-resident (the Q4 ~22.7 GiB spilled
+          model: openai/hf.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-IQ3_XXS
+          api_base: http://ollama.ollama.svc:11434/v1
+          # Ollama has no auth (in-cluster ClusterIP only); the openai provider
+          # just needs a non-empty key.
+          api_key: dummy
+
+      # ── Turing node (smartmirror1, 2x RTX 2070) ────────────────────────────
+      # ONE route for every model on the node, present and future. NOTE the two halves are
+      # named on DIFFERENT axes and both matter: `model_name` is the NODE (what users type),
+      # while `litellm_params.model` is the PROVIDER wildcard.
+      #
+      # ⚠ THE PROVIDER MUST BE `ollama_chat`, NOT `ollama`. with plain
+      # `ollama/*` a tool-calling request returned `tool_calls: null` and
+      # `finish_reason: stop` with empty content — while billing the completion tokens. The
+      # model had emitted a correct call and the gateway threw it away.
+      #
+      # Cause: plain `ollama` routes through litellm's LEGACY /api/generate completion path
+      # (llms/ollama/completion/transformation.py), which only recovers a tool call by
+      # JSON-parsing the text content and never reads Ollama's native `tool_calls` field.
+      # `ollama_chat` uses chat/transformation.py, which reads it properly and sets
+      # finish_reason correctly. Both providers share OllamaModelInfo (utils.py: `OLLAMA ==
+      # provider or OLLAMA_CHAT == provider`), so live enumeration is UNAFFECTED — verified,
+      # all 7 models still enumerate. There is no trade-off here; `ollama` was simply wrong.
+      #
+      # For an agent this failure was fatal AND invisible: it looked like a model that thinks
+      # and then does nothing, with no error anywhere.
+      #
+      # `ollama_chat/*` is a
+      # PROVIDER-NATIVE wildcard: LiteLLM expands it by calling the provider's own
+      # OllamaModelInfo.get_models(), which GETs /api/tags on the live server
+      # (litellm/llms/ollama/common_utils.py:93) and returns one `ollama/<name>` per
+      # model actually present. So `ollama pull` alone makes a model appear in
+      # /v1/models — and therefore in Open WebUI's picker — with NO commit here and NO
+      # LiteLLM restart. That is what makes user-driven model add self-service.
+      #
+      # Requires `check_provider_endpoint: true` in litellm_settings (below), which is
+      # what switches wildcard expansion from a static catalogue to a live API call.
+      #
+      # WHY NOT `openai/*`: measured, and it is a trap. get_known_models_from_wildcard()
+      # derives the provider from litellm_params.model, so `openai/*` expands to
+      # OpenAI's ENTIRE built-in catalogue — 374 phantom ids (gpt-*, o1-*, dall-e,
+      # tts-*, whisper-*), none of which exist here, drowning the real models in the
+      # picker. `ollama/*` expands from the live server instead. The provider prefix is
+      # the whole difference.
+      #
+      # api_base is set per-deployment AND as OLLAMA_API_BASE in deployment.yaml: the
+      # per-deployment value serves requests, the env var is what the enumeration path
+      # (which has no deployment context) uses.
+      #
+      # TWO known cosmetic/latency effects, neither a fault:
+      #   1. The literal "turing/*" appears in /v1/models (and so in the picker) alongside
+      #      the real models. Selecting it errors. LiteLLM only omits it when
+      #      return_wildcard_routes=false is honoured for the caller, and Open WebUI takes
+      #      the list verbatim; an admin can hide it per-model in Open WebUI's admin UI
+      #      (Models -> toggle) or via a per-connection model_ids allowlist.
+      #   2. This proxy recomputes the enumerated list only at STARTUP. Measured: a model
+      #      pulled at t=0 was still missing from /v1/models at t=635s, and appeared at once
+      #      after a restart — so the AvailableModelsCache ttl_seconds=300
+      #      (litellm/utils.py:7065, hardcoded, no env override) does NOT refresh the
+      #      listing in practice. model-sync-cronjob.yaml closes the gap: every 5 min it
+      #      diffs /api/tags against /v1/models and restarts this Deployment ONLY on drift.
+      #      (Reloader does not cover this one: a model pulled INTO Ollama changes nothing
+      #      in any ConfigMap or Secret, so there is no content change for it to see.)
+      # PREFIX = THE NODE, never the backend. `turing/` and `thor/` name WHERE a model runs;
+      # which engine serves it (Ollama today, vLLM later) is deliberately NOT in the id.
+      # Reason: the backend is switchable at RUNTIME from the chat tool, so encoding it would
+      # invalidate every saved client config and chat history the moment someone flipped a
+      # node — an `ollama-thor/...` id would 404 as soon as vLLM took the GPU. The node is
+      # the stable fact; the engine is not.
+      #
+      # `turing` matches ecc/gpu-model=nvidia-turing-sm75 (the GPU arch), `thor` matches
+      # jetson-thor. NB the arch is Turing (NVIDIA sm_75) — not "Turin", which is an
+      # unrelated AMD CPU.
+      - model_name: turing/*
+        litellm_params:
+          model: ollama_chat/*
+          api_base: http://ollama-turing.ollama-turing.svc:11434
+
+      # ── Thor (ecc/gpu-model=jetson-thor, Blackwell sm_110, ~117 GiB unified) ─────
+      # A SECOND live wildcard, with a CUSTOM PREFIX. This started as two explicit routes on
+      # the belief that a second ollama wildcard was impossible because expansion derives the
+      # advertised id from the provider, so both would collide on `ollama/...`. That was
+      # wrong, and the upstream code says so explicitly: get_known_models_from_wildcard takes
+      # the display prefix from `model_name` and the PROVIDER from `litellm_params.model`, and
+      # its own comment cites "ollama_server1/*" as the way to distinguish multiple instances
+      # of one provider. It strips the provider segment rather than stacking both.
+      #
+      # Measured on a probe proxy before committing: `thor/*` enumerated exactly Thor's 3
+      # models and the Turing route exactly its 4 — no overlap, and both routed and
+      # answered. The per-deployment api_base wins over the global OLLAMA_API_BASE env var
+      # (which points at the Turing node), so the two do not interfere.
+      #
+      # Consequence: `ollama pull` on the THOR is now self-service too. Adding a model no
+      # longer needs an entry here — the catalogue in ../ollama/prepull-models.yaml stays the
+      # declaration of what a fresh node should hold, not a gate on what can be served.
+      #
+      # model-sync-cronjob.yaml must reconcile BOTH prefixes — matching only `ollama/`
+      # leaves a freshly pulled Thor model unadvertised until a manual restart.
+      # ⚠ A CONCRETE route for the agent model, in ADDITION to the thor/* wildcard below.
+      # It exists so /v1/models advertises a context window. Two upstream facts force it:
+      #   - LiteLLM does NOT auto-populate max_input_tokens for OpenAI-compatible/Ollama
+      #     backends (BerriAI/litellm#27830, OPEN) — the field is null unless set by hand.
+      #   - A wildcard entry cannot carry it: router.get_configured_token_limits() returns
+      #     (None, None) for "wildcard-expanded or unknown names", and /v1/models lists the
+      #     literal "thor/*" rather than enumerating models (BerriAI/litellm#13643, closed
+      #     as not planned).
+      # Without this, Hermes probes /v1/models, finds no window, logs "probe-down" and falls
+      # back to the model card's 262,144 while Ollama's real window is num_ctx — so its
+      # compaction trigger lands PAST the truncation point and the context is silently
+      # destroyed. model_info.max_input_tokens is the documented workaround, and Hermes
+      # reads exactly that key (agent/model_metadata.py preferred input-window keys).
+      # ⚠ Keep max_input_tokens == num_ctx below.
+      - model_name: thor/qwen3-coder:30b
+        litellm_params:
+          model: ollama_chat/qwen3-coder:30b
+          api_base: http://ollama.ollama.svc:11434
+          num_ctx: 131072
+        model_info:
+          max_input_tokens: 131072
+
+      - model_name: thor/*
+        litellm_params:
+          model: ollama_chat/*
+          api_base: http://ollama.ollama.svc:11434
+          # ⚠ num_ctx is NOT optional here, and leaving it out silently breaks agent loops.
+          # Ollama defaults a slot to n_ctx=16384 regardless of what the model supports,
+          # while Hermes reads no context length off this endpoint and assumes the model
+          # card's 262,144. An agent turn starts at ~8.2k tokens of system prompt + tool
+          # schemas, so a reply of any length walks into
+          #     slot context shift, n_keep = 4, n_left = 16379, n_discard = 8189
+          # — llama.cpp discarding the OLDEST half of the window, which is the system
+          # prompt and the tool definitions. The model keeps generating with its
+          # instructions gone, so it never emits a valid terminal tool call and the
+          # dispatcher records "worker exited cleanly (rc=0) without calling
+          # kanban_complete — protocol violation". Measured 2026-09-15: that one line is
+          # what every card failure on this board turned out to be.
+          # ⚠ 65536 was NOT enough and nearly reproduced the bug it was meant to fix. A
+          # research card doing 11 web searches accumulated its results into the prompt and
+          # peaked at 65,396 tokens — 140 tokens of headroom. It did not shift, but the next
+          # search would have, and the failure is silent when it does.
+          # 131072 is the next stop with the same reasoning: thor has ~84 GiB free against a
+          # ~20 GB model, so the KV cache has room. Any tool whose OUTPUT lands in the
+          # context (web_search, file reads, long command output) makes the ceiling a
+          # function of how many times it is called, not of the card's length — size for the
+          # worst card, not the typical one.
+          num_ctx: 131072
+
+    general_settings:
+      # Attribute each request to the END USER, not to the single service key.
+      #
+      # Open WebUI presents ONE credential to this gateway (its `litellm-key`, which is the
+      # master key), so without this every call is logged as `litellm_proxy_master_key` with
+      # an EMPTY end_user column — measured: 5 of 5 spend rows, one distinct end_user (none).
+      # "Per-user attribution" was claimed in several comments here and was simply not true.
+      #
+      # LiteLLM reads this header into `end_user_id` and `data["user"]`
+      # (litellm_pre_call_utils.py: get_user_from_headers). Open WebUI emits it only when
+      # ENABLE_FORWARD_USER_INFO_HEADERS=true (default False — see ../open-webui/deployment.yaml).
+      # BOTH halves are required; the header alone does nothing, verified against a probe pod.
+      #
+      # Email rather than the opaque user id, so spend rows are readable and match the OIDC
+      # identity. It is a HINT, not authentication: anyone holding the service key could set
+      # it to any value. That is acceptable because the key never leaves the cluster — for
+      # external clients the boundary is the per-client virtual key, not this header.
+      #
+      # NOTE this is read ONLY at startup: the running pod keeps the old behaviour until it
+      # is rolled — measured, end_user stayed empty with the mounted file already correct.
+      # The Deployment carries reloader.stakater.com/auto, so editing this file and syncing
+      # rolls the pod automatically; the model-sync CronJob would not, it restarts on
+      # MODEL-LIST drift only.
+      user_header_name: X-OpenWebUI-User-Email
+      master_key: os.environ/LITELLM_MASTER_KEY
+      # Persist keys/users/spend in Postgres (CNPG litellm-pg) so virtual keys and
+      # budgets survive restarts.
+      database_url: os.environ/DATABASE_URL
+      # Persist model_list edits made through the admin UI in the DB, and merge them
+      # with the routes defined above at startup. Without this the UI's "Add Model"
+      # is memory-only (lost on restart) and ArgoCD would revert it anyway. The
+      # config.yaml routes below remain the GitOps baseline; UI-added models are
+      # additive and survive restarts. Requires DATABASE_URL (set above).
+      store_model_in_db: true
+      # ⚠ JWT AUTH IS NOT AVAILABLE HERE — it is an ENTERPRISE-ONLY feature.
+      # Setting general_settings.enable_jwt_auth + litellm_jwtauth loads cleanly and
+      # looks correct, but every JWT request is refused at runtime by
+      # user_api_key_auth.py:1354:
+      #   "JWT Auth is an enterprise only feature. You must be a LiteLLM Enterprise
+      #    user ... set `LITELLM_LICENSE` in your env"
+      # Measured against this deployment. It is a hard gate on
+      # `premium_user`, not a warning, so there is no open-source path to
+      # "authenticate with an OIDC token and mint your own virtual key".
+      # Do NOT re-add the config without a paid licence — it fails closed and the
+      # error names `premium_user`, not the config, which is easy to misdiagnose.
+
+    litellm_settings:
+      drop_params: true
+      # Expand provider wildcards (`ollama_chat/*`) by ASKING THE PROVIDER rather than using a
+      # static model catalogue — i.e. /api/tags on the Ollama server. This is what makes a
+      # freshly pulled model show up in /v1/models with no config change. Without it,
+      # the wildcard would expand to litellm's static ollama list, which is both wrong and
+      # unrelated to what this node actually holds.
+      check_provider_endpoint: true

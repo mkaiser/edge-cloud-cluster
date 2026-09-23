@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: kube-prometheus-stack-grafana
+  namespace: prometheus
+spec:
+  encryptedData:
+    admin-password: ""
+    admin-user: AgB6qxtN0ogHG4g5hDPI9lWL+yplp2osfsTo3Oh0btfccwuH6wXwoko47quou+9qbwGQBPXfWS4DPZhs6nLcljsvRTK1pYr2FCfe24qNcweoJoheZ4cxe9buxEjHvJogzsLp9gNJunmdid4xqNJU5IlEoOsne9940BDjlHgKjxRHGXQ6u3fmhsuGjUpH1/R8Dj7Lq+yduqeUeNr0YrzlldqWoe0arvMPfbGRNGvnl9SqrOv4ju56jUvfgpbUeV4A+bKEsomaVE9kOQe+4pi8pZpZCj+3VR7WUJvy8ME+uVTR9sBKV1bMQaNzYoGDnV4EUiRAvOkSoOVdQmOKcFgjLf7stCe/6l67GWiYzTyed8eoTgbPAwreSTH+lAkNAuM5ZrZxDpfaIA/bjKnY3opa5hDzIqGgIsSUy8cGWgR9uinRXFlH5uyteUrkdnula71JSPEiUmXXhogJML7JO5ymWkJ008zgr5U3et6fl+eACjGB6QD7eFhhHeEbW4yNcM7L39mSgfHHjmqf7serRjCWPYf2xjGtMiDckr+1X8O1evs4YtCWDCjQTnSVj/4vN71n2ceWki0p0wJ7nSOO9ut4v8mCxBryI6V+aHIYpSHX219NgT9hg4asl2wQ2N8p34UTrUq77OOaVvSmGa33lFiHEllyya/12SlOeS8opm1Yg8PAXyrIat7usAKmRPtzWc6Bz7hVj2vxwA==
+  template:
+    metadata:
+      name: kube-prometheus-stack-grafana
+      namespace: prometheus

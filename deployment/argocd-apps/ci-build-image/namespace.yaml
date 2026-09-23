@@ -1,0 +1,7 @@
+# Namespace for the shared CI build image (buildah + skopeo). BUILD-ONLY, like the EDA
+# module apps: it holds the build trigger and the build-files ConfigMap and nothing else —
+# the image it produces is consumed by GitLab CI jobs, never by a pod in this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ci-build-image

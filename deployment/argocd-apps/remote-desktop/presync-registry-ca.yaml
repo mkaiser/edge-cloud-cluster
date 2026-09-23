@@ -1,0 +1,128 @@
+# PreSync: pull the image-registry CA into THIS namespace, rather than waiting for
+# image-registry to push it here.
+#
+# WHY THIS EXISTS — a push into a namespace you do not own cannot survive that namespace
+# being recreated. image-registry/ca-distribute.yaml is a PostSync hook of the
+# IMAGE-REGISTRY app, so it only ever runs when THAT app syncs. Anything that later
+# recreates the remote-desktop namespace (a cluster recreate, a prune, an ordinary sync
+# that deletes and recreates it) takes the ConfigMap with it, and nothing re-asserts it.
+# Measured 2026-09-04 on ecc196: ca-distribute completed at 09:37:08Z, the remote-desktop
+# namespace was recreated at 09:38:41Z — 93s later — and the broker was left with no CA.
+#
+# Every OTHER consumer of this CA already reads the source secret directly at the moment it
+# needs it (the EDA and ollama build jobs do exactly this, see their postsync-build-image
+# jobs). The broker was the sole outlier in depending on a pushed copy. This job makes
+# remote-desktop own its own dependency: it runs on EVERY remote-desktop sync, after the
+# namespace exists (namespace.yaml is PreSync weight -10) and before any pod starts, so a
+# recreate cannot outrun it.
+#
+# ⚠ The CA is re-minted by cert-manager on every cluster recreate, so this re-asserts the
+# ConfigMap rather than skipping when one already exists. A stale CA fails every pull with
+# x509 UnknownAuthority, which reads like a network fault rather than a trust one.
+#
+# ⚠ A ConfigMap that is ABSENT WHEN A POD STARTS never populates in that pod, even after it
+# is created — the kubelet leaves the mounted directory empty and the pod must restart.
+# That is the second reason this is PreSync and not PostSync: the CA must exist before the
+# desktop Deployment is applied, or the broker comes up blind and needs a restart it should
+# never have needed.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-registry-ca
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: remote-desktop-registry-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+# read the CA secret in the image-registry ns; write the ConfigMap into our own.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: remote-desktop-registry-ca
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: remote-desktop-registry-ca
+subjects:
+- kind: ServiceAccount
+  name: remote-desktop-registry-ca
+  namespace: remote-desktop
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-registry-ca
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # After the namespace (-10) and the RBAC above (-1), before the desktop Deployment.
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 3
+  # NO ttlSecondsAfterFinished — deliberately. hook-delete-policy: BeforeHookCreation
+  # already deletes this Job on the next sync, and a TTL would delete the pod with the
+  # only copy of the logs. Alloy/Loki does not save you: its pod discovery is a poll, so a
+  # short-lived Job can finish and vanish before it is ever scraped.
+  template:
+    spec:
+      serviceAccountName: remote-desktop-registry-ca
+      restartPolicy: OnFailure
+      containers:
+      - name: fetch-ca
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Fetching the image-registry CA..."
+          i=1
+          CA=""
+          while [ "$i" -le 60 ]; do
+            CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)
+            # A CA Certificate's secret carries ca.crt; fall back to tls.crt, which for an
+            # isCA cert is the same self-signed certificate.
+            [ -n "$CA" ] || CA=$(kubectl -n image-registry get secret image-registry-ca-tls \
+                   -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)
+            [ -n "$CA" ] && break
+            echo "  try ${i}/60: not issued yet, retrying in 5s..."
+            i=$((i + 1)); sleep 5
+          done
+          [ -n "${CA:-}" ] || { echo "ERROR: image-registry-ca-tls never appeared"; exit 1; }
+
+          printf '%s' "$CA" | base64 -d > /tmp/ca.crt
+          # Sanity-check before writing: an empty or truncated bundle would be accepted here
+          # and then fail at TLS handshake time, far from the cause.
+          #
+          # ⚠ NOT `openssl x509` — this image (alpine/k8s) ships NO openssl. A PEM
+          # header/footer test needs no extra tooling and catches what actually matters.
+          head -1 /tmp/ca.crt | grep -q 'BEGIN CERTIFICATE' \
+            || { echo "ERROR: decoded CA has no PEM header"; head -3 /tmp/ca.crt; exit 1; }
+          grep -q 'END CERTIFICATE' /tmp/ca.crt \
+            || { echo "ERROR: decoded CA is truncated (no END marker)"; exit 1; }
+
+          kubectl -n remote-desktop create configmap image-registry-ca \
+            --from-file=ca.crt=/tmp/ca.crt \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "image-registry-ca is present in remote-desktop."

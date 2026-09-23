@@ -1,0 +1,44 @@
+# ArgoCD Application: NodeLocal DNSCache — a CoreDNS cache on every node, with a
+# CiliumLocalRedirectPolicy steering pod DNS traffic to the local instance.
+#
+# WAVE 1, not 0, and the ordering is load-bearing: the CiliumLocalRedirectPolicy is a
+# `cilium.io/v2` custom resource, so its CRD has to exist first — and that CRD only appears
+# once cilium (wave 0) has been deployed WITH `localRedirectPolicies.enabled: true`
+# (src/cni.ts and app-of-apps/wave0-cilium.yaml, which must stay in sync). Placed at wave 0
+# alongside cilium this app would race the CRD and fail its first sync.
+#
+# It stays early regardless, because almost everything after it resolves names: the cache is
+# transparent when healthy, but a pod that starts before the LRP exists simply talks to the
+# cluster CoreDNS directly, which is the pre-existing behaviour and harmless.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: node-local-dns
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/node-local-dns
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    # A first sync can land before the cilium agents have finished rolling out the LRP
+    # feature, in which case the CRD is briefly absent and the policy fails to apply.
+    # Retry rather than leaving the app Failed until someone notices.
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

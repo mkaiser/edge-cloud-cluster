@@ -1,0 +1,259 @@
+# Backing datastores for Zammad: redis, memcached, elasticsearch.
+#
+# All three replace subcharts that the zammad chart would otherwise pull in
+# (values.yaml disables them). Rationale, per upstream state at chart 17.0.1:
+#   - redis/memcached: upstream moved these to cloudpirates charts, but the repo
+#     already runs hand-rolled instances for zulip/nextcloud/gitlab — same pattern.
+#   - elasticsearch: upstream is STILL on the bitnami subchart, kept alive only by
+#     a `bitnamilegacy/elasticsearch` image override plus
+#     `global.security.allowInsecureImages: true`. We use Elastic's own official
+#     image instead. See NOTES.md and https://github.com/zammad/zammad-helm/issues/353
+#
+# ES major version is bounded by ZAMMAD, not by us: Zammad version-checks the
+# engine (see below) and its docs pin the supported range. Zammad 7.1 deprecates
+# ES 7 and supports 8.x and 9.x, both CI-covered upstream; ES 8 becomes the
+# MINIMUM from Zammad 7.2. So 9.x is the forward-compatible choice here. Re-read
+# https://docs.zammad.org/en/latest/prerequisites/software.html before the next
+# ES major — an unsupported engine is refused outright, not degraded.
+#
+# Elasticsearch is optional for Zammad but strongly recommended; without it search
+# degrades to SQL LIKE. OpenSearch is NOT an option — Zammad version-checks the
+# engine and rejects it.
+---
+# ---------------------------------------------------------------------------
+# Redis — Zammad's websocket/job backend.
+#
+# Unlike the repo's other redis instances this one REQUIRES a password: the chart
+# hardcodes REDIS_URL as "redis://:$(REDIS_PASSWORD)@host:port" and only emits the
+# REDIS_PASSWORD env var when a password is configured, so an unauthenticated
+# redis would receive the literal string "$(REDIS_PASSWORD)". The password comes
+# from the sealed zammad-redis-auth secret (also referenced by values.yaml
+# secrets.redis) and is applied here via `requirepass`.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: zammad-redis
+  namespace: zammad
+spec:
+  selector:
+    app: zammad-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zammad-redis
+  namespace: zammad
+spec:
+  serviceName: zammad-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zammad-redis
+  template:
+    metadata:
+      labels:
+        app: zammad-redis
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: redis
+          image: redis:8.10-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zammad-redis-auth
+                  key: redis-password
+          command:
+            - sh
+            - -c
+            - exec redis-server --save 60 1 --loglevel warning --requirepass "$REDIS_PASSWORD"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # redis-cli reads REDISCLI_AUTH from the env, so the probes authenticate
+          # without leaking the password into the process args.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 2Gi
+---
+# ---------------------------------------------------------------------------
+# Memcached — Rails cache. Stateless, no persistence.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: zammad-memcached
+  namespace: zammad
+spec:
+  selector:
+    app: zammad-memcached
+  ports:
+    - port: 11211
+      targetPort: 11211
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zammad-memcached
+  namespace: zammad
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zammad-memcached
+  template:
+    metadata:
+      labels:
+        app: zammad-memcached
+    spec:
+      priorityClassName: standard
+      containers:
+        - name: memcached
+          image: memcached:1.6-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          args: ["-m", "256"]
+          ports:
+            - containerPort: 11211
+          readinessProbe:
+            tcpSocket:
+              port: 11211
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 11211
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 320Mi
+---
+# ---------------------------------------------------------------------------
+# Elasticsearch — single node, official Elastic image (NOT bitnamilegacy).
+#
+# Zammad 7 supports Elasticsearch >= 7.8, < 10. The chart's init job sets
+# Setting.set('es_url', 'http://zammad-elasticsearch:9200') and rebuilds the
+# search index on first start, so no manual reindex is needed.
+#
+# Security is disabled: this listens only on the pod network inside the zammad
+# namespace, and the chart talks plain HTTP (zammadConfig.elasticsearch.schema).
+#
+# node.store.allow_mmap=false avoids the vm.max_map_count>=262144 host sysctl,
+# which would otherwise need a privileged initContainer on every node. The perf
+# cost is irrelevant at helpdesk ticket volumes.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: zammad-elasticsearch
+  namespace: zammad
+spec:
+  selector:
+    app: zammad-elasticsearch
+  ports:
+    - port: 9200
+      targetPort: 9200
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zammad-elasticsearch
+  namespace: zammad
+spec:
+  serviceName: zammad-elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zammad-elasticsearch
+  template:
+    metadata:
+      labels:
+        app: zammad-elasticsearch
+    spec:
+      priorityClassName: standard
+      securityContext:
+        # The Elastic image runs as uid 1000 and will not start on a
+        # root-owned Longhorn mount.
+        fsGroup: 1000
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:9.5.4  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 9200
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: xpack.security.enabled
+              value: "false"
+            - name: xpack.ml.enabled
+              value: "false"
+            - name: node.store.allow_mmap
+              value: "false"
+            - name: bootstrap.memory_lock
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health?wait_for_status=yellow&timeout=1s
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /_cluster/health?wait_for_status=yellow&timeout=1s
+              port: 9200
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1536Mi
+            limits:
+              memory: 2560Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 10Gi

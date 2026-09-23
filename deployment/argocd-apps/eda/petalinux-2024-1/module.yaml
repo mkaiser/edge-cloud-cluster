@@ -1,0 +1,65 @@
+# PetaLinux 2024.1 CONTAINER module manifest — baked into the runnable module image at
+# /module.yaml. Read by the remote-desktop broker (which publishes it) and the module CLI
+# (which generates `podman run` launchers from it).
+#
+# `runtime: container` marks it: the tool runs in ITS OWN container via podman inside the
+# sandboxed desktop pod, NOT natively on PATH.
+#
+# NAMED `petalinux`, version `2024.1`, so the user-facing form matches the Xilinx modules:
+# `module load petalinux/2024.1`, exactly as `module load xilinx/2024.1`. The DASHED spelling
+# (petalinux-2024-1) is only ever an identifier — the app directory, the k8s namespace and the
+# GitLab project — because those may not contain a dot or a slash. Never `petalinux-2024.1`.
+#
+# Consequences of the container path, all deliberate:
+#   - NO Lmod modulefile is generated, so `env.set`, `env.prepend_path`, `env.source` and
+#     `conflicts` would all be INERT here and are omitted rather than shipped as dead keys.
+#     PetaLinux's own environment (settings.sh) is therefore sourced INSIDE the image, by the
+#     shims the `command` paths below point at — not by the module system.
+#   - NO `env:` block at all: PetaLinux is unlicensed, so there is no license host to inject.
+#     The Xilinx modules' XILINXD_LICENSE_FILE has no counterpart here.
+#   - NO `desktop_entries`: everything PetaLinux ships is a command-line tool. See the
+#     interactivity warning below — the Applications menu would be the wrong promise.
+name: petalinux
+version: "2024.1"
+runtime: container
+# Publish/pull from THIS app's own GitLab project rather than the default
+# <IMAGE_BASE>/<name>. Keeps the image independently deletable and independently
+# rebuildable, and leaves room for a second PetaLinux version beside it.
+# Honoured by broker.sh module_image() + module-cli.sh (base-r14+).
+image: deployments/infrastructure/eda/modules/petalinux-2024-1
+# CLI entries — for BATCH/scripted use. Each generates a wrapper named after the REAL binary
+# into a per-module shim dir ($HOME/.local/module-bin/petalinux/2024.1/) which `module load`
+# prepends to PATH, so an existing script runs unchanged:
+#   petalinux-create -t project --template zynqMP -n myproj
+#
+# ⚠ `command` points at /usr/local/bin/<tool> IN THE IMAGE, which is a shim that sources
+# /opt/petalinux/settings.sh and then execs the real binary wherever the install put it.
+# Pointing straight at the real binary would run it with none of PetaLinux's environment
+# (PETALINUX, PATH, the Yocto host tools) and it exits immediately telling you to source
+# settings.sh — and the path is not stable across releases anyway (2024.1 has no
+# `tools/` directory, which is where older releases keep them). The Dockerfile resolves and
+# asserts every tool below in the BUILT image, so a renamed tool fails the build rather
+# than a user's run.
+#
+# ⚠ THESE TOOLS ARE NOT INTERACTIVE HERE. The launcher protocol has no stdin and no TTY: it
+# writes a run request and streams the container's log back. So `petalinux-config` with no
+# arguments (which opens menuconfig) has nothing to draw on and nothing to type into. Use the
+# non-interactive forms — `petalinux-config --get-hw-description <dir> --silentconfig`,
+# `petalinux-config -c kernel --silentconfig` — or edit the project's .conf files directly.
+cli_entries:
+  - name: petalinux-create
+    command: /usr/local/bin/petalinux-create
+  - name: petalinux-config
+    command: /usr/local/bin/petalinux-config
+  - name: petalinux-build
+    command: /usr/local/bin/petalinux-build
+  - name: petalinux-package
+    command: /usr/local/bin/petalinux-package
+  - name: petalinux-boot
+    command: /usr/local/bin/petalinux-boot
+  - name: petalinux-util
+    command: /usr/local/bin/petalinux-util
+  - name: petalinux-devtool
+    command: /usr/local/bin/petalinux-devtool
+  - name: petalinux-upgrade
+    command: /usr/local/bin/petalinux-upgrade

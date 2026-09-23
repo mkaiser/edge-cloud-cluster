@@ -1,0 +1,215 @@
+# Longhorn recurring backup jobs.
+# Applied to all volumes via the default RecurringJob group.
+# Snapshots stay on-node (fast, no S3 cost); backups go to S3 (survives full cluster loss).
+#
+# Retention: GFS approximated via 4 separate backup jobs, each with independent retain counts.
+# etcd snapshots: hourly, retain 72 (3 days) — configured in src/nodes-k3s-base.ts.
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: snapshot-hourly
+  namespace: longhorn-system
+spec:
+  cron: "0 * * * *"
+  task: snapshot
+  # retain 24 (1 day), NOT 72 (3 days). Snapshots live on the same disk as the volume,
+  # so retain is a direct multiplier on disk usage: at 72 the cluster accumulated 253Gi
+  # of snapshots and the cloud disk ran out of scheduling headroom. This only shrinks the
+  # local fast-rollback window — the S3 backup jobs below are the disaster-recovery path
+  # and are unaffected.
+  retain: 24
+  concurrency: 10
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-6hourly
+  namespace: longhorn-system
+spec:
+  # Backup jobs are staggered across the hour, NOT all on :30. They share one lock per
+  # volume in the S3 backupstore (backupstore/volumes/<hash>/locks/), so two backup jobs
+  # covering the same volume at the same minute make one of them fail with
+  # "failed to acquire lock ... when performing backup create/restore". Longhorn retries
+  # and usually wins the second time, but the failed run is what surfaces in the weekly
+  # report. Minute assignments: 6hourly :15, GFS dailies/weekly/monthly/yearly :30/:35/:40/:45
+  # (all in the `default` group, so they must not coincide), cnpg :45 (own group), mesh :00.
+  cron: "15 */6 * * *"
+  task: backup
+  retain: 10
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-daily
+  namespace: longhorn-system
+spec:
+  cron: "30 2 * * *"
+  task: backup
+  retain: 14
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-weekly
+  namespace: longhorn-system
+spec:
+  cron: "35 2 * * 0"
+  task: backup
+  retain: 12
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-monthly
+  namespace: longhorn-system
+spec:
+  cron: "40 2 1 * *"
+  task: backup
+  retain: 18
+  concurrency: 1
+  groups:
+    - default
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: backup-yearly
+  namespace: longhorn-system
+spec:
+  cron: "45 2 1 1 *"
+  task: backup
+  retain: 4
+  concurrency: 1
+  groups:
+    - default
+---
+# `cnpg` group: CloudNativePG data volumes on the `longhorn-cloud-db` StorageClass
+# (src/storage.ts). Deliberately has NO snapshot job.
+#
+# CNPG archives WAL continuously and takes a daily base backup to its own S3
+# bucket (barmanObjectStore, retention 30d), which gives application-consistent PITR —
+# strictly stronger than a crash-consistent Longhorn snapshot. Hourly block snapshots of
+# these volumes were therefore pure duplication, AND their worst case: Postgres recycles
+# WAL by rewriting the same 16MB segments in place, so an idle cluster still dirties
+# ~0.3Gi/hour. That combination consumed ~90% of the cloud disk.
+#
+# A daily volume-level S3 backup is kept as a coarse net beneath barman: it restores the
+# whole PVC without needing a working CNPG recovery bootstrap.
+#
+# NB: membership is via recurringJobSelector on the StorageClass, which is also what opts
+# these volumes OUT of `default` (Longhorn applies `default` only to volumes with no
+# selector). Removing the selector silently puts hourly snapshots back.
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: cnpg-backup-daily
+  namespace: longhorn-system
+spec:
+  cron: "45 4 * * *"
+  task: backup
+  retain: 7
+  concurrency: 1
+  groups:
+    - cnpg
+---
+# `no-retention` — an ANCHOR job, bound directly to individual volumes that must be in
+# NO recurring-job group. It is deliberately in no group itself, so it is never applied
+# by group membership; a volume joins it only via an explicit
+# `recurring-job.longhorn.io/no-retention` label.
+#
+# WHY IT EXISTS: Longhorn auto-adds `recurring-job-group.longhorn.io/default` to any
+# volume left with no recurring-job label at all, and `default` carries snapshot-hourly
+# plus all five backup jobs. So "strip every label" is not a reachable state — it just
+# hands the volume to `default`, which is strictly worse than the scope group it
+# replaced. Measured 2026-09-21 on ryax-action-builder-nix-store: the strip succeeded
+# and `default` was back on the volume within the same reconcile.
+#
+# The task is `snapshot-cleanup`, which CREATES nothing — it only coalesces snapshots
+# already marked for deletion. Bound to a volume it is therefore a no-op that costs no
+# disk, while still counting as a recurring-job label and so keeping `default` off.
+#
+# Consumers: deployment/argocd-apps/cape-demo/ryax/snapshot-policy.yaml.
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: no-retention
+  namespace: longhorn-system
+spec:
+  # Deliberately infrequent: nothing depends on this running, it exists to be a label.
+  cron: "0 5 * * 0"
+  task: snapshot-cleanup
+  # snapshot-cleanup ignores retain, but the CRD requires the field.
+  retain: 0
+  concurrency: 1
+  groups: []
+---
+# Per-scope mesh groups: mesh-local volumes get their own, less-frequent cadence —
+# they're large and mesh nodes upload backups to Hetzner S3 over their own internet
+# link. Each longhorn-<scope> StorageClass joins its volumes to a group named after
+# the scope via recurringJobSelector (src/storage.ts), so a volume belongs to exactly
+# ONE scope group — no double-backup even with overlapping disk tags (ToDo item 5).
+#
+# ⚠ The group lists below are GENERATED from the distinct storageScope tags in
+# project_settings.nodes.mesh — do not edit them by hand; run
+# scripts/environment/updateConfigFromProjectSettings.sh.
+#
+# They are generated because a MISSING entry is silent data loss rather than an error: a
+# volume on a scope with no group here is in NO group at all, since the longhorn-<scope>
+# StorageClass sets a recurringJobSelector and Longhorn applies the `default` group ONLY to
+# volumes with no selector. Kept by hand, three scopes had already drifted out. Verify with:
+#   kubectl get volumes.longhorn.io -n longhorn-system -o json | jq -r
+#     '.items[].metadata.labels | keys[] | select(startswith("recurring-job-group"))' | sort -u
+#
+# A group naming a scope that no StorageClass references is harmless, which is why the list
+# covers disabled nodes too (src/storage.ts mints classes for enabled nodes only).
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: mesh-snapshot-6hourly
+  namespace: longhorn-system
+spec:
+  cron: "0 */6 * * *"
+  task: snapshot
+  retain: 8
+  concurrency: 2
+  groups:
+  # BEGIN storage-scopes (auto-generated from project-settings:nodes.mesh[].storageScope)
+    - unibi-hclab
+    - unibi
+    - unibi-ryax
+    - unibi-recslab
+    - home-martin
+    - budapest-emdc
+  # END storage-scopes
+---
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: mesh-backup-daily
+  namespace: longhorn-system
+spec:
+  cron: "0 3 * * *"
+  task: backup
+  retain: 7
+  concurrency: 1
+  groups:
+  # BEGIN storage-scopes (auto-generated from project-settings:nodes.mesh[].storageScope)
+    - unibi-hclab
+    - unibi
+    - unibi-ryax
+    - unibi-recslab
+    - home-martin
+    - budapest-emdc
+  # END storage-scopes

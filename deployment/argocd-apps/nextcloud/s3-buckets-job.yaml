@@ -1,0 +1,74 @@
+# Sync Job: ensure Nextcloud's S3 bucket exists.
+# Ownership of this bucket moved from Pulumi (src/storage.ts ensure-s3-bucket loop)
+# to the app that uses it (Nextcloud primary object store → s3://<clusterprefix>-nextcloud-files).
+# Idempotent (head-bucket || create-bucket). NOT deleted on app removal (data-safe);
+# full-teardown wipe lives in scripts/environment/deleteS3Buckets.sh (discovers all
+# live buckets).
+#
+# Credentials come from the nextcloud-s3 sealed secret (keys accessKey / secretKey).
+# Hook: Sync + sync-wave -1 (NOT PreSync, NOT PostSync):
+#   - Sync (not PreSync): the sealed secret is a normal synced resource, absent
+#     during PreSync — a PreSync job's secretKeyRef can't resolve and deadlocks.
+#   - wave -1 (not PostSync): Nextcloud uses S3 as its primary object store, so the
+#     bucket should exist before it boots. wave -1 runs during Sync, before the app's
+#     own resources.
+# The nextcloud-s3 SealedSecret must carry sync-wave: "-2" so it is applied and
+# decrypted before this wave -1 job runs (avoids CreateContainerConfigError on fresh deploy).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nextcloud-s3-buckets
+  namespace: nextcloud
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: ensure-buckets
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-s3
+                  key: accessKey
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-s3
+                  key: secretKey
+            - name: AWS_DEFAULT_REGION
+              value: "nbg1" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+            - name: AWS_PAGER
+              value: ""
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ENDPOINT="https://nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+              for BUCKET in edgecloudinfra-nextcloud-files edgecloudinfra-nextcloud-pg; do # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+                if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/dev/null; then
+                  echo "Bucket $BUCKET already exists."
+                else
+                  echo "Creating bucket $BUCKET ..."
+                  aws s3api create-bucket --bucket "$BUCKET" \
+                    --endpoint-url "$ENDPOINT" --region "$AWS_DEFAULT_REGION"
+                  echo "Created $BUCKET."
+                fi
+              done
+              echo "Nextcloud S3 buckets ready."

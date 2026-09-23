@@ -1,5 +1,7 @@
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+THIS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+echo "THIS_DIR: $THIS_DIR"
 
 # Check if script is being sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -13,7 +15,7 @@ fi
 mkdir -p .pulumi-state
 
 
-source "$SCRIPT_DIR/setPulumiPassphrase.sh"
+source "$THIS_DIR/setPulumiPassphrase.sh"
 
 if [[ ! "$store_env" =~ ^[Yy]?$ ]]; then
     echo "PULUMI_CONFIG_PASSPHRASE will not be stored as environment variable. You will need to set it manually before running pulumi commands."

@@ -1,0 +1,217 @@
+# Sync the DESKTOPS automatically, but ONLY when there is no session to lose.
+#
+# Both desktops (remote-desktop and remote-desktop-bender) have no `automated` syncPolicy:
+# applying a change restarts a single-replica `Recreate` Deployment and kills every logged-in
+# session, so a human decides when. That rule has one hole worth closing: when a desktop is
+# NOT RUNNING there is nobody to disturb, and making a person click Sync buys nothing. Two
+# cases in particular:
+#   - first boot after a cluster recreate — the app is created, reports OutOfSync, and would
+#     otherwise sit there until someone notices;
+#   - the desktop is down or crash-looping — the pending change is quite likely the fix.
+#
+# So: every 5 minutes, for EACH desktop, if it is OutOfSync AND has ZERO ready replicas,
+# sync it. If a single replica is Ready the change is left alone, however old it is. The two
+# are independent — one being up never blocks the other's rollout.
+#
+# ⚠ THIS DELIBERATELY DOES NOT LOOK AT SESSIONS. "Ready pod ⇒ hands off" is a fact the API
+# server already knows; "nobody is logged in" would mean probing `who`, xrdp ptys, VNC
+# sockets and Guacamole's connection table, and being wrong there logs a person out — the
+# exact failure this whole arrangement exists to prevent. Down-means-safe needs no probe and
+# cannot be wrong in that direction.
+#
+# ⚠ IT LIVES IN ITS OWN APP, NOT IN EITHER DESKTOP. Anything inside a desktop app is only
+# applied by the manual sync it is supposed to trigger — on a fresh cluster it would never
+# run.
+#
+# ⚠ ONE CronJob FOR BOTH, not one each: the logic is identical and a second copy would drift.
+# Adding a third desktop means one more entry in DESKTOPS below, one more `resourceNames`
+# entry, and one more read Role in its namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: desktop-rollout
+  namespace: argocd-apps
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: desktop-rollout
+  namespace: argocd-apps
+rules:
+# Read the Application's sync status, and set `.operation` to request the sync. `patch` on
+# applications is the whole privilege — it cannot touch workloads, secrets or nodes.
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  resourceNames: ["remote-desktop", "remote-desktop-bender"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: desktop-rollout
+  namespace: argocd-apps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: desktop-rollout
+subjects:
+- kind: ServiceAccount
+  name: desktop-rollout
+  namespace: argocd-apps
+---
+# Reading the Deployment's readyReplicas is the entire "is anyone using it" test.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: desktop-rollout-read
+  namespace: remote-desktop
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["remote-desktop-gvisor"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: desktop-rollout-read
+  namespace: remote-desktop
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: desktop-rollout-read
+subjects:
+- kind: ServiceAccount
+  name: desktop-rollout
+  namespace: argocd-apps
+---
+# ⚠ A SECOND read Role, because a Role is NAMESPACED and cannot grant across namespaces.
+# The bender desktop's Deployment lives in its own namespace, so its readyReplicas needs its
+# own grant — the same one-Deployment, get-only privilege as above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: desktop-rollout-read
+  namespace: remote-desktop-bender
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["remote-desktop-bender"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: desktop-rollout-read
+  namespace: remote-desktop-bender
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: desktop-rollout-read
+subjects:
+- kind: ServiceAccount
+  name: desktop-rollout
+  namespace: argocd-apps
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: desktop-rollout
+  namespace: argocd-apps
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: desktop-rollout
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: rollout
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                set -eu
+                # ns:deployment:application, one per desktop. Adding a third means one more
+                # line here, plus its `resourceNames` and its read Role above.
+                DESKTOPS="remote-desktop:remote-desktop-gvisor:remote-desktop
+                remote-desktop-bender:remote-desktop-bender:remote-desktop-bender"
+
+                # ⚠ `|| true` ON THE LOOP BODY, not inside it. Under `set -eu` a non-zero
+                # from one desktop's check would abort the whole CronJob and the SECOND
+                # desktop would never be examined — one desktop being broken must not stop
+                # the other being rolled out. Each iteration reports and moves on.
+                echo "$DESKTOPS" | while IFS=: read -r NS DEPLOY APP; do
+                  [ -n "$APP" ] || continue
+                  echo "── $APP ──"
+                  check_one() {
+                    sync=$(kubectl -n argocd-apps get application "$APP" \
+                             -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+                    if [ -z "$sync" ]; then
+                      echo "  Application $APP does not exist yet (or is unreadable) — nothing to do."
+                      return 0
+                    fi
+                    if [ "$sync" != "OutOfSync" ]; then
+                      echo "  $APP is $sync — nothing to do."
+                      return 0
+                    fi
+
+                    # ⚠ Test `.operation`, NOT `.status.operationState.phase`. The status is
+                    # HISTORICAL and can be stale for hours: measured 2026-09-03, an operation
+                    # blocked by a sync window that was later deleted sat at phase=Running with
+                    # `.operation` already gone, and a phase-based check refused to act forever.
+                    # `.operation` is the live request — present means queued or running.
+                    op=$(kubectl -n argocd-apps get application "$APP" \
+                           -o jsonpath='{.operation}' 2>/dev/null || true)
+                    if [ -n "$op" ]; then
+                      echo "  $APP already has a sync in flight — leaving it alone."
+                      return 0
+                    fi
+
+                    # The safety test: a Ready replica means somebody may be working in it.
+                    # A missing Deployment (first boot) reads as empty, which is also safe.
+                    ready=$(kubectl -n "$NS" get deploy "$DEPLOY" \
+                              -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+                    : "${ready:=0}"
+                    if [ "$ready" -gt 0 ] 2>/dev/null; then
+                      echo "  $APP is OutOfSync, but the desktop has ${ready} READY replica(s) —"
+                      echo "    somebody may be logged in. Leaving the change for a human to sync"
+                      echo "    from the ArgoCD UI. (This is the normal, expected outcome.)"
+                      return 0
+                    fi
+
+                    echo "  $APP is OutOfSync and the desktop has NO ready replica — nothing to"
+                    echo "    disturb, so syncing it automatically."
+                    # ⚠ NO `revision` IN THE SYNC. remote-desktop is a MULTI-SOURCE app (helm
+                    # chart + a values ref + this repo's directory), and a single revision field
+                    # cannot describe three sources: ArgoCD accepts the operation, reports
+                    # "successfully synced", and applies CACHED manifests. Measured 2026-09-03 —
+                    # `revision: HEAD` reported `deployment.apps/remote-desktop-gvisor
+                    # serverside-applied` while neither the new label nor `replicas: 1` reached
+                    # the cluster. An EMPTY sync block means "each source's own targetRevision",
+                    # which is what we want, and it applied correctly.
+                    # ⚠ Kept for the SINGLE-source app too: an empty block is correct for both,
+                    # and a divergence here is how the bug above gets reintroduced.
+                    #
+                    # initiatedBy WITHOUT automated:true on purpose: ArgoCD decides manual-vs-auto
+                    # from that flag alone (controller/sync.go: isManual = !InitiatedBy.Automated),
+                    # and this sync is a deliberate act, not drift correction.
+                    kubectl -n argocd-apps patch application "$APP" --type merge -p \
+                      '{"operation":{"sync":{},"initiatedBy":{"username":"desktop-rollout (desktop was down)"}}}'
+                    echo "  sync requested."
+                  }
+                  check_one || echo "  ERROR checking $APP — continuing with the next desktop." >&2
+                done
+                # ⚠ ALWAYS 0. The loop body runs in a `|`-subshell, so nothing it sets can be
+                # read here anyway — and a desktop that could not be checked is a condition to
+                # report, not a failed CronJob: the next run five minutes later retries it,
+                # and a failing Job would only add noise that hides a real problem.
+                exit 0

@@ -1,0 +1,464 @@
+# ArgoCD Sync hook: give the appliance a real, long-lived self-signed TLS certificate
+# and bind it to the web UI.
+#
+# WHY SELF-SIGNED AND NOT THE CLUSTER WILDCARD. The obvious idea — import
+# argocd-infra/wildcard-tls — fails on three independent counts, and each one alone is
+# fatal:
+#   1. NAME. Every automated consumer reaches the appliance at the LITERAL IP
+#      192.168.1.237 (project_settings fileserver.endpoint, deliberately — the AD zone
+#      publishes the on-prem DC's MESH address, so resolving by name would route LAN
+#      traffic over the overlay). No wildcard can cover an IP literal, and Let's Encrypt
+#      will not issue for a private address. A cert that does not name what clients dial
+#      is not verifiable no matter who signed it.
+#   2. LIFETIME. The wildcard is `*.<subdomain>.<domain>` and the subdomain changes on
+#      every cluster recreate. The appliance OUTLIVES cluster
+#      generations — it is the one box in this design that is not disposable. Binding its
+#      UI cert to a per-generation name means the UI serves a stale cert the moment the
+#      cluster is recreated, which is exactly backwards.
+#      Note the Job as written cannot fail that way — it never reads the wildcard — but
+#      the temptation is real and this is the reason not to.
+#   3. CUSTODY. Importing the wildcard copies its PRIVATE KEY onto an appliance outside
+#      the cluster's secret management, where nothing rotates or revokes it. That key
+#      fronts every app in the cluster; the appliance UI is not worth that blast radius.
+#
+# So: a cert scoped to this box, naming every address it is actually reached by, valid
+# well past any single cluster generation. It is self-signed, which means clients still
+# do not verify it by default — see "WHAT THIS DOES AND DOES NOT BUY" below.
+#
+# ⚠ 25.10 CANNOT MINT A SELF-SIGNED CERT FOR YOU. Verified against `core.get_methods` on
+# the live appliance (25.10.4), not from docs — re-check on a major upgrade:
+#   - `certificate.create.create_type` enumerates exactly
+#     CERTIFICATE_CREATE_IMPORTED / _CSR / _IMPORTED_CSR / _ACME.
+#     There is NO CERTIFICATE_CREATE_INTERNAL — the self-signed path older recipes use
+#     was removed.
+#   - There is NO `certificateauthority.*` namespace at all any more.
+# Consequence: the keypair is generated HERE, in the pod, and imported as
+# CERTIFICATE_CREATE_IMPORTED. That is not a workaround, it is the only remaining road.
+# ACME is not an option either: it needs a publicly-resolvable name and reachable
+# http-01/dns-01 for a box that is LAN-only.
+#
+# ⚠ WHY `cryptography` IS INSTALLED HERE WHEN NOTHING ELSE IN THIS APP INSTALLS ANYTHING.
+# configure-job.yaml is proudly dependency-free (see its header: no pip, no egress on the
+# critical path). This Job breaks that rule because generating an X.509 cert by hand is
+# not a "few dozen lines of wire protocol" — it is ASN.1, and hand-rolling it is how you
+# get a subtly malformed cert that some clients accept and others reject.
+# The cost is bounded and understood:
+#   - It runs ONCE PER CERT LIFETIME (~10 years), not on every sync. The idempotence gate
+#     below exits before the import on every ordinary run.
+#   - pip needs egress, and this pod is LAB-PINNED. ⚠ THE APPLIANCE'S OWN RESOLVER IS NOT
+#     THE POD'S — the pod uses cluster DNS, so a wedged appliance resolver (single
+#     nameserver = the on-prem DC, no fallback; see configure-job step 2) does NOT block
+#     this. But lab egress is filtered (see the webfilter note in the repo memory), so if
+#     the install fails, that is why, and the failure is loud rather than silent.
+#
+# ⚠ SYNC HOOK AT WAVE 2, AFTER configure-job (wave 1). Ordering is load-bearing: step 1 of
+# configure-job sets the appliance hostname to fs-1, and this cert names fs-1. Minting a
+# cert for a name the box does not yet answer to would produce a correct-looking cert that
+# mismatches on day one. Same Replace=true reasoning as configure-job (a Job's
+# spec.template is immutable under ServerSideApply).
+#
+# ⚠ SAME NAMESPACE AND NODE CONSTRAINTS AS configure-job, for the same reasons.
+# It runs in samba-ad because that is where the truenas-admin credential is sealed for
+# this app's Jobs (truenas/sealSecrets.sh seals both copies), and it MUST land on a lab
+# node: cloud pods cannot reach 192.168.1.0/24. Without the ecc/mesh toleration the pod
+# stays Pending FOREVER rather than failing — the worst diagnostic outcome.
+#
+# ⚠ ONE PROCESS, ONE WEBSOCKET, ONE AUTH — the appliance rate-limits at 20 auth attempts
+# per 60s then locks out for TEN MINUTES. backoffLimit is 1 for that reason, exactly as in
+# configure-job.
+#
+# WHAT THIS DOES AND DOES NOT BUY.
+#   DOES: a stable, long-lived identity for the box, naming every address it is reached
+#         by; an end to the "expires 2027" default cert; a fingerprint that can be pinned;
+#         and a cert that survives cluster recreates untouched.
+#   DOES NOT: make `verify_mode = CERT_NONE` in tnclient.py safe to remove. A self-signed
+#         cert is not verifiable without distributing its CA. tnclient.py keeps
+#         verification OFF and keeps relying on the LAN-locality argument in its header.
+#         ⚠ DO NOT flip tnclient.py to CERT_REQUIRED because this Job exists — it will
+#         fail, and the reason will not be obvious from the traceback.
+#
+# ⚠ THE UI RESTARTS WHEN THE CERT IS BOUND. system.general.ui_restart drops every active
+# HTTP session on the appliance, including this Job's own websocket if it were still
+# talking. The bind is therefore the LAST thing done, the restart is fired after all API
+# work is complete, and it is deliberately NOT awaited (there is nothing to wait for — the
+# server we would ask has just been restarted).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truenas-certificate-src
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # ⚠ Hook resources order by HOOK-WEIGHT, not sync-wave. A PreSync/Sync Job that mounts
+    # a ConfigMap carrying only a sync-wave annotation fails "configmap not found" —
+    # the ConfigMap has to win on the hook ordering, not the wave ordering.
+    argocd.argoproj.io/sync-wave: "2"
+data:
+  certificate.py: |
+    """Mint a long-lived self-signed cert for the appliance and bind it to the web UI.
+
+    Read-before-write, like configure.py: three outcomes (absent / drifted / correct), so a
+    second run is provably a no-op. NEVER "create and ignore the error" — that hides real
+    failures.
+
+    The idempotence gate is the whole design. Importing on every sync would mint a new
+    keypair every few minutes, pile up certificate rows, and restart the UI each time.
+    """
+    import datetime, ipaddress, os, sys
+
+    sys.path.insert(0, "/src")
+    from tnclient import TrueNAS
+
+    HOST      = os.environ["TN_HOST"]
+    USER      = os.environ["TN_USER"]
+    PASSWORD  = os.environ["TN_PASS"]
+    CERT_NAME = os.environ["CERT_NAME"]              # ecc_fs1_selfsigned
+    FQDN      = os.environ["FS_FQDN"]                # fs-1.ad.base.internal
+    HOSTNAME  = os.environ["FS_HOSTNAME"]            # fs-1
+    ENDPOINT  = os.environ["TN_ENDPOINT"]            # 192.168.1.237
+    DAYS      = int(os.environ["CERT_DAYS"])
+    RENEW_AT  = int(os.environ["CERT_RENEW_DAYS"])   # re-mint when fewer days remain
+    BIND      = os.environ.get("BIND_UI", "false").lower() == "true"
+
+    def desired_names():
+        """Every address a client legitimately dials. Order is stable so the drift check
+        below compares like with like.
+
+        ⚠ THE IP SAN IS THE LOAD-BEARING ONE, not the DNS names. Every automated consumer
+        (configure-job, eda-fileserver's provisioner, csi-driver-nfs) connects to the
+        LITERAL IP — see project_settings fileserver.endpoint and its comment. A cert with
+        only DNS names would mismatch for all of them. `localhost` is kept because the
+        appliance's own middleware dials itself.
+        """
+        dns = [FQDN, HOSTNAME, "localhost"]
+        ips = [ENDPOINT, "127.0.0.1"]
+        # Dedupe while preserving order — FQDN and HOSTNAME coincide if the domain is empty.
+        seen, out = set(), []
+        for n in dns:
+            if n and n not in seen:
+                seen.add(n)
+                out.append("DNS:" + n)
+        for i in ips:
+            if i and i not in seen:
+                seen.add(i)
+                out.append("IP:" + i)
+        return out
+
+    def norm_sans(entries):
+        """⚠ THE APPLIANCE AND THIS SCRIPT SPELL IP SANs DIFFERENTLY.
+
+        `desired_names()` emits `IP:192.168.1.237` (the spelling `generate()` parses), but
+        `certificate.query` returns `IP Address:192.168.1.237`. Comparing the two literally
+        NEVER matches, so every run decides "SANs drifted" and mints a fresh certificate —
+        measured 2026-09-02, 14 accumulated `ecc_fs1_selfsigned-*` rows, one per run, none of
+        them ever pruned. The log line even prints both lists side by side; they look
+        identical unless you notice the prefix.
+
+        Normalise to one spelling before comparing. Do NOT "fix" this by changing
+        `desired_names()` instead: `generate()` splits on the first ':' and would then read
+        the SAN type as "IP Address", fall through to the DNS branch, and mint a
+        certificate whose IP SAN is a DNS name.
+        """
+        return sorted(e.replace("IP Address:", "IP:") for e in (entries or []))
+
+    def find_cert(tn, name):
+        rows = tn.rpc("certificate.query", [[["name", "=", name]]])
+        return rows[0] if rows else None
+
+    def days_left(row):
+        """`until` comes back as a C-locale string ('Sun Sep 19 16:36:38 2027'), not ISO.
+        Parsing it is what lets this Job renew rather than only create."""
+        raw = row.get("until")
+        if not raw:
+            return None
+        for fmt in ("%a %b %d %H:%M:%S %Y", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                until = datetime.datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            print(f"  WARNING: cannot parse expiry {raw!r} — treating as valid")
+            return None
+        return (until - datetime.datetime.now()).days
+
+    def generate(names):
+        """Self-signed keypair. Imported as CERTIFICATE_CREATE_IMPORTED because 25.10
+        removed the appliance-side self-signed path (see the manifest header)."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        # RSA-4096, not EC: certificate.create's key_length enum is {2048, 4096} and RSA is
+        # what every SMB/NFS/browser client on this LAN accepts without argument.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+        subject = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, FQDN),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "edge-cloud-cluster"),
+        ])
+        san = []
+        for entry in names:
+            kind, _, value = entry.partition(":")
+            san.append(x509.IPAddress(ipaddress.ip_address(value))
+                       if kind == "IP" else x509.DNSName(value))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)                      # self-signed: issuer == subject
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            # Backdated a day so a small clock skew between pod and appliance cannot make a
+            # freshly-minted cert "not yet valid" — a confusing failure right after import.
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=DAYS))
+            .add_extension(x509.SubjectAlternativeName(san), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        return (
+            cert.public_bytes(serialization.Encoding.PEM).decode(),
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).decode(),
+        )
+
+    def ui_cert_id(cfg):
+        """⚠ `system.general.config.ui_certificate` CHANGED SHAPE. 26.0 returns the bare
+        certificate id, 25.x returned the whole row. Reading `.get("id")` unconditionally
+        raises AttributeError on 26.0 — measured on fs-1 running 26.0.0-BETA.3. Accept
+        both spellings."""
+        v = cfg.get("ui_certificate")
+        return v.get("id") if isinstance(v, dict) else v
+
+    def main():
+        want = desired_names()
+        with TrueNAS(HOST, USER, PASSWORD) as tn:
+            info = tn.rpc("system.info")
+            print(f"appliance {info.get('hostname')} running {info.get('version')}")
+            print(f"desired SANs: {', '.join(want)}")
+
+            row = find_cert(tn, CERT_NAME)
+
+            # -- decide: absent / drifted / correct ---------------------------------
+            reason = None
+            if row is None:
+                reason = "absent"
+            else:
+                have = list(row.get("san") or [])
+                left = days_left(row)
+                if norm_sans(have) != norm_sans(want):
+                    reason = f"SANs drifted ({have} -> {want})"
+                elif left is not None and left < RENEW_AT:
+                    reason = f"expires in {left}d (< {RENEW_AT}d)"
+
+            if reason is None:
+                left = days_left(row)
+                print(f"  certificate '{CERT_NAME}': already correct"
+                      + (f" ({left}d remaining)" if left is not None else ""))
+            else:
+                print(f"  certificate '{CERT_NAME}': {reason} -> minting")
+                pem_cert, pem_key = generate(want)
+                # A NEW row is created and the old one deleted only AFTER the UI has been
+                # re-pointed. Deleting first would momentarily leave ui_certificate dangling
+                # on a box whose UI is the only recovery path if this Job then fails.
+                new_id = tn.job("certificate.create", [{
+                    "name": f"{CERT_NAME}-{datetime.datetime.now():%Y%m%d%H%M%S}"
+                            if row else CERT_NAME,
+                    "create_type": "CERTIFICATE_CREATE_IMPORTED",
+                    "certificate": pem_cert,
+                    "privatekey": pem_key,
+                    # Put it in the appliance's own trust store so middleware that dials
+                    # the box by name (and any future consumer that DOES verify) can chain
+                    # to it. Harmless for clients that ignore it.
+                    "add_to_trusted_store": True,
+                }])
+                cert_id = new_id if isinstance(new_id, int) else (new_id or {}).get("id")
+                if cert_id is None:
+                    # Fall back to a lookup: certificate.create is a job and older builds
+                    # return the row rather than the id.
+                    fresh = tn.rpc("certificate.query", [[["name", "!=", ""]]])
+                    cert_id = max((r["id"] for r in fresh), default=None)
+                if cert_id is None:
+                    raise RuntimeError("certificate imported but its id could not be resolved")
+                tn.changes.append(f"certificate {CERT_NAME}")
+                print(f"  imported as certificate id {cert_id}")
+                row = tn.rpc("certificate.get_instance", [cert_id])
+
+            # -- bind to the web UI --------------------------------------------------
+            restart_ui = False
+            if not BIND:
+                print("  ui binding: SKIPPED (BIND_UI is false)")
+            else:
+                current = ui_cert_id(tn.rpc("system.general.config"))
+                if current == row["id"]:
+                    print(f"  ui certificate: already bound to id {row['id']}")
+                else:
+                    print(f"  ui certificate: {current} -> {row['id']}")
+                    tn.rpc("system.general.update", [{"ui_certificate": row["id"]}])
+                    tn.changes.append("ui_certificate")
+                    restart_ui = True
+
+            # -- retire superseded copies -------------------------------------------
+            # ⚠ THIS RUNS ON EVERY PASS, not only when a certificate was just minted.
+            # It used to sit inside the rebind branch above, which meant it never ran at
+            # all with BIND_UI false — and by the time that was noticed the appliance held
+            # 12 orphaned `<CERT_NAME>-<timestamp>` rows from the SAN-comparison bug that
+            # `norm_sans` fixes. A cleanup that only fires while making a change cannot
+            # clean up a backlog, so it is its own unconditional step.
+            #
+            # Two safeties, because this deletes state on a box that outlives the cluster:
+            # it never touches whatever `ui_certificate` currently points at (re-read here
+            # rather than trusted from above, so a rebind that just happened is reflected),
+            # and `force` is deliberately NOT passed — a certificate still in use by a
+            # service must fail loudly instead of being yanked out from under it.
+            # Filtered client-side with startswith, not with a query operator: the same
+            # pattern the S3 converge uses, and one less appliance behaviour to depend on.
+            bound_id = ui_cert_id(tn.rpc("system.general.config"))
+            for old in [c for c in (tn.rpc("certificate.query") or [])
+                        if (c.get("name") or "").startswith(CERT_NAME)]:
+                if old["id"] == row["id"]:
+                    continue
+                if old["id"] == bound_id:
+                    print(f"  keeping certificate id {old['id']} — bound to the web UI")
+                    continue
+                try:
+                    tn.job("certificate.delete", [old["id"]])
+                    tn.changes.append(f"retired certificate {old['id']}")
+                    print(f"  retired superseded certificate id {old['id']}")
+                except Exception as exc:
+                    print(f"  WARNING: could not delete old cert "
+                          f"{old['id']}: {exc}")
+
+            if restart_ui:
+                # ⚠ LAST API CALL. This drops every HTTP session on the appliance,
+                # including the one we are speaking on. Nothing may follow it, and its
+                # result is deliberately not awaited — the server that would answer is
+                # the one restarting.
+                print("  restarting the appliance UI to pick up the certificate ...")
+                try:
+                    tn.rpc("system.general.ui_restart")
+                except Exception as exc:
+                    # The restart tearing down our own websocket is the EXPECTED
+                    # outcome, not a failure. Treating it as one would fail a Job that
+                    # in fact succeeded.
+                    print(f"  (connection dropped as expected: {exc})")
+
+            print()
+            if tn.changes:
+                print("CHANGED: " + ", ".join(tn.changes))
+            else:
+                print("NO CHANGES — certificate already converged (idempotent re-run)")
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: truenas-certificate
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # Weight 1: strictly after the ConfigMap above (weight 0) that it mounts.
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # ⚠ LOW ON PURPOSE — same reasoning as configure-job: a failed run has already spent
+  # auth attempts against the appliance's 20-per-60s limit, and a retry storm turns a
+  # small error into a ten-minute lockout of the whole appliance.
+  backoffLimit: 1
+  # RSA-4096 keygen plus a pip install; generous, but bounded so a wedged run cannot block
+  # the Application indefinitely.
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      # See the manifest header: this MUST run on the appliance's LAN. Cloud pods cannot
+      # reach 192.168.1.0/24, and without the toleration the pod stays Pending forever.
+      nodeSelector:
+        ecc/fileserver-lan: "true"  # automatically updated from project-settings:applicationPlacements.labels.fileserverLan
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: certificate
+          image: docker.io/library/python:3.14-slim # renovate: tracked by "Container image tags" regex (docker datasource)
+          # ⚠ The ONE pip install in this app. See the manifest header for why hand-rolling
+          # ASN.1 is the worse option. --no-cache-dir keeps the layer small; the version is
+          # pinned so a silent upstream change cannot alter what a "no-op" re-run would do.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir --quiet 'cryptography==46.0.3'
+              exec python3 /src/certificate.py
+          env:
+            - name: TN_HOST
+              # ⚠ THE LITERAL IP, deliberately — same value and same reasoning as
+              # project_settings fileserver.endpoint. Resolving the appliance by name would
+              # route LAN traffic over the mesh overlay, and on a first bring-up the AD zone
+              # may not answer at all.
+              value: "192.168.1.237" # automatically updated from project-settings:storage.fileserver.endpoint
+            - name: TN_ENDPOINT
+              value: "192.168.1.237" # automatically updated from project-settings:storage.fileserver.endpoint
+            - name: FS_FQDN
+              value: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+            - name: FS_HOSTNAME
+              value: "fs-1" # automatically updated from project-settings:storage.fileserver.hostname
+            # Stable, box-scoped name. NOT keyed on the cluster subdomain: the appliance
+            # outlives cluster generations and this cert must not be re-minted by a recreate.
+            - name: CERT_NAME
+              value: "ecc_fs1_selfsigned"
+            # ~10 years. Long on purpose: this is a self-signed cert for one LAN box whose
+            # trust comes from being pinned/imported by hand, not from a CA's schedule.
+            # A short lifetime would buy nothing and guarantee an outage the day it lapses.
+            - name: CERT_DAYS
+              value: "3650"
+            # Re-mint when under a year remains, so renewal happens during an ordinary sync
+            # long before anything breaks.
+            - name: CERT_RENEW_DAYS
+              value: "365"
+            # ⚠ BINDING IS GATED OFF BY DEFAULT, and this is the one switch to think about.
+            # Flipping it re-points the appliance's web UI at the new cert AND RESTARTS THE
+            # UI, dropping every active session. The cert import itself is harmless and
+            # reversible; the bind is what users notice. Turn it on deliberately, once the
+            # minted cert has been inspected in Credentials -> Certificates.
+            - name: BIND_UI
+              value: "false"
+            - name: TN_USER
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_USER }
+            - name: TN_PASS
+              valueFrom:
+                secretKeyRef: { name: truenas-admin, key: TRUENAS_ADMIN_PASSWORD }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            # RSA-4096 keygen is CPU-bound but brief; the memory ceiling covers pip.
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        # ⚠ TWO ConfigMaps: certificate.py from this file, tnclient.py from
+        # configure-job.yaml's ConfigMap. The client is NOT duplicated here — a third copy
+        # would need a third entry in check-tnclient.sh's drift check. Both are Sync hooks
+        # in the same namespace, so both exist when this Job runs.
+        - name: src
+          projected:
+            sources:
+              - configMap:
+                  name: truenas-certificate-src
+                  items: [{ key: certificate.py, path: certificate.py }]
+              - configMap:
+                  name: truenas-configure-src
+                  items: [{ key: tnclient.py, path: tnclient.py }]

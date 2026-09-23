@@ -1,0 +1,79 @@
+# ArgoCD Application: Nextcloud (vanilla official Helm chart).
+# Accessible at https://nextcloud.subdomain.domain.tld (alias files.subdomain.domain.tld...).
+# OIDC login via Authentik (oidc_login app, configured by PostSync job).
+# Bundled PostgreSQL + Redis; data on Longhorn; object store on Hetzner S3.
+#
+# Document editing: Collabora Online (richdocuments). The CODE backend is a SEPARATE
+# Application — app-of-apps/nextcloud-collabora.yaml, sync-wave 10, one ahead of this
+# one — because Collabora is a different vendor's product reached over WOPI, not a
+# subchart of the nextcloud chart. The PostSync job below depends on it being up.
+# Antivirus (ClamAV) is foreseen but disabled — enable via one-liner (see postsync job).
+#
+# Multi-source:
+#   1. Helm chart (nextcloud/nextcloud)
+#   2. ref source for $values
+#   3. Git directory for PostSync config job + sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nextcloud
+  namespace: argocd-apps
+  annotations:
+    # Explicit wave (was implicit 0) so nextcloud-collabora at wave 10 is ordered
+    # ahead of it — the PostSync job needs the WOPI backend already serving.
+    argocd.argoproj.io/sync-wave: "11"
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://nextcloud.github.io/helm/
+      chart: nextcloud
+      targetRevision: "9.2.6" # renovate: datasource=helm depName=nextcloud registryUrl=https://nextcloud.github.io/helm/
+      helm:
+        releaseName: nextcloud
+        valueFiles:
+          - $values/deployment/argocd-apps/nextcloud/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/nextcloud
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nextcloud
+  # Our postgres StatefulSet's volumeClaimTemplates get k8s-added defaults ArgoCD
+  # can't reconcile (immutable) — ignore that path to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+    # Gateway API server-defaults (parentRefs group/kind, backendRefs
+    # group/kind/weight) are API-owned; under ServerSideApply ArgoCD reads them
+    # as permanent drift and the app never leaves OutOfSync. The chart renders
+    # this route, so the drift shows up here rather than in a manifest we own.
+    # Only ever list fields the desired state does NOT declare — ignoreDifferences
+    # strips the path from the normalized LIVE state, so ignoring a field we do
+    # declare would CREATE drift instead of hiding it.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

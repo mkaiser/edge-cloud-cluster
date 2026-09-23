@@ -1,0 +1,37 @@
+# ArgoCD Application: external-dns (Hetzner DNS provider)
+# Automatically creates/updates DNS records from Ingress hostnames.
+# Requires the 'hetzner-dns-token' secret in the 'external-dns' namespace,
+# which is created by Pulumi (main.ts).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  sources:
+    - repoURL: https://kubernetes-sigs.github.io/external-dns/
+      chart: external-dns
+      targetRevision: "1.22.0"  # https://github.com/kubernetes-sigs/external-dns/releases
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/external-dns/values.yaml
+
+    # ref source so valueFiles ($values) can be resolved from the git repo
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: external-dns
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - SkipDryRunOnMissingResource=true
+      - ServerSideApply=true
+    automated:
+      prune: true
+      selfHeal: true      
+

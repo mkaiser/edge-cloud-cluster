@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: guacamole-pg-user
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: AgBuT9aFuJ18t2dfha9U71jM65z2QkrZteL4CFQIsbmmFPFkEuh/Ij13NdhWIRAa2ZdeZn8Bs9cnQv1zZZZmZpB6rlo/aEezte7+OIKmviJ+7iTg41J55s8kidpYCHAxsW8pRNxkYGUA7iU+gqOjfd31eW5u1Vy1OPqo+DuY0S78gGFfg/L4tIv+ycxUMh47yU0eTF04wdHkfUPg/R/hwRq34J8R6EyVV0mlj16NSs4KFB+X6zECNfwkOtEwAFo6POj6mjgWSqMutBjiUO9ZRqx1Wzpo3hOE5xTcXd3tFjjikTby7KYiyAT8cb3LmaFinK9O+YuxuZUulxdotYYq0FpMip17qvKrQJL9nQ21mmNQ/U/3hT1HFhH4qMVVvBjwgskM0JY9783HzS2nMY9HKMWgrK2nlYz39Hj4Efe5oGTpYDP2DcLAZHM7bxn+PWDMDqAT715yLPkvu0DLBlQPcLv0RyNqWx/fDb+0ffx7rw30P9aiHLzbb65u3mY34XEPox0zpYCa3nYf6FognuGA9RQHgO4AWoRWmkluyoiDFwoyraj95En7V4TbCbP5vWTozFwOSKYjAOtZJ4QJ7e0UFMQbOZ7Xna2ORTAF8rZKu45phobxhgwXKFN9TO8ybR3XgM8C14N0ohccnAda55ra3Ht1T74ymCMH5g7F0V9tb2bfxNHYIx2GXy5zkbyvZo8xVPX5ZnRq/DEZsJvlOWi6BXpt/ox4o/58UHHbRhAgA+ZkdO999bBRkuycsKRxPkxNyoY=
+    username: ""
+  template:
+    metadata:
+      name: guacamole-pg-user
+      namespace: remote-desktop

@@ -1,0 +1,16 @@
+# The `osxcar-sdv-switch` namespace as a PLAIN Sync-phase manifest.
+#
+# ⚠ NOT A HOOK. Every hook-delete-policy deletes the object and the default when the
+# annotation is absent is BeforeHookCreation — there is no policy meaning "keep". As a
+# PreSync hook a namespace deletes ITSELF on every sync, cascading away the namespaced
+# PreSync hooks inside it. See remote-desktop/namespace.yaml for the full post-mortem.
+#
+# The namespace the PreSync hook needs comes from `CreateNamespace=true`, which the
+# controller applies BEFORE it builds the PreSync task list — not from this file.
+# Wave -10 orders it ahead of everything else in the Sync phase.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: osxcar-sdv-switch
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"

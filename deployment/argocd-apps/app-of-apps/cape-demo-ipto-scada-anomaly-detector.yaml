@@ -1,0 +1,54 @@
+# ArgoCD Application: PostgreSQL backing the IPTO SCADA anomaly-detector demo.
+#
+# The demo is a Ryax workflow; this app deploys ONLY the database its `dbase` module
+# writes to. The workflow itself is not deployed from git — it is imported into Ryax
+# by its owners through the Ryax UI.
+#
+# ⚠ mesh tier. The database is pinned to the lab (ecc/site=unibi-hclab) and its volume
+# is carved from longhorn-unibi-ryax, the same storage scope the Ryax engine and its
+# execution pods use. It cannot run cloud-side, so there is nothing to bring up on a
+# cloud-only restore.
+#
+# BEFORE FIRST DEPLOY:
+#   deployment/argocd-apps/cape-demo/ipto-scada-anomaly-detector/sealSecrets.sh
+# The password is NOT generated — the workflow modules carry it compiled in, so the
+# script takes it from CAPE_DEMO_PG_PASSWORD or prompts. See the app's README.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cape-demo-ipto-scada-anomaly-detector
+  namespace: argocd-apps
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    placement.ecc/tier: mesh
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/cape-demo/ipto-scada-anomaly-detector
+    directory:
+      exclude: "{README.md,*.sh}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ryaxns-tools
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # namespace.yaml is a PreSync hook rather than relying on this, because the
+      # sealed secret is ALSO a PreSync hook and would otherwise run before the
+      # namespace exists. Kept on so the destination namespace is covered either way.
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # Retry forever, matching the other app-of-apps entries: a transient failure
+    # should not leave the app Failed until the next git change.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

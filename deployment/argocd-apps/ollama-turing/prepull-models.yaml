@@ -1,0 +1,129 @@
+# Model catalogue as a GitOps artifact.
+#
+# THIS is what makes the user-facing model list declarative. Ollama decides which model is
+# LOADED (on demand, per request, LRU-evicted); this ConfigMap decides which models are
+# PULLED and therefore offerable at all. A fresh node — or a recreated cluster — repopulates
+# itself from git instead of someone remembering a list of `ollama pull` commands.
+#
+# The list is sized for 8 GiB Turing cards (7.5 GiB usable; no FP8/NVFP4 on sm_75). The sizes
+# below are DOWNLOAD sizes; resident VRAM is smaller. Measured for the biggest entry:
+# qwen3.5:9b @ 8192 ctx = 5.6 GB resident, 34/34 layers on GPU, ~1.9 GiB spare.
+#
+# NOTE ON QWEN CODER: there is deliberately no `qwen*-coder` entry. The Qwen Coder line went
+# MoE-only (smallest is qwen3-coder:30b-a3b at ~19 GB) — and a MoE does NOT fit like its
+# active-parameter count suggests: all expert weights must be resident even though only ~3.3B
+# activate per token. qwen2.5-coder:7b would fit but is three generations stale. The current
+# general model beats it at this size, so qwen3.5:9b serves the coding role too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-turing-catalogue
+  namespace: ollama-turing
+data:
+  models: |
+    # One model ref per line. Blank lines and #-comments ignored.
+    # <ref>  # <approx Q4_K_M size> — role
+    qwen3.5:9b          # 6.6 GB dl / 5.6 GB resident — primary: chat, coding, tool-calling agents
+    qwen3.5:4b          # 3.4 GB dl — fast alternative; co-resides with a second model
+    qwen3.5:2b          # 2.7 GB dl — fast; co-resides with a second model. NOTE it is a
+                        # THINKING model and a weak instruction-follower at this size: it
+                        # burns hundreds of tokens reasoning, so a small max_tokens returns
+                        # finish_reason=length with EMPTY content. Not a routing fault. Give
+                        # it a large budget, or pass think=false. Use 9b for agents/tools.
+    # NOT prepulled: qwen2.5-coder:14b-instruct-q5_K_M (12 GB resident). It is the best
+    # coder that stays 100% GPU here, but ONLY in the 1-replica x nvidia.com/gpu:2
+    # layer-split mode — it does not fit one 8 GiB card. Pulling it in the default 2x1-GPU
+    # mode would burn 9 GB of the store for a model that cannot load. Measured 49/49 layers,
+    # 4809/4696 MiB across the two cards; q6_K misses by ONE layer (4% CPU spill).
+    nomic-embed-text    # 0.3 GB dl — embeddings for Open WebUI RAG (small, keep resident)
+---
+# PostSync (not PreSync): the Deployment must be up to serve /api/pull, and a slow multi-GB
+# download must not hold the sync open before the app is usable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-turing-prepull
+  namespace: ollama-turing
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # BeforeHookCreation, so a re-sync replaces the old Job instead of colliding with its
+    # immutable spec.template (cf. the failed-hook-Job wedge: a retained failed Job makes new
+    # commits silently re-run the OLD pod spec).
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # Bounded retries: a HuggingFace/registry hiccup should retry, not spin forever.
+  backoffLimit: 3
+  # 2h: the first pull on a fresh node is ~10 GB total over the lab uplink.
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      # Runs against the Service, so it needs no GPU and must NOT take one — a GPU request
+      # here would sit Pending behind the two serving replicas forever.
+      #
+      # Pinned to the SAME node anyway: the pull writes into the shared hostPath model store
+      # via the server, and keeping the (multi-GB) transfer on the node that stores it avoids
+      # a pointless WireGuard round-trip. Without this it tolerates every GPU taint and can
+      # land on the Thor, which works but drags the download across the mesh.
+      nodeSelector:
+        ecc/gpu-model: nvidia-turing-sm75  # automatically updated from project-settings:applicationPlacements.labels.gpuModel
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: prepull
+          image: docker.io/ollama/ollama:0.34.1 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # Drive the RUNNING server over the Service; do not start a second one.
+            - name: OLLAMA_HOST
+              value: http://ollama-turing.ollama-turing.svc:11434
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              echo "Waiting for the ollama-turing Service to answer..."
+              i=0
+              until ollama list >/dev/null 2>&1; do
+                i=$((i+1))
+                [ "$i" -gt 60 ] && { echo "ERROR: server not reachable after 5m" >&2; exit 1; }
+                sleep 5
+              done
+              echo "Server is up. Present models:"
+              ollama list 2>/dev/null || true
+
+              rc=0
+              # Strip comments, then pull each ref. Per-model failure is a WARNING, not a Job
+              # failure: one unavailable tag must not block the rest of the catalogue (and a
+              # failed hook Job would wedge later syncs).
+              sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' /catalogue/models | while read -r ref; do
+                ref=$(echo "$ref" | tr -d '[:space:]')
+                [ -z "$ref" ] && continue
+                echo "=== pull $ref ==="
+                if ollama pull "$ref"; then
+                  echo "ok: $ref"
+                else
+                  echo "WARN: failed to pull $ref (continuing)" >&2
+                fi
+              done
+
+              echo "=== catalogue after prepull ==="
+              ollama list 2>/dev/null || true
+              exit $rc
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: catalogue
+          configMap:
+            name: ollama-turing-catalogue

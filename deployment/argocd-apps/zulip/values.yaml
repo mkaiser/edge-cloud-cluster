@@ -1,0 +1,160 @@
+# Zulip Helm values (docker-zulip/helm/zulip chart).
+#
+# Auth: Authentik OIDC via GenericOpenIdConnectBackend. Email/password login disabled.
+# Storage: self-managed datastores (datastores.yaml) — PostgreSQL (zulip image),
+# Redis, RabbitMQ, Memcached — replacing the chart's bitnami sub-charts.
+# Files: Hetzner S3 (<clusterprefix>-zulip uploads, <clusterprefix>-zulip-avatars).
+#
+# Secrets (NOT in git):
+#   zulip-oidc-client-secret  — key SECRET_social_auth_oidc_secret (sealed by authentik/sealSecrets.sh)
+#   zulip-s3                  — keys access-key / secret-key (sealed by deployment/argocd-apps/zulip/sealSecrets.sh)
+#   zulip-secret-key          — key secret-key / Django SECRET_KEY (sealed by deployment/argocd-apps/zulip/sealSecrets.sh)
+
+zulip:
+  environment:
+    SETTING_EXTERNAL_HOST: "zulip.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+    SETTING_ZULIP_ADMINISTRATOR: "no-reply@your-domain.tld" # automatically updated from project-settings:mail.senderEmail
+
+    # Trust the in-cluster reverse proxy (the Gateway data plane, which terminates TLS
+    # and forwards plain HTTP with X-Forwarded-* headers). Without this, docker-zulip's
+    # nginx doesn't mark forwarded requests secure, so Zulip's middleware raises
+    # ProxyMisconfigurationError → HTTP 500 on every API request through the ingress
+    # (broke zulip-sync-users). Written to zulip.conf [loadbalancer] ips by the
+    # entrypoint. Covers the pod CIDR (X-Forwarded-For gateway 10.42.x) and the
+    # node private network (the host-network Envoy DaemonSet at 10.0.0.x).
+    LOADBALANCER_IPS: "10.42.0.0/16,10.0.0.0/16" # automatically updated from project-settings:network.trustedProxyCidrs
+
+    # Required by the chart schema
+    SECRETS_secret_key:
+      valueFrom:
+        secretKeyRef:
+          name: zulip-secret-key
+          key: secret-key
+
+    # OIDC via Authentik — fully declarative, no wizard needed.
+    # Bare backend class name only: the docker-zulip entrypoint prepends
+    # "zproject.backends." itself (AUTHENTICATION_BACKENDS += ('zproject.backends.<X>',)).
+    # Passing the full dotted path double-prefixes it →
+    # ModuleNotFoundError: No module named 'zproject.backends.zproject'.
+    ZULIP_AUTH_BACKENDS: "GenericOpenIdConnectBackend"
+    # auto_signup True → a first-time SSO login auto-provisions the Zulip account
+    # from the Authentik identity. This is NOT self-registration: only people an
+    # admin has created in Authentik can authenticate. Email/password signup is
+    # off because OIDC is the only auth backend. (The sync-users CronJob also
+    # mirrors the Authentik "employees" group + deactivates removed users.)
+    # NOTE: docker-zulip emits this SETTING_ as RAW PYTHON appended to the
+    # generated prod_settings.py (booleans render unquoted), so the dict must carry
+    # the client "secret" itself — GenericOpenIdConnectBackend.check_config()
+    # requires oidc_url + client_id + secret, and this assignment OVERRIDES Zulip's
+    # built-in IdP dict that would otherwise load it. get_secret() is imported at the
+    # top of that file and reads social_auth_oidc_secret from zulip-secrets.conf
+    # (populated by SECRETS_social_auth_oidc_secret below). Without the secret key
+    # the OIDC login page 500s with "backend is not configured correctly".
+    # NOTE: must be a single-line plain scalar (NOT a >- folded block). In a folded
+    # block YAML does not treat `#` as a comment, so the "automatically updated"
+    # anchor would fold into the value and break Python (SyntaxError: '{' was never
+    # closed). On one line the trailing `#` is a real YAML comment and is stripped.
+    SETTING_SOCIAL_AUTH_OIDC_ENABLED_IDPS: '{"authentik": {"oidc_url": "https://id.subdomain1.your-domain.tld/application/o/zulip/", "display_name": "Login with Authentik", "client_id": "zulip", "secret": get_secret("social_auth_oidc_secret"), "auto_signup": True}}' # automatically updated from project-settings:{general.subdomain,general.domain}
+
+    # The OIDC backend (GenericOpenIdConnectBackend.oidc_config → social-core
+    # get_json → request, which reads VERIFY_SSL) fetches Authentik's discovery,
+    # token and userinfo endpoints server-side. The LE-staging cert is untrusted,
+    # so verification must be off while testing; updateConfigFromProjectSettings.sh
+    # flips this to "True" for letsencrypt-prod.
+    SETTING_SOCIAL_AUTH_VERIFY_SSL: "True" # automatically updated from project-settings:{tls.certIssuerType,tls.verifySsl}
+    SECRETS_social_auth_oidc_secret:
+      valueFrom:
+        secretKeyRef:
+          name: zulip-oidc-client-secret
+          key: SECRET_social_auth_oidc_secret
+
+    # Hetzner S3 (path-style required for non-AWS endpoints)
+    SETTING_S3_AUTH_UPLOADS_BUCKET: "edgecloudinfra-zulip" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+    SETTING_S3_AVATAR_BUCKET: "edgecloudinfra-zulip-avatars" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+    SETTING_S3_ENDPOINT_URL: "https://nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+    SETTING_S3_REGION: "nbg1" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+    SETTING_S3_ADDRESSING_STYLE: "path"
+
+    SECRETS_s3_key:
+      valueFrom:
+        secretKeyRef:
+          name: zulip-s3
+          key: access-key
+    SECRETS_s3_secret_key:
+      valueFrom:
+        secretKeyRef:
+          name: zulip-s3
+          key: secret-key
+
+    # Email — required for notifications; password in zulip-secret-key (email-password key)
+    SETTING_EMAIL_HOST: "subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain,general.tld}
+    SETTING_EMAIL_HOST_USER: "no-reply@your-domain.tld" # automatically updated from project-settings:mail.senderEmail
+    SETTING_EMAIL_PORT: "587"
+    SETTING_EMAIL_USE_TLS: "True"
+    SETTING_EMAIL_USE_SSL: "False"
+
+    # Disable local password auth — OIDC only
+    SETTING_ENABLE_PASSWORD_RESET_FLOW: "False"
+
+    # Hide the "Register" button on the login page. With OIDC-only auth and
+    # invite_required=True the button was harmless but confusing — it just
+    # showed "you must be invited". Setting this to True removes the button.
+    SETTING_REGISTER_LINK_DISABLED: "True"
+
+    # Limit stale session window — users deactivated in Authentik lose access within 8 h
+    SETTING_SESSION_COOKIE_AGE: "28800"
+
+# Chart 2.1.0 has no Gateway API support — routing is an HTTPRoute in
+# httproute.yaml beside this file, which also documents why the former
+# proxy-body-size: 100M cap has no Gateway API equivalent.
+ingress:
+  enabled: false
+
+# Bundled bitnami sub-charts are DISABLED — replaced by self-managed datastores
+# (deployment/argocd-apps/zulip/datastores.yaml) on official/Zulip-published images, since
+# the chart's bitnami subcharts use the unmaintained bitnamilegacy catalog.
+# PostgreSQL keeps Zulip's own zulip/zulip-postgresql image (required FTS plugins).
+postgresql:
+  enabled: false
+redis:
+  enabled: false
+rabbitmq:
+  enabled: false
+memcached:
+  enabled: false
+
+# External datastores (our datastores.yaml). Passwords reuse the existing sealed
+# secrets; redis + memcached run without auth (internal-only).
+externalPostgresql:
+  host: zulip-postgresql
+  port: 5432
+  database: zulip
+  user: zulip
+  password:
+    valueFrom:
+      secretKeyRef:
+        name: zulip-postgresql
+        key: password
+
+externalRedis:
+  host: zulip-redis
+  port: 6379
+  # No auth (internal-only); chart schema requires the key when redis.enabled=false.
+  password: ""
+
+externalRabbitmq:
+  host: zulip-rabbitmq
+  port: 5672
+  user: zulip
+  password:
+    valueFrom:
+      secretKeyRef:
+        name: zulip-rabbitmq-auth
+        key: rabbitmq-password
+
+externalMemcached:
+  host: zulip-memcached
+  port: 11211
+  user: ""
+  # No auth (internal-only); chart schema requires the key when memcached.enabled=false.
+  password: ""

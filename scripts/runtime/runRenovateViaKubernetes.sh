@@ -3,8 +3,8 @@
 # Creates a one-off Job from the 'renovate' CronJob and (by default) follows its logs.
 #
 # Usage:
-#   ./scripts/misc/runRenovateNow.sh            # run + follow logs
-#   ./scripts/misc/runRenovateNow.sh --no-logs  # run, don't follow
+#   ./scripts/runtime/runRenovateViaKubernetes.sh            # run + follow logs
+#   ./scripts/runtime/runRenovateViaKubernetes.sh --no-logs  # run, don't follow
 #
 # Requires a working kubeconfig (KUBECONFIG or ~/.kube/config; falls back to
 # scripts/runtime/getKubeConfig.sh if the cluster is unreachable).

@@ -1,0 +1,223 @@
+# Authentik integration for Ryax — group + access policy + portal tile, managed
+# entirely from this folder via the Authentik API (self-contained per-app model;
+# copied from deployment/argocd-apps/remote-desktop/authentik-provider.yaml).
+#
+#   PostSync  job → create the `ryax` group + `access-ryax` expression policy,
+#                   then the "Ryax" application (tile, group "Development")
+#                   bound to that policy.
+#   PreDelete job → delete the application + its binding on app removal. The
+#                   `ryax` group and `access-ryax` policy are intentionally left
+#                   in place (they may carry user memberships).
+#
+# NO OAuth2 provider: Ryax has its OWN username/password auth
+# (RYAX_DEFAULT_USER_*, from the ryax-admin-credentials sealed secret) and no
+# OIDC support in its charts, so this is a LINK-ONLY tile plus an access policy —
+# not SSO. meta_launch_url just points a user at the Ryax login page.
+#
+# Replaces the former deployment/manual/ryax/{add,remove}AuthentikTile.sh, which
+# (a) only ran under the manual install path — the ArgoCD app's git-directory
+# source excludes *.sh, so under ArgoCD Ryax got no tile at all, (b) created no
+# group or policy, (c) derived its hostname from an Ingress object, which no
+# longer exists under Gateway API, and (d) authenticated with the SUPERUSER
+# bootstrap token. This manifest is applied by BOTH paths.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace) — it can write providers/applications/bindings/groups/policies
+# but NOT users, flows or secrets.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ryax-authentik
+  namespace: ryaxns
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ryax-authentik-token-read
+  namespace: ryaxns
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ryax-authentik-token-read
+  namespace: ryaxns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ryax-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: ryax-authentik
+    namespace: ryaxns
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-authentik-provider
+  namespace: ryaxns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ryax-authentik
+      # Ryax itself runs on the unibi-hclab mesh nodes, but this job only talks to
+      # the Authentik API — keep it on the control plane like the other
+      # provisioning jobs so it does not need the mesh toleration.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PUBLIC_URL
+              value: "https://ryax.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n ryaxns \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              # `ryax` access group (idempotent).
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              GRP_PK=$(first_pk "core/groups/?name=ryax")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'ryax'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"ryax","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "ryax group pk=$GRP_PK"
+
+              # access-ryax expression policy (idempotent).
+              POL_PK=$(first_pk "policies/expression/?name=access-ryax")
+              POL_EXPR='groups = set(request.user.groups.values_list("name", flat=True))
+              return bool(groups & {"ryax", "authentik-admins"})'
+              POL_PAYLOAD=$(POL_EXPR="$POL_EXPR" python3 -c "
+              import json, os
+              print(json.dumps({'name':'access-ryax','execution_logging':False,'expression':os.environ['POL_EXPR']}))
+              ")
+              if [ -z "$POL_PK" ]; then
+                echo "Creating expression policy 'access-ryax'..."
+                POL_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating expression policy 'access-ryax' (pk=$POL_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/${POL_PK}/" >/dev/null
+              fi
+              echo "access-ryax policy pk=$POL_PK"
+
+              # Application tile. No 'provider' key — link-only, no OIDC.
+              APP_PAYLOAD=$(PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Ryax',
+                'slug': 'ryax',
+                'group': 'Development',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                'meta_icon': 'https://raw.githubusercontent.com/RyaxTech/ryax-engine/master/docs/docs/_static/ryax-icon.png',
+              }))
+              ")
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404.
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app ryax "Ryax" "$APP_PAYLOAD"
+
+              # Bind access-ryax policy (idempotent).
+              APP_PK=$(first_pk "core/applications/?slug=ryax")
+              if [ -n "$APP_PK" ] && [ -n "$POL_PK" ]; then
+                BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                  echo "  binding access-ryax policy to Ryax"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              fi
+
+              echo "ryax Authentik tile + group/policy configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ryax-authentik-provider-cleanup
+  namespace: ryaxns
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ryax-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n ryaxns \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'ryax'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/ryax/" >/dev/null 2>&1 || true
+
+              # `ryax` group + access-ryax policy intentionally kept (user memberships).
+              echo "ryax Authentik cleanup done."

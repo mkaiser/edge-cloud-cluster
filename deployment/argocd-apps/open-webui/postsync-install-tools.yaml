@@ -1,0 +1,228 @@
+# PostSync: install the Open WebUI Tools from git, so a cluster recreate does not need a
+# human pasting Python into the web UI.
+#
+# WHY THE REST API AND NOT A DB INSERT
+# ------------------------------------
+# The `tool` table has a `specs` column that is COMPUTED AT WRITE TIME and never recomputed
+# on read (routers/tools.py calls get_tool_specs on create/update only; get_tools just reads
+# the column). Its shape comes from LangChain's convert_to_openai_function at a PINNED
+# version plus two Open WebUI cleanup passes — so hand-computing it in psql would rot on any
+# image bump, and a wrong value fails QUIETLY: `ToolModel.specs` is a required list[dict], so
+# one bad row makes get_tools() fail validation and return [], hiding EVERY tool. That is the
+# same class of bug already recorded for a NULL user_id in the `model` table
+# (postsync-hide-wildcard-model.yaml).
+#
+# POST /api/v1/tools/create computes specs server-side AND validates the module by actually
+# executing it, so the row is always correct for the running image. That is worth the extra
+# moving parts.
+#
+# Other options considered and rejected:
+#   * A directory/ConfigMap of .py files picked up at boot — DOES NOT EXIST. There is no
+#     TOOLS_DIR anywhere in the backend; load_tool_module_by_id reads only from the DB.
+#   * TOOL_SERVER_CONNECTIONS (external OpenAPI tool servers) — declarative, but only takes
+#     effect on a VIRGIN DB (Config.seed_defaults skips existing keys), and would mean
+#     rewriting both tools as an HTTP service, losing Valves and __user__/__event_emitter__.
+#   * An Open WebUI API key — ENABLE_API_KEYS defaults FALSE, and turning it on widens the
+#     auth surface cluster-wide just to bootstrap two rows.
+#
+# AUTH: a short-lived JWT signed with WEBUI_SECRET_KEY, the same sealed secret the app itself
+# uses. Runs in the app's own image so `from open_webui.utils.auth import create_token` is
+# the app's own code rather than a reimplementation of its token format.
+#
+# The tool must be owned by a REAL admin user (see the specs note above), and on an OIDC-only
+# instance nobody exists until someone logs in. That is not a failure: the Job exits 0 with a
+# message and the next sync installs them.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-install-tools
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # BeforeHookCreation, not HookSucceeded: a FAILED Job left behind makes spec.template
+    # immutable, so later commits silently re-run the OLD pod spec
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  template:
+    metadata:
+      name: open-webui-install-tools
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: install
+          # The app's own image: it already has open_webui on the path plus psycopg2.
+          image: ghcr.io/open-webui/open-webui:v0.11.3  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: OWUI_URL
+              value: "http://open-webui.open-webui.svc:8080"
+            - name: TOOLS_DIR
+              value: /tools
+            - name: OWUI_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              value: "postgresql://open-webui:$(OWUI_DB_PASSWORD)@open-webui-pg-rw:5432/open-webui"
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: secret-key
+          command: ["python3", "/scripts/install_tools.py"]
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: tools
+          configMap:
+            name: open-webui-tools
+        - name: scripts
+          configMap:
+            name: open-webui-install-tools-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: open-webui-install-tools-script
+  namespace: open-webui
+  # A PLAIN resource, like tools-configmap.yaml and for the same reason: hook resources are
+  # not drift-compared, so an edit to this script would leave the cluster running the old one
+  # while ArgoCD reported Synced. Negative wave keeps it ahead of the PostSync Job that mounts it.
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  install_tools.py: |
+    import datetime, json, os, sys, time, urllib.error, urllib.request
+
+    sys.path.insert(0, "/app/backend")
+    from open_webui.utils.auth import create_token  # noqa: E402
+
+    BASE = os.environ.get("OWUI_URL", "http://open-webui.open-webui.svc:8080")
+    TOOLS_DIR = os.environ.get("TOOLS_DIR", "/tools")
+
+    # Wait for the API. A PostSync hook can start before the new pod is serving, and on a fresh
+    # cluster the first boot also runs migrations.
+    def wait_ready(tries=60, delay=5):
+        for i in range(tries):
+            try:
+                with urllib.request.urlopen(f"{BASE}/health", timeout=5) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:
+                pass
+            print(f"waiting for open-webui ({i+1}/{tries})", flush=True)
+            time.sleep(delay)
+        return False
+
+
+    def admin_id(conn_str_env="DATABASE_URL"):
+        """Install AS an existing admin.
+
+        A tool row needs a real user_id: Open WebUI's ToolModel requires it, and a bogus value
+        would make get_tools() fail pydantic validation and return [] — silently hiding EVERY
+        tool, the same failure mode already recorded for the model table's NULL user_id.
+        So pick the oldest admin rather than inventing a sentinel.
+        """
+        import psycopg2
+        from urllib.parse import urlparse
+
+        u = urlparse(os.environ[conn_str_env])
+        c = psycopg2.connect(
+            dbname=u.path[1:], user=u.username, password=u.password,
+            host=u.hostname, port=u.port or 5432,
+        )
+        cur = c.cursor()
+        cur.execute("select id from \"user\" where role='admin' order by created_at limit 1")
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+    def api(tok, path, body=None, method="GET"):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            f"{BASE}{path}", data=data, method=method,
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.load(r)
+
+
+    def main():
+        if not wait_ready():
+            print("open-webui did not become ready", file=sys.stderr)
+            return 1
+
+        uid = admin_id()
+        if not uid:
+            # OIDC-only instance: nobody has logged in yet, so there is no user to own a tool.
+            # Exit 0 — this is a normal state on a fresh cluster, not a failure. The next sync
+            # after the first admin login installs the tools.
+            print("no admin user yet (nobody has logged in) — skipping, will install on a later sync")
+            return 0
+
+        # Short-lived token signed with WEBUI_SECRET_KEY, which this Job already needs to mount.
+        # Deliberately NOT an API key: ENABLE_API_KEYS defaults false and turning it on widens
+        # the auth surface cluster-wide just to bootstrap two rows.
+        tok = create_token(data={"id": uid}, expires_delta=datetime.timedelta(minutes=15))
+
+        existing = {t["id"] for t in api(tok, "/api/v1/tools/")}
+        rc = 0
+        for fn in sorted(os.listdir(TOOLS_DIR)):
+            if not fn.endswith(".py"):
+                continue
+            tool_id = fn[:-3]
+            content = open(os.path.join(TOOLS_DIR, fn)).read()
+            # Name/description come from the file's own frontmatter; the create endpoint parses
+            # it into meta.manifest, so only a minimal meta is needed here.
+            title = tool_id.replace("_", " ").title()
+            for line in content.splitlines()[:12]:
+                if line.strip().startswith("title:"):
+                    title = line.split(":", 1)[1].strip()
+                    break
+            form = {"id": tool_id, "name": title, "content": content,
+                    "meta": {"description": f"Installed from git by the open-webui PostSync job."}}
+            try:
+                if tool_id in existing:
+                    # Idempotent re-run: /create 400s on a duplicate id, so update instead.
+                    api(tok, f"/api/v1/tools/id/{tool_id}/update", form, "POST")
+                    print(f"updated {tool_id} ({title})")
+                else:
+                    api(tok, "/api/v1/tools/create", form, "POST")
+                    print(f"created {tool_id} ({title})")
+            except urllib.error.HTTPError as e:
+                # The create path EXECUTES the module to derive specs, so a syntax error or a
+                # bad import surfaces here. Report it and fail the Job — a tool installed with
+                # empty specs exposes no callable functions and looks "installed but broken".
+                print(f"FAILED {tool_id}: HTTP {e.code} {e.read()[:400]!r}", file=sys.stderr)
+                rc = 1
+
+        # Verify what actually landed, rather than trusting the create response.
+        for t in api(tok, "/api/v1/tools/"):
+            n = len(t.get("specs") or [])
+            print(f"  {t['id']}: {n} function(s)")
+            if n == 0:
+                print(f"  WARNING {t['id']} exposes no functions", file=sys.stderr)
+        return rc
+
+
+    if __name__ == "__main__":
+        sys.exit(main())

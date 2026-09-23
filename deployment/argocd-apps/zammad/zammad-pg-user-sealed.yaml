@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zammad-pg-user
+  namespace: zammad
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: AgBa1iF53kzwuxWoxNZH0Lkx4iggIJNrrH7Dztul2CYYgQcj5WP+fTR8N8ngh9yj0ysBdMoIW5TtoPCk90sjENrBUO2PV3b7rxtsrnr463K/dgds54Wbgk76QtEWNKWWsVFKlK4p5wFuF/+EDVO8VDSkgzPXvKnvEbltFFslAU6dGNerePKJJoaojfkDMU0blVbNeYHv88i/PiGl85z70dFqpqb0MgnfwkTj6oiQFYuulXYE64/8cGnj+gm34Yusardd7b1yZieSSqSrQrVIvCg8ZI4bxA/2ODCcOb80542tWue9VjUGM/ZXjzT0Lf0a5pSeHnbaO4DHUG6rE3pZ9CwhQx/lt5JlnHEYGM33j6wEq5dfng3/G1jUSrtEtTPrCxcQI5peErOoQPMebfMIy43jF35P2kUMeK/kEWjiqy1+JnBx8Dk987TpqVoEeUoAa0UX4CQcNQzE2/iSrdVKNUGRSNn8h/pretIvAKTaiYreluOUDyCwBg6Wvr1Xf2TcVVhtO0XkcuSTgu3wk4/UeNVpFwtvZ19eGp7W9tb3fA26NtXmjY9lO8zWuPkdMO5K30jco2Ta8Wtfq1MVpI9ayIVGTV39z9F/MD4dAoKVB2vqGskNdS3zLCs0Ncfm4eBh12TuK45elazOd/KHXrPA2+moHuT4WWFSG23q4RJZcdRAAk1ZtXrnvt+IonQS7f3m2FjY4UUt220FJM9Maxf5UoLzuwfegfR2mdMzsCjymM48iLC6fID31FxQkwEOWpn/iIo=
+    username: ""
+  template:
+    metadata:
+      name: zammad-pg-user
+      namespace: zammad

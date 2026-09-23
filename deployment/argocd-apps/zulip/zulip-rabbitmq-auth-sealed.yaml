@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: zulip-rabbitmq-auth
+  namespace: zulip
+spec:
+  encryptedData:
+    rabbitmq-password: ""
+  template:
+    metadata:
+      name: zulip-rabbitmq-auth
+      namespace: zulip

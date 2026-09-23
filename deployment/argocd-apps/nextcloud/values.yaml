@@ -1,0 +1,162 @@
+# Nextcloud Helm values (official nextcloud/nextcloud chart).
+# Applied by the wave10-nextcloud Application via $values valueFiles.
+#
+# Secrets (NOT in git), provided by sealed secrets:
+#   nextcloud-admin                — admin username/password
+#   nextcloud-db                   — PostgreSQL password (also used by bundled subchart)
+#   nextcloud-s3                   — Hetzner S3 access/secret key (primary object store)
+#   nextcloud-oidc-client-secret   — Authentik OIDC client secret (sealed by authentik/sealSecrets.sh)
+
+# Apache flavor = single self-contained container (Apache serves HTTP + runs PHP).
+# The 'fpm' flavor is FastCGI-only and REQUIRES a separate nginx container
+# (nginx.enabled), without which the HTTP liveness probe kills it → CrashLoopBackOff.
+image:
+  flavor: apache
+
+nextcloud:
+  host: nextcloud.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  existingSecret:
+    enabled: true
+    secretName: nextcloud-admin
+    usernameKey: username
+    passwordKey: password
+  trustedDomains:
+    - nextcloud.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+    - files.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+
+  # Point the Nextcloud image at our own redis (redis.yaml). Setting REDIS_HOST
+  # makes the entrypoint wire redis for local/distributed cache + file locking.
+  extraEnv:
+    - name: REDIS_HOST
+      value: nextcloud-redis
+    - name: REDIS_HOST_PORT
+      value: "6379"
+
+  # Primary object storage on Hetzner S3 (bulk file data). Metadata stays in PostgreSQL.
+  objectStore:
+    s3:
+      enabled: true
+      host: nbg1.your-objectstorage.com # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+      bucket: edgecloudinfra-nextcloud-files # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+      usePathStyle: true
+      ssl: true
+      existingSecret: nextcloud-s3
+      secretKeys:
+        accessKey: accessKey
+        secretKey: secretKey
+
+  # Outgoing SMTP + per-user IMAP defaults are configured by the PostSync job
+  # (deployment/argocd-apps/nextcloud/postsync-configure.yaml) from the nextcloud-smtp secret,
+  # so host/port/credentials are never stored in plaintext here.
+
+  # Extra config.php snippets.
+  configs:
+    proxy.config.php: |
+      <?php
+      $CONFIG = array(
+        'overwriteprotocol' => 'https',
+        'overwrite.cli.url' => 'https://nextcloud.subdomain1.your-domain.tld', # automatically updated from project-settings:{general.subdomain,general.domain}
+        'default_phone_region' => 'DE',
+      );
+
+internalDatabase:
+  enabled: false
+
+# External PostgreSQL: we run our own CloudNativePG cluster
+# (deployment/argocd-apps/nextcloud/postgres.yaml, service `nextcloud-pg-rw`) instead of
+# the chart's bundled subchart. The bundled subchart in chart 9.1.x ships
+# bitnamilegacy images AND mis-wires its secret (the app's nextcloud-db secret uses
+# db-username/db-password while the subchart expects password/AUTHENTIK_PG_ADMIN_PASSWORD).
+# externalDatabase.existingSecret natively uses db-username/db-password, so this is clean.
+externalDatabase:
+  enabled: true
+  type: postgresql
+  # CNPG read-write (primary) service; see postgres.yaml (Cluster nextcloud-pg).
+  host: nextcloud-pg-rw
+  database: nextcloud
+  existingSecret:
+    enabled: true
+    secretName: nextcloud-db
+    usernameKey: db-username
+    passwordKey: db-password
+
+postgresql:
+  enabled: false
+
+# Use our own official-image redis (deployment/argocd-apps/nextcloud/redis.yaml) instead of
+# the chart's bundled bitnami redis subchart (unmaintained). The Nextcloud image
+# auto-configures redis (local + distributed cache, file locking) from REDIS_HOST.
+redis:
+  enabled: false
+
+# First-boot install (maintenance:install + trusted_domains setup) can take a few
+# minutes. Without a startupProbe, the liveness probe kills the pod mid-install,
+# leaving a partial config.php (no trusted_domains) → status.php 400 → CrashLoopBackOff.
+# The startupProbe gives install up to ~10 min before liveness/readiness engage.
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 60
+  successThreshold: 1
+
+persistence:
+  enabled: true
+  storageClass: longhorn-cloud
+  size: 10Gi
+
+ingress:
+  enabled: false
+
+# Native Gateway API support (nextcloud chart httpRoute). TLS terminates at the
+# shared Gateway's wildcard listener — no tls block, no ssl-redirect annotation.
+# wellKnown renders the carddav/caldav service-discovery redirects as portable
+# RequestRedirect rules (they needed an implementation-specific snippet before).
+#
+# NB: no request-body size cap is set here. Envoy's default max request body is
+# unlimited for streamed uploads, which is what Nextcloud has been running with.
+# Set a ClientTrafficPolicy if a cap is wanted.
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - nextcloud.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  wellKnown:
+    enabled: true
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: "/"
+      # Large file uploads/downloads run long — replaces timeout-server: 3600s.
+      timeouts:
+        request: 3600s
+        backendRequest: 3600s
+
+cronjob:
+  enabled: true
+
+metrics:
+  enabled: true
+  https: true
+  tlsSkipVerify: true
+  # ⚠ The chart's ServiceMonitor is deliberately off; servicemonitor.yaml beside this file
+  # is ours. Two reasons, both established on the live cluster 2026-09-03:
+  #   - TWO apps were rendering a monitor with the same name in the same namespace
+  #     (prometheus/nextcloud): this chart, and an additionalServiceMonitors entry in
+  #     kube-prometheus-stack's values. The stack's copy held the object (its
+  #     argocd tracking-id was on it) and named the port `metrics`, while the metrics
+  #     Service names its only port `http` (targetPort: metrics) — so Prometheus accepted
+  #     the object and matched NOTHING: 0 active targets, 10 dropped, no error anywhere.
+  #     That entry is gone; owning the monitor here also ends the contest over it.
+  #   - the chart's values path moves. This version reads `metrics.serviceMonitor`, newer
+  #     ones read `prometheus.serviceMonitor` with `labels` rather than `additionalLabels`,
+  #     so a bump would leave these settings on a dead path and the monitor would vanish as
+  #     quietly as it was broken.
+  # Ours names the Service port explicitly and does not move with the chart.
+  serviceMonitor:
+    enabled: false

@@ -1,0 +1,209 @@
+# CronJob: PULL-ONLY mirror of the EXTERNAL repository into the in-cluster GitLab project.
+#
+# ⚠ WHY THIS IS HAND-ROLLED AND NOT GitLab's PULL MIRROR. This instance is GitLab **CE**
+# (`/api/v4/version` reports `"enterprise": false`), and pull mirroring is an EE/Premium
+# feature. Measured on ecc204:
+#   PUT /projects/:id  mirror=true      -> HTTP 400, `mirror` is not an accepted parameter
+#   POST /projects/:id/mirror/pull      -> not available
+# The instance setting `mirror_available` reads `true`, which is misleading — it is an
+# instance toggle with no effect without an EE licence. A previous version of this app
+# shipped a CronJob calling `mirror/pull`; it could never have worked here.
+#
+# ⚠ PULL-ONLY, BY DESIGN. Nothing is ever pushed back to the external source, and BUILD
+# OUTPUTS are never pushed into this project either — a push here would be clobbered by the
+# next mirror run (see the force-push note below). Outputs go to the NFS builds dataset
+# (storage.fileserver.datasets.eda.builds) or to the on-prem S3 bucket.
+#
+# ⚠ IT FORCE-PUSHES, so the external repo is authoritative and `main` MUST NOT be protected
+# in this project. A protected branch rejects the mirror with `pre-receive hook declined`
+# and the run fails on every ref (measured: all 4 branches + 1 tag rejected until `main`
+# was unprotected). presync-gitlab-project.yaml therefore leaves it unprotected — do not
+# "harden" it by re-adding protection, and do not commit work directly to this project.
+#
+# ⚠ --recurse-submodules IS NOT USED HERE, and that is deliberate: `git clone --mirror`
+# copies refs and objects only, so a submodule is just a gitlink and needs no special
+# handling to MIRROR. The CI job that CONSUMES this repo does need it — `deploy.sh` is a
+# SYMLINK into the `scripts/shared` submodule (fpga-scripts), so a plain clone leaves it
+# dangling and `./deploy.sh` fails "not found". That belongs in the pipeline, not here.
+#
+# ⚠ A POLL, not a webhook: a webhook would need the EXTERNAL GitLab to reach INTO this
+# cluster, and `make production` closes 22/6443 leaving admin WireGuard as the only way in.
+# There is no inbound path to hook.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osxcar-sdv-switch-mirror
+  namespace: osxcar-sdv-switch
+---
+# ClusterRole, not a namespaced Role in `gitlab`: this app's ArgoCD destination namespace is
+# osxcar-sdv-switch, so a Role in another namespace would need the AppProject to whitelist
+# it. Same pattern as the PreSync hook next door.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: osxcar-sdv-switch-mirror
+rules:
+# The toolbox exec is how the root PAT is minted. A PAT lives in GitLab's DATABASE, so a
+# sealed copy would name a token that does not exist after a recreate: the secret would
+# still apply, the mirror would still start, and every push would 401 in a way that reads
+# as a permissions problem.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: osxcar-sdv-switch-mirror
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: osxcar-sdv-switch-mirror
+subjects:
+- kind: ServiceAccount
+  name: osxcar-sdv-switch-mirror
+  namespace: osxcar-sdv-switch
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: osxcar-sdv-switch-mirror
+  namespace: osxcar-sdv-switch
+spec:
+  schedule: "*/10 * * * *"
+  # Never overlap: a slow clone must not race a second push against the same refs.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # A run that has not finished in 8 min is wedged; well under the 10 min schedule so a
+  # hung run always clears before the next is due.
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 480
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: osxcar-sdv-switch-mirror
+          restartPolicy: OnFailure
+          # The lab: the external host is reachable from here, and this keeps the clone off
+          # the cloud→lab WireGuard link.
+          nodeSelector:
+            ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+          tolerations:
+          - { key: ecc/mesh, operator: Exists, effect: NoSchedule }  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          containers:
+          - name: mirror
+            # alpine/git, matching gitlab-mirror: it ships git and nothing else. kubectl is
+            # needed too (to mint the PAT), so the k8s image is used and git comes from it —
+            # verified `git version 2.54.0`.
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            env:
+            - name: GITLAB_API
+              value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8080/api/v4"
+            # ⚠ PORT 8181 = workhorse. git-over-HTTP needs the workhorse JWT; 8080 hits puma
+            # directly and returns "Nil JSON web token" 403. Same pin as the runner clone_url.
+            - name: GITLAB_GIT
+              value: "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+            - name: PROJECT_PATH
+              value: "deployments/eda/osxcar-sdv-switch"
+            envFrom:
+            # url / token of the EXTERNAL repo — see sealSecrets.sh.
+            - secretRef:
+                name: external-git
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                set -eu
+
+                echo "Minting a root PAT via the toolbox..."
+                PAT=$(kubectl -n gitlab exec deploy/gitlab-toolbox -c toolbox -- \
+                  gitlab-rails runner \
+                  "u=User.find_by(admin:true)||User.find_by(username:'root'); t=u.personal_access_tokens.create!(name:'osxcar-mirror-$(date +%s)',scopes:['api','write_repository'],expires_at:1.year.from_now); puts t.token" \
+                  2>/dev/null | tail -1)
+                [ -n "$PAT" ] || { echo "ERROR: could not obtain a PAT" >&2; exit 1; }
+
+                # ⚠ Credentials are kept OUT of argv and out of the repo config. `git clone`
+                # would otherwise store the tokenised URL in .git/config on disk, and a URL
+                # on the command line is world-readable via /proc/<pid>/cmdline.
+                # GIT_CONFIG_COUNT/KEY/VALUE injects an insteadOf rewrite for THIS process
+                # only — the same mechanism the CI job uses for the submodule.
+                export GIT_TERMINAL_PROMPT=0
+                EXT_HOST=$(printf '%s' "$url" | sed -E 's#^https?://##; s#/.*##')
+
+                WORK=$(mktemp -d)
+                trap 'rm -rf "$WORK"' EXIT INT TERM
+
+                echo "Mirroring ${EXT_HOST} -> ${PROJECT_PATH}..."
+                # --mirror: refs and objects only. Submodule contents are NOT fetched and do
+                # not need to be (a submodule is a gitlink); the consuming pipeline resolves
+                # them with --recurse-submodules.
+                GIT_CONFIG_COUNT=1 \
+                GIT_CONFIG_KEY_0="url.https://oauth2:${token}@${EXT_HOST}/.insteadOf" \
+                GIT_CONFIG_VALUE_0="https://${EXT_HOST}/" \
+                  git clone --mirror -q "$url" "$WORK/src.git"
+
+                REFS=$(git -C "$WORK/src.git" for-each-ref --format='%(refname)' | wc -l)
+                # Refuse to report success on an EMPTY mirror. A token that authenticates but
+                # can see nothing clones zero refs and exits 0, and the following push would
+                # then PRUNE every ref in the target — turning a permissions problem into
+                # data loss. Same guard as gitlab-mirror's.
+                [ "$REFS" -gt 0 ] || { echo "ERROR: cloned 0 refs — refusing to push a prune-only mirror" >&2; exit 1; }
+                echo "  ${REFS} ref(s) cloned."
+
+                # ⚠ UNPROTECT EVERY BRANCH HERE, not only in the PreSync hook. On a FRESH
+                # project the hook has nothing to unprotect: no branch exists yet, so its
+                # DELETE calls are no-ops, and GitLab then protects `main` ITSELF the moment
+                # this mirror creates it (group default_branch_protection=2). The next run
+                # dies with
+                #   GitLab: You are not allowed to force push code to a protected branch
+                #   ! [remote rejected] main -> main (pre-receive hook declined)
+                # and EVERY ref is rejected, not just main — measured after the 2026-09-11
+                # cluster recreate. The hook is still right to unprotect (it also covers the
+                # build branch); this is the half that must run AFTER the branches exist.
+                # URL-encode the project path for the API (the git push above uses the
+                # plain form). Defined HERE: ENC_REPO is a variable of the PreSync hook, not
+                # of this CronJob, and referencing it would abort under `set -u`.
+                ENC_REPO=$(printf '%s' "$PROJECT_PATH" | sed 's#/#%2F#g')
+                # ⚠ LISTING protected_branches AND DELETING THEM IS NOT ENOUGH. That list
+                # comes back EMPTY here while the branch is still protected, because the
+                # rule is INHERITED from the instance-wide default_branch_protection_defaults
+                # (allow_force_push=false), not stored as a project entry. So this loop
+                # printed nothing at all and the push below still died with
+                #   ! [remote rejected] main -> main (pre-receive hook declined)
+                # Measured 2026-09-18 on ecc217. An inherited rule can only be overridden by
+                # an explicit project-level entry, so CREATE one that allows force-push.
+                #
+                # ⚠ `main` ONLY, deliberately. It is the DEFAULT branch, and the inherited
+                # rule applies to the default branch — that one ref is what rejects the whole
+                # push. The other mirrored branches carry no protection and need no entry, so
+                # this does not touch them. Push stays restricted to root.
+                ROOT_UID=$(curl -sS -H "PRIVATE-TOKEN: ${PAT}" "${GITLAB_API}/user" \
+                  | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+                curl -sS -o /dev/null -H "PRIVATE-TOKEN: ${PAT}" -X PUT \
+                  "${GITLAB_API}/projects/${ENC_REPO}" --data "default_branch_protection=0" || true
+                curl -sS -o /dev/null -H "PRIVATE-TOKEN: ${PAT}" -X DELETE \
+                  "${GITLAB_API}/projects/${ENC_REPO}/protected_branches/main" || true
+                _c=$(curl -sS -o /dev/null -w '%{http_code}' -H "PRIVATE-TOKEN: ${PAT}" \
+                      -X POST "${GITLAB_API}/projects/${ENC_REPO}/protected_branches" \
+                      --data "name=main&allow_force_push=true&merge_access_level=40" \
+                      --data "allowed_to_push[][user_id]=${ROOT_UID}" || echo 000)
+                echo "  'main': force-push allowed (HTTP ${_c})"
+
+                # --prune so branches deleted upstream disappear here too; without it the
+                # mirror drifts into a union of every branch that ever existed.
+                # The refspecs are FORCED: the external repo is authoritative, so a rewritten
+                # upstream history must win. This is why `main` must stay unprotected here.
+                GIT_CONFIG_COUNT=1 \
+                GIT_CONFIG_KEY_0="url.http://oauth2:${PAT}@gitlab-webservice-default.gitlab.svc.cluster.local:8181/.insteadOf" \
+                GIT_CONFIG_VALUE_0="${GITLAB_GIT}/" \
+                  git -C "$WORK/src.git" push --prune "${GITLAB_GIT}/${PROJECT_PATH}.git" \
+                    '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+
+                echo "Mirror complete: ${PROJECT_PATH} now matches ${EXT_HOST}."

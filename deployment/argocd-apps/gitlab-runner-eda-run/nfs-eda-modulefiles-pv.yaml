@@ -1,0 +1,67 @@
+# A SECOND static PV onto the module-manifest export, for the [eda-run] runner's build pods.
+#
+# ⚠ WHY A SECOND PV AT ALL. A PersistentVolume binds to exactly ONE PVC
+# (`nfs-eda-modulefiles` is claimed by remote-desktop/nfs-eda-modulefiles), so another
+# namespace cannot reuse it — a claim here would stay Pending forever. Two PVs onto the SAME
+# export is the supported shape; verified on ecc204 (a gVisor pod in gitlab-runner read
+# hyperlynx/petalinux/xilinx through exactly this pairing).
+#
+# ⚠ THE volumeHandle MUST DIFFER from the remote-desktop PV's. csi-driver-nfs treats it as
+# the volume's IDENTITY, so two PVs sharing a handle are the same volume to the driver.
+# Hence the `-ci` suffix — it is not decoration.
+#
+# ⚠ readOnly, AND THAT IS THE SECURITY BOUNDARY. Writing <name>/<version>/module.yaml here
+# is what authorises the privileged broker to pull and run an image AS ROOT (broker.sh
+# allowed(), fail-closed). NFS scopes by client network and these pods share a node, so the
+# server cannot distinguish them — WHICH PODS MOUNT IT, and how, is the only boundary there
+# is. A CI job must be able to READ the manifests (its broker sidecar publishes them) and
+# must never be able to add one. Do not drop readOnly to "fix" a permissions error: the fix
+# is to register the module from the owning EDA app's PostSync job instead.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-eda-modulefiles-ci
+  labels:
+    ecc/volume: nfs-eda-modulefiles-ci
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size. The manifests are a few KB.
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as the other EDA claims; see gitlab-runner-eda/nfs-installers-pv.yaml.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: fs-1-datapool-eda-modulefiles-ci
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      # ⚠ NO project-settings anchor — the datasets.* pass rewrites a bare <pool>/<name>
+      # token and would eat the /mnt prefix. Kept in step with
+      # storage.fileserver.datasets.eda.moduleFiles by check-subdirs.sh, which precommit runs.
+      share: /mnt/datapool/eda/modulefiles # automatically updated from project-settings:storage.fileserver.datasets.eda.moduleFiles
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-eda-modulefiles-ci
+  namespace: gitlab-runner
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 1Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-eda-modulefiles-ci

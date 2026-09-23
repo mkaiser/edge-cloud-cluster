@@ -1,0 +1,138 @@
+# ArgoCD Applications: GitLab Runners (kubernetes executor).
+#
+# ONE runner install here — the default/untagged cloud profile. GitLab 16+ token
+# auth binds TAGS AT RUNNER CREATION, so each tag profile needs its own glrt- token
+# → its own chart install (the chart's register flow handles exactly ONE token from
+# `runners.secret`). Tokens are minted by the gitlab bootstrap PostSync job into:
+#   gitlab-runner-token        (default / untagged / cloud)
+#   gitlab-runner-token-mesh   (tags: mesh / mesh nodes, EXCLUDING the GPU node)
+#
+# The THOR runner (tags: arm64,thor,buildah — shared by vllm + ollama) now lives in
+# its own file, app-of-apps/gitlab-runner-thor.yaml, so the GPU build runner can be
+# toggled independently. Its token still comes from the same bootstrap job.
+#
+# The MESH runner now lives in app-of-apps/gitlab-runner-mesh.yaml, leaving this file with
+# the default/cloud runner only. Its token is still minted by the gitlab bootstrap job.
+#
+# The EDA runner (tags: eda) also lives in its own file, app-of-apps/gitlab-runner-eda.yaml.
+# It is SHARED by five consumers — eda-xilinx-2024-1, eda-xilinx-2026-1,
+# eda-petalinux-2024-1, eda-hyperlynx-2604 and remote-desktop (its base-image build).
+# UNLIKE the others its
+# token is NOT minted here — it is self-contained, minted by its own PreSync job
+# (deployment/argocd-apps/gitlab-runner-eda/presync-runner-token.yaml) so the EDA build
+# stack depends on no other app's sync.
+#
+# App-SPECIFIC runners live WITH their app, not here, so disabling the app in the
+# app-of-apps removes its runner too.
+#
+# Each manager pod spawns EPHEMERAL build pods (per-node registration is NOT a thing
+# with the k8s executor). "Use all mesh nodes" = give the runner mesh tolerations so
+# its build pods MAY schedule there; the scheduler spreads them.
+#
+# Setup: GitLab first (gitlab.yaml) → bootstrap job mints the token secrets →
+# ArgoCD syncs these two apps (+ gitlab-runner-thor.yaml). No manual UI registration.
+---
+# ── DEFAULT runner (cloud, untagged) ───────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+    name: gitlab-runner
+    namespace: argocd-apps
+    annotations:
+        placement.ecc/tier: cloud
+spec:
+    project: default
+    sources:
+        - repoURL: https://charts.gitlab.io
+          chart: gitlab-runner
+          targetRevision: "0.92.2"
+          helm:
+              valuesObject:
+                  # Internal service URL — bypasses TLS entirely, works for both staging and
+                  # production certs without tls-skip-verify or cert copying.
+                  gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+
+                  # Runner authentication token (GitLab 16+ token-based registration)
+                  runners:
+                      secret: gitlab-runner-token
+                      config: |
+                          [[runners]]
+                            # Clone over the internal service URL — the external
+                            # https://gitlab.<tld> clone URL fails in build pods while
+                            # certIssuerType is letsencrypt-staging (untrusted CA;
+                            # broke the vLLM image build).
+                            clone_url = "http://gitlab-webservice-default.gitlab.svc.cluster.local:8181"
+                            [runners.kubernetes]
+                              namespace = "gitlab-runner"
+                              image = "alpine:latest"
+                              privileged = false
+                              cpu_request = "250m"
+                              memory_request = "256Mi"
+                              cpu_limit = "2"
+                              memory_limit = "2Gi"
+                            [runners.cache]
+                              Type = "s3"
+                              Shared = true
+                              [runners.cache.s3]
+                                ServerAddress = "nbg1.your-objectstorage.com" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+                                BucketName = "edgecloudinfra-gitlab-runner-cache" # automatically updated from project-settings:{general.name,storage.objectStorage.buckets}
+                                BucketLocation = "nbg1" # automatically updated from project-settings:storage.objectStorage.baseEndpoint
+                                Insecure = false
+
+                  # S3 cache credentials from sealed secret
+                  envVars:
+                      - name: CACHE_S3_ACCESS_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: gitlab-runner-cache-s3
+                                key: accessKey
+                      - name: CACHE_S3_SECRET_KEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: gitlab-runner-cache-s3
+                                key: secretKey
+
+                  rbac:
+                      create: true
+
+                  resources:
+                      requests:
+                          cpu: 100m
+                          memory: 128Mi
+                      limits:
+                          memory: 512Mi
+
+        - repoURL: git@github.com:YourProject/yourGit.git
+          targetRevision: main
+          path: deployment/argocd-apps/gitlab-runner
+          directory:
+              exclude: "{*.template,*.sh,gitlab-runner-token-sealed.yaml,gitlab-runner-cache-s3-sealed.yaml}"
+
+    destination:
+        server: https://kubernetes.default.svc
+        namespace: gitlab-runner
+    syncPolicy:
+        automated:
+            prune: true
+            selfHeal: true
+        syncOptions:
+            - CreateNamespace=true
+        # ⚠ RETRY FOREVER — this app's PreSync hook depends on ANOTHER component finishing
+        # bring-up, and on a recreate it is not ready yet. ArgoCD's DEFAULT budget is 5 retries;
+        # on the ecc187 recreate gitlab-runner-eda burned all five before GitLab was serving and
+        # then stayed `phase=Failed retry=5` PERMANENTLY — no [eda] runner, so the remote-desktop
+        # base image could never build and the desktop sat in Init:ImagePullBackOff. One unlucky
+        # ordering took out the whole EDA desktop, recoverable only by a manual `argocd app sync`.
+        #
+        # A plain re-sync fixes it once the dependency is up, with no manifest change — which is
+        # exactly what this retry automates. Same block as remote-desktop.yaml; read its comment
+        # for the fuller reasoning.
+        #
+        # Do NOT enlarge the hook's own budget instead: a pending PreSync hook holds the
+        # Application open and blocks everything behind it. The outer loop is the right lever.
+        retry:
+          limit: -1
+          backoff:
+            duration: 1m
+            factor: 2
+            maxDuration: 10m

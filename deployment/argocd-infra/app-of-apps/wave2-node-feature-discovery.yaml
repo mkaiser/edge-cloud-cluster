@@ -1,0 +1,58 @@
+# ArgoCD Application: node-feature-discovery
+#
+# Labels every node with hardware facts read OFF THE BOX, rather than declared for it. This is
+# the only label class in the cluster not derived from project_settings.ts, and the distinction
+# is the point: settings express what a node is FOR (site, storage scope, whether it builds EDA
+# images), while these express what it can actually DO.
+#
+# WHY IT EXISTS: unibi-hclab-fs-vm is a QEMU/KVM guest on the TrueNAS appliance and TrueNAS
+# gives it the default CPU model, which advertises none of SSE4.2/POPCNT/CX16 — even though
+# the host Xeon Silver 4510 has them all. Anything built for the now-standard x86-64-v2
+# baseline dies at import there (measured: ryax-intelliscale, "NumPy was built with baseline
+# optimizations: (X86_V2) but your machine doesn't support"). Nothing expressed that, so
+# whether a pod worked was decided by which node it happened to land on.
+#
+# The label consumers match is
+#   feature.node.kubernetes.io/cpu-cpuid.X86_64_V2=true
+# which NFD derives from the psABI microarchitecture level. It is PRESENT on capable nodes and
+# ABSENT below that, so a consumer matches positively (operator: In) and nothing has to delete
+# a stale label when a node improves — re-detection alone is enough.
+#
+# ⚠ Do NOT switch consumers to the individual feature flags (cpu-cpuid.SSE42 and friends):
+# NFD's default attributeBlacklist hides exactly those, so such a selector matches a label
+# that is never emitted and the pod is silently unschedulable. See values.yaml.
+#
+# Wave 2, for the same reason as nested-runtime: it depends on NOTHING from mesh nodes. The
+# DaemonSet reports Healthy with zero mesh nodes present and labels each one as it joins, so
+# there is nothing to gate on and a barrier would only deadlock until a node arrived.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: node-feature-discovery
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  sources:
+    - repoURL: https://kubernetes-sigs.github.io/node-feature-discovery/charts
+      chart: node-feature-discovery
+      targetRevision: "0.19.0" # renovate: datasource=helm depName=node-feature-discovery registryUrl=https://kubernetes-sigs.github.io/node-feature-discovery/charts
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-infra/node-feature-discovery/values.yaml
+
+    # ref source so valueFiles ($values) resolve from the git repo
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: node-feature-discovery
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

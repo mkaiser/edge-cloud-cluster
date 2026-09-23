@@ -1,0 +1,219 @@
+# Re-run the appliance configuration when the SET OF DOMAIN CONTROLLERS changes.
+#
+# WHY THIS EXISTS. configure-job.yaml discovers the on-prem DCs at RUNTIME (its
+# read-onprem-dcs initContainer reads the pods and their nodes' ecc/lan-ip labels) and writes
+# them into the appliance as resolver hosts and Kerberos KDCs. What it has no way of knowing
+# is WHEN to do that again: enrolling a DC changes samba-ad's StatefulSet, nothing in the
+# truenas app, so ArgoCD sees no drift here and the hook never fires. The appliance then
+# keeps the DC list it was given at bootstrap — which is how it ended up pointing at exactly
+# one DC (192.168.1.194) while a second one was running (measured 2026-09-03).
+#
+# ⚠ NOTHING IS GENERATED INTO A MANIFEST FOR THIS. The DC set is read from the live cluster
+# on every tick — from the ecc/ad-dc NODE LABELS, not from the running pods, so a DC that is
+# merely down is still part of the set (see the body) — and compared against a ConfigMap
+# this job owns. There is no anchored value to
+# keep in step, and no second copy of the appliance client: this job never talks to TrueNAS.
+#
+# ⚠ IT RE-RUNS THE JOB DIRECTLY, IT DOES NOT SYNC THE APPLICATION. Forcing an ArgoCD sync on
+# an app that is already Synced does not reliably re-run its hooks — measured repeatedly on
+# 2026-09-03, where a sync reported "successfully synced (no more tasks)" and left the hook
+# untouched. Cloning the existing Job spec is deterministic and needs nothing from ArgoCD.
+#
+# ⚠ ONLY ON A REAL CHANGE, never on a timer. The configure job carries a leave-and-rejoin
+# repair path that deletes the appliance's machine account, and it has fired unattended
+# before (2026-08-31). Running it every tick would arm that permanently; running it when the
+# DC set actually changed is exactly when a human would have run it by hand.
+#
+# ⚠ AND "A REAL CHANGE" MEANS THE DECLARATION, NOT THE LIVE POD SET. Reading Running pods
+# made a transient outage indistinguishable from a removal, and re-ran configure against a
+# shrunken set — which stripped the surviving DC's resolver entries and wedged the appliance
+# (measured 2026-09-04, check F; full detail in the body).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+rules:
+# the DC pods, the Job to clone, and the ConfigMap holding the last-seen set
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  # ⚠ watch, not just get/list: `kubectl wait --for=condition=complete` opens a WATCH, and
+  # without it the wait still succeeds by falling back to polling while printing a wall of
+  # "Failed to watch ... is forbidden" that makes a healthy run look broken.
+  verbs: ["get", "list", "create", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: truenas-dc-set-watch
+subjects:
+- kind: ServiceAccount
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+---
+# Node labels are cluster-scoped: ecc/lan-ip is where a DC's LAN address lives.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: truenas-dc-set-watch
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: truenas-dc-set-watch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: truenas-dc-set-watch
+subjects:
+- kind: ServiceAccount
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: truenas-dc-set-watch
+  namespace: samba-ad
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: truenas-dc-set-watch
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+          - name: watch
+            image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                set -eu
+                CM=truenas-dc-set-seen
+
+                # The declared DC set: every node LABELLED ecc/ad-dc, by its ecc/lan-ip.
+                # Sorted, so ordering can never look like a change.
+                #
+                # ⚠ THE LABEL, NOT THE RUNNING PODS — and this distinction is the whole
+                # correctness of this job. A pod set answers "which DCs are up right now",
+                # which is NOT the question: a DC that is rebooting, draining, NotReady or
+                # mid-`kubectl delete` is still part of the topology and must keep its
+                # resolver entry. Only a DELIBERATE removal should reconfigure the
+                # appliance, and CLAUDE.md already makes the label exactly that deliberate
+                # act — removing a DC requires `kubectl label node <n> ecc/ad-dc-` by hand,
+                # because `pulumi up` cannot unset it. The label is also what
+                # statefulset-onprem.yaml selects on, so this now agrees with the thing that
+                # actually places the DCs.
+                #
+                # ⚠ MEASURED REGRESSION THIS FIXES (2026-09-04, check F). Deleting
+                # ad-onprem-1 to test failover made this job fire 36s later, read ONE
+                # Running DC as a topology change, and re-run configure — which stripped the
+                # survivor's redundancy: `nameserver2: '192.168.1.194' -> ''` and both .194
+                # /etc/hosts overrides deleted. The appliance then wedged (groups resolved,
+                # every USER "does not exist") and needed a leave+rejoin to recover. The
+                # OUTAGE did not break it: that same run logged `testuser: already correct
+                # (uid 5010)` with the DC already down, and its only change was the resolver.
+                # A 2->1 shrink is the same transient outage the empty-set guard below
+                # already refuses to act on — it was just one DC short of being caught.
+                DC_SELECTOR="ecc/ad-dc=true"  # automatically updated from project-settings:applicationPlacements.labels.adDc
+                DESIRED=$(kubectl get nodes -l "$DC_SELECTOR" \
+                            -o jsonpath='{range .items[*]}{.metadata.labels.ecc/lan-ip}{"\n"}{end}' \
+                          | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+
+                if [ -z "$DESIRED" ]; then
+                  echo "No nodes labelled ecc/ad-dc with an ecc/lan-ip — refusing to act."  # automatically updated from project-settings:applicationPlacements.labels.lanIp
+                  echo "  An empty set is never a legitimate reconfiguration: it is what a"
+                  echo "  transient outage looks like, and writing it would strip the"
+                  echo "  appliance's resolvers."
+                  exit 0
+                fi
+
+                SEEN=$(kubectl -n samba-ad get cm "$CM" -o jsonpath='{.data.dcSet}' 2>/dev/null || true)
+                echo "live DC set : ${DESIRED}"
+                echo "last applied: ${SEEN:-<none>}"
+
+                if [ "$DESIRED" = "$SEEN" ]; then
+                  echo "unchanged — nothing to do."
+                  exit 0
+                fi
+
+                # ⚠ FIRST RUN SEEDS, IT DOES NOT RECONFIGURE. With no ConfigMap yet, the
+                # appliance was configured by the ordinary hook moments ago; re-running the
+                # job (and its repair path) just because this watcher is new would be a
+                # gratuitous leave/rejoin.
+                if [ -z "$SEEN" ]; then
+                  kubectl -n samba-ad create configmap "$CM" --from-literal=dcSet="$DESIRED" \
+                    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                  echo "seeded the baseline; no reconfiguration on a first run."
+                  exit 0
+                fi
+
+                echo "DC SET CHANGED — re-running the appliance configuration."
+                RUN="truenas-configure-dcset-$(date +%s)"
+                # Clone the hook Job's spec. Everything the API server owns or the batch
+                # controller injects has to go, or the create is rejected: the generated
+                # selector and the controller-uid/batch labels most of all. The ArgoCD hook
+                # annotations go too — this copy is ours, and ArgoCD must not adopt or prune
+                # it.
+                # ⚠ RUN passed as a command-scoped env var. The python reads os.environ,
+                # and a plain shell variable is not in the child's environment — it would
+                # have silently created a job literally named "placeholder", once.
+                kubectl -n samba-ad get job truenas-configure -o json \
+                  | RUN="$RUN" python3 -c '
+                import json, sys, os
+                j = json.load(sys.stdin)
+                j["metadata"] = {"name": os.environ["RUN"], "namespace": "samba-ad",
+                                 "labels": {"app": "truenas-configure-dcset"}}
+                spec = j["spec"]
+                spec.pop("selector", None)
+                spec.pop("manualSelector", None)
+                tmpl = spec["template"]
+                tmpl["metadata"] = {"labels": {"app": "truenas-configure-dcset"}}
+                j.pop("status", None)
+                json.dump({"apiVersion": "batch/v1", "kind": "Job",
+                           "metadata": j["metadata"], "spec": spec}, sys.stdout)
+                ' > /tmp/job.json
+                kubectl create -f /tmp/job.json
+
+                # Record the new set ONLY after the run succeeds, so a failure is retried on
+                # the next tick instead of being remembered as done.
+                echo "waiting for $RUN ..."
+                if kubectl -n samba-ad wait --for=condition=complete "job/$RUN" --timeout=900s; then
+                  kubectl -n samba-ad create configmap "$CM" --from-literal=dcSet="$DESIRED" \
+                    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                  echo "appliance reconfigured for: $DESIRED"
+                else
+                  echo "ERROR: $RUN did not complete — NOT recording the new set, so the"
+                  echo "  next tick retries. Check its logs before assuming the appliance"
+                  echo "  knows about the new DC." >&2
+                  exit 1
+                fi

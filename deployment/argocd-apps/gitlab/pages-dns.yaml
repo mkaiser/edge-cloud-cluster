@@ -1,0 +1,151 @@
+# GitLab DNS records (external-dns crd source, dynamic — no hardcoded IPs):
+#   - *.pages.gitlab.<tld>            (Pages wildcard)
+#   - gitlab.<tld>                    (main host)
+#   - registry.gitlab.<tld>          (container registry)  <- needed for image pulls
+#   - kas.gitlab.<tld>               (agent server)
+#
+# A PostSync job reads the control-plane public IPs from the envoy-gateway-public-ips
+# ConfigMap (published by src/ingress.ts) and applies the DNSEndpoints dynamically. external-dns creates/maintains the Hetzner records
+# and cleans them up on cluster destroy.
+#
+# Why the explicit records: *.pages.gitlab.<tld> creates an empty non-terminal node
+# at gitlab.<tld> that SHADOWS the *.<tld> wildcard — so gitlab.<tld> and everything
+# under it (registry.gitlab.*, kas.gitlab.*) stop resolving via the wildcard and each
+# needs its own A/AAAA record. (Without registry.gitlab.<tld> here, image pulls fail
+# NXDOMAIN cluster-wide — e.g. the vLLM Thor image.)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitlab-pages-dns
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitlab-pages-dns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+# The CP public IPs come from this ConfigMap, published by Pulumi (src/ingress.ts).
+# NOT the Envoy Service's spec.externalIPs: Kubernetes programs externalIPs as a NAT
+# rule on EVERY node, which makes mesh nodes black-hole their own traffic to the cloud
+# public IP.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["envoy-gateway-public-ips"]
+  verbs: ["get"]
+- apiGroups: ["externaldns.k8s.io"]
+  resources: ["dnsendpoints"]
+  verbs: ["get", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitlab-pages-dns
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitlab-pages-dns
+subjects:
+- kind: ServiceAccount
+  name: gitlab-pages-dns
+  namespace: gitlab
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gitlab-pages-dns
+  namespace: gitlab
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 120
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: gitlab-pages-dns
+      restartPolicy: Never
+      containers:
+      - name: apply-dns
+        image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+        env:
+        - name: PAGES_HOSTNAME
+          value: "*.pages.gitlab.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+          echo "Reading control-plane public IPs..."
+          # Published by Pulumi (src/ingress.ts) as one IP per line under ipv4/ipv6.
+          # NOT the Envoy Service's spec.externalIPs — that field programs a NAT rule on
+          # every node, so mesh nodes hijack their own outbound traffic to the cloud
+          # public IP and can never reach headscale once the mesh drops.
+          IPV4_LIST=$(kubectl get cm envoy-gateway-public-ips -n envoy-gateway-system \
+            -o jsonpath='{.data.ipv4}')
+          IPV6_LIST=$(kubectl get cm envoy-gateway-public-ips -n envoy-gateway-system \
+            -o jsonpath='{.data.ipv6}')
+
+          if [ -z "$IPV4_LIST" ] && [ -z "$IPV6_LIST" ]; then
+            echo "ERROR: envoy-gateway-public-ips ConfigMap has no addresses"
+            exit 1
+          fi
+
+          echo "External IPs: $IPV4_LIST $IPV6_LIST"
+
+          MANIFEST=$(mktemp)
+
+          # A records
+          printf 'apiVersion: externaldns.k8s.io/v1alpha1\nkind: DNSEndpoint\nmetadata:\n  name: gitlab-pages-wildcard\n  namespace: gitlab\nspec:\n  endpoints:\n' > "$MANIFEST"
+          printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: A\n    targets:\n' "${PAGES_HOSTNAME}" >> "$MANIFEST"
+          echo "$IPV4_LIST" | while read -r ip; do
+            [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST"
+          done
+
+          # AAAA records (only if IPv6 IPs exist)
+          if [ -n "$IPV6_LIST" ]; then
+            printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: AAAA\n    targets:\n' "${PAGES_HOSTNAME}" >> "$MANIFEST"
+            echo "$IPV6_LIST" | while read -r ip; do
+              [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST"
+            done
+          fi
+
+          kubectl apply -f "$MANIFEST"
+          rm -f "$MANIFEST"
+          echo "DNSEndpoint applied for ${PAGES_HOSTNAME}"
+
+          # gitlab.SUBDOMAIN AND every host UNDER it (registry.gitlab.*, kas.gitlab.*)
+          # need explicit records: *.pages.gitlab.SUBDOMAIN creates an empty
+          # non-terminal node at gitlab.SUBDOMAIN that shadows the *.SUBDOMAIN wildcard,
+          # so nothing under *.gitlab.SUBDOMAIN resolves via the wildcard.
+          # Derive the gitlab hostname by stripping the "*.pages." prefix, then add the
+          # sub-hosts that terminate on the same Gateway.
+          GITLAB_HOSTNAME=$(echo "${PAGES_HOSTNAME}" | sed 's/\*\.pages\.//')
+          # Hostnames needing an explicit record (gitlab + everything shadowed under it).
+          EXPLICIT_HOSTS="${GITLAB_HOSTNAME} registry.${GITLAB_HOSTNAME} kas.${GITLAB_HOSTNAME}"
+          echo "Creating explicit A/AAAA records for: ${EXPLICIT_HOSTS}"
+          MANIFEST2=$(mktemp)
+          printf 'apiVersion: externaldns.k8s.io/v1alpha1\nkind: DNSEndpoint\nmetadata:\n  name: gitlab-hostname\n  namespace: gitlab\nspec:\n  endpoints:\n' > "$MANIFEST2"
+          for host in $EXPLICIT_HOSTS; do
+            printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: A\n    targets:\n' "${host}" >> "$MANIFEST2"
+            echo "$IPV4_LIST" | while read -r ip; do
+              [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST2"
+            done
+            if [ -n "$IPV6_LIST" ]; then
+              printf '  - dnsName: "%s"\n    recordTTL: 300\n    recordType: AAAA\n    targets:\n' "${host}" >> "$MANIFEST2"
+              echo "$IPV6_LIST" | while read -r ip; do
+                [ -n "$ip" ] && printf '    - %s\n' "$ip" >> "$MANIFEST2"
+              done
+            fi
+          done
+          kubectl apply -f "$MANIFEST2"
+          rm -f "$MANIFEST2"
+          echo "DNSEndpoint applied for: ${EXPLICIT_HOSTS}"

@@ -1,0 +1,95 @@
+# ArgoCD Application: GitLab CE
+# Self-hosted GitLab on Hetzner Cloud with Authentik OIDC, Hetzner S3 object storage,
+# container registry, Pages, and in-cluster runner.
+#
+# Multi-source:
+#   1. Official GitLab Helm chart
+#   2. Git repo ref for sensitive helm values file (OIDC secret, rails secrets)
+#   3. Git repo directory for plain manifests (authentik OIDC jobs, sealed secrets, pages DNS)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitlab
+  namespace: argocd-apps
+  annotations:
+    # ⚠ CLOUD IS A DELIBERATE AVAILABILITY CHOICE, NOT A DEFAULT. Gitaly needs POSIX
+    # semantics, and more importantly git must keep working when the mesh link drops: a
+    # lab-hosted GitLab would take CI, every cloud consumer and the runners down with the
+    # WireGuard tunnel. Anything proposing to move GitLab to the lab "for throughput" has to
+    # argue with that, not merely with the numbers — the lab uplink measures ~4.9 MB/s
+    # outbound, so the move would not even be the win it looks like.
+    #
+    # ⚠ STATE THE LIMIT HONESTLY: this protects cloud consumers and CI, NOT lab users. When
+    # the mesh is down, people at the lab lose git entirely. The TrueNAS mirror is a
+    # read-only disaster copy, not a failover — see plans/old/gitlab-storage-placement.md.
+    placement.ecc/tier: cloud
+spec:
+  project: default
+  sources:
+    # 1. Official GitLab Helm chart
+    - repoURL: https://charts.gitlab.io
+      chart: gitlab
+      # renovate: datasource=helm depName=gitlab registryUrl=https://charts.gitlab.io
+      # Chart 10.3.2 = GitLab 19.3.0. ⚠ The chart minor and the GitLab minor track each other
+      # (10.2.x=19.2.x, 10.3.x=19.3.x) — do not read the chart version as the app version.
+      # ⚠ Since chart 10.0.0 the bundled PostgreSQL, Redis, MinIO and spamcheck subcharts are
+      # GONE: this deployment supplies its own external PG17 (CNPG, gitlab-pg) and Redis.
+      # 10.3.2 itself has no breaking changes; it does enable IPv6 binding on the webservice
+      # by default, which is inert here (the cluster is IPv4 SingleStack).
+      targetRevision: "10.3.2"
+      helm:
+        valueFiles:
+          - $values/deployment/argocd-apps/gitlab/values.yaml
+          - $values/deployment/argocd-apps/gitlab/helm-values-secret.yaml
+
+    # 2. Git repo ref for values files
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    # 3. Plain manifests (authentik OIDC jobs, sealed secrets, pages DNS)
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/gitlab
+      directory:
+        exclude: '{*.template,*.sh,values.yaml,helm-values-secret.yaml*}'
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitlab
+  ignoreDifferences:
+    # volumeClaimTemplates are immutable — Kubernetes adds status/defaultMode fields at
+    # runtime that ArgoCD (even with SSA) cannot reconcile, causing perpetual OutOfSync.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+    # Gateway API server-defaults are API-owned; under ServerSideApply ArgoCD reads
+    # them as permanent drift and the app never leaves OutOfSync. The chart renders
+    # these (gitlab-gw + 4 routes), so the drift is not in anything we author.
+    #
+    # Only list fields the desired state does NOT declare: ignoreDifferences strips
+    # the path from the normalized LIVE state, so ignoring a field the chart DOES
+    # emit would create drift rather than hide it. Verified against the live diff —
+    # the chart already emits backendRefs[].kind and parentRefs[].group/kind, and
+    # the only additions are the empty `group` fields below.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+    # certificateRefs is an ATOMIC list, so a jq path *inside* it (…[].group) does
+    # not normalize — the whole list has to be ignored or the Gateway stays
+    # OutOfSync forever. Same trap as the shared gateway in argocd-infra.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      jqPathExpressions:
+        - .spec.listeners[].tls.certificateRefs
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

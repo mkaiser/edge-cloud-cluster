@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: samba-ad-authentik
+  namespace: samba-ad
+spec:
+  encryptedData:
+    AD_PROVISIONER_TOKEN: AgBEYyK87H6RBFt6n2/ufPkFmQmLNKi6Zeh98be0Wxb2zwHEebJMeoHQTLcS4RJaDEQbJabWH4TBMVDZLst/GmRqQFjX498xQXi+6ZGKKIfVuuGv8DBSuF8FmKl89HyAPxpxzun8PtavER8QymdbN/wPMDSxL+cgazsPFcjw287vUhgdOgFjvklQ8z46G0GvHv14XfMIHbeLfOz4WRqut5N9OdeEcCWm82C5g0u3ehiMBT+UGEaehhEoRBG8Rix4J3XBCneaBj0NtJ4sNYX4ifnuAbDEIgVzNtovpoSfeRDkx8vv1cALKf64sxoC8XFxReMs1PtgBMbXax7L3XglecSONx7LDwqj20v5WK4H62e6duNqvoJAvASXrsAOlzKR7Tk/m1t0CnhujUWy0H9GcX6xDfwIpj+tIvj5DvIpY0pV7JUE0MXDDfVW7XWaUJyq64MIvvCcWYpDx0FreExMAbjvEF0WSDQJfuoTgZENCKomROZuV6mH1vQovDKmqbzKc83Sodmiz5bjf1zQcVKUNygpAHO1AxZF7t1pRAotqlPRrF95gpw6ayuvw5ieA/KbClYvIcV9nTOGXBLeK88QX8Ia+3aTB9yMF/UMYx6qVbSp5O+Ed0p8B6RVLG3vcDrd/5E2sVxiCIUkRxj071VB/gv4uUctZGolKnqRb9oqJ3YsIWx7v1Qw1+zhBZq+QkUNcoZnd6dmTzEy4D6C0pIw7VUQPH8adnCs/sHRC4lro8HUGN2P8R2QdZ3+tv4deeo0JAjO3dLcGtExHNOBvF82EYnIHOlwzsAiqLX2kt3vScimg8SXmx7z9KloTOaa7k8MpzfOU6i07cBFQMTzh7+137Jwn80rQ/SJCfE=
+    SAMBA_AD_BIND_PASSWORD: ""
+  template:
+    metadata:
+      name: samba-ad-authentik
+      namespace: samba-ad

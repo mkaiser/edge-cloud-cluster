@@ -1,0 +1,83 @@
+# Layer 2 of the image-registry boundary: WHO CAN REACH IT.
+#
+# Layer 1 is the htpasswd credential (deployment.yaml + sealSecrets.sh). This policy is the
+# second line, because what this registry serves is executed AS ROOT by the remote-desktop
+# broker — allowed() authorises a module by <repo>:<tag> and never verifies the CONTENT at
+# that tag, so publish rights are effectively root-execution rights.
+#
+# ⚠ Cilium runs enable-policy=default: it denies ONLY where a policy selects the pod. Before
+# this file existed nothing selected image-registry, so every pod in the cluster could reach
+# it — including the desktop container, where unprivileged LDAP users have shells. Selecting
+# the pod here is what flips it to default-deny for ingress.
+#
+# Allowed in:
+#   - the [eda] CI build pods (ns gitlab-runner) — they push the module images
+#   - the remote-desktop broker (ns remote-desktop) — it pulls them
+#
+# ⚠ Namespace-level, not pod-level, and that is a real limitation worth naming: any pod in
+# gitlab-runner or remote-desktop passes this layer. It cannot be narrowed usefully by
+# labels here because GitLab CI job pods are created by the runner with generated labels
+# that change per job. The CREDENTIAL is what distinguishes callers within those namespaces;
+# this policy just keeps the rest of the cluster out.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: image-registry-ingress
+  namespace: image-registry
+spec:
+  endpointSelector:
+    matchLabels:
+      app: image-registry
+  ingress:
+    # CI build pods: push.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: gitlab-runner
+      toPorts:
+        - ports:
+            - port: "5000"
+              protocol: TCP
+    # The desktop brokers: pull. One rule per namespace — each desktop's broker resolves
+    # the registry by Service name from inside its pod, so this is the in-cluster path
+    # (the kubelet's is the `host`/`remote-node` rule below).
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: remote-desktop
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: remote-desktop-bender
+      toPorts:
+        - ports:
+            - port: "5000"
+              protocol: TCP
+    # kubelet IMAGE PULLS, via the NodePort (service.yaml, 127.0.0.1:30500). The kubelet is
+    # in the host namespace, so it is `host` on the node that pulls and `remote-node` when
+    # the NodePort forwards to a registry pod on a different node — both, or a pull works on
+    # one node and hangs on another with nothing in the pod log to say why.
+    #
+    # ⚠ THIS IS WHERE THE NODEPORT'S LAN EXPOSURE LANDS. A packet from any lab-LAN host to
+    # <node>:30500 is SNATed to the node address, so it arrives with the same identity as
+    # the kubelet and this rule admits it. The policy therefore cannot separate the two —
+    # what does is the CREDENTIAL: the node-side account is the read-only `eda-pull`, and
+    # what the broker runs is digest-pinned. Do not treat this rule as a boundary against
+    # the LAN; it is not one.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "5000"
+              protocol: TCP
+    # kubelet probes come from the node, not a pod endpoint — without this the readiness
+    # and liveness probes are dropped and the pod never becomes Ready.
+    #
+    # ⚠ PORT 5001, not 5000: the probes hit /debug/health on the debug server, because
+    # /v2/ sits behind the htpasswd challenge and returns 401 to a credential-less kubelet.
+    # Restricted to host/remote-node precisely BECAUSE 5001 is unauthenticated — no pod
+    # endpoint is granted it.
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "5001"
+              protocol: TCP

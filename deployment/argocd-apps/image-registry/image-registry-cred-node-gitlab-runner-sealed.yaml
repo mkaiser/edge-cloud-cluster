@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: image-registry-cred-node
+  namespace: gitlab-runner
+spec:
+  encryptedData:
+    .dockerconfigjson: AgCDUlCYdVlkYL2W+3K88JneewcPBi/5CUggQ7WYFuAN0Z9JbZurXGAhd/7lzT2wQFqCv6n7rbdfonRQpnvzlHPEM1AQ34ga+OAt0qoe1hwNZ2jrZyqqoxbPA/Sq7AN4sXwSGDWBmSY7EC0Kr/McIZGq3HFJZKZyGqQZD7Kp8IkssKzhc5BZkzeMyyfM1gD/RIb9vgtXS5uXtd5Smr+CqTM2PNXrZkp9THoHLfTPl5XgXH/etPJ8MA3tvQT7b5W+yvqaKYlbPD9BXXrJy5Qo4R6aqKArU9BnZwTTmI9ou+sc+MUQhbUgdHOSBZrrk7D4Llzv7GctKocvq2Avrtm4/XxBuZHLiXQ8Y5RxvbuR8EQGVDpTq9OrVmtnc65TSKwAWt9alH9mwuZMIAgEpgoGXIJlCPq+TdIwoX4DHRRKroh6eInpIHCT5IOe4YVwSyiUW9KKk+5LjZ13BEFXD20F7s1njXvtMm0R8DP2hqTNrVed7x/Ymvj+Ie5MqiZP9vwZPhBqEut4kZWURYTj++CAfnBz6BzhxvCN0S1k8E2T4qDFjKEZyCgXj8aamHzGpJiMi8PgFAMvSRQtGkte+Mi/byh3J5ZntYghpjujBIjYM/QkPNh3ZfQDkcXnwhEMhQe5yqAistk6fp0cvfhbTNrkwJhzUTNqBN0Y+hJfXrFzZroBt+a+2T+k8G+i3EBmf8C8SWqM6oQ3hM4C0WIochI7HsQJPAFyfqo59ua6tj7waqFrGGNMOzWwHt5NbzfBP80JHucWt/lZ3Ou11+vwXYPm/vrei3nFP+9wh6K0O/TDOdt+QhRqeeXI82Vh/3Ql7VhJKSChXDC5Ep4IA2SAp35dtt7VMWr+8lmnaBc5BifPRDZTVJi+NqXib3Spv55b9jL68esc7iCfHM9NC9o4xF5V9b6/7y+1QM5c8Y/6lXCzbRwMFYgwUSa9kQNeUhs7Eg3hOckmK4A9omfCQ2MhRjfRCHUEwRpbXw6RV1Dysn7dquRDLiVANh+936GbC0XEW7f/+PKIVhppf3zR1A==
+  template:
+    metadata:
+      name: image-registry-cred-node
+      namespace: gitlab-runner
+    type: kubernetes.io/dockerconfigjson

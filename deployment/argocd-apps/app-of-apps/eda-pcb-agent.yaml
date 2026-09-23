@@ -1,0 +1,103 @@
+# ArgoCD Application: EDA PCB Agent — a SHARED, root-capable Hermes workstation with KiCad.
+#
+# One pod, one shared AD account (`eda-pcb-agent`), two surfaces:
+#   • the X session over RDP, reached through remote-desktop's Guacamole tile — this is where
+#     the two humans and the agent share ONE tmux pane;
+#   • the Hermes admin dashboard at pcb-agent.<tld>, gated by an Authentik OIDC provider this
+#     app creates itself (authentik-provider.yaml). Nothing pcb-specific lives in
+#     argocd-infra/authentik/.
+#
+# ── Why the dashboard chat cannot BE the shared surface ───────────────────────
+# hermes_cli/pty_session.py holds ONE websocket per session, so the second viewer is closed
+# with code 4409, and the attach token is minted per-browser into localStorage deliberately.
+# A live shared view therefore needs a shared X session; the dashboard is still worth having
+# for config/Kanban/logs. Hence both surfaces on one pod.
+#
+# ── Plain runc, deliberately ──────────────────────────────────────────────────
+# NO runtimeClassName. doc/nested-container-runtime.md says runsc is for workloads running
+# NESTED CONTAINERS; this one does not. remote-desktop needs gVisor because it runs EDA module
+# images nested AND because unprivileged LDAP users have interactive shells there. Neither
+# applies: this pod serves one shared account, by explicit design decision. Dropping gVisor is
+# what buys real setuid (so sudo works), real FUSE, and a working `apt install` — which is the
+# whole point, since the agent must install its own tools.
+#
+# Root is a CAPABILITY SET, never `privileged: true`: these lab nodes host the Samba AD DC and
+# the image-registry, and full privileged is node-root on them. See deployment.yaml.
+#
+# placement.ecc/tier: mesh — the NFS home only mounts at the fileserver's site
+# (csi-driver-nfs's node driver is pinned to ecc/fileserver-lan), so this pod is site-bound.
+#
+# ⚠ automated.selfHeal IS safe here and is NOT safe on remote-desktop: syncing this app ends
+# only this shared session, never someone else's. That is what makes a recreate hands-off.
+#
+# ⚠ retry is REQUIRED, not decoration. Three separate races need it: a PostSync Authentik hook
+# can outrun Authentik's own bring-up; samba-ad provisions users at wave 13 and truenas creates
+# the home at wave 16, so on a fresh cluster the home may not exist at first start; and
+# connection-seed.yaml depends on remote-desktop's Postgres being up. Each recovers on retry —
+# expect one failed start on a fresh cluster rather than reading it as a fault.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eda-pcb-agent
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/eda-pcb-agent
+    directory:
+      # Build inputs and docs are mirrored into GitLab by the PreSync build hook; they are not
+      # Kubernetes manifests and must not be applied.
+      exclude: "{*.sh,README.md,Dockerfile,Dockerfile.*,.gitlab-ci.yml,ci-*.yml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: eda-pcb-agent
+  ignoreDifferences:
+    # ⚠ THE MINTED LiteLLM KEY IS OWNED AT RUNTIME, NOT BY GIT.
+    # eda-pcb-agent-secrets ships `litellm-key` as a sealed PLACEHOLDER so the pod can start
+    # before the mint job has run; postsync-litellm-key.yaml then patches the real virtual
+    # key into that same field. Without this rule ArgoCD re-applies the SealedSecret on every
+    # sync, the controller regenerates the Secret from it, and the placeholder OVERWRITES the
+    # minted key — after which every completion fails with
+    #   HTTP 401 ... Received API Key = sk-...-job
+    # and the mint job cannot repair it, because the alias already exists in LiteLLM.
+    # Measured on ecc205, twice.
+    #
+    # Narrow on purpose: only this ONE key of this ONE Secret. A rotated dashboard password
+    # or OIDC secret still syncs normally, and a genuinely changed placeholder is simply
+    # irrelevant — the mint job is the only writer that matters for this field.
+    - group: ""
+      kind: Secret
+      name: eda-pcb-agent-secrets
+      namespace: eda-pcb-agent
+      jsonPointers:
+        - /data/litellm-key
+    # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs group/kind) are
+    # API-owned; under ServerSideApply ArgoCD reads them as permanent drift and the app never
+    # leaves OutOfSync — even though kubectl diff against the manifest is empty. Narrow on
+    # purpose: a real hostname/path/backend/port change still shows up.
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

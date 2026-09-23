@@ -1,0 +1,246 @@
+# Two declarative fixes to Open WebUI's model picker: hide the literal wildcard route
+# names, and attach the Model Library / LLM Backend Switch tools to every real model.
+#
+# WHY IT SHOWS UP AT ALL
+# ----------------------
+# LiteLLM serves each Ollama node through ONE provider-native wildcard route (`turing/*`,
+# `thor/*`), which it expands from a live GET /api/tags — that is what makes `ollama pull`
+# enough to add a model, with no per-model config. The cost is that the route NAME is itself
+# advertised in /v1/models (verified: `turing/*` and `thor/*` both appear alongside the real
+# ids), because get_complete_model_list() appends the configured proxy model list
+# before expanding wildcards, and only strips the literal when the router has NO deployment
+# for it (litellm/proxy/auth/model_checks.py — `models_to_remove` is populated only in the
+# no-deployment branches). Ours HAS a deployment, so the literal survives.
+# `return_wildcard_routes=false` does not help: it governs a different code path.
+#
+# Selecting a bare `turing/*` in the picker errors, so it is pure noise.
+#
+# WHY THIS SHAPE
+# --------------
+# Rejected alternatives, each measured or read first:
+#   * LiteLLM key/team `models` allowlist — DOES hide it (verified: a key scoped to two
+#     explicit models listed exactly those), but it is an ALLOWLIST, so it reintroduces the
+#     per-model configuration the wildcard exists to remove. Scoping a key to `ollama/*`
+#     instead expands dynamically but keeps the literal.
+#   * Open WebUI `OPENAI_API_CONFIGS` `model_ids` — also an allowlist, and worse: it REPLACES
+#     endpoint discovery entirely (routers/openai.py builds the list from model_ids without
+#     calling /v1/models), so the picker would freeze at whatever we hardcoded.
+#   * Open WebUI has no blocklist/exclude option — checked; only `model_ids`.
+#
+# What DOES work is a `model` row with is_active=false: utils/models.py does
+# `models.remove(model)` for an inactive override whose base_model_id is NULL. That is the
+# same mechanism as the admin UI's per-model toggle, which is what was asked for — this just
+# applies it declaratively so it survives a cluster recreate instead of being a click someone
+# has to remember.
+#
+# Runs as PostSync: the `model` table only exists after Open WebUI has migrated its schema.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-hide-wildcard-model
+  namespace: open-webui
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: hide
+          image: docker.io/library/postgres:18.6-alpine # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PGHOST
+              value: open-webui-pg-rw
+            - name: PGDATABASE
+              value: open-webui
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-pg-user
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-pg-user
+                  key: password
+            # The gateway credential, to enumerate the models it advertises. Already present
+            # in THIS namespace (it is the app's own OPENAI_API_KEY), so no cross-namespace
+            # Secret read is needed — litellm-secrets in the litellm namespace is not
+            # readable from here.
+            - name: LITELLM_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: litellm-key
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # Wait for the schema. On a fresh cluster this Job can win the race against
+              # Open WebUI's first-boot migration, and `model` would not exist yet.
+              i=0
+              until psql -tAc "select 1 from information_schema.tables \
+                               where table_name='model'" | grep -q 1; do
+                i=$((i+1))
+                [ "$i" -gt 60 ] && { echo "ERROR: table 'model' absent after 5m" >&2; exit 1; }
+                echo "waiting for Open WebUI to create the model table..."
+                sleep 5
+              done
+
+              # Idempotent: insert the hidden override, or force is_active=false if a row
+              # already exists (e.g. an admin re-enabled it by hand).
+              # base_model_id NULL + is_active false is what makes utils/models.py drop the
+              # entry from the served list.
+              # user_id MUST be a non-null string, not NULL. Learned the hard way: with NULL
+              # the row is written fine but ModelModel's pydantic validation rejects it
+              # ("user_id: Input should be a valid string"), Models.get_all_models() returns
+              # [] — silently dropping EVERY override — and the hide simply does not happen.
+              # A sentinel is correct here: there is no real owner (this cluster is OIDC-only,
+              # so on a fresh deploy the user table is empty and we cannot reference an admin),
+              # and the value is never used for anything but attribution.
+              #
+              # `coder` is hidden for a DIFFERENT reason than the wildcards, and the
+              # distinction matters when Thor is switched back to vLLM:
+              #   * turing/*, thor/*, ollama/* — permanently meaningless, selecting one
+              #                 always errors. `ollama/*` is a route name this cluster no
+              #                 longer uses; its row is kept so a DB that still carries it
+              #                 stays hidden.
+              #   * coder     — a route that only answers while the Thor vLLM is scaled
+              #                 up. Thor has ONE non-shareable GPU, so vLLM and
+              #                 ollama-thor are mutually exclusive; while ollama-thor
+              #                 holds it, `coder` fails, which reads to a user like a
+              #                 cluster fault. Worse, it sorts first, so a new chat lands
+              #                 on it by default and the UI looks broken.
+              #                 The vllm app is currently DISABLED and litellm's `coder`
+              #                 route is commented out with it, so nothing advertises the
+              #                 id today. This row stays regardless: it is idempotent, and
+              #                 it must already be in place the moment vLLM is re-enabled.
+              # ⚠ scripts/runtime/switchLLMBackend.sh must FLIP this row when it hands the
+              # GPU to vLLM (is_active = true), or the working backend stays invisible.
+              psql -v ON_ERROR_STOP=1 <<'SQL'
+              INSERT INTO model (id, user_id, base_model_id, name, params, meta,
+                                 created_at, updated_at, is_active)
+              VALUES
+                ('turing/*', 'system:gitops', NULL, 'turing/* (hidden)', '{}', '{}',
+                 extract(epoch from now())::bigint,
+                 extract(epoch from now())::bigint, false),
+                ('thor/*', 'system:gitops', NULL, 'thor/* (hidden)', '{}', '{}',
+                 extract(epoch from now())::bigint,
+                 extract(epoch from now())::bigint, false),
+                ('ollama/*', 'system:gitops', NULL, 'ollama/* (hidden)', '{}', '{}',
+                 extract(epoch from now())::bigint,
+                 extract(epoch from now())::bigint, false)
+                -- ⚠ NO ROW FOR THE vLLM ROUTE. It used to force-hide `coder` as
+                -- "vLLM, scaled down"; since 2026-09-18 vLLM is the ACTIVE thor backend
+                -- (serving thor/qwen3.6-35b-a3b-nvfp4), so a row here would hide the one
+                -- model the Thor actually serves. switchLLMBackend.sh owns that
+                -- visibility now and flips it per switch — only the WILDCARD names are
+                -- unconditionally hidden here.
+              ON CONFLICT (id) DO UPDATE
+                SET is_active = false,
+                    -- also repair a NULL user_id written by an earlier version of this Job,
+                    -- which would keep the whole override set failing validation.
+                    user_id = COALESCE(model.user_id, 'system:gitops'),
+                    updated_at = extract(epoch from now())::bigint;
+              SQL
+
+              # ── Attach the tools to every REAL model ────────────────────────────────────
+              #
+              # WHY THIS IS NEEDED. Installing a tool does NOT make a model use it:
+              # utils/middleware.py gates the whole tool path on `if tool_ids:`, and the
+              # frontend only populates tool_ids from `model.info.meta.toolIds`
+              # (Chat.svelte — "Set Default Tools"). With no such row the model is handed no
+              # tools at all and answers "I don't have a tool to list available models",
+              # which is exactly what users saw. A per-chat toggle in the UI also works, but
+              # it is per user per chat and does not survive a recreate.
+              #
+              # ⚠ THE ROW SHAPE IS THE SAME AS THE HIDE, DIFFERING ONLY IN is_active.
+              # utils/models.py branches on base_model_id:
+              #   base_model_id NULL + is_active FALSE -> models.remove(model)   (the hide)
+              #   base_model_id NULL + is_active TRUE  -> model['info'] = the override,
+              #                                          which is what carries meta.toolIds
+              #   base_model_id NOT NULL               -> a SEPARATE, ADDITIONAL entry
+              # So an attach row must be base_model_id NULL + is_active TRUE. Setting
+              # base_model_id would duplicate every model in the picker instead of
+              # decorating it.
+              #
+              # A row is needed per model id, and the ids are DISCOVERED from the gateway
+              # rather than listed here: the set changes whenever someone pulls a model,
+              # which is the whole point of the live wildcard. A static list would go stale
+              # on the next pull.
+              #
+              # busybox wget, because this is the postgres image (no curl). Fail SOFT: if the
+              # gateway cannot be reached we must not wipe or skip the hides above, so just
+              # report and leave tool attachment to the next sync.
+              MODEL_IDS=$(wget -qO- --timeout=20 \
+                            --header="Authorization: Bearer $LITELLM_KEY" \
+                            http://litellm.litellm.svc:4000/v1/models 2>/dev/null \
+                          | tr ',' '\n' | grep -o '"id":"[^"]*"' \
+                          | sed 's/"id":"//;s/"$//' \
+                          | grep -v '\*$' | sort -u)
+
+              if [ -z "$MODEL_IDS" ]; then
+                echo "WARNING: could not enumerate models from the gateway — tools not"
+                echo "         attached this run. The hides above are already applied."
+              fi
+
+              # ⚠ TWO psql/sh traps already hit here, both measured — do not "simplify":
+              #   * `psql -c "...:'mid'..."` does NOT interpolate -v variables. Only file or
+              #     stdin input does, so -c gave `syntax error at or near ":"` for every row.
+              #   * A heredoc whose terminator is INDENTED fails under busybox sh inside a
+              #     `for` body ("unexpected end of file (expecting done)").
+              # Writing the statement to a file once and feeding it with -f avoids both, and
+              # keeps the id out of the SQL text so a model name can never be injected.
+              TOOLS='["model_library","llm_backend_switch"]'
+              cat > /tmp/attach.sql <<'SQL'
+              INSERT INTO model (id, user_id, base_model_id, name, params, meta,
+                                 created_at, updated_at, is_active)
+              -- meta is the WHOLE object, so toolIds must be nested inside it. Passing
+              -- :'tools' directly here wrote the bare array as meta and the UI read no
+              -- toolIds at all (measured).
+              VALUES (:'mid', 'system:gitops', NULL, :'mid', '{}',
+                      jsonb_build_object('toolIds', (:'tools')::jsonb)::text,
+                      extract(epoch from now())::bigint,
+                      extract(epoch from now())::bigint, true)
+              ON CONFLICT (id) DO UPDATE
+                SET meta = jsonb_set(
+                      COALESCE(NULLIF(model.meta::text,'')::jsonb, '{}'::jsonb),
+                      '{toolIds}', (:'tools')::jsonb, true)::text,
+                    user_id = COALESCE(model.user_id, 'system:gitops'),
+                    updated_at = extract(epoch from now())::bigint
+                -- Never resurrect a deliberately hidden row (the wildcard names):
+                -- those are base_model_id NULL + is_active false and must stay so.
+                WHERE model.is_active;
+              SQL
+
+              attached=0
+              for mid in $MODEL_IDS; do
+                if psql -q -v ON_ERROR_STOP=1 -v mid="$mid" -v tools="$TOOLS" \
+                        -f /tmp/attach.sql; then
+                  attached=$((attached+1))
+                else
+                  echo "WARNING: could not attach tools to '$mid'"
+                fi
+              done
+              echo "tools attached to $attached model(s)"
+
+              echo "--- model overrides now ---"
+              psql -tAc "select id || '  is_active=' || is_active
+                         || '  toolIds=' || COALESCE(meta::jsonb ->> 'toolIds','-')
+                         from model order by id"
+              echo "Wildcard route names are hidden from the picker."
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

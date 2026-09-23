@@ -1,0 +1,308 @@
+# Two MutatingAdmissionPolicies for things the chart cannot express in values.
+#   1. ryax-placement             — placement for the execution pods in ryaxns-execs
+#   2. ryax-action-builder-probes — probe timing that would kill a build in progress
+#
+# ⚠ Do NOT add a policy that injects `argocd.argoproj.io/sync-options: Skip health
+# check`. A mutation lands on the live object, while ArgoCD decides what to wait for
+# from the manifest it renders from git — verified not to work. There was such a
+# policy for the chart's Ingresses; the Ingresses are simply not rendered now
+# (`<subchart>.ingress.enabled: false` in values.yaml).
+#
+# ── 1. Placement ────────────────────────────────────────────────────────────────
+#
+# Scoped to ryaxns-execs ONLY. The platform's own pods in ryaxns take placement from
+# global.tolerations/nodeSelector in values.yaml (plus per-subchart keys for the
+# upstream subcharts that ignore those globals).
+#
+# What values cannot reach is this namespace: Ryax runs user action pods here and the
+# RUNNER creates them at execution time, so they appear in no chart manifest. Every
+# mesh node is tainted ecc/mesh=true:NoSchedule, so without the injected toleration
+# they sit Pending forever.
+#
+# A policy rather than a patch list: it is enforced by the API server at pod creation
+# and matches by NAMESPACE, so pods that do not exist yet are covered. Native CEL
+# admission (k8s 1.34+, GA in admissionregistration.k8s.io/v1).
+#
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: ryax-placement
+  annotations:
+    # Must exist BEFORE any Ryax pod is admitted — a pod created ahead of the policy
+    # gets no placement and hangs Pending on the mesh taint. Negative wave puts both
+    # objects in the first sync step, ahead of every chart resource (wave 0).
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  # Fail closed: if the policy cannot be evaluated, reject the pod rather than
+  # admit one that would hang Pending on the mesh taint with no placement at all.
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  # ⚠ THE SITE LITERAL LIVES HERE, NOT in the CEL under `mutations`. A `>-` block scalar is
+  # not YAML-commented text: everything inside it, `#` included, goes verbatim to the CEL
+  # compiler, which has no comment syntax. The anchor comment used to sit on a `value:` line
+  # inside that block, so it became part of the expression and the policy stopped compiling
+  # ("token recognition error at: '#'"). With `failurePolicy: Fail` that is an outage rather
+  # than a cosmetic problem: it took the app OutOfSync and blocked its sync.
+  #
+  # ⚠ The anchor is the DECLARE-ONLY `applicationPlacements.celLiteral.meshSite`, so this
+  # line is CHECKED but never rewritten, and the quotes below must be kept by hand. They are
+  # load-bearing twice over — YAML strips the outer pair, and CEL needs what is left to be a
+  # string rather than the identifier `unibi-hclab`. The ordinary
+  # `applicationPlacements.meshSite` anchor cannot be used: the updater replaces the whole
+  # value region and would strip exactly those quotes on the next settings run. See
+  # DECLARE_ONLY_PREFIXES in scripts/environment/applyProjectSettings.py.
+  variables:
+    - name: meshSite
+      expression: '"unibi-hclab"'  # automatically updated from project-settings:applicationPlacements.celLiteral.meshSite
+  matchConditions:
+    # Skip pods that already pin themselves to the control plane. `ryax-crds-upgrade`
+    # (the chart's CRD-installer hook) sets nodeSelector
+    # node-role.kubernetes.io/control-plane=true; adding ecc/site=unibi-hclab on top
+    # produces a selector NO node satisfies — the control plane is at site
+    # hetzner-fsn1, and the unibi-hclab nodes are not control-plane — so the pod sits
+    # Pending with "4 node(s) didn't match Pod's node affinity/selector" and the sync
+    # hangs on the hook. Such pods are cluster-management helpers, not Ryax workloads,
+    # and need no mesh placement.
+    - name: not-control-plane-pinned
+      expression: >-
+        !has(object.spec.nodeSelector) ||
+        !("node-role.kubernetes.io/control-plane" in object.spec.nodeSelector)
+  # NOTE: these are JSONPatch, not ApplyConfiguration. `spec.nodeSelector`,
+  # `spec.tolerations` and the nodeAffinity structs are all marked ATOMIC in the
+  # Pod schema, and ApplyConfiguration refuses to merge atomic fields — it fails at
+  # admission with "may not mutate atomic arrays, maps or structs". Note that
+  # `kubectl apply --dry-run=server` on the POLICY does NOT catch this: the CEL
+  # compiles fine and the error only appears when a pod is actually admitted.
+  mutations:
+    # 1. Site pin — RYAXNS ONLY, not ryaxns-execs. Preserve any nodeSelector the
+    #    pod already has (ryax-alloy sets its own from values.yaml) by adding just
+    #    our key when the map exists.
+    #
+    #    Why the core engine (ryaxns) needs this and execution pods (ryaxns-execs)
+    #    must NOT get it: the engine's storage (longhorn-unibi-ryax) physically lives
+    #    on the nodes carrying that scope, so its pods genuinely cannot
+    #    run anywhere else. An
+    #    execution pod carries no such constraint — Ryax itself already pins it to
+    #    one exact node via `nodeSelector.kubernetes.io/hostname`, set from the
+    #    Node Pool the workflow is constrained to (manageWorker.sh). Adding
+    #    ecc/site=unibi-hclab on top of that hostname pin is pure redundancy that
+    #    can only be WRONG the moment a worker node sits at any other site — which
+    #    is exactly what happened when a mis-provisioned mesh node's ecc/site label
+    #    didn't match, and its execution pods sat permanently Pending with "node(s)
+    #    had untolerated taint(s)" even though the hostname selector alone would
+    #    have scheduled it correctly. The hostname pin is authoritative; this
+    #    mutation must defer to it rather than second-guess it with a second,
+    #    unmaintained site list.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          object.metadata.namespace != "ryaxns"
+            ? []
+            : (has(object.spec.nodeSelector)
+                ? [JSONPatch{
+                    op: "add",
+                    path: "/spec/nodeSelector/ecc~1site",
+                    value: variables.meshSite
+                  }]
+                : [JSONPatch{
+                    op: "add",
+                    path: "/spec/nodeSelector",
+                    value: {"ecc/site": variables.meshSite}
+                  }])
+    # 2. Mesh-taint toleration. Appended only when an equivalent one is absent, so
+    #    re-invocation (reinvocationPolicy: IfNeeded) cannot stack duplicates.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          has(object.spec.tolerations) &&
+          object.spec.tolerations.exists(t, has(t.key) && t.key == "ecc/mesh")
+            ? []
+            : (has(object.spec.tolerations)
+                ? [JSONPatch{
+                    op: "add",
+                    path: "/spec/tolerations/-",
+                    value: Object.spec.tolerations{
+                      key: "ecc/mesh", operator: "Equal",
+                      value: "true", effect: "NoSchedule"
+                    }
+                  }]
+                : [JSONPatch{
+                    op: "add",
+                    path: "/spec/tolerations",
+                    value: [Object.spec.tolerations{
+                      key: "ecc/mesh", operator: "Equal",
+                      value: "true", effect: "NoSchedule"
+                    }]
+                  }])
+    # 3. GPU-taint toleration, so GPU ACTIONS can run on the discrete-GPU node
+    #    (smartmirror1, ecc/gpu-model=nvidia-turing-sm75). Same exists-guard shape as
+    #    patch 2, so reinvocation cannot stack duplicates.
+    #
+    #    ⚠ This USED to be the place that kept Ryax off every GPU box: nothing tolerated
+    #    `ecc/gpu=true:NoSchedule`, so the taint alone was the guard. That is no longer
+    #    true, and the THOR must now be excluded explicitly — patch 4 below does it. Do
+    #    not drop patch 4 believing the taint still covers it.
+    #
+    #    The toleration is keyed to `ecc/gpu` (the capability). WHICH GPU box a pod may
+    #    use is decided by patch 4 plus the Node Pool's own `kubernetes.io/hostname`
+    #    selector, which Ryax sets from the pool the workflow is constrained to.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          has(object.spec.tolerations) &&
+          object.spec.tolerations.exists(t, has(t.key) && t.key == "ecc/gpu")
+            ? []
+            : (has(object.spec.tolerations)
+                ? [JSONPatch{
+                    op: "add",
+                    path: "/spec/tolerations/-",
+                    value: Object.spec.tolerations{
+                      key: "ecc/gpu", operator: "Equal",
+                      value: "true", effect: "NoSchedule"
+                    }
+                  }]
+                : [JSONPatch{
+                    op: "add",
+                    path: "/spec/tolerations",
+                    value: [Object.spec.tolerations{
+                      key: "ecc/gpu", operator: "Equal",
+                      value: "true", effect: "NoSchedule"
+                    }]
+                  }])
+    # 4. Thor exclusion. The Jetson Thor is aarch64/sm_110 and is a scarce single-GPU
+    #    eval box reserved for the LLM serving stack (ollama, vllm); Ryax action images
+    #    are built x86_64 by the action-builder and would not run there anyway. Patch 3
+    #    tolerates the GPU taint generally, so without this a GPU action could be
+    #    scheduled onto the Thor and fail with an exec-format error.
+    #
+    #    Expressed as a REQUIRED nodeAffinity NotIn on the model label rather than a
+    #    nodeSelector, because a selector would collide with the hostname pin Ryax sets
+    #    on every execution pod (see patch 1's reasoning). Only added when the pod has no
+    #    nodeAffinity yet — an execution pod never carries one, and a pod that does is
+    #    pinning itself deliberately.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          has(object.spec.affinity)
+            ? []
+            : [JSONPatch{
+                op: "add",
+                path: "/spec/affinity",
+                value: Object.spec.affinity{
+                  nodeAffinity: Object.spec.affinity.nodeAffinity{
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      Object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution{
+                        nodeSelectorTerms: [
+                          Object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms{
+                            matchExpressions: [
+                              Object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.matchExpressions{
+                                key: "ecc/gpu-model",
+                                operator: "NotIn",
+                                values: ["jetson-thor"]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                  }
+                }
+              }]
+---
+# Action-builder probe timing — not expressible in values, like the placement above.
+#
+# ⚠ Still present in 26.9.0 (checked 2026-09-10): the sibling IntelliScale probe
+# defect was fixed upstream there — probes became values-driven and gained a
+# startupProbe — but action-builder was NOT, so this policy stays. Re-check it on the
+# next chart bump; a values knob or a startupProbe upstream means this file can lose
+# its second policy the way it lost the IntelliScale one.
+#
+# subcharts/action-builder/templates/deployment.yaml hardcodes livenessProbe with
+# timeoutSeconds=1, failureThreshold=1 — a SINGLE missed 1s healthz check kills the
+# pod. This Deployment's entire job is running `nix run` builds (see
+# the Deployment exists to run `nix run` builds): a build pins its one event loop for tens of
+# seconds to minutes, starving the healthz handler, so the kubelet restarts the pod
+# mid-build — discarding it — every time a build takes long enough. Confirmed via
+# `kubectl describe pod`: "Liveness probe failed: ... context deadline exceeded"
+# immediately followed by "Killing ... will be restarted", with a `nix run` process
+# still active per `ps aux` in the container at the moment of the kill. The
+# resulting repository-service build_error ("Action builder has restarted... try
+# to increase disk space or memory") is misleading: this is a probe-timing bug,
+# not a resource shortage — the node had 90%+ CPU/memory headroom every time.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: ryax-action-builder-probes
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  # Ignore, not Fail: bad probe timing degrades one component's restart behavior,
+  # whereas failing closed here would block the pod entirely.
+  failurePolicy: Ignore
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: is-action-builder
+      expression: >-
+        has(object.spec.containers) &&
+        size(object.spec.containers) > 0 &&
+        object.spec.containers[0].name == "ryax-action-builder" &&
+        has(object.spec.containers[0].livenessProbe)
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          [
+                JSONPatch{op: "replace", path: "/spec/containers/0/livenessProbe/timeoutSeconds", value: 10},
+                JSONPatch{op: "replace", path: "/spec/containers/0/livenessProbe/failureThreshold", value: 6},
+                JSONPatch{op: "replace", path: "/spec/containers/0/livenessProbe/periodSeconds", value: 30}
+              ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: ryax-action-builder-probes
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  policyName: ryax-action-builder-probes
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["ryaxns"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: ryax-placement
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  policyName: ryax-placement
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          # ryaxns-execs ONLY. The platform's own pods in ryaxns get their placement
+          # from global.tolerations/nodeSelector in values.yaml (26.9.0+), verified as
+          # 18/18 workloads in the render — so this policy no longer touches them.
+          #
+          # What values CANNOT reach is this namespace: Ryax runs user action pods here
+          # (global.ryax.userNamespace) and the RUNNER creates them at execution time,
+          # so they are in no chart manifest. Without the injected ecc/mesh toleration
+          # they sit Pending on every mesh node — measured 2026-09-10, an execution pod
+          # with the right hostname selector and no toleration.
+          values: ["ryaxns-execs"]

@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: xwiki-db
+  namespace: xwiki
+spec:
+  encryptedData:
+    db-password: ""
+    superadmin-password: ""
+  template:
+    metadata:
+      name: xwiki-db
+      namespace: xwiki

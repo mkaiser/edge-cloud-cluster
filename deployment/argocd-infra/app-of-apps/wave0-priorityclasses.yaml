@@ -1,0 +1,26 @@
+# ArgoCD Application: PriorityClasses — applied very early (wave 0) so they exist
+# before any workload (wave >= 20) references them. Cluster-scoped scheduling
+# priorities for graceful degradation under resource pressure.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: priorityclasses
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/priorityclasses
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

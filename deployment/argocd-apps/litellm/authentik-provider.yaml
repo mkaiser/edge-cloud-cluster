@@ -1,0 +1,263 @@
+# Authentik OAuth2 provider + application tile for LiteLLM — managed entirely
+# from this folder via the Authentik API (Part B: self-contained per-app OIDC),
+# so nothing litellm-specific lives in the authentik folder.
+#
+#   PostSync  job → create/update the "litellm" OAuth2 provider + two application
+#                   tiles: "LiteLLM API" (slug litellm, OIDC-backed, launches the
+#                   API root) and "LiteLLM UI" (slug litellm-ui, launch-only
+#                   bookmark to /ui/) — both group "AI" — + bind the
+#                   central access-ai policy to both.
+#   PreDelete job → delete both applications + the provider on app removal.
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace) — NOT the superuser bootstrap token. The OIDC client secret
+# (key client-secret) comes from litellm-oidc-client-secret in this namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litellm-authentik
+  namespace: litellm
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-authentik-token-read
+  namespace: litellm
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-authentik-token-read
+  namespace: litellm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: litellm-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: litellm-authentik
+    namespace: litellm
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-authentik-provider
+  namespace: litellm
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: litellm-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-oidc-client-secret
+                  key: client-secret
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n litellm \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # Include the groups scope so the OIDC token carries the user's group
+              # membership — LiteLLM's GENERIC_ROLE_MAPPINGS_* (deployment.yaml) maps
+              # authentik-admins → proxy_admin and everyone else → internal_user.
+              # Without groups, every SSO user falls back to INTERNAL_USER_VIEW_ONLY.
+              MAP_PKS="[]"
+              for s in openid profile email groups; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'litellm',
+                'client_type': 'confidential',
+                'client_id': 'litellm',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict', 'url': 'https://llm.subdomain1.your-domain.tld/sso/callback'}], # automatically updated from project-settings:{general.subdomain,general.domain}
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=litellm")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'litellm'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'litellm' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              # Tile 1 — "LiteLLM API": the OIDC-backed application (owns the litellm
+              # provider). slug stays 'litellm' (the provider redirect URIs key off
+              # llm.<tld>/sso/callback). meta_launch_url is the API root.
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'LiteLLM API',
+                'slug': 'litellm',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'AI',
+                'meta_launch_url': 'https://llm.subdomain1.your-domain.tld', # automatically updated from project-settings:{general.subdomain,general.domain}
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/litellm.svg',
+              }))
+              ")
+
+              # Tile 2 — "LiteLLM UI": a launch-only bookmark to the admin/model UI at
+              # /ui/. No provider — the UI has its own login (Authentik SSO or the
+              # sealed litellm-admin local account), so this tile just deep-links there.
+              APP_UI_PAYLOAD=$(python3 -c "
+              import json
+              print(json.dumps({
+                'name': 'LiteLLM UI',
+                'slug': 'litellm-ui',
+                'group': 'AI',
+                'meta_launch_url': 'https://llm.subdomain1.your-domain.tld/ui/', # automatically updated from project-settings:{general.subdomain,general.domain}
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/litellm.svg',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app litellm    "LiteLLM API" "$APP_PAYLOAD"
+              upsert_app litellm-ui "LiteLLM UI"  "$APP_UI_PAYLOAD"
+
+              # Bind the central access-ai expression policy (blueprint-apps.yaml) to an
+              # application by slug. Idempotent — skip if already bound. Same gate for
+              # both tiles: only access-ai users see them.
+              bind_access_ai() {  # $1=slug
+                local app_pk pol_pk bound
+                app_pk=$(first_pk "core/applications/?slug=$1")
+                pol_pk=$(first_pk "policies/expression/?name=access-ai")
+                if [ -z "$app_pk" ] || [ -z "$pol_pk" ]; then
+                  echo "  WARN: app '$1' or access-ai policy not found — skipping access binding"
+                  return 0
+                fi
+                bound=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${app_pk}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$bound" | tr ',' '\n' | grep -qx "$pol_pk"; then
+                  echo "  binding access-ai policy to '$1'"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${app_pk}\",\"policy\":\"${pol_pk}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              }
+              bind_access_ai litellm
+              bind_access_ai litellm-ui
+
+              echo "LiteLLM Authentik providers + tiles (API + UI) + access bindings configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-authentik-provider-cleanup
+  namespace: litellm
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: litellm-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n litellm \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting applications 'litellm' + 'litellm-ui'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/litellm/" >/dev/null 2>&1 || true
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/litellm-ui/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=litellm" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'litellm' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "LiteLLM Authentik cleanup done."

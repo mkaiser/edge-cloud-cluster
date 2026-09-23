@@ -1,0 +1,67 @@
+# ArgoCD Application: XWiki (official xwiki-contrib Helm chart).
+# Accessible at https://wiki.subdomain.domain.tld
+# OIDC via Authentik (xwiki OIDC extension, configured post-install).
+# DB: our own official postgres (deployment/argocd-apps/xwiki/postgres.yaml) via externalDB;
+# Solr runs internally (chart default). Data on Longhorn.
+#
+# Multi-source:
+#   1. Helm chart (xwiki)
+#   2. ref source for $values
+#   3. Git directory for our postgres + sealed secrets
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: xwiki
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  sources:
+    - repoURL: https://xwiki-contrib.github.io/xwiki-helm
+      chart: xwiki
+      targetRevision: "1.7.3" # renovate: datasource=helm depName=xwiki registryUrl=https://xwiki-contrib.github.io/xwiki-helm
+      helm:
+        releaseName: xwiki
+        valueFiles:
+          - $values/deployment/argocd-apps/xwiki/values.yaml
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      ref: values
+
+    - repoURL: git@github.com:YourProject/yourGit.git
+      targetRevision: main
+      path: deployment/argocd-apps/xwiki
+      directory:
+        exclude: "{values.yaml,*.sh,*.template}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: xwiki
+  # xwiki + our postgres are StatefulSets; k8s mutates immutable volumeClaimTemplates
+  # with defaults ArgoCD can't reconcile → ignore to avoid perpetual OutOfSync.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+      # group/kind) are API-owned; under ServerSideApply ArgoCD reads them as
+      # permanent drift and the app never leaves OutOfSync.
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

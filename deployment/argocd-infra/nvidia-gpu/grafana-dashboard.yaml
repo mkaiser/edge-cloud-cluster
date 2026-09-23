@@ -1,0 +1,227 @@
+# GPU utilization dashboard — the two GPU mesh nodes, thor-eval and smartmirror1.
+# Discovered by the Grafana dashboard sidecar via the grafana_dashboard label
+# (searchNamespace: ALL in prometheus/grafana/grafana.yaml), so it needs no wiring.
+#
+# Lives in ns `prometheus` next to Grafana, matching the Loki and CNPG dashboards — NOT in
+# kube-system beside the exporter that feeds it. The sidecar would find it either way; the
+# convention is that dashboards sit together.
+#
+# WHAT THIS DASHBOARD IS FOR: the two GPU nodes are scarce, dedicated, and taint-fenced, so
+# the question is almost always "is the card actually busy, or is a job sitting on an idle
+# GPU it reserved". Hence utilization is the top row and per-CARD, not per-node: smartmirror1
+# has TWO separate 8 GiB RTX 2070s (BAR1 is capped at 256 MB, so they can never be pooled),
+# and a node-level average of one busy and one idle card reads as 50% and means nothing.
+#
+# ⚠ THE TWO NODES DO NOT EXPOSE THE SAME METRICS, and that is hardware, not a broken scrape.
+# The Thor is an integrated SoC GPU: NVML has no memory query on Tegra, so `memory.used` and
+# `memory.total` come back [N/A] and the exporter deliberately emits NOTHING for it rather
+# than a zero. So the memory panels show smartmirror1 only, BY DESIGN — a missing Thor series
+# there is the expected state, not an incident. Utilization, temperature and power are
+# available on both. (Verified on the live nodes 2026-09-20.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-utilization-dashboard
+  namespace: prometheus
+  labels:
+    grafana_dashboard: "1"
+data:
+  gpu-utilization.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "schemaVersion": 39,
+      "tags": ["gpu", "mesh", "nvidia"],
+      "title": "GPU Utilization — thor & smartmirror",
+      "uid": "gpu-utilization",
+      "timezone": "browser",
+      "time": { "from": "now-6h", "to": "now" },
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {
+            "name": "node",
+            "type": "query",
+            "datasource": "Prometheus",
+            "query": "label_values(gpu_utilization_percent, node)",
+            "includeAll": true,
+            "multi": true,
+            "current": { "text": "All", "value": "$__all" }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "GPU utilization now",
+          "description": "Per CARD, not per node. smartmirror1 has two independent RTX 2070s — a node-level average would hide one card pinned at 100% next to one idle.",
+          "type": "gauge",
+          "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "blue" }, { "value": 70, "color": "green" } ] }
+            },
+            "overrides": []
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [
+            { "expr": "gpu_utilization_percent{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Cards reporting",
+          "description": "Cards nvidia-smi enumerated per node. thor-eval must be 1 and smartmirror1 must be 2 — a drop means the driver or the exporter lost the device, which no workload error would say plainly.",
+          "type": "stat",
+          "gridPos": { "h": 6, "w": 4, "x": 8, "y": 0 },
+          "datasource": "Prometheus",
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [
+            { "expr": "gpu_cards_total{node=~\"$node\"}", "legendFormat": "{{node}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "GPU utilization over time (per card)",
+          "description": "The main view. A flat line at 0 while a pod holds the card is the case worth catching: the GPU is reserved and doing nothing.",
+          "type": "timeseries",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_utilization_percent{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Memory bus utilization (per card)",
+          "description": "Fraction of time the memory bus was in use — NOT how full the memory is (that is the panel below). Available on both node classes.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_memory_utilization_percent{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "GPU memory used (smartmirror1 only — Tegra reports none)",
+          "description": "⚠ thor-eval is ABSENT here by design, not broken: its iGPU shares system RAM and NVML has no Tegra memory query, so the exporter emits nothing rather than a misleading 0. For Thor memory, read the node's ordinary RAM metrics instead. Each RTX 2070 is a separate 8 GiB pool — they cannot be added together.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_memory_used_bytes{node=~\"$node\"}", "legendFormat": "used {{node}} gpu{{gpu}}", "refId": "A" },
+            { "expr": "gpu_memory_total_bytes{node=~\"$node\"}", "legendFormat": "total {{node}} gpu{{gpu}}", "refId": "B" }
+          ]
+        },
+        {
+          "id": 6,
+          "title": "GPU memory used (% of card)",
+          "description": "The ratio the raw-bytes panel makes you compute by eye. smartmirror1 only, for the same Tegra reason. Near 100% is where an allocation fails rather than queues.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "100 * gpu_memory_used_bytes{node=~\"$node\"} / gpu_memory_total_bytes{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 7,
+          "title": "GPU temperature",
+          "description": "Both node classes. The Thor is a passively-constrained SoC, so a sustained climb here shows up as clock throttling long before anything fails.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "celsius",
+              "custom": { "fillOpacity": 0, "showPoints": "never" },
+              "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 80, "color": "orange" }, { "value": 90, "color": "red" } ] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_temperature_celsius{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 8,
+          "title": "GPU power draw",
+          "description": "Both node classes. Power is the honest idle check on the Thor, where memory is unreadable: a card at a few watts is genuinely doing nothing.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "watt",
+              "min": 0,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_power_watts{node=~\"$node\"}", "legendFormat": "{{node}} gpu{{gpu}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 9,
+          "title": "Exporter up (per GPU node)",
+          "description": "0 means the exporter pod runs but its nvidia-smi query failed — a driver problem on the node, distinct from the pod being gone entirely (which shows as no series at all).",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "max": 1,
+              "custom": { "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "targets": [
+            { "expr": "gpu_exporter_up", "legendFormat": "{{instance}}", "refId": "A" }
+          ]
+        }
+      ]
+    }

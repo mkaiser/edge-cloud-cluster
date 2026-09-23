@@ -1,0 +1,61 @@
+# ArgoCD Application: LiteLLM (gateway/identity layer in front of the Ollama nodes).
+# Accessible at https://llm.<subdomain>.<domain> — users log in via Authentik OIDC
+# and mint their own virtual keys (per-user PAT model). Agents present a virtual
+# key; Open WebUI routes its traffic through here too.
+# OIDC via Authentik; provider + tile created by authentik-provider.yaml (PostSync).
+# State: CNPG Postgres litellm-pg (postgres.yaml).
+#
+# Synced by the wave19-argocd-apps app-of-apps (argocd-infra), so this Application
+# carries no sync-wave of its own.
+#
+# placement.ecc/tier: flex — schedulable cloud OR mesh; state on the lab mesh storage scope.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: litellm
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/litellm
+    directory:
+      exclude: "*.sh"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: litellm
+  # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+  # group/kind) are owned by the API server. Under ServerSideApply ArgoCD reads
+  # them as permanent drift, leaving the app OutOfSync forever and stalling the
+  # wave barriers — even though kubectl diff against the manifest is empty.
+  # Narrow on purpose: a real hostname/path/backend/port change still shows up.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # authentik-provider.yaml is a PostSync hook that calls the Authentik API. On a fresh
+    # recreate it races Authentik's own bring-up, and without retry a single hook failure
+    # leaves the app Failed until a git change or drift-selfHeal — so the OIDC provider and
+    # tile never get created. Note retry only re-attempts a sync that FAILS; it will not
+    # unstick an already-Failed hook (that needs an explicit `operation` patch).
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

@@ -1,0 +1,348 @@
+# Authentik OAuth2 provider + application tile for this app's Hermes dashboard —
+# created from THIS folder, so nothing pcb-specific lives in the authentik folder and
+# disabling this app leaves no orphaned provider behind.
+#
+#   PostSync  job → the eda-pcb-agent-users group, the access-eda-pcb-agent policy, the
+#                   "eda-pcb-agent-dashboard" OAuth2 provider, the "EDA PCB Agent"
+#                   application (tile, group "Development"), and the policy binding.
+#   PreDelete job → removes the application + provider (the group and policy are kept
+#                   deliberately, so group membership survives a redeploy).
+#
+# The scoped provisioner token comes from authentik-provisioner-token in THIS namespace
+# (sealed by this app's sealSecrets.sh); the confidential client secret (key client-secret)
+# comes from eda-pcb-agent-oidc-client-secret alongside it. ⚠ That same value is written into
+# the pod's .env by the seed initContainer — a mismatch 401s the TOKEN EXCHANGE, not the login
+# form, so it presents as an IdP fault rather than a secret mismatch.
+#
+# ⚠ THE POLICY IS THE ONLY AUTHORIZATION ON THIS APP. The dashboard's basic-auth is a
+# fallback for in-cluster callers, not a second gate for browsers. A missing policy is
+# therefore a HARD failure below, never a warning — an ungated dashboard on a pod with
+# root-capable shell is not a degraded state worth tolerating.
+#
+# ⚠ Its own group rather than the central access-admin-only: the two humans who share this
+# workstation are not necessarily cluster admins, and this app's access list must be
+# changeable without touching who is an admin everywhere else.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eda-pcb-agent-authentik
+  namespace: eda-pcb-agent
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-pcb-agent-authentik-token-read
+  namespace: eda-pcb-agent
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-pcb-agent-authentik-token-read
+  namespace: eda-pcb-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-pcb-agent-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: eda-pcb-agent-authentik
+    namespace: eda-pcb-agent
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-pcb-agent-authentik-provider
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-pcb-agent-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            # The dashboard host. The RDP session is NOT gated here — it is reached
+            # through remote-desktop's Guacamole, which does its own OIDC.
+            #
+            # The marker rewrites only the <cluster>.<basedomain> segment, so the
+            # "pcb-agent." prefix and the "/auth/callback" path below survive a
+            # subdomain bump. Do NOT add general.tld to the field list — that
+            # switches to the whole-hostname pass and would eat the prefix.
+            - name: PUBLIC_URL
+              value: "https://pcb-agent.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eda-pcb-agent-oidc-client-secret
+                  key: client-secret
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n eda-pcb-agent \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              # ── The access group and policy, both owned by this app ───────────────
+              # ⚠ attributes."ecc/seed"="all" marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts both seed users in it. An
+              # UNLABELLED group is not synced and only emits a WARN — easy to miss.
+              # ⚠ SET AT CREATE TIME ONLY: the provisioner role has add_group but NOT
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              GRP_PK=$(first_pk "core/groups/?name=eda-pcb-agent-users")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'eda-pcb-agent-users'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"eda-pcb-agent-users","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "eda-pcb-agent-users group pk=$GRP_PK"
+
+              # ⚠ THIS JOB DOES NOT ADD USERS TO THE GROUP, and must not try. Adding a user
+              # to a group needs authentik_core.add_user_to_group, which cannot be scoped to
+              # ONE group — granting it to the token 13 app namespaces hold would let any app
+              # move any user into authentik-admins. The central seed-user-group-sync CronJob
+              # populates seeded groups instead; real humans are added by an operator.
+              POL_PK=$(first_pk "policies/expression/?name=access-eda-pcb-agent")
+              # ⚠ THE CONTINUATION LINE MUST NOT BE INDENTED, however wrong it looks here.
+              # Authentik compiles a policy by wrapping the body in a function with
+              # textwrap.indent(expression, "    ") and NO dedent
+              # (lib/expression/evaluator.py wrap_expression). So any leading whitespace the
+              # YAML block adds becomes part of the Python source and the policy dies with
+              # "unexpected indent" — which surfaces as the policy DENYING everyone, not as a
+              # deploy error. Verified by compiling the wrapped form both ways.
+              # ⚠ The same shape in windows/ and remote-desktop/authentik-provider.yaml IS
+              # indented and therefore does not compile; do not copy it from there.
+              # Built with printf so the expression's second line reaches Authentik with no
+              # leading whitespace. Authentik compiles a policy by wrapping the body in a
+              # function with textwrap.indent(expression, "    ") and NO dedent
+              # (lib/expression/evaluator.py wrap_expression), so any indentation that
+              # survives into the stored value becomes part of the Python source and the
+              # policy fails to compile — which presents as the policy DENYING EVERYONE
+              # rather than as a deploy error.
+              #
+              # A plain multi-line quoted string (the shape windows/ and remote-desktop/ use)
+              # is also correct: a YAML block scalar strips the common indentation, so the
+              # shell already receives the continuation line flush-left. Verified against
+              # both manifests and against the live access-remote-desktop policy, whose
+              # stored expression carries no leading whitespace and compiles.
+              # printf is used here only because it makes that requirement explicit at the
+              # point of use rather than depending on the block scalar's behaviour.
+              POL_EXPR=$(printf '%s\n%s\n' \
+                'groups = set(request.user.groups.values_list("name", flat=True))' \
+                'return bool(groups & {"eda-pcb-agent-users", "authentik-admins"})')
+              POL_PAYLOAD=$(POL_EXPR="$POL_EXPR" python3 -c "
+              import json, os
+              print(json.dumps({'name':'access-eda-pcb-agent','execution_logging':False,'expression':os.environ['POL_EXPR']}))
+              ")
+              if [ -z "$POL_PK" ]; then
+                echo "Creating expression policy 'access-eda-pcb-agent'..."
+                POL_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating expression policy 'access-eda-pcb-agent' (pk=$POL_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/${POL_PK}/" >/dev/null
+              fi
+              echo "access-eda-pcb-agent policy pk=$POL_PK"
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              echo "auth_flow=$AUTH_FLOW inval_flow=$INVAL_FLOW signing_key=$SIGN_KEY"
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # openid/profile/email are the plugin's default scope set; groups is
+              # added so the claim is available for future group-based rules.
+              MAP_PKS="[]"
+              for s in openid profile email groups; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              echo "scope mapping pks: $MAP_PKS"
+
+              # The redirect_uri MUST end in /auth/callback — the plugin rejects
+              # anything else before it ever contacts the IDP
+              # (_validate_redirect_uri, self_hosted/__init__.py).
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" PUBLIC_URL="$PUBLIC_URL" \
+                CLIENT_SECRET="$OIDC_CLIENT_SECRET" python3 -c "
+              import json, os
+              p = {
+                'name': 'eda-pcb-agent-dashboard',
+                'client_type': 'confidential',
+                'client_id': 'eda-pcb-agent-dashboard',
+                'client_secret': os.environ['CLIENT_SECRET'],
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict',
+                                   'url': os.environ['PUBLIC_URL'] + '/auth/callback'}],
+                'grant_types': ['authorization_code', 'refresh_token'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=eda-pcb-agent-dashboard")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating OAuth2 provider 'eda-pcb-agent-dashboard'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'eda-pcb-agent-dashboard' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'EDA PCB Agent',
+                'slug': 'eda-pcb-agent',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'AI',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                # ⚠ VERIFY A NEW ICON URL RESOLVES BEFORE COMMITTING IT. selfhst has no
+                # robot.svg — that name 404'd, and Authentik stores whatever URL it is
+                # given without fetching it, so the tile rendered broken with nothing in
+                # any log. android-robot is the nearest generic-agent icon that exists.
+                # ⚠ NO BACKTICKS IN THIS BLOCK. It sits inside a DOUBLE-quoted bash
+                # heredoc, so backticks are command substitution even in a Python
+                # comment — the first version of this note ran robot.svg as a command
+                # and logged a command-not-found error during the sync.
+                # ⚠ AND NO DOUBLE QUOTES EITHER, for the same reason. This whole block is
+                # the argument to python3 -c followed by a double-quoted string, so a
+                # double quote anywhere in here CLOSES that string early. The previous
+                # version of the line above quoted the command-not-found message
+                # verbatim; bash then re-parsed the remainder and collapsed its spaces,
+                # so python received a truncated program and died with a SyntaxError
+                # about an unclosed brace — pointing at line 3, six lines ABOVE the
+                # actual culprit. Verified by dumping what python receives.
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/android-robot.svg',
+              }))
+              ")
+
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404. A list-query EXISTS check can return a
+              # false-negative (token visibility / pagination), making the old logic
+              # POST a duplicate → 400 "Application with this slug already exists".
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app eda-pcb-agent "EDA PCB Agent" "$APP_PAYLOAD"
+
+              # Access control: bind this app's OWN expression policy, created above.
+              # Idempotent — skip if already bound.
+              # This is the only gate on the dashboard (see the file header), so a
+              # missing policy is a HARD failure, not a warning.
+              # Read the application by SLUG, not via a list query. Authentik applies
+              # object-level view filtering to list endpoints: with the scoped provisioner
+              # token `?slug=eda-pcb-agent` returns pagination.count=1 but an EMPTY results array,
+              # so first_pk() yields "" for an application that plainly exists. The detail
+              # endpoint has no such filter (verified: GET /core/applications/eda-pcb-agent/ -> 200
+              # with the right pk while the list showed 0 results). This is what made the
+              # first run die with "application 'eda-pcb-agent' not found after upsert"
+              # AFTER it had just successfully created it.
+              APP_PK=$(curl -fsS -H "$AUTH" "$API/core/applications/eda-pcb-agent/" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin).get('pk',''))" 2>/dev/null || true)
+              POL_PK=$(first_pk "policies/expression/?name=access-eda-pcb-agent")
+              [ -z "$APP_PK" ] && { echo "ERROR: application 'eda-pcb-agent' not found after upsert"; exit 1; }
+              [ -z "$POL_PK" ] && { echo "ERROR: access-eda-pcb-agent policy not found — refusing to leave the dashboard ungated"; exit 1; }
+              BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+              if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                echo "  binding access policy to EDA PCB Agent"
+                curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                  "$API/policies/bindings/" >/dev/null
+              fi
+
+              echo "eda-pcb-agent Authentik provider + tile + access binding configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eda-pcb-agent-authentik-provider-cleanup
+  namespace: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eda-pcb-agent-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n eda-pcb-agent \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'eda-pcb-agent'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/eda-pcb-agent/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=eda-pcb-agent-dashboard" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'eda-pcb-agent-dashboard' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              echo "eda-pcb-agent Authentik cleanup done."

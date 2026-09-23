@@ -1,0 +1,302 @@
+# Authentik OAuth2 provider (PUBLIC client) + application tile for the remote-desktop
+# Desktop (Guacamole) — managed entirely from this folder via the Authentik
+# API (self-contained per-app OIDC; copied from the hyperlynx app).
+#
+# ⚠ NOT SELF-CONTAINED IN ONE RESPECT: the provider and the access policy below are the
+# front door for EVERY app that seeds a tile into this Guacamole — eda-pcb-agent and
+# remote-desktop-bender do, rather than running Guacamoles of their own. So
+# `access-remote-desktop` carries groups this app does not itself use, and removing one
+# locks that app's users out of a portal this folder owns. See the note at POL_EXPR.
+#
+#   PostSync  job → create the remote-desktop-users group + access-remote-desktop expression
+#                   policy, then the public "guacamole-remote-desktop" provider +
+#                   "Remote Desktops" application (ONE tile for all three desktops,
+#                   group "Development" — see the APP_PAYLOAD note for why it is not
+#                   one tile per desktop)
+#                   bound to that policy. Guacamole uses the implicit flow
+#                   (no client secret).
+#   PreDelete job → delete the application + provider on app removal. The
+#                   remote-desktop-users group + access-remote-desktop policy are
+#                   intentionally left in place (they may carry user memberships).
+#
+# Auth: the SCOPED provisioner token (key `token` in authentik-provisioner-token,
+# this namespace).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remote-desktop-authentik
+  namespace: remote-desktop
+---
+# The provider/cleanup jobs read the scoped provisioner token from this
+# namespace via `kubectl get secret` — grant the SA get on exactly that secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remote-desktop-authentik-token-read
+  namespace: remote-desktop
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["authentik-provisioner-token"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remote-desktop-authentik-token-read
+  namespace: remote-desktop
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: remote-desktop-authentik-token-read
+subjects:
+  - kind: ServiceAccount
+    name: remote-desktop-authentik
+    namespace: remote-desktop
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-authentik-provider
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: remote-desktop-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: provider
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: PUBLIC_URL
+              value: "https://remote-desktop.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n remote-desktop \
+                -o jsonpath='{.data.token}' | base64 -d)
+              [ -z "$TOKEN" ] && { echo "ERROR: provisioner token empty"; exit 1; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Waiting for Authentik API..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                curl -fsS -H "$AUTH" "$API/core/users/?username=akadmin" >/dev/null 2>&1 && break
+                echo "  waiting... ($i/60)"; sleep 10; i=$((i+1))
+              done
+              [ "$i" -ge 60 ] && { echo "ERROR: Authentik API never ready"; exit 1; }
+
+              first_pk() {
+                curl -fsS -H "$AUTH" "$API/$1" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')"
+              }
+
+              # remote-desktop-users access group (idempotent).
+              # attributes.ecc/seed=all marks it a non-admin access group, so
+              # seed-user-group-sync.yaml (authentik ns) puts BOTH seed users in it.
+              # Set at create time only: the provisioner role has add_group but not
+              # change_group, so an existing unlabelled group must be labelled centrally.
+              GRP_PK=$(first_pk "core/groups/?name=remote-desktop-users")
+              if [ -z "$GRP_PK" ]; then
+                echo "Creating group 'remote-desktop-users'..."
+                GRP_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d '{"name":"remote-desktop-users","is_superuser":false,"attributes":{"ecc/seed":"all"}}' "$API/core/groups/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              fi
+              echo "remote-desktop-users group pk=$GRP_PK"
+
+              # access-remote-desktop expression policy (idempotent).
+              POL_PK=$(first_pk "policies/expression/?name=access-remote-desktop")
+              # ⚠ THIS IS THE DOOR TO A SHARED GUACAMOLE, NOT TO ONE DESKTOP.
+              # Five apps seed tiles into this Guacamole (remote-desktop, eda-pcb-agent,
+              # hermes, remote-desktop-bender, windows), so this policy must admit the UNION
+              # of their audiences — Authentik denies an application outright as soon as >=1
+              # binding exists and the user matches none, so a group left out here never
+              # reaches the portal at all and never sees the tile it was granted.
+              # Who is here and why:
+              #   remote-desktop-users  this app's own tile
+              #   employees             remote-desktop-bender
+              #   eda-pcb-agent-users   the hermes desktop sidecar (and eda-pcb-agent's own
+              #                         tile, which until now rode in on `employees`)
+              #   windows-users         the Windows VM, which no longer has its own portal
+              #   authentik-admins      operators, incl. testadmin
+              # Widening the door does NOT widen tile visibility: that is
+              # guacamole_connection_permission, seeded per app, so each group still sees
+              # only the tiles granted to it.
+              POL_EXPR='groups = set(request.user.groups.values_list("name", flat=True))
+              return bool(groups & {"remote-desktop-users", "employees", "eda-pcb-agent-users", "windows-users", "authentik-admins"})'
+              POL_PAYLOAD=$(POL_EXPR="$POL_EXPR" python3 -c "
+              import json, os
+              print(json.dumps({'name':'access-remote-desktop','execution_logging':False,'expression':os.environ['POL_EXPR']}))
+              ")
+              if [ -z "$POL_PK" ]; then
+                echo "Creating expression policy 'access-remote-desktop'..."
+                POL_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating expression policy 'access-remote-desktop' (pk=$POL_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$POL_PAYLOAD" "$API/policies/expression/${POL_PK}/" >/dev/null
+              fi
+              echo "access-remote-desktop policy pk=$POL_PK"
+
+              AUTH_FLOW=$(first_pk "flows/instances/?slug=default-provider-authorization-implicit-consent")
+              INVAL_FLOW=$(first_pk "flows/instances/?slug=default-provider-invalidation-flow")
+              SIGN_KEY=$(first_pk "crypto/certificatekeypairs/?name=authentik%20Self-signed%20Certificate")
+              [ -z "$AUTH_FLOW" ] && { echo "ERROR: authorization flow not found"; exit 1; }
+
+              # openid/profile/email + the custom groups scope (Guacamole maps groups→connections).
+              MAP_PKS="[]"
+              for s in openid profile email; do
+                PK=$(first_pk "propertymappings/provider/scope/?scope_name=${s}")
+                [ -n "$PK" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$PK');print(json.dumps(l))")
+              done
+              GROUPS_MAP=$(first_pk "propertymappings/provider/scope/?managed=custom.scope-groups")
+              [ -n "$GROUPS_MAP" ] && MAP_PKS=$(python3 -c "import json;l=$MAP_PKS;l.append('$GROUPS_MAP');print(json.dumps(l))")
+              echo "scope mapping pks: $MAP_PKS"
+
+              PROVIDER_PAYLOAD=$(AUTH_FLOW="$AUTH_FLOW" INVAL_FLOW="$INVAL_FLOW" \
+                SIGN_KEY="$SIGN_KEY" MAP_PKS="$MAP_PKS" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              p = {
+                'name': 'guacamole-remote-desktop',
+                'client_type': 'public',
+                'client_id': 'guacamole-remote-desktop',
+                'authorization_flow': os.environ['AUTH_FLOW'],
+                'property_mappings': json.loads(os.environ['MAP_PKS']),
+                'redirect_uris': [{'matching_mode': 'strict', 'url': os.environ['PUBLIC_URL']}],
+                'grant_types': ['implicit', 'authorization_code'],
+              }
+              if os.environ.get('INVAL_FLOW'): p['invalidation_flow'] = os.environ['INVAL_FLOW']
+              if os.environ.get('SIGN_KEY'):   p['signing_key'] = os.environ['SIGN_KEY']
+              print(json.dumps(p))
+              ")
+
+              PROV_PK=$(first_pk "providers/oauth2/?name=guacamole-remote-desktop")
+              if [ -z "$PROV_PK" ]; then
+                echo "Creating public OAuth2 provider 'guacamole-remote-desktop'..."
+                PROV_PK=$(curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pk'])")
+              else
+                echo "Updating OAuth2 provider 'guacamole-remote-desktop' (pk=$PROV_PK)..."
+                curl -fsS -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$PROVIDER_PAYLOAD" "$API/providers/oauth2/${PROV_PK}/" >/dev/null
+              fi
+              echo "provider pk=$PROV_PK"
+
+              # ⚠ ONE TILE FOR ALL THE DESKTOPS, and the name says so on purpose.
+              # Guacamole is a shared portal: remote-desktop, remote-desktop-bender and the
+              # hermes desktop sidecar are RDP CONNECTIONS inside it, not separate web apps,
+              # and they all live behind this one URL. A tile per desktop would need a
+              # deep-link carrying Guacamole's base64 connection identifier, which changes
+              # whenever a connection is recreated — a dashboard link that silently 404s.
+              #
+              # Each user still sees only the connections granted to them: that is
+              # guacamole_connection_permission, seeded per app in its own connection-seed.
+              # So the tile is the front door and the list behind it is already filtered.
+              #
+              # ⚠ The name is plural and the description names the desktops, because
+              # otherwise the dashboard does not advertise that a bender or Hermes desktop
+              # exists at all — which is the whole reason this was widened.
+              # ⚠ The SLUG stays 'remote-desktop'. It is the URL primary key AND what the
+              # upsert below matches on; changing it orphans the existing application and
+              # its policy bindings instead of updating them.
+              APP_PAYLOAD=$(PROV_PK="$PROV_PK" PUBLIC_URL="$PUBLIC_URL" python3 -c "
+              import json, os
+              print(json.dumps({
+                'name': 'Remote Desktops',
+                'slug': 'remote-desktop',
+                'provider': int(os.environ['PROV_PK']),
+                'group': 'Development',
+                'meta_launch_url': os.environ['PUBLIC_URL'],
+                'meta_description': 'Linux desktops over RDP. You see the ones you have access to: the shared EDA desktop, the bender desktop, and the Hermes agent desktop.',
+                'meta_icon': 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/apache-guacamole.svg',
+              }))
+              ")
+              # Upsert by slug: PATCH the existing app (slug is the URL primary key),
+              # fall back to POST only on 404 (see windows app for the rationale).
+              upsert_app() {  # $1=slug $2=name $3=payload
+                local code
+                code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+                  -H "$AUTH" -H "Content-Type: application/json" \
+                  -d "$3" "$API/core/applications/$1/")
+                if [ "$code" = "404" ]; then
+                  echo "Creating application '$2'..."
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "$3" "$API/core/applications/" >/dev/null
+                elif [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "Updated application '$2' (slug=$1)."
+                else
+                  echo "ERROR: PATCH application '$1' returned HTTP $code"; exit 1
+                fi
+              }
+              upsert_app remote-desktop "Remote Desktop" "$APP_PAYLOAD"
+
+              # Bind access-remote-desktop policy (idempotent).
+              APP_PK=$(first_pk "core/applications/?slug=remote-desktop")
+              if [ -n "$APP_PK" ] && [ -n "$POL_PK" ]; then
+                BOUND=$(curl -fsS -H "$AUTH" "$API/policies/bindings/?target=${APP_PK}&page_size=100" \
+                  | python3 -c "import json,sys; print(','.join(b.get('policy','') for b in json.load(sys.stdin)['results'] if b.get('policy')))")
+                if ! echo "$BOUND" | tr ',' '\n' | grep -qx "$POL_PK"; then
+                  echo "  binding access-remote-desktop policy to Remote Desktop"
+                  curl -fsS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+                    -d "{\"target\":\"${APP_PK}\",\"policy\":\"${POL_PK}\",\"order\":0,\"enabled\":true}" \
+                    "$API/policies/bindings/" >/dev/null
+                fi
+              fi
+
+              echo "remote-desktop Authentik public provider + tile + group/policy configured."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: remote-desktop-authentik-provider-cleanup
+  namespace: remote-desktop
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: remote-desktop-authentik
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: cleanup
+          image: docker.io/alpine/k8s:1.37.0  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              API="http://authentik-server.authentik.svc.cluster.local/api/v3"
+              TOKEN=$(kubectl get secret authentik-provisioner-token -n remote-desktop \
+                -o jsonpath='{.data.token}' | base64 -d || true)
+              [ -z "$TOKEN" ] && { echo "Provisioner token unavailable — skipping cleanup."; exit 0; }
+              AUTH="Authorization: Bearer ${TOKEN}"
+
+              echo "Deleting application 'remote-desktop'..."
+              curl -fsS -X DELETE -H "$AUTH" "$API/core/applications/remote-desktop/" >/dev/null 2>&1 || true
+
+              PROV_PK=$(curl -fsS -H "$AUTH" "$API/providers/oauth2/?name=guacamole-remote-desktop" \
+                | python3 -c "import json,sys; r=json.load(sys.stdin)['results']; print(r[0]['pk'] if r else '')" 2>/dev/null || true)
+              if [ -n "$PROV_PK" ]; then
+                echo "Deleting OAuth2 provider 'guacamole-remote-desktop' (pk=$PROV_PK)..."
+                curl -fsS -X DELETE -H "$AUTH" "$API/providers/oauth2/${PROV_PK}/" >/dev/null 2>&1 || true
+              fi
+              # remote-desktop-users group + access-remote-desktop policy intentionally kept.
+              echo "remote-desktop Authentik cleanup done."

@@ -1,0 +1,147 @@
+# invite-minter: OIDC-gated room-scoped guest-link generator (see the ConfigMap
+# in invite-minter-script.yaml for the full rationale + the Deno source).
+#
+# Runs the stock denoland/deno image over the mounted minter.ts — no custom image
+# build. Reuses the EXISTING "jitsi" OAuth2 client (a second redirect URI
+# /invite/callback is added to it by authentik-provider.yaml) and the same
+# JWT_APP_SECRET / OIDC_CLIENT_SECRET sealed secrets as the oidc-adapter.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jitsi-invite-minter
+  namespace: jitsi
+  labels:
+    app.kubernetes.io/name: jitsi-invite-minter
+  annotations:
+    # deno runs the script from the ConfigMap at container start, so a script edit alone
+    # changes nothing in the running pod. Reloader (argocd-infra/reloader) rolls this
+    # Deployment when the mounted ConfigMap/Secret content changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jitsi-invite-minter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jitsi-invite-minter
+    spec:
+      containers:
+        - name: minter
+          image: docker.io/denoland/deno:2.9.6  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["deno", "run", "--allow-net", "--allow-env",
+                    "/app/minter.ts"]
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: PORT
+              value: "9000"
+            # Per-application OIDC issuer (NO trailing slash — discovery appends
+            # /.well-known/openid-configuration).
+            - name: OIDC_ISSUER_URL
+              value: "https://id.subdomain1.your-domain.tld/application/o/jitsi" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_ID
+              value: "jitsi"
+            - name: OIDC_SCOPES
+              value: "openid profile email"
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jitsi-oidc-client-secret
+                  key: OIDC_CLIENT_SECRET
+            - name: JWT_APP_ID
+              value: "jitsi"
+            - name: JWT_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jitsi-jwt
+                  key: JWT_APP_SECRET
+            # Public base for the guest links + OIDC redirect host.
+            - name: PUBLIC_URL
+              value: "https://meet.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            # Guest-token TTL: default 3h, host may request up to 7d via the form.
+            - name: GUEST_EXP_SECOND
+              value: "10800"
+            - name: GUEST_EXP_MAX_SECOND
+              value: "604800"
+            # Host login session (cookie) lifetime.
+            - name: SESSION_EXP_SECOND
+              value: "3600"
+            # Deno caches remote deps to $DENO_DIR; make it writable for the
+            # non-root filesystem and warm on first request.
+            - name: DENO_DIR
+              value: "/tmp/deno"
+          volumeMounts:
+            - name: script
+              mountPath: /app
+            - name: deno-cache
+              mountPath: /tmp/deno
+          readinessProbe:
+            httpGet:
+              path: /invite/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /invite/healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: jitsi-invite-minter-script
+        - name: deno-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jitsi-invite-minter
+  namespace: jitsi
+  labels:
+    app.kubernetes.io/name: jitsi-invite-minter
+spec:
+  selector:
+    app.kubernetes.io/name: jitsi-invite-minter
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+---
+# Routes https://meet.<tld>/invite/* to the minter. Same host as the web + /oidc
+# routes; Gateway API resolves the overlap by path specificity (longest
+# PathPrefix wins), so /invite beats the chart's "/" route.
+#
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: jitsi-invite-minter
+  namespace: jitsi
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - meet.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /invite
+      backendRefs:
+        - name: jitsi-invite-minter
+          port: 9000

@@ -13,7 +13,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
 import * as helm from "@pulumi/kubernetes/helm";
 import * as command from "@pulumi/command";
-import { project_settings } from "../project_settings";
+import { project_settings, haReplicas } from "../project_settings";
 
 export class CertManagerComponent extends pulumi.ComponentResource {
     public readonly certManager: helm.v3.Release;
@@ -48,17 +48,17 @@ export class CertManagerComponent extends pulumi.ComponentResource {
             {
                 name: "cert-manager",
                 chart: "cert-manager",
-                version: "v1.20.2", // https://artifacthub.io/packages/helm/cert-manager/cert-manager
+                version: "v1.21.2", // https://artifacthub.io/packages/helm/cert-manager/cert-manager
                 namespace: "cert-manager",
                 repositoryOpts: { repo: "https://charts.jetstack.io" },
                 values: {
                     crds: { enabled: true },
-                    // HA replica counts — kept in sync with project_settings.ha by
-                    // scripts/environment/updateConfigFromProjectSettings.sh (ha.<key> anchors).
-                    // The webhook is in the admission path, so its HA matters most.
-                    replicaCount: 2, // project-settings: ha.certManager
-                    webhook: { replicaCount: 2 }, // project-settings: ha.certManagerWebhook
-                    cainjector: { replicaCount: 2 }, // project-settings: ha.certManagerCainjector
+                    // HA replica counts read straight from project_settings (this is TS —
+                    // no script patching needed). The webhook is in the admission path, so
+                    // its HA matters most.
+                    replicaCount: haReplicas("certManager"),
+                    webhook: { replicaCount: haReplicas("certManagerWebhook") },
+                    cainjector: { replicaCount: haReplicas("certManagerCainjector") },
                     // Use public DNS for ACME DNS-01 challenge verification instead of in-cluster CoreDNS
                     extraArgs: [
                         "--dns01-recursive-nameservers-only",
@@ -69,7 +69,7 @@ export class CertManagerComponent extends pulumi.ComponentResource {
                         servicemonitor: {
                             // Disabled: ServiceMonitor CRDs don't exist at Pulumi time.
                             // The cert-manager ServiceMonitor is declared in
-                            // deployment/kube-prometheus-stack/prometheus.yaml via additionalServiceMonitors.
+                            // deployment/argocd-infra/prometheus/kube-prometheus-stack/prometheus.yaml via additionalServiceMonitors.
                             enabled: false,
                         },
                     },
@@ -117,7 +117,7 @@ KUBECFG
             {
                 name: "cert-manager-webhook-hetzner",
                 chart: "cert-manager-webhook-hetzner",
-                version: "0.7.0", // https://github.com/hetzner/cert-manager-webhook-hetzner
+                version: "0.9.0", // https://github.com/hetzner/cert-manager-webhook-hetzner
                 namespace: "cert-manager",
                 repositoryOpts: { repo: "https://charts.hetzner.cloud" },
                 values: {
@@ -140,7 +140,7 @@ KUBECFG
             "cert-manager-hetzner-secret",
             {
                 metadata: { name: "hetzner", namespace: "cert-manager" },
-                stringData: { token: projectSettings.general.hcloudToken },
+                stringData: { token: projectSettings.hetzner.hcloudToken },
             },
             { provider: k8sProvider, parent: this, dependsOn: [this.certManagerNs] },
         );

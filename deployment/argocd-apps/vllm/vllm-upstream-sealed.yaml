@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: vllm-upstream
+  namespace: vllm
+spec:
+  encryptedData:
+    api-key: ""
+  template:
+    metadata:
+      name: vllm-upstream
+      namespace: vllm

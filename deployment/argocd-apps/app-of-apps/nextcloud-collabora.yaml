@@ -1,0 +1,61 @@
+# ArgoCD Application: Collabora Online (CODE) — the document-editing backend that
+# Nextcloud's richdocuments app drives over WOPI.
+# Accessible at https://collabora.<subdomain>.<domain> (Nextcloud's wopi_url).
+#
+# Deliberately SEPARATE from the nextcloud Application. Collabora is a different
+# product from a different vendor (Collabora Productivity, built on LibreOffice),
+# integrated over a protocol — not a subchart of the nextcloud umbrella chart, whose
+# only subcharts (mariadb/postgresql/redis) are disabled here anyway. Bumping the
+# nextcloud chart can never move collabora/code — Renovate tracks the image tag
+# independently (docker datasource; the CalVer-ish 5-segment tags order fine by
+# default, so no versioning override is needed).
+#
+# Sync-wave 10 — one wave AHEAD of nextcloud (11). The Nextcloud PostSync job runs
+# `occ app:enable richdocuments` and sets wopi_url against this host, so the WOPI
+# backend must exist first or that job flakes on a fresh cluster build.
+#
+# Namespace stays `nextcloud`: the ingress targets the `collabora` Service by name and
+# richdocuments resolves it in-cluster. Only the Application boundary moved, not the
+# runtime topology.
+#
+# Plain manifests only (no Helm chart): collabora.yaml (Deployment + Service + Ingress)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nextcloud-collabora
+  namespace: argocd-apps
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    placement.ecc/tier: flex
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/nextcloud-collabora
+    directory:
+      exclude: "*.sh"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nextcloud
+  # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+  # group/kind) are owned by the API server. Under ServerSideApply ArgoCD reads
+  # them as permanent drift, leaving the app OutOfSync forever and stalling the
+  # wave barriers — even though kubectl diff against the manifest is empty.
+  # Narrow on purpose: a real hostname/path/backend/port change still shows up.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

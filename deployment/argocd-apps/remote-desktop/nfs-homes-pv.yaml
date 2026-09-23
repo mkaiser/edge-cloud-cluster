@@ -1,0 +1,87 @@
+# ⚠ THE `server:` VALUE ONLY TAKES EFFECT ON A FRESH CLUSTER. A PersistentVolume's
+# `spec.persistentvolumesource` is IMMUTABLE after creation, so on a cluster whose PVs
+# already exist this change cannot be applied — ArgoCD reports the PV OutOfSync and keeps
+# serving the old value. That drift is EXPECTED and harmless: the existing PV still mounts
+# via the IP, and the next recreate builds it from scratch with the name. Do NOT "fix" it
+# by deleting a Bound PV to force the update — that detaches live data.
+# A STATIC PV pinned to the homes export ROOT, plus the claim the desktops mount.
+#
+# ⚠ WHY THERE IS NO NFS StorageClass AT ALL — dynamic provisioning was tried first and
+# removed. A dynamically provisioned NFS volume gets its own SUBDIRECTORY under the export
+# (`subDir: ${namespace}-${pvc}-${pv}`), so the desktop mounted
+#   datapool/homes/remote-desktop-nfs-homes-pvc-<uuid>/
+# while the fileserver creates per-user homes at
+#   datapool/homes/<user>/
+# Two different directories. The desktop showed only its own seeded `desktop`/`headless`
+# dirs and no user homes at all — and nothing errored, because both paths exist and are
+# writable. Exactly the silent-wrong-place failure that removing pam_mkhomedir was meant to
+# prevent.
+#
+# The per-user directories are the SHARED namespace here: every desktop pod and every SMB
+# client must see the same /home/<user>. So the volume has to be the export root itself,
+# which means a static PV — subDir templating cannot express "no subdirectory".
+#
+# ⚠ storageClassName is EMPTY STRING, not omitted. Empty explicitly means "no dynamic
+# provisioning"; omitting the field entirely lets the DEFAULT class (longhorn-cloud) claim
+# it, which would silently hand the desktop a Longhorn volume instead of the homes export.
+# Every static NFS PV in this repo does the same — that is the convention, not a quirk.
+#
+# ⚠ Do NOT reintroduce an NFS StorageClass to "tidy this up". csi-driver-nfs is deployed for
+# its NODE driver, which is what mounts these static PVs; its dynamic provisioner is
+# deliberately unused for the reason above.
+#
+# ⚠ persistentVolumeReclaimPolicy: Retain. This PV points at every user's home directory.
+# Delete would hand the CSI driver permission to remove them when the claim goes away.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-homes
+  labels:
+    # The claim below selects on this, so the pairing cannot bind to the wrong volume.
+    ecc/volume: nfs-homes
+spec:
+  capacity:
+    # Nominal — an NFS export has no reserved size; the real limit is the datapool (or a ZFS
+    # quota on datapool/homes, which is where to enforce one).
+    storage: 500Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    # ⚠ Keep in step with the other static NFS PVs — there is no StorageClass to inherit
+    # mountOptions from, so every PV repeats the set. nfsvers in particular matters: the
+    # export still offers NFSV3, and a client left to negotiate could land on v3, which has
+    # no real id mapping and maps every uid to nobody.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # ⚠ volumeHandle must be unique across the cluster AND stable. The driver treats it as
+    # the volume's identity; changing it orphans the binding.
+    volumeHandle: fs-1-datapool-homes
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/homes # automatically updated from project-settings:storage.fileserver.datasets.homes.dataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-homes
+  namespace: remote-desktop
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Empty string, for the same reason as the PV above: no dynamic provisioning.
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 500Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-homes

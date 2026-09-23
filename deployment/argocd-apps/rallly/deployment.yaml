@@ -1,0 +1,133 @@
+# Rallly — group availability polling (Doodle replacement).
+# Accessible at https://rallly.<subdomain>.<domain>
+# OIDC via Authentik (OIDC_DISCOVERY_URL / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET).
+# PostgreSQL self-managed in postgres.yaml (longhorn-cloud-db — cloud-only storage,
+# unlike litellm/open-webui/xwiki's mesh-backed state; a mesh-scheduled app pod here
+# means the DB hop, not the app hop, crosses WireGuard — same trade-off, just flipped).
+# Secrets from rallly-secrets (db-password, secret-password) and
+# rallly-oidc-client-secret (client-secret) — both SealedSecrets.
+# placement.ecc/tier: flex — schedulable cloud OR mesh; no GPU, low priority.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rallly
+  namespace: rallly
+  annotations:
+    # Rallly is configured entirely from env read at startup. Reloader
+    # (argocd-infra/reloader) rolls the pod when rallly-secrets, the OIDC client secret or
+    # staging-ca-bundle change; a re-seal otherwise never reaches the process.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rallly
+  template:
+    metadata:
+      labels:
+        app: rallly
+    spec:
+      priorityClassName: low
+      # Flex placement: schedulable on cloud OR mesh. Tolerate the mesh taint so it
+      # CAN run there, and softly PREFER unibi-hclab so it actually moves once available
+      # — see the identical pattern (and the full rationale) in litellm/deployment.yaml.
+      # Soft, not hard: at cluster bootstrap no mesh node exists yet. The descheduler's
+      # LowNodeUtilization/RemovePodsViolatingNodeAffinity plugins
+      # (deployment/argocd-infra/descheduler/) evict the cloud-bootstrapped pod once a
+      # mesh node is Ready, since nothing else moves a running pod.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: ecc/site  # automatically updated from project-settings:applicationPlacements.labels.site
+                    operator: In
+                    values:
+                      - unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+      containers:
+        - name: rallly
+          image: lukevella/rallly:4  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NEXT_PUBLIC_BASE_URL
+              value: "https://rallly.subdomain1.your-domain.tld" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: RALLLY_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-secrets
+                  key: db-password
+            - name: DATABASE_URL
+              # CNPG read-write (primary) service; see postgres.yaml (Cluster rallly-pg).
+              value: "postgresql://rallly:$(RALLLY_DB_PASSWORD)@rallly-pg-rw:5432/rallly"
+            - name: SECRET_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-secrets
+                  key: secret-password
+            - name: OIDC_DISCOVERY_URL
+              value: "https://id.subdomain1.your-domain.tld/application/o/rallly/.well-known/openid-configuration" # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: OIDC_CLIENT_ID
+              value: "rallly"
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rallly-oidc-client-secret
+                  key: client-secret
+            - name: SUPPORT_EMAIL
+              value: "no-reply@your-domain.tld" # automatically updated from project-settings:mail.senderEmail
+            - name: NEXT_PUBLIC_SELF_HOSTED
+              value: "true"
+            - name: REGISTRATION_ENABLED
+              value: "false"
+            - name: EMAIL_LOGIN_ENABLED
+              value: "false"
+            - name: OIDC_NAME_CLAIM_PATH
+              value: "preferred_username"
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/ssl/staging-ca/ca-bundle.pem"
+          volumeMounts:
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1500Mi
+      volumes:
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rallly
+  namespace: rallly
+spec:
+  selector:
+    app: rallly
+  ports:
+    - port: 3000
+      targetPort: 3000

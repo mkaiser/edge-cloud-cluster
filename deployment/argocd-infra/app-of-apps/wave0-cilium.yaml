@@ -1,0 +1,188 @@
+# Cilium CNI — the cluster pod network.
+#
+# This Application ADOPTS a release Pulumi already installed (src/cni.ts). It does not
+# bootstrap it: k3s runs with `flannel-backend: none`, so until Cilium exists every node is
+# NotReady with no pod network and ArgoCD itself cannot be scheduled. Pulumi therefore
+# installs it during `make bootstrap`, and this app takes over day-2 management so a version
+# bump is a git push rather than a `pulumi up`.
+#
+# ⚠ KEEP `targetRevision` BELOW IN SYNC WITH THE CHART VERSION IN src/cni.ts.
+# They are the same release; a mismatch makes ArgoCD fight Pulumi on every sync. Renovate
+# bumps this one (helm datasource) and the src/cni.ts pin (custom TS manager) independently,
+# so both PRs must land together.
+#
+# ⚠ VALUES BELOW MUST MIRROR src/cni.ts. The dangerous ones are `MTU` (auto-detect breaks
+# mesh nodes), `ipam.mode` (the chart default collides with the private plane) and
+# `policyEnforcementMode` (the chart default is ENFORCING).
+#
+# Wave 0: before everything. Waves 2+ all assume a working pod network, and the mesh apps at
+# wave 10 (mesh-gateway, node-guard) manipulate the CNI's tunnel device directly.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cilium
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://helm.cilium.io
+    chart: cilium
+    targetRevision: "1.20.2" # renovate: datasource=helm depName=cilium registryUrl=https://helm.cilium.io
+    helm:
+      valuesObject:
+        # Datapath: VXLAN over the private plane (cloud) / tailscale0 (mesh).
+        routingMode: tunnel
+        tunnelProtocol: vxlan
+        tunnelPort: 8472 # automatically updated from project-settings:network.cniTunnelPort
+        # Device MTU (cilium_vxlan/cilium_host/lxc*), NOT the pod MTU: Cilium installs a route
+        # MTU of (device - 50) on remote pod CIDRs, so pods actually get 1180. NOT auto-detected
+        # on purpose: mesh nodes tunnel over tailscale0 (WireGuard MTU 1280) and VXLAN adds 50B,
+        # so the chart's auto-detected ~1450 silently drops large frames while small ones pass —
+        # a mesh node Ready with crash-looping pods. Do NOT raise to 1280 (wire ceiling is 1180,
+        # measured) — see project_settings.network.cni.mtu.
+        MTU: 1230 # automatically updated from project-settings:network.cniMtu
+        # MUST stay "kubernetes": the chart default "cluster-pool" allocates pod CIDRs from
+        # 10.0.0.0/8, which overlaps the Hetzner private plane and the mesh range.
+        ipam:
+          mode: kubernetes
+        k8s:
+          requireIPv4PodCIDR: true
+        # Cilium's eBPF datapath owns Service forwarding. MUST stay paired with
+        # `disable-kube-proxy: true` on the k3s SERVER (src/nodes-k3s-common.ts) — k3s runs
+        # kube-proxy in-process, so with only one set either nothing programs Services or both
+        # do. Watch headscale DERP/STUN (NodePort 30478, externalTrafficPolicy: Local): a
+        # source-IP regression degrades silently to DERP relay. Keep in sync with src/cni.ts.
+        kubeProxyReplacement: true
+        # ── socket-LB: enabled, but BYPASSED INSIDE POD NAMESPACES ──────────
+        # hostNamespaceOnly=true is the load-bearing half. Cilium's socket-LB rewrites the
+        # destination at connect()/sendmsg() in the caller's cgroup, which works only if the
+        # calling process shares the host's netns view. gVisor runs its processes under its
+        # own netstack (and a VM-based runtime under its own guest kernel), so the hook never
+        # fires for them and the ClusterIP is passed through untranslated — nothing downstream fixes it,
+        # because with kubeProxyReplacement: true there is no kube-proxy iptables fallback.
+        # Upstream names this exact case: "due to the Pod's nature the socket-level
+        # loadbalancer is ineffective (e.g., KubeVirt, Kata Containers, gVisor)"
+        # (Documentation/network/kubernetes/kubeproxy-free.rst), which warns to set
+        # hostNamespaceOnly=true when using kubeProxyReplacement.
+        # Setting it re-enables service lookup in the tc BPF program at the veth, which the
+        # sandbox's traffic DOES traverse.
+        #
+        # The shape is the diagnostic — pod networking is entirely FINE, only service VIPs
+        # fail: a sandboxed pod reaches external IPs, node IPs and other pods' IPs, but every
+        # ClusterIP (incl. 10.43.0.10:53, so ALL DNS) times out, while a runc pod on the SAME
+        # node is fine — which is what makes it read as an app bug. socketLB.enabled alone
+        # does NOT fix it; hostNamespaceOnly is the part that matters.
+        #
+        # Downstream it presents as an identity fault, not a network one: no DNS means SSSD
+        # never reaches the Authentik LDAP outpost, so `id testuser` returns "no such user"
+        # for a user that EXISTS in AD, while the desktops sit Running 2/2, 0 restarts, with
+        # ZERO warning events.
+        #
+        # ⚠ AFTER ANY CHANGE HERE, CHECK EVERY NODE FOR DUPLICATE GENERATIONS:
+        #     bpftool cgroup show /run/cilium/cgroupv2 | grep -c cil_sock
+        # 11 = healthy, 22 = two generations attached `multi`; the stale one sends ClusterIP
+        # traffic to a RECYCLED pod IP while every cilium table reads correct, and only a node
+        # reboot clears it. Keep in sync with src/cni.ts.
+        socketLB:
+          enabled: true
+          hostNamespaceOnly: true
+        # ── Local Redirect Policy: steers ClusterIP traffic to a node-local backend ──
+        # Required by the node-local DNS cache (deployment/argocd-infra/node-local-dns):
+        # the stock upstream nodelocaldns intercepts the DNS VIP with its own iptables
+        # NOTRACK rules and a link-local bind, which assumes a kube-proxy data path that
+        # kubeProxyReplacement: true removes. A CiliumLocalRedirectPolicy is upstream's
+        # answer for that case, and it needs no kubelet change and no pod restarts.
+        #
+        # kubeProxyReplacement + socketLB.hostNamespaceOnly + this flag is verbatim
+        # Cilium's supported setup #2 (Documentation/network/kubernetes/
+        # local-redirect-policy.rst). hostNamespaceOnly matters here beyond compatibility:
+        # LRP "supports either the socket-level loadbalancer or the tc loadbalancer", so
+        # the redirect still reaches gVisor/Kata pods over the same tc path their service
+        # traffic already takes — the exact pods hostNamespaceOnly exists for.
+        #
+        # ⚠ NOT the flat `localRedirectPolicy` key: the chart marks it "deprecated, please
+        # use 'localRedirectPolicies.enabled' instead". Keep in sync with src/cni.ts.
+        localRedirectPolicies:
+          enabled: true
+        # "default" = ENFORCING but default-allow (an endpoint is unrestricted until a policy
+        # selects it). ⚠ "never" also disables CiliumNetworkPolicy, so it cannot be used to
+        # debug a single namespace. Keep in sync with src/cni.ts.
+        policyEnforcementMode: default
+        # Cilium ships Envoy as a standalone DaemonSet; Envoy Gateway runs its own. Both use
+        # hostNetwork and both default to --base-id 0, so they fight over the abstract socket
+        # @envoy_domain_socket_parent_0 and the loser exits with errno=98, stalling the
+        # bootstrap at wave 1. Keep in sync with src/cni.ts.
+        envoy:
+          baseID: 42
+        # Leader-elected and off the datapath, but it owns IPAM — while it is down no NEW pod
+        # gets an IP. Anchored to highAvailability.replicas.ciliumOperator so it follows the
+        # same switch as every other essential component; the chart default of 2 cannot
+        # schedule on a single-CP cluster (host ports), where the surplus pod sits Pending and
+        # marks the app Degraded, stalling the wave-1 barrier.
+        operator:
+          replicas: 1 # automatically updated from project-settings:highAvailability.replicas.ciliumOperator
+          prometheus:
+            enabled: true
+            metricsService: true
+        # ⚠ metricsService, not serviceMonitor. The chart creates the cilium-agent and
+        # cilium-operator metrics Services ONLY when serviceMonitor.enabled or
+        # metricsService is set, and its ServiceMonitors need the Prometheus operator CRDs
+        # — which do not exist yet at wave 0, since kube-prometheus-stack is wave 2. So the
+        # chart publishes the Services and the ServiceMonitors live with Prometheus as
+        # additionalServiceMonitors. Keep in sync with src/cni.ts.
+        # (cilium-envoy already has its own metrics Service: envoy.prometheus.enabled
+        # defaults to true and Envoy runs as the standalone DaemonSet here.)
+        prometheus:
+          enabled: true
+          metricsService: true
+        hubble:
+          enabled: true
+          relay:
+            enabled: true
+          ui:
+            enabled: true
+          # Number of recent flows each agent caches for `hubble observe` / the UI to read
+          # back — 4x the chart's default 4095. Measured 2026-09-03: ~500 flows/s cluster-wide,
+          # so the default held roughly 8 seconds of history per agent and anything not read
+          # within that window was gone before anyone could look at it. 16383 buys ~30s at
+          # that rate for a few MB per agent. Raise (2^n-1, max 65535) if drop-hunting during
+          # the NetworkPolicy rollout keeps arriving too late.
+          # ⚠ This does NOT stop hubble_lost_events_total{source="hubble_ring_buffer"} from
+          # climbing, and it is not meant to: a bounded ring that wraps always evicts unread
+          # flows, at any capacity. Loss from the OTHER two sources is the real fault signal
+          # — see the hubble alert in kube-prometheus-stack's rules.
+          eventBufferCapacity: "16383"
+          # Hubble's flow metrics are where POLICY DROPS become a number you can alert on;
+          # `hubble observe --verdict DROPPED` only shows them to someone already looking.
+          # dns is query-only and skips AAAA — the full form and httpV2 carry per-request
+          # label sets and are the ones that hurt cardinality, and httpV2 additionally needs
+          # L7 visibility policies to see anything.
+          metrics:
+            enabled:
+              - drop
+              - tcp
+              - flow
+              - icmp
+              - "dns:query;ignoreAAAA"
+        # Agent must reach the apiserver before kube-proxy programs the kubernetes ClusterIP.
+        # This is the init CP's own vSwitch IP, NOT the kube-vip VIP: kube-vip is a pod, so it
+        # cannot be up before the CNI it would serve — pointing here at the VIP deadlocks a
+        # fresh bootstrap (agent + operator die on "network is unreachable"). Must stay in sync
+        # with initCpApiHost() in src/cni.ts.
+        k8sServiceHost: "10.0.1.2" # automatically updated from project-settings:network.initCpPrivateIp
+        k8sServicePort: 6443 # automatically updated from project-settings:network.k3sApiPort
+        # NB: tolerations intentionally left at the chart default (`- operator: Exists`) so the
+        # agent lands on mesh nodes carrying ecc/mesh=true:NoSchedule.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # ServerSideApply is what makes adoption of the Pulumi-installed release work.
+      - ServerSideApply=true

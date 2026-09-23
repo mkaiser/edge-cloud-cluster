@@ -1,0 +1,126 @@
+# Registry garbage collection — REPLACES the CronJob of the same name from the
+# ryax-engine chart's registry subchart.
+#
+# WHY A REPLACEMENT AND NOT VALUES: the chart's GC CronJob carries TWO independent
+# bugs, and only one is reachable from values.yaml.
+#
+#   1. Its volume mount is guarded on `.Values.persistence.enable` while the values
+#      file defines `persistence.enabled`. The guard is always false → no PVC mount.
+#      Fixed in values.yaml by setting BOTH keys (see the comment there).
+#
+#   2. Its command is hardcoded to `/etc/docker/registry/config.yml`. That is the
+#      registry v2 path; the chart deploys `registry:3`, which ships its config at
+#      `/etc/distribution/config.yml`. Nothing in the chart mounts a config either.
+#      `args` is not templated, so no value can reach it.
+#
+# Bug 2 alone is fatal, so fixing the values key is not sufficient — hence this file.
+# Verified 2026-09-21 against docker.io/registry:3: the v2 path exits non-zero with a
+# usage dump, and the stock image's own config already declares
+# `storage.delete.enabled: true` and `rootdirectory: /var/lib/registry`, which is
+# exactly what GC needs. So we point at the shipped config rather than mounting one.
+#
+# ⚠ The chart's trailing `|| echo Nothing to be cleaned` is deliberately NOT carried
+# over. That mask is why this went unnoticed: it converts every failure — missing
+# config, missing mount, corrupt blob store — into exit 0, so the CronJob reports
+# Complete and `lastSuccessfulTime` stays current while nothing is ever reclaimed.
+# Measured 2026-09-21: the PVC reached 100% (21.43 of 21.47 GB) and every image push
+# began failing, with a KubePersistentVolumeFillingUp alert as the only signal. A GC
+# failure must be loud — this job is allowed to fail.
+#
+# ⚠ SAME NAME as the chart's CronJob, on purpose: ArgoCD applies both manifests to one
+# object, and this source is ordered after the chart, so this definition wins. Renaming
+# it would leave the broken chart CronJob running alongside this one.
+#
+# Upstream is unfixed on master (46099b4, 2026-09-10) and 26.9.0 is the latest release,
+# so neither bug clears via a version bump. On the next chart bump, re-render
+# cronJobs.yaml: if upstream fixes the config path, delete this file and keep only the
+# values key; if it fixes both, delete both.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ryax-registry-garbage-collect
+  namespace: ryaxns
+spec:
+  # Every 2h, matching the chart's cadence.
+  schedule: "0 */2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  # 3, not the chart's 1. GC is the thing whose silent failure caused the outage this
+  # file fixes, so keep enough failed pods around to read the logs from.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No backoffLimit: 300 (the chart's value). GC failures here are configuration
+      # errors, not transient ones — retrying 300 times only buries the cause.
+      backoffLimit: 2
+      # Bounds a HANG, not just a slow GC: if the pod can never attach the RWO volume
+      # (see the podAffinity note below) it would otherwise sit in ContainerCreating
+      # forever, which reads as "still working" rather than broken. 30 min is well
+      # clear of a real GC run over this volume.
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          # ⚠ podAffinity, NOT a nodeSelector — carried over from the chart's own job and
+          # load-bearing. ryax-registry-pvc-0 is ReadWriteOnce and permanently mounted by
+          # the running registry Deployment, so this Job can only attach it by landing on
+          # the SAME NODE (two pods may share an RWO Filesystem volume on one node; across
+          # nodes the attach never happens).
+          #
+          # A site-level nodeSelector is not enough: unibi-hclab has several nodes, so the
+          # scheduler is free to pick a different one. Measured 2026-09-21 — an earlier
+          # version of this file used `ecc/site: unibi-hclab`, landed on bender while the
+          # registry was on pcie-tb-s, and sat in ContainerCreating indefinitely:
+          #   FailedAttachVolume ... Volume is already used by pod(s) ryax-registry-...
+          # That is a silent hang, not a failure: the Job never completes and never errors,
+          # so it would look like a slow GC rather than a broken one.
+          #
+          # `registrySetup: "0"` is the label the chart puts on the registry pod itself.
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: "kubernetes.io/hostname"
+                  labelSelector:
+                    matchExpressions:
+                      - key: "registrySetup"
+                        operator: "In"
+                        values:
+                          - "0"
+          containers:
+            - name: garbage-collect
+              image: docker.io/registry:3  # renovate: tracked by "Container image tags" regex (docker datasource)
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+
+                  echo "=== registry GC starting $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+                  df -h /var/lib/registry
+
+                  # Fail loudly if the PVC is not actually mounted. Without this the job
+                  # would "succeed" against an empty overlayfs and reclaim nothing —
+                  # precisely the failure mode being fixed here.
+                  if [ ! -d /var/lib/registry/docker/registry/v2 ]; then
+                    echo "FAILED: /var/lib/registry/docker/registry/v2 missing — PVC not mounted."
+                    exit 1
+                  fi
+
+                  # --delete-untagged also removes manifests no tag references, which is
+                  # what actually frees space here: Ryax pushes each action build under a
+                  # fresh repository and never deletes the old ones.
+                  /bin/registry garbage-collect --delete-untagged /etc/distribution/config.yml
+
+                  echo "=== registry GC finished $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+                  df -h /var/lib/registry
+              volumeMounts:
+                - name: registry-data-dir
+                  mountPath: /var/lib/registry
+          volumes:
+            - name: registry-data-dir
+              persistentVolumeClaim:
+                claimName: ryax-registry-pvc-0

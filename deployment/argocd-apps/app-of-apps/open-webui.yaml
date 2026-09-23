@@ -1,0 +1,61 @@
+# ArgoCD Application: Open WebUI (web chat).
+# Accessible at https://ai.<subdomain>.<domain>, behind Authentik SSO.
+# Talks to models through the LiteLLM gateway, never vLLM directly. Attribution is
+# per-USER (not just per-key) only because ENABLE_FORWARD_USER_INFO_HEADERS is on here and
+# litellm sets user_header_name — both halves are required, see litellm/config.yaml.
+# directly. OIDC via Authentik; provider + tile created by authentik-provider.yaml.
+# State: CNPG Postgres open-webui-pg (postgres.yaml). Wave 20 (user apps).
+#
+# placement.ecc/tier: flex — schedulable cloud OR mesh; state on the lab mesh storage scope.
+# Plain manifests only:
+#   deployment.yaml, postgres.yaml, ingress.yaml, staging-ca.yaml,
+#   authentik-provider.yaml, presync-wait-mesh-storage.yaml, *-sealed.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: open-webui
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: flex
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/open-webui
+    directory:
+      exclude: "{*.sh,README.md}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: open-webui
+  # Gateway API server-defaults (backendRefs group/kind/weight, parentRefs
+  # group/kind) are owned by the API server. Under ServerSideApply ArgoCD reads
+  # them as permanent drift, leaving the app OutOfSync forever and stalling the
+  # wave barriers — even though kubectl diff against the manifest is empty.
+  # Narrow on purpose: a real hostname/path/backend/port change still shows up.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      jqPathExpressions:
+        - .spec.rules[].backendRefs[].group
+        - .spec.rules[].backendRefs[].kind
+        - .spec.rules[].backendRefs[].weight
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # Retry failed syncs forever (limit<0 = unlimited): the PreSync mesh-storage gate
+    # (presync-wait-mesh-storage.yaml) intentionally fails until an operator provisions
+    # a lab mesh node (`make provision-mesh-node`) — possibly hours/days after a
+    # cluster recreate. Worst-case re-check cadence: 30min in-pod poll + 10min backoff.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

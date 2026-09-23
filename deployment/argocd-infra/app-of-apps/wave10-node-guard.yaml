@@ -1,0 +1,29 @@
+# ArgoCD Application: node-guard
+# Host-level enforcement DaemonSets that must hold on EVERY node (CP + mesh).
+# Currently: mesh-antiloop-guard — the `inet mesh_antiloop` nftables table that
+# blocks tailscale WG/disco (udp 41641) on the CNI overlay interfaces (cilium_*/lxc*),
+# preventing WG-in-VXLAN-in-WG tunnel recursion (doc/network-firewall.md).
+# Wave 10 (with mesh-gateway): needs nothing but the node itself; placed before the
+# mesh-monitoring probes (wave 11) so throughput probes measure guarded paths.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: node-guard
+  namespace: argocd-infra
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-infra/node-guard
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: headscale
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

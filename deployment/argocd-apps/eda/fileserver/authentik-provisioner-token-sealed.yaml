@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: eda-fileserver
+spec:
+  encryptedData:
+    token: AgCdYv5FU/cPs97wlZgnWKt6JgPsvn5Zzc81N5B8u40jOL2pXf6GhadQA7IfvgcrUaRv/YqFym0OQNsnm5lPemd7ilYxEu47cYqQgei7AhxxdOGJiKoXvJuz4OBGCManM7vHiicXxnpDlvpyvu7j9O8hw47ImYdFE+vmMvfAtc4V4ToLhg8v/c5RkDNBb58lKjj39R76owE2EY6Di05+HQTyign7DpIDeyoYOERRaQdXWtbY8ypcOFjSyZjwMj3GcsO3E/RLWst/KAeTzIWzTPKbuiWJQA4ku8ZdTIOQV8WId59ZDaacYFcXSfwo0JAlvaj8S4/I4Hu1kURZoth734hMLSehY49xDFTcTg8VqVVkaENZ7KIlITNaT7DTXjPseagkVFhR/PZArkWXHns8lnszUchiMzeUr6B0X16gq4E3lHpVWDO5T96dE7RpzE/9S+7sWTmf4ZP9+SqqmyeKrySx4WN1oIa9XDlRHSmhCU0Cn03pCXfuHlYiSyahK2Tezjy8F653y9C8ylYEGz9NuY35EES9dK6S0NobTNEc4xRfoAJVsQx87XVTHkJaY96gbrdogf2r5RViZqydJl3Z75VAlhJh7tIfQAFfLZkN56MWLWmK+3qTxyVrA1Ve9KZrImTPqudzGm6DCLAdtIo18WLuKZKZUEGu6NOfadbs0IH1htI5+jzFBIgSPSG38DkqH2rZ+Lf1p3lMaEyFunhagd+fxFFYs7NY4GATtAAd9xiMhB0+IhWWotNLq0C+/6UwDWEtWEm2a1DAl4t05v00bt2kigWGCI3r8iJV5S22Yk844P0Lai2KThWw2B/sPjm8K78Ft8Z/VHe77rB/9MsIBobX2fEyax7tTsE=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: eda-fileserver

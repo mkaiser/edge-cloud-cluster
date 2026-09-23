@@ -81,9 +81,17 @@ S3_ACCESS=$(kubectl get secret longhorn-s3-credentials -n longhorn-system \
 S3_SECRET=$(kubectl get secret longhorn-s3-credentials -n longhorn-system \
     -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d || true)
 S3_ENDPOINT="https://nbg1.your-objectstorage.com"
+# etcd bucket name = project_settings.general.name + "-etcd" (constant across subdomain
+# bumps). Derived at runtime so a general.name change never leaves a stale literal here.
+_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ETCD_BUCKET=$(perl -ne '
+    $in = 1 if /^\s*general:\s*\{/;
+    if ($in && /^\s*name:\s*"([^"]+)"/) { print "$1"; exit; }
+' "$_REPO_ROOT/project_settings.ts" 2>/dev/null)
+ETCD_BUCKET="${ETCD_BUCKET:-edgecloudinfra}-etcd"
 if [ -n "$S3_ACCESS" ] && [ -n "$S3_SECRET" ]; then
     ETCD_S3_LINE=$(AWS_ACCESS_KEY_ID="$S3_ACCESS" AWS_SECRET_ACCESS_KEY="$S3_SECRET" \
-        aws s3 ls "s3://edgecloudinfra-etcd/k3s-etcd/" \
+        aws s3 ls "s3://${ETCD_BUCKET}/k3s-etcd/" \
         --endpoint-url "$S3_ENDPOINT" 2>/dev/null \
         | grep -i "shutdown-snapshot" | sort | tail -1 || true)
     if [ -n "$ETCD_S3_LINE" ]; then
@@ -237,19 +245,19 @@ echo "┌───────────────────────�
 echo "│  Backup Summary                                             │"
 echo "├─────────────────────────────────────────────────────────────┤"
 if $ETCD_OK; then
-    printf "│  etcd     : OK\n"
-    printf "│  snapshot : %s\n" "$ETCD_SNAP_NAME"
-    printf "│  size     : %s\n" "$ETCD_SIZE_STR"
+    echo "│  etcd     : OK"
+    echo "│  snapshot : $ETCD_SNAP_NAME"
+    echo "│  size     : $ETCD_SIZE_STR"
 else
-    printf "│  etcd     : FAILED\n"
-    printf "│  check    : kubectl logs job/%s -n kube-system\n" "$JOB_NAME"
+    echo "│  etcd     : FAILED"
+    echo "│  check    : kubectl logs job/$JOB_NAME -n kube-system"
 fi
 echo "├─────────────────────────────────────────────────────────────┤"
 if [ "$LH_STATUS" = "skipped" ]; then
-    printf "│  Longhorn : skipped (not installed or no S3 target)\n"
+    echo "│  Longhorn : skipped (not installed or no S3 target)"
 else
-    printf "│  Longhorn : %s\n" "$LH_STATUS"
-    printf "│  PVCs     : %s/%s\n" "$LH_DONE" "$LH_TOTAL"
-    printf "│  uploaded : %s\n" "$LH_HUMAN"
+    echo "│  Longhorn : $LH_STATUS"
+    echo "│  PVCs     : $LH_DONE/$LH_TOTAL"
+    echo "│  uploaded : $LH_HUMAN"
 fi
 echo "└─────────────────────────────────────────────────────────────┘"

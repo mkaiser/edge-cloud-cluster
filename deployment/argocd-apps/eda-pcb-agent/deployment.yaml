@@ -1,0 +1,926 @@
+# The shared workstation: one pod, two containers, one shared X session.
+#
+#   desktop — xrdp + xfce + KiCad, joined to AD. The session the two humans attach to.
+#   hermes  — the agent's dashboard (config, Kanban board, logs) on :9119.
+#
+# ── PLAIN RUNC, AND THAT IS THE WHOLE DESIGN ──────────────────────────────────
+# ⚠ NO runtimeClassName. doc/nested-container-runtime.md: runsc is for workloads running
+# NESTED CONTAINERS; this one does not. remote-desktop needs gVisor because it runs EDA
+# module images nested AND because unprivileged LDAP users have interactive shells there —
+# neither applies to a single shared account that must install its own tools.
+# Under gVisor setuid is ineffective (sudo dies with "effective uid is not 0"), FUSE returns
+# ENOSYS, and capabilities never reach the host kernel. Adding runsc here does not harden
+# this pod, it breaks it in three places at once.
+#
+# ⚠ A CAPABILITY SET, NOT privileged: true. Full privileged is node-root equivalent, and
+# these lab nodes host the Samba AD DC and the image-registry. The agent executes
+# LLM-generated shell — a different threat model from a CI builder.
+#
+# ⚠ allowPrivilegeEscalation MUST be true. false sets NoNewPrivs=1 in the kernel and sudo can
+# then NEVER work, however correct the sudoers drop-in is.
+#
+# ⚠ automountServiceAccountToken: false. The agent runs arbitrary shell; deny it an apiserver
+# identity. This matters MORE here, not less — and it is what stops it reaching the
+# cross-namespace secrets the PostSync Jobs in this namespace can read.
+#
+# ⚠ NEVER mount nfs-eda-modulefiles (/registry). That export is the module-registry
+# AUTHORISATION boundary: writing a file there is what authorises the privileged broker to
+# pull and run an image as root.
+#
+# ⚠ NO hostPath. Scratch is an emptyDir; anything durable goes on the NFS home. hostPath is
+# the escape path the capability set exists to avoid.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eda-pcb-agent
+  namespace: eda-pcb-agent
+  annotations:
+    # ⚠ THERE IS DELIBERATELY NO health-check opt-out HERE. `sync-options: Skip health check`
+    # used to sit on this line and is NOT a real ArgoCD sync option — the controller parses
+    # the list and silently ignores anything it does not know, so it did nothing at all while
+    # reading as if it did. The real annotation is `argocd.argoproj.io/ignore-healthcheck`,
+    # and it is not wanted either: it only removes the resource from APPLICATION health
+    # aggregation (controller/health.go), never from the Sync phase's own wave gating, so it
+    # could not have rescued a first sync — it would only have reported this app Healthy while
+    # the desktop crash-looped. That is the exact failure shape this app is built to make
+    # loud: a pod that looks Running while it resolves nobody.
+    #
+    # A first sync where the image does not exist yet is covered by the Application's
+    # `retry: limit: -1`, and Degraded-until-built is the truthful status meanwhile.
+    # Hermes reads config.yaml ONCE at process start and the startup script reads its
+    # ConfigMap once — an edit would otherwise sync green and change nothing in the running
+    # pod. Reloader rolls this Deployment when the ConfigMaps/Secrets it references change.
+    #
+    # ⚠ ONE ROLL PER SYNC, because keytab-job.yaml runs in PRESYNC: the keytab Secret has
+    # already settled by the time this Deployment is applied, so Reloader sees its final hash
+    # and does not roll the pod a second time. The Job is also idempotent (it exits early when
+    # the exported keytab matches the Secret), so an ordinary sync changes nothing at all here.
+    # Watch the ReplicaSet, not pod status, while a roll is in flight: the old pod is deleted
+    # mid-Running, so `kubectl get pod` shows Failed/`cannot exec into a completed pod` and the
+    # events carry a readiness ProbeWarning plus `connection refused` on 3389 — all of which is
+    # the OLD pod shutting down. It self-heals; do not chase it.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  # ⚠ Recreate, not RollingUpdate: the NFS home is ReadWriteMany but the tmux socket and the
+  # X session are not — two pods would fight over one shared session. Also required by
+  # scripts/environment/checkRwoRolloutStrategy.py's rule for PVC-mounting Deployments.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: eda-pcb-agent
+  template:
+    metadata:
+      labels:
+        app: eda-pcb-agent
+    spec:
+      priorityClassName: standard
+      automountServiceAccountToken: false
+      # ⚠ NO runtimeClassName — see the header. Its ABSENCE is load-bearing.
+      nodeSelector:
+        # The NFS CSI node driver only exists at the fileserver's site, so the home can only
+        # be mounted here. This is what makes the app mesh-tier rather than cloud.
+        ecc/site: unibi-hclab  # automatically updated from project-settings:applicationPlacements.meshSite
+        ecc/eda-builder: "true"  # automatically updated from project-settings:applicationPlacements.labels.edaBuilder
+      tolerations:
+        - { key: ecc/mesh, operator: Equal, value: "true", effect: NoSchedule }  # automatically updated from project-settings:applicationPlacements.labels.mesh
+        # ⚠ EVICT FAST — the k8s default is 300s and that window IS the outage.
+        # The lab nodes go away for hours at a time. At the default the pod keeps its claim
+        # on a dead node for five minutes before eviction even begins, during which it still
+        # reports `1/1 Running` while its Service has zero endpoints — so the failure reads
+        # as an application fault rather than a node fault (measured twice on 2026-09-14).
+        # 30s is well clear of a transient kubelet hiccup and costs nothing while healthy:
+        # the taint is only applied once the node controller declares the node unreachable.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      affinity:
+        nodeAffinity:
+          # PREFER the lab node that does NOT host an on-prem AD DC. A soft preference, not a
+          # hard pin: root-in-container next to the directory is worth avoiding, but not at
+          # the cost of the pod being unschedulable when that node is down.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: ecc/ad-dc  # automatically updated from project-settings:applicationPlacements.labels.adDc
+                    operator: DoesNotExist
+      imagePullSecrets:
+        # ⚠ BOTH, on purpose. A pull secret is matched by REGISTRY HOST STRING: the
+        # FQDN-keyed one does not apply to a 127.0.0.1:30500/... image and vice versa.
+        - name: eda-pcb-agent-registry-cred
+        - name: image-registry-cred-node
+      initContainers:
+        # ── Seed HERMES_HOME on the NFS home ──────────────────────────────────
+        # ⚠ NOT a plain copy: the ConfigMap holds literal ${...} placeholders for the
+        # secrets (git must never hold them), substituted here from the mounted env. `install`
+        # alone would ship the literal string and every completion would 401 — with a message
+        # that names the placeholder, not the cause.
+        #
+        # Runs in the hermes image so the seeded tree is owned correctly for that container.
+        - name: seed-hermes
+          image: docker.io/nousresearch/hermes-agent:v2026.9.14  # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-euc"]
+          args:
+            - |
+              set -eu
+              AGENT_HOME_DIR=/home/eda-pcb-agent
+              HOME_DIR="$AGENT_HOME_DIR/.hermes"
+
+              # ⚠ The home itself is created by truenas, not here — see startup-configmap.yaml.
+              # If it is missing, fail rather than creating a directory that masks the real one.
+              if [ ! -d /home/eda-pcb-agent ]; then
+                echo "[seed] FATAL: /home/eda-pcb-agent does not exist on the homes export." >&2
+                echo "[seed]   truenas/configure-job.yaml (wave 16) creates it from the" >&2
+                echo "[seed]   Authentik employees group. Expect this on a first bring-up;" >&2
+                echo "[seed]   the app's retry covers it." >&2
+                exit 1
+              fi
+              # ⚠ .local is the PERSISTENT INSTALL PREFIX (see the PATH env on the hermes
+              # container). Created here so it exists, is owned by the AD uid, and is on PATH
+              # from the very first boot — an agent that has to create it itself will
+              # sometimes build into /usr instead and silently lose the result on the next
+              # restart. share/kicad is where KiCad looks for plugins and libraries.
+              mkdir -p "$HOME_DIR" /home/eda-pcb-agent/work \
+                       /home/eda-pcb-agent/.local/bin \
+                       /home/eda-pcb-agent/.local/lib \
+                       /home/eda-pcb-agent/.local/share/kicad
+
+              # ⚠ AN EMPTY VALUE PASSES THE ${...} GUARD BELOW AND IS STILL BROKEN: sed
+              # substitutes nothing, leaving api_key: "" (a 401 on every request) or a blank
+              # dashboard username (which the basic plugin reads as "register no password
+              # provider", turning the gate into a no-op that answers 200 with no
+              # credentials). The placeholder guard cannot see that, so check emptiness here.
+              for v in LITELLM_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET; do
+                eval "_val=\${$v:-}"
+                if [ -z "$_val" ]; then
+                  echo "[seed] FATAL: $v is empty — refusing to seed a config that cannot work." >&2
+                  echo "[seed]   Has this app's sealSecrets.sh run and created eda-pcb-agent-secrets?" >&2
+                  exit 1
+                fi
+              done
+
+              # config.yaml: git is the source of truth -> overwrite every start.
+              # Each placeholder is substituted BY NAME, so nothing else in the file can be
+              # mangled by an accidental $ in a comment or a prompt.
+              sed -e "s|\${LITELLM_KEY}|${LITELLM_KEY}|g" \
+                  -e "s|\${DASHBOARD_USERNAME}|${DASHBOARD_USERNAME}|g" \
+                  -e "s|\${DASHBOARD_PASSWORD}|${DASHBOARD_PASSWORD}|g" \
+                  -e "s|\${DASHBOARD_SESSION_SECRET}|${DASHBOARD_SESSION_SECRET}|g" \
+                  /bootstrap/config.yaml > "$HOME_DIR/config.yaml"
+              chmod 0640 "$HOME_DIR/config.yaml"
+
+              # ⚠ Fail loudly rather than serve a config that 401s on every request, or one
+              # that silently disables the dashboard password gate. The pattern must be built
+              # as '${' + $v + '}': inside double quotes "\${v}" is the LITERAL string ${v},
+              # which never appears in the file, so the guard would never fire. -F keeps $ and
+              # { out of regex interpretation entirely.
+              for v in LITELLM_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET; do
+                if grep -qF '${'"$v"'}' "$HOME_DIR/config.yaml"; then
+                  echo "[seed] FATAL: \${$v} not substituted in config.yaml" >&2
+                  exit 1
+                fi
+              done
+
+              # SOUL.md: seed ONCE. The agent edits its own SOUL over time and overwriting it
+              # on every restart would erase that.
+              if [ ! -f "$HOME_DIR/SOUL.md" ]; then
+                install -m 0640 /bootstrap/SOUL.md "$HOME_DIR/SOUL.md"
+              fi
+
+              # Skills: OVERWRITTEN every start, unlike SOUL.md. These are operating
+              # instructions maintained in git, not something the agent authors — and a stale
+              # copy is actively harmful here, since the skill is what tells it which install
+              # locations survive a restart.
+              # The install-kicad skill was retired: KiCad is baked into the desktop
+              # sidecar, so the skill only ever said "do not build it". Its still-true
+              # half (plugin paths, what persists) now lives in the kicad skill. The home
+              # is PERSISTENT, so an old copy has to be removed, not merely left unseeded.
+              rm -rf "$HOME_DIR/skills/install-kicad"
+              # ⚠ Remove the NESTED skill the curator wrote inside the kicad skill.
+              # The agent's self-improvement curator authors skills of its own, and it put
+              # one at skills/kicad/kicad-mcp-pro/SKILL.md (2026-09-21) that instructs
+              # `--mode write`. The MCP server now runs review/readonly, so that text is a
+              # stale instruction which outlives the config change it contradicts — and on
+              # this PERSISTENT NFS home nothing else would ever remove it. Same lesson as
+              # install-kicad above.
+              # ⚠ Targeted, NOT `rm -rf skills/kicad`. The agent also built references/,
+              # review/ and scripts/ in there (kicad-happy's review tooling); blowing the
+              # whole directory away every restart would destroy work the agent is expected
+              # to accumulate. Seed the file we own, delete the one we retired.
+              rm -rf "$HOME_DIR/skills/kicad/kicad-mcp-pro"
+              mkdir -p "$HOME_DIR/skills/kicad"
+
+              # ⚠ The agent's OWN venv, cleared on every start. It installed kicad-mcp-pro
+              # and kicad-sch-api into ~/.venv (python3.13, THIS container) on 2026-09-21.
+              # That copy can never work: `kicad-cli` exists only in the desktop sidecar, so
+              # the server there has nothing to drive — and two installs of one package, the
+              # reachable one being the useless one, is a debugging trap. The real pair lives
+              # in /opt/kicad-py in the sidecar and is reached over loopback MCP.
+              # The skill tells the agent not to create one; this makes that enforceable
+              # rather than advisory, because the home is PERSISTENT NFS and a stale venv
+              # would otherwise outlive every restart.
+              # ⚠ Scoped to the venv ALONE. Everything else the agent installs into its home
+              # (skills, libraries, KiCad plugins) is work it is expected to accumulate.
+              if [ -d "$AGENT_HOME_DIR/.venv" ]; then
+                echo "[seed] clearing the agent's own ~/.venv (kicad tooling belongs in the sidecar)"
+                rm -rf "$AGENT_HOME_DIR/.venv"
+              fi
+              # ── kicad-happy: the REVIEW skills, pinned and reproducible ──────
+              # Eleven skills (kicad analysis, bom, emc, spice, jlcpcb, datasheets and four
+              # distributor ones). They were installed BY THE AGENT from GitHub on
+              # 2026-09-21, which meant they existed only as files on this NFS home: they
+              # survived a pod restart but not a home wipe, a second agent or a new user,
+              # and nothing pinned the version. Fetching them here makes them a build input.
+              #
+              # ⚠ PINNED TO A RELEASE, NOT THE COMMIT THE AGENT CHOSE. It had picked
+              # a6bba1a — untagged, 12 days past v2.2.1, its own message reading "v2.3 batch
+              # adoption". Renovate cannot track a bare SHA against releases.
+              # ⚠ KNOWN COST OF THAT CHOICE: v2.2.1 has no skills/lcsc/scripts/search_lcsc.py
+              # (JLCPCB catalogue search with --basic/--in-stock), which a6bba1a added and
+              # which serves the "use as many basic parts as possible" requirement directly.
+              # v2.2.1 is self-consistent without it — its lcsc SKILL.md never references the
+              # script — so nothing BREAKS; the agent just cannot search the catalogue
+              # parametrically. REVISIT WHEN v2.3 SHIPS: that is where the search work lands,
+              # and Renovate will raise it.
+              #
+              # ⚠ NEVER overwrite skills/kicad/SKILL.md. That file is OURS (seeded below
+              # from /bootstrap) and tells the agent how to reach KiCad in the sidecar;
+              # kicad-happy ships a DIFFERENT skill at the same path, about analysing
+              # projects. Its references/, review/ and scripts/ subdirectories are wanted —
+              # only the SKILL.md collides — so the extraction excludes exactly that one
+              # file and the seed below then writes ours.
+              #
+              # Failure here is NOT fatal: the agent still has its own kicad skill and the
+              # MCP servers. Say so and carry on rather than blocking the pod.
+              # The version is pinned as an env var on this container (see above), so
+              # Renovate can see it. Fail loudly if it is ever unset rather than fetching
+              # some default.
+              : "${KICAD_HAPPY_VERSION:?KICAD_HAPPY_VERSION must be set on the seed-hermes container}"
+              KH_MARK="$HOME_DIR/skills/.kicad-happy-version"
+              if [ "$(cat "$KH_MARK" 2>/dev/null)" = "$KICAD_HAPPY_VERSION" ]; then
+                echo "[seed] kicad-happy $KICAD_HAPPY_VERSION already installed"
+              else
+                echo "[seed] installing kicad-happy $KICAD_HAPPY_VERSION"
+                KH_TMP="$(mktemp -d)"
+                if curl -fsSL --max-time 120 \
+                     "https://github.com/aklofas/kicad-happy/archive/refs/tags/${KICAD_HAPPY_VERSION}.tar.gz" \
+                     -o "$KH_TMP/kh.tgz" \
+                   && tar xzf "$KH_TMP/kh.tgz" -C "$KH_TMP" \
+                        --exclude='*/skills/kicad/SKILL.md' ; then
+                  KH_SRC="$(find "$KH_TMP" -maxdepth 2 -type d -name skills | head -1)"
+                  if [ -n "$KH_SRC" ]; then
+                    cp -a "$KH_SRC/." "$HOME_DIR/skills/"
+                    printf '%s\n' "$KICAD_HAPPY_VERSION" > "$KH_MARK"
+                    echo "[seed] kicad-happy $KICAD_HAPPY_VERSION installed ($(ls -1 "$KH_SRC" | wc -l) skills)"
+                  else
+                    echo "[seed] WARNING kicad-happy tarball had no skills/ directory — skipping" >&2
+                  fi
+                else
+                  echo "[seed] WARNING could not fetch kicad-happy $KICAD_HAPPY_VERSION — skipping" >&2
+                fi
+                rm -rf "$KH_TMP"
+              fi
+
+              # ⚠ AFTER kicad-happy, never before: this is the file that must win.
+              install -m 0640 /bootstrap/kicad-SKILL.md \
+                "$HOME_DIR/skills/kicad/SKILL.md"
+
+              # ── The `kicad` command the agent actually calls ────────────────
+              # ⚠ KiCad is NOT in this container. It is in the `desktop` sidecar, and the
+              # two share only /home. This wrapper submits a job into the queue that
+              # sidecar's kicad-job-runner watches (startup-configmap.yaml) and blocks
+              # until it answers, so from the agent's side it behaves like a local
+              # command: stdout/stderr on stdout, the job's exit code as its own.
+              #
+              # ⚠ THE QUEUE DIRS ARE CREATED HERE, BY THE AGENT'S OWN UID. The runner
+              # deliberately does not create them: it runs as root before dropping user,
+              # and root-owned dirs make the agent's writes fail with EACCES.
+              install -d -m 0755 /home/eda-pcb-agent/.kicad-jobs/in \
+                                 /home/eda-pcb-agent/.kicad-jobs/out
+              # ⚠ Indented to stay inside this YAML block scalar — a heredoc line at column 0
+              # would END the scalar and break the manifest. YAML strips the common indent
+              # when the ConfigMap is rendered, so the shebang is the file's first byte.
+              cat > /home/eda-pcb-agent/.local/bin/kicad <<'KCEOF'
+              #!/bin/bash
+              # Run a KiCad command in the desktop sidecar. Usage: kicad <shell command...>
+              #
+              # ⚠ ARGUMENTS ARE RE-QUOTED, not flattened with "$*". The runner executes the
+              # job file with bash, so `kicad python3 -c "import pcbnew; ..."` must arrive
+              # with its quoting intact — "$*" collapses it and bash then dies with
+              # `syntax error near unexpected token ('`. printf %q per argument is what
+              # keeps a quoted -c script, a path with spaces, and a glob working.
+              # ⚠ bash, not sh: printf %q is a bash builtin and /bin/sh here is dash,
+              # which rejects it with `printf: %q: invalid directive`.
+              set -eu
+              # ⚠ ABSOLUTE, never $HOME. The gateway runs with HOME=/root and a spawned
+              # worker gets a per-profile sandbox home (~/.hermes/home) — neither is the
+              # AD home the desktop sidecar shares. $HOME here would silently queue jobs
+              # into a directory nothing is watching.
+              Q="/home/eda-pcb-agent/.kicad-jobs"
+              [ -d "$Q/in" ] || { echo "kicad: $Q/in missing — is the desktop sidecar up?" >&2; exit 127; }
+              id="j$(date +%s)$$"
+              for a in "$@"; do printf '%q ' "$a"; done > "$Q/in/.$id.tmp"
+              printf '\n' >> "$Q/in/.$id.tmp"
+              mv "$Q/in/.$id.tmp" "$Q/in/$id.job"      # atomic: the runner never sees a partial file
+              i=0
+              while [ ! -f "$Q/out/$id.rc" ]; do
+                i=$((i+1))
+                [ "$i" -gt 1800 ] && { echo "kicad: timed out after 30m waiting for the runner" >&2; exit 124; }
+                sleep 1
+              done
+              cat "$Q/out/$id.out" 2>/dev/null || true
+              rc=$(cat "$Q/out/$id.rc")
+              rm -f "$Q/out/$id.out" "$Q/out/$id.rc"
+              exit "$rc"
+              KCEOF
+              chmod 0755 /home/eda-pcb-agent/.local/bin/kicad
+              # ⚠ The symlink that puts this on the agent's PATH is NOT made here — it has to
+              # be created in the `hermes` container itself (see its command:). This
+              # initContainer mounts only /home, /bootstrap and /run/agent-ids, so anything it
+              # writes to /usr/local/bin lands in its OWN ephemeral root and is discarded the
+              # moment it exits. Only the wrapper below /home survives, because /home is a
+              # volume shared with the other containers.
+
+              # ── Force every SQLite DB out of WAL ────────────────────────────
+              # ⚠ `database.journal_mode: delete` in config.yaml is NOT enough, and believing
+              # it is cost a silent data-loss incident. Upstream resolves that key in exactly
+              # ONE place — hermes_state.resolve_journal_mode(), whose only caller is
+              # hermes_state.py itself. Databases opened by their own connection code never
+              # consult it: measured on ecc210, state.db/projects.db/response_store.db/
+              # runs_idempotency.db were all `delete` while kanban.db and shared-state.db were
+              # `wal`, from the same config.
+              #
+              # WAL on NFS is the one thing this app must never have: it coordinates readers
+              # and writers through a shared-memory index (-shm) and needs real byte-range
+              # locking, and this home is an NFS export that provides neither. The observed
+              # failure is NOT a crash — four kanban_create tool calls RETURNED SUCCESS and the
+              # board stayed empty (0 rows in `tasks`, 0 in `task_events`), i.e. committed
+              # transactions were acknowledged and silently lost. That is precisely the job
+              # state this app exists to preserve.
+              #
+              # journal_mode is a PERSISTENT property of the file, so a DB created in WAL stays
+              # WAL across restarts — fixing the config alone never converts an existing one.
+              # Hence this loop, on every start, before the gateway opens anything. Idempotent:
+              # a DB already in `delete` is left alone. Checkpoint first so no committed page is
+              # stranded in a -wal we are about to retire.
+              for _db in "$HOME_DIR"/*.db; do
+                [ -e "$_db" ] || continue
+                python3 - "$_db" <<'PYEOF' || echo "[seed] WARN: journal_mode fix failed for $_db" >&2
+              import sqlite3, sys
+              p = sys.argv[1]
+              c = sqlite3.connect(p, timeout=30)
+              if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                  c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                  got = str(c.execute("PRAGMA journal_mode=delete").fetchone()[0]).lower()
+                  print(f"[seed] {p}: wal -> {got}")
+                  if got != "delete":
+                      raise SystemExit(f"refused to leave WAL: still {got}")
+              c.close()
+              PYEOF
+              done
+
+              # .env is loaded with override=True and BEATS the config file, so write the same
+              # key here too rather than leaving a second source of truth to disagree.
+              #
+              # ⚠ HERMES_REAL_HOME is what makes `terminal.home_mode: "real"` in the bootstrap
+              # ConfigMap actually reach the NFS home; the key is INERT without this line.
+              # _iter_real_home_candidates() consults HERMES_REAL_HOME FIRST, then $HOME, then
+              # the passwd entry. Here the latter two BOTH say /opt/data — the upstream image's
+              # gateway run script hardcodes `export HOME=/opt/data` and the baked `hermes`
+              # passwd entry points there too — so without this the resolver picks the image's
+              # ephemeral data dir and the agent still never sees /home/eda-pcb-agent.
+              # It is a plain path, not a secret; it lives here only because .env is the one
+              # channel that reaches the s6-supervised gateway (the container environment does
+              # not), the same reason OPENAI_API_KEY is written above.
+              umask 077
+              cat > "$HOME_DIR/.env" <<EOF
+              OPENAI_API_KEY=${LITELLM_KEY}
+              SEARXNG_URL=http://searxng.searxng.svc:8080
+              HERMES_DASHBOARD_OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+              HERMES_REAL_HOME=/home/eda-pcb-agent
+              EOF
+
+              # Own the tree as the DIRECTORY uid, not a baked one: this is a real AD account
+              # on a shared export, so a wrong owner here is a permissions failure the agent
+              # cannot fix itself.
+              AGENT_UID=$(stat -c %u /home/eda-pcb-agent)
+              AGENT_GID=$(stat -c %g /home/eda-pcb-agent)
+              # ⚠ .local is NOT chowned recursively: once KiCad is built it holds tens of
+              # thousands of files, and a recursive chown over NFS on every pod start would
+              # add minutes to boot for no benefit. Only the top level needs the right owner.
+              chown -R "$AGENT_UID:$AGENT_GID" "$HOME_DIR" /home/eda-pcb-agent/work || true
+              chown "$AGENT_UID:$AGENT_GID" \
+                /home/eda-pcb-agent/.local \
+                /home/eda-pcb-agent/.local/bin \
+                /home/eda-pcb-agent/.local/bin/kicad \
+                /home/eda-pcb-agent/.local/lib \
+                /home/eda-pcb-agent/.local/share \
+                /home/eda-pcb-agent/.local/share/kicad 2>/dev/null || true
+              # ⚠ THE QUEUE MUST BE OWNED BY THE AGENT, and this container is root, so
+              # `install -d` above created it root-owned. Without this chown every job
+              # submission dies with `Permission denied` on .kicad-jobs/in — measured on
+              # ecc210 immediately after the first deploy of this queue.
+              chown "$AGENT_UID:$AGENT_GID" \
+                /home/eda-pcb-agent/.kicad-jobs \
+                /home/eda-pcb-agent/.kicad-jobs/in \
+                /home/eda-pcb-agent/.kicad-jobs/out 2>/dev/null || true
+
+              # ⚠ HAND THE UID TO THE HERMES CONTAINER. Both containers share this home, so
+              # they must agree on who owns it. Hermes' s6 stage2 usermods its baked user to
+              # HERMES_UID and then drops to it — left at the default 10000 it chowns
+              # config.yaml to 10000 while the desktop writes as the AD uid, and whichever
+              # process loses cannot read .env (mode 0600) at all:
+              #   PermissionError: [Errno 13] Permission denied: .../.hermes/.env
+              # which crash-loops the container with no hint that ownership is the cause.
+              # Measured on ecc205: config.yaml 10000:10000 next to SOUL.md 5022:6000.
+              #
+              # ⚠ It CANNOT be a literal in the manifest: the uid is 5000 + Authentik pk and
+              # therefore changes on every cluster recreate. Discovered here, consumed by the
+              # hermes container's command wrapper.
+              printf 'HERMES_UID=%s\nHERMES_GID=%s\n' "$AGENT_UID" "$AGENT_GID" \
+                > /run/agent-ids/ids.env
+              echo "[seed] HERMES_HOME seeded (uid=$AGENT_UID gid=$AGENT_GID)"
+          env:
+            # ⚠ AN ENV VAR, NOT A SHELL ASSIGNMENT IN args:. renovate.json's ARG manager
+            # matches only Dockerfile and build-files-configmap.yaml; its YAML managers key
+            # off a literal `tag:`/`targetRevision:` line. A `# renovate:` comment above a
+            # shell variable inside the script would therefore match NOTHING and fail
+            # silently — the pin would look tracked and never move, which is worse than no
+            # annotation at all. This shape is one the manager actually recognises.
+            - name: KICAD_HAPPY_VERSION
+              value: "v2.2.1" # renovate: datasource=github-releases depName=aklofas/kicad-happy
+            - name: LITELLM_KEY
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: litellm-key } }
+            - name: DASHBOARD_USERNAME
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: dashboard-username } }
+            - name: DASHBOARD_PASSWORD
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: dashboard-password } }
+            # Signs the stateless dashboard session tokens. Reusing an already-sealed value
+            # rather than inventing another secret; blank would mean a random per-process key,
+            # so sessions would not survive a restart.
+            - name: DASHBOARD_SESSION_SECRET
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: dashboard-password } }
+            - name: OIDC_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-oidc-client-secret, key: client-secret } }
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: home
+              mountPath: /home
+            - name: bootstrap-seed
+              mountPath: /bootstrap
+              readOnly: true
+            - name: agent-ids
+              mountPath: /run/agent-ids
+      containers:
+        # ── the desktop ────────────────────────────────────────────────────────
+        - name: desktop
+          image: registry.gitlab.subdomain1.your-domain.tld/deployments/infrastructure/eda/eda-pcb-agent:r6 # automatically updated from project-settings:{general.subdomain,general.domain}
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /startup/startup.sh"]
+          ports:
+            - name: rdp
+              containerPort: 3389
+          env:
+            - name: AGENT_USER
+              value: "eda-pcb-agent"
+            # The AD identity the startup script asserts sssd.conf against. These ARE
+            # anchored — the comment can sit on its own line here, unlike inside the
+            # sssd.conf heredoc — so a realm rename propagates and the guard catches drift.
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            - name: AD_REALM
+              value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+            # The DC's AD FQDN — must be its Kerberos SPN name, NOT the k8s Service name (an
+            # SPN for the Service name does not exist). Resolves in-cluster via the CoreDNS
+            # forward that dns-config-job.yaml writes.
+            # ⚠ NOT ANCHORED: only the `.{adDomain}` SUFFIX is machine-managed — the leading
+            # `ad-cloud-0` is the DC pod's own name. Both halves are dotted labels, so no
+            # regex can tell where one ends and the other begins, and an adDomain anchor here
+            # rewrites the WHOLE token to `ad.base.internal`, destroying the SPN. Renaming
+            # activeDirectory.adLabel means editing this line by hand; the AD_REALM line above
+            # IS anchored, so the mismatch surfaces immediately as a Kerberos failure.
+            - name: AD_DC_FQDN
+              value: "ad-cloud-0.ad.base.internal"
+            # ⚠ Must match MACHINE in this app's keytab-job.yaml, with the trailing `$` AD
+            # uses for computer principals.
+            - name: AD_MACHINE_ACCOUNT
+              value: "pcb-agent$"
+          securityContext:
+            runAsUser: 0
+            # ⚠ REQUIRED — false sets NoNewPrivs=1 and sudo dies. See the header.
+            allowPrivilegeEscalation: true
+            capabilities:
+              # SYS_ADMIN: mount/namespace operations the session and apt's maintainer
+              # scripts need. MKNOD: device nodes under /dev for the X server.
+              # SETUID/SETGID: the su/sudo drop path. CHOWN/DAC_OVERRIDE/FOWNER: ownership
+              # work on the home. Nothing here grants node-level access on its own.
+              add: ["SYS_ADMIN", "MKNOD", "SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "FOWNER"]
+              drop: ["ALL"]
+          startupProbe:
+            # Startup is slow and ORDER-DEPENDENT: sssd must bind, the identity must resolve
+            # and the home must be present before xrdp is worth probing. Generous, because a
+            # first bring-up legitimately waits on samba-ad and truenas.
+            tcpSocket: { port: rdp }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: rdp }
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            # KiCad's 3D viewer and a board render are the memory wildcard; the agent's own
+            # builds are the CPU one. Starting point — measure and revisit.
+            limits: { cpu: "6", memory: "12Gi" }
+          volumeMounts:
+            - name: home
+              mountPath: /home
+            - name: startup
+              mountPath: /startup
+              readOnly: true
+            - name: staging-ca
+              mountPath: /run/staging-ca
+              readOnly: true
+            - name: keytab
+              mountPath: /etc/krb5.keytab
+              subPath: krb5.keytab
+              readOnly: true
+            - name: scratch
+              mountPath: /scratch
+            # X clients share memory through /dev/shm; the 64Mi default makes KiCad's 3D
+            # viewer crash on a non-trivial board.
+            - name: dshm
+              mountPath: /dev/shm
+        # ── the agent's dashboard ──────────────────────────────────────────────
+        - name: hermes
+          image: docker.io/nousresearch/hermes-agent:v2026.9.14  # renovate: tracked by "Container image tags" regex (docker datasource)
+          # ⚠ WRAPPED so HERMES_UID/HERMES_GID can be the AD uid, which is only known at
+          # runtime (5000 + Authentik pk, so it moves on every recreate) and therefore cannot
+          # be a literal in this manifest or a plain env value. s6's stage2 usermods the
+          # image's baked user to these and then drops to it; left at the default 10000 the
+          # two containers disagree about who owns the shared home and hermes dies with
+          # PermissionError on .env. The seed initContainer discovers the uid and writes it
+          # into /run/agent-ids/ids.env.
+          #
+          # ⚠ THE CMD MUST REACH /init AS THE IMAGE EXPECTS IT: `/init <args>` where the
+          # args are then routed by docker/main-wrapper.sh (non-executable first arg ->
+          # `hermes "$@"`). Two earlier shapes both failed on ecc205 and each failed QUIETLY:
+          #   exec /init gateway run
+          #     -> /init runs its CMD directly (rc.init: `$arg0 "$@"`), so s6 tried to execute
+          #        a program named `gateway`:  rc.init: 91: gateway: not found
+          #        The container still came up 2/2 with a WORKING DASHBOARD and NO gateway
+          #        process, so nothing looked broken — but every gateway-side feature was
+          #        absent, including the Kanban dispatcher (kanban.dispatch_in_gateway). With
+          #        no server-side dispatcher a long task is driven only by the browser's
+          #        websocket and stops when the tab is backgrounded.
+          #   exec /init /opt/hermes/docker/main-wrapper.sh gateway run
+          #     -> reached the wrapper but HERMES_UID never got through, so stage2 left the
+          #        baked uid 10000 and hermes died with PermissionError on .env.
+          #
+          # ⚠ HERMES_UID/HERMES_GID MUST BE REAL CONTAINER ENV, not something this script
+          # exports. stage2-hook.sh reads them from the environment /init itself was given
+          # (docker/stage2-hook.sh:104) — before any CMD runs — so a value exported here is
+          # simply too late. `exec env HERMES_UID=... /init ...` puts them in /init's OWN
+          # environment, which is what stage2 inherits.
+          #
+          # The uid is 5000 + Authentik pk, so it moves on every recreate and cannot be a
+          # literal; the seed initContainer discovers it from the home directory's owner and
+          # publishes it in /run/agent-ids/ids.env.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -r /run/agent-ids/ids.env ]; then
+                . /run/agent-ids/ids.env
+              else
+                echo "[hermes] FATAL: /run/agent-ids/ids.env is missing — the seed initContainer" >&2
+                echo "[hermes]   did not run. Without the directory uid this container would" >&2
+                echo "[hermes]   chown the shared home to 10000 and break the desktop's access." >&2
+                exit 1
+              fi
+              echo "[hermes] starting gateway+dashboard as uid=${HERMES_UID} gid=${HERMES_GID} (from the directory)"
+              # ⚠ PUT `kicad` ON THE AGENT'S PATH. This MUST happen in THIS container, not in
+              # the seed initContainer: the `terminal` tool does not run in the gateway's
+              # environment, it spawns its own bash whose PATH is
+              #     /usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.
+              # — no /home/eda-pcb-agent/.local/bin. So a card saying "run kicad ..." fails
+              #     /usr/bin/bash: line 5: kicad: command not found   (exit 127)
+              # while the identical command works under `kubectl exec`, whose login shell does
+              # get that directory from the PATH env below. That asymmetry is exactly how six
+              # cards were misread as model failures on 2026-09-15.
+              # The seed initContainer cannot do this — it mounts only /home, /bootstrap and
+              # /run/agent-ids, so its /usr/local/bin is a private overlay that is thrown away.
+              # Recreated on every start because / is ephemeral; /home is not.
+              ln -sf /home/eda-pcb-agent/.local/bin/kicad /usr/local/bin/kicad
+              # ⚠ EXACTLY the image's own entrypoint form — docker/entrypoint-dispatch.sh:18
+              # is `exec /init /opt/hermes/docker/main-wrapper.sh "$@"`. The wrapper path is
+              # what makes `gateway run` mean `hermes gateway run`; /init alone would try to
+              # execute `gateway` as a program and start only the dashboard.
+              exec env "HERMES_UID=${HERMES_UID}" "HERMES_GID=${HERMES_GID}" \
+                /init /opt/hermes/docker/main-wrapper.sh gateway run
+          ports:
+            - name: dashboard
+              containerPort: 9119
+          env:
+            - name: HERMES_HOME
+              value: "/home/eda-pcb-agent/.hermes"
+            # ⚠ MUST be kept in step with HERMES_HOME. The upstream image sets
+            # HERMES_WRITE_SAFE_ROOT=/opt/data *alongside* HERMES_HOME=/opt/data, on the
+            # assumption that the two are the same path — the guard exists to stop the agent
+            # escaping its mounted data volume. We moved HERMES_HOME onto the NFS home and
+            # left the guard at the image default, which fenced the agent OUT of its own
+            # home: /opt/data is node-local ext4 (/dev/nvme0n1p2), not the NFS export.
+            #
+            # The failure is silent and easy to misread as a model problem.
+            # `file_safety._classify_write_denial()` prefix-matches the resolved path and
+            # HARD-BLOCKS write_file/patch outside the roots — no approval prompt, no retry.
+            # Measured 2026-09-14: a goal-mode worker was judged "goal unachievable — write
+            # permissions denied outside HERMES_WRITE_SAFE_ROOT (/opt/data)" after three
+            # tasks had been blamed on qwen3-coder failing to call kanban_complete.
+            #
+            # Roots are os.pathsep-separated. /home/eda-pcb-agent covers both the work tree
+            # and .hermes (state, kanban, sessions); /opt/data stays so the image's own
+            # scratch paths keep working.
+            - name: HERMES_WRITE_SAFE_ROOT
+              value: "/home/eda-pcb-agent:/opt/data"
+            # ⚠ A PERSISTENT PREFIX, AHEAD OF /usr. This is what makes "the agent builds
+            # its own tools" actually true across restarts.
+            #
+            # The container filesystem is an ephemeral overlay, and anything written to /usr
+            # is DISCARDED on the next pod restart — which this Deployment does on any config
+            # change (Recreate + Reloader-rolled). Only /home survives: it is the NFS export,
+            # and it is mounted exec-capable (verified: a script written there runs).
+            #
+            # ⚠ The agent CANNOT `apt-get` regardless — the gateway is dropped to the
+            # unprivileged `hermes` user by `exec s6-setuidgid hermes` in
+            # /run/service/gateway-default/run. System build dependencies must be baked into
+            # the image; see the Dockerfile and doc/hermes-deployments.md.
+            #
+            # So anything built with --prefix=$HOME/.local, and any pip/uv --user install,
+            # persists and stays on PATH. Placed BEFORE the system paths so a
+            # self-built tool wins over an older distro package of the same name.
+            #
+            # ⚠ Do NOT point this at /opt/data/.local/bin, which the image's own PATH still
+            # carries: /opt/data is the image's default HERMES_HOME and is ephemeral here,
+            # since HERMES_HOME was moved onto the shared NFS home above.
+            - name: PATH
+              value: "/home/eda-pcb-agent/.local/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            # Where the agent's own builds land, referenced by the kicad skill.
+            - name: AGENT_PREFIX
+              value: "/home/eda-pcb-agent/.local"
+            - name: HERMES_DASHBOARD
+              value: "true"
+            - name: HERMES_DASHBOARD_HOST
+              value: "0.0.0.0"
+            - name: HERMES_DASHBOARD_PORT
+              value: "9119"
+            # ⚠ WITHOUT THIS THE FILES TAB BROWSES THE WRONG DIRECTORY. The dashboard's
+            # s6 run script hardcodes `export HOME=/opt/data` and `cd /opt/data` before
+            # dropping privileges, so the managed-files policy falls back to Path.home()
+            # and the Files page shows /opt/data — the image's ephemeral data dir, holding
+            # only .bashrc/.profile/lazy-packages. Nothing the agent or the humans actually
+            # work on is reachable, and nothing reports an error: the listing is a real
+            # directory, just not the right one.
+            #
+            # HERMES_DASHBOARD_FILES_ROOT is consulted FIRST and wins unconditionally
+            # (hermes_cli/web_server_files.py _managed_files_policy), so it overrides that
+            # fallback without touching the image. It also LOCKS the root — can_change_path
+            # becomes False — which is why it points at the home rather than / : the Files
+            # tab is reachable through Authentik by anyone in the access group, and the
+            # shared NFS home is exactly the scope they are entitled to.
+            # Verified against the deployed build (v0.21.3): unset -> /opt/data unlocked,
+            # set -> /home/eda-pcb-agent locked.
+            #
+            # ⚠ Reaches the dashboard as ORDINARY POD ENV, unlike the gateway's settings
+            # in $HERMES_HOME/.env — the dashboard's run script is `#!/command/with-contenv`,
+            # so it DOES inherit the container environment (confirmed: the sibling
+            # HERMES_DASHBOARD_* vars above arrive the same way).
+            - name: HERMES_DASHBOARD_FILES_ROOT
+              value: "/home/eda-pcb-agent"
+            # ⚠ MANDATORY, not defence-in-depth: the dashboard's auth gate engages on any
+            # non-loopback bind and FAILS CLOSED when no auth provider is registered.
+            # HERMES_DASHBOARD_INSECURE is accepted but IGNORED. Without these two the
+            # dashboard does not start at all. Authentik in front is the primary gate; this
+            # also covers in-cluster callers.
+            - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: dashboard-username } }
+            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+              valueFrom: { secretKeyRef: { name: eda-pcb-agent-secrets, key: dashboard-password } }
+            # ⚠ SSL_CERT_FILE REPLACES Python's trust store, it does not add to it. So on
+            # letsencrypt-prod this must point at the SYSTEM bundle — left at the staging-only
+            # bundle it would break TLS to every publicly-trusted host instead. The anchor is
+            # what updateConfigFromProjectSettings.sh rewrites; do not drop it.
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-certificates.crt" # automatically updated from project-settings:{tls.certIssuerType,tls.oidcCaBundle}
+          securityContext:
+            # ⚠ The image's PID 1 is s6-overlay's /init, whose stage2 hook usermods the baked
+            # user, chowns state and then drops via s6-setuidgid. All of that needs root;
+            # starting as a non-root uid makes main-wrapper.sh exit 1.
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+              drop: ["ALL"]
+          # ⚠ /api/health, NEVER /health — AND THAT IS NOT A COSMETIC DIFFERENCE.
+          # `/health` is a DASHBOARD PAGE and it is SSO-gated: it answers 302 to
+          # /auth/login, kubelet FOLLOWS redirects, and that login route performs OIDC
+          # discovery against Authentik. So a probe on /health does not measure this
+          # container at all — it measures Authentik, the OIDC provider object, and the TLS
+          # path to id.<tld>. Every one of those failed here in turn:
+          #   * the staging CA bundle on a prod cluster -> CERTIFICATE_VERIFY_FAILED -> 503
+          #   * then, with TLS fixed, `OIDC discovery returned 404` because the provider is
+          #     created by authentik-provider.yaml, a POSTSYNC hook — which cannot run until
+          #     the Deployment is healthy, which cannot happen until this probe passes.
+          # That last one is a DEADLOCK, and it is the third of that exact shape in this app
+          # (see keytab-job.yaml and authentik-user-job.yaml). Probing the right endpoint
+          # dissolves it: hermes becomes ready on its own, the Sync phase completes, PostSync
+          # runs, and the provider is created in the ordinary way.
+          #
+          # /api/health is the endpoint upstream itself probes — apps/desktop/electron/
+          # backend-health.ts calls probeHealth(`${base}/api/health`) — it needs no auth, and
+          # it says so: {"ok":true,"version":"0.21.2","auth_required":true}.
+          #
+          # ⚠ The LIVENESS probe matters most here. On /health an Authentik outage would
+          # restart this container repeatedly for a fault entirely outside it.
+          startupProbe:
+            httpGet: { path: /api/health, port: dashboard }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /api/health, port: dashboard }
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /api/health, port: dashboard }
+            periodSeconds: 30
+            # Generous: the agent's own tool loop can make the event loop briefly
+            # unresponsive, and a 1s default would restart the pod mid-task.
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            # ⚠ SIZED FOR A SOURCE BUILD, not for serving the dashboard. The agent is
+            # expected to compile its own tools — KiCad from git pulls in wxWidgets and
+            # OpenCASCADE, a large C++ build that OOMs at 4Gi and takes hours on 2 cores.
+            # The node has 24 CPU / 32Gi allocatable, and the limit is a CEILING, not a
+            # reservation: the request stays small so this does not crowd the desktop
+            # container, which is what a human is actually waiting on.
+            # ⚠ Keep `requests` low. Raising it would reserve capacity permanently for a
+            # build that runs once.
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "8", memory: "12Gi" }
+          volumeMounts:
+            - name: home
+              mountPath: /home
+            - name: hermes-bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            # s6 needs a writable /run, and the agent writes scratch to /tmp.
+            - name: run
+              mountPath: /run
+            - name: tmp
+              mountPath: /tmp
+            # Mounted at a dedicated path rather than over /etc/ssl/certs, which would SHADOW
+            # the image's own trust store and break every other outbound TLS call.
+            - name: staging-ca
+              mountPath: /etc/ssl/staging-ca
+              readOnly: true
+            - name: agent-ids
+              mountPath: /run/agent-ids
+              readOnly: true
+
+        # ── DIRECT RDP FROM THE MESH ──────────────────────────────────────────
+        # Gives this pod its OWN tailnet identity, so a native RDP client on any mesh device
+        # connects to eda-pcb-agent.ts.internal:3389 — no Guacamole, no browser.
+        #
+        # WHY A SIDECAR AND NOT A SUBNET ROUTE: the CP mesh-gateway advertises ONLY
+        # 10.0.0.0/23, and the lab node 192.168.1.0/24. Advertising the service CIDR
+        # (10.43.0.0/16) to reach this ClusterIP would make EVERY ClusterIP in the cluster
+        # routable from the tailnet and leave the ACL as the only thing containing it. A
+        # sidecar is tag-scoped by construction and gets a stable MagicDNS name; ClusterIPs
+        # are not stable across redeploys anyway.
+        #
+        # WHY NOT A NodePort: a NodePort listens on EVERY node. Mesh nodes deliberately do
+        # not carry the `inet public_guard` nftables table (doc/network-firewall.md), so a
+        # NodePort there is reachable from whatever else can reach that host — an
+        # IdP-unauthenticated port into a root-capable shared box. The sidecar exposes one
+        # port to one tagged identity instead.
+        #
+        # ⚠ USERSPACE, and therefore NOT TS_DEST_IP. containerboot hard-errors
+        # "TS_DEST_IP is not supported with TS_USERSPACE" (cmd/containerboot/settings.go);
+        # inbound forwarding is expressed in the serve config instead
+        # (tailscale-serve-configmap.yaml). Userspace also means no NET_ADMIN, no
+        # /dev/net/tun and no privileged flag — worth keeping even though this pod is plain
+        # runc and COULD have them. remote-desktop is userspace because gVisor forces it;
+        # here it is a choice, so do not "simplify" it to the privileged mesh-gateway recipe.
+        #
+        # ⚠ THE ACL NEEDS NO EDIT. policy-configmap.yaml already grants
+        # autogroup:member -> tag:desktop on ["22","3389"], and the pre-auth key is minted
+        # with --tags tag:desktop by presync-tailscale-key.yaml. The grant starts matching
+        # the moment this node registers. Read that file before narrowing it: this is a
+        # SHARED root-capable account, unlike remote-desktop's per-user LDAP sessions, so a
+        # tag of its own is the way to restrict it — not deleting the sidecar.
+        - name: tailscale
+          image: ghcr.io/tailscale/tailscale:v1.102.3 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef: { name: headscale-preauthkey-pcb-agent, key: key }
+            # MagicDNS name: eda-pcb-agent.ts.internal
+            - name: TS_HOSTNAME
+              value: eda-pcb-agent
+            # headscale, not tailscale SaaS.
+            - name: TS_EXTRA_ARGS
+              value: --login-server=https://vpn.subdomain1.your-domain.tld --accept-dns=false # automatically updated from project-settings:{general.subdomain,general.domain}
+            - name: TS_USERSPACE
+              value: "true"
+            - name: TS_SERVE_CONFIG
+              value: /etc/tailscale/serve.json
+            # ⚠ MUST be set and MUST be empty. containerboot auto-detects Kubernetes
+            # (KUBERNETES_SERVICE_HOST) and then stores tailscaled state in a Secret literally
+            # named `tailscale`, IGNORING TS_STATE_DIR — it crash-loops with "missing get
+            # permission on secret \"tailscale\"". An explicitly empty value disables Secret
+            # storage entirely. Leaving it UNSET is NOT the same thing.
+            # ⚠ And this pod has automountServiceAccountToken: false, so it could not read
+            # such a Secret even if it tried.
+            - name: TS_KUBE_SECRET
+              value: ""
+            # State in an emptyDir: Recreate-strategy pod, so a roll re-registers under the
+            # same hostname. headscale de-duplicates with a -N suffix, which is the churn
+            # `make prune-orphaned-mesh-nodes` cleans up. Keeping state would need an RWO PVC
+            # for a sidecar that owns no data.
+            - name: TS_STATE_DIR
+              value: /var/lib/tailscale
+            - name: TS_AUTH_ONCE
+              value: "true"
+          volumeMounts:
+            - { name: tailscale-serve, mountPath: /etc/tailscale, readOnly: true }
+            - { name: tailscale-state, mountPath: /var/lib/tailscale }
+            # ⚠ subPath: replaces the ONE file, not /etc/ssl/certs — mounting the directory
+            # would hide every other root. Safe here because this container speaks TLS to
+            # headscale and nothing else.
+            - name: staging-ca
+              mountPath: /etc/ssl/certs/ca-certificates.crt
+              subPath: ca-bundle.pem
+              readOnly: true
+          securityContext:
+            # No NET_ADMIN, no privileged, no /dev/net/tun — the whole point of userspace.
+            runAsUser: 0
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+      volumes:
+        - name: tailscale-serve
+          configMap: { name: eda-pcb-agent-tailscale-serve }
+        - name: tailscale-state
+          emptyDir: {}
+        - name: home
+          persistentVolumeClaim:
+            claimName: nfs-homes-pcb-agent
+        - name: startup
+          configMap:
+            name: eda-pcb-agent-startup
+            defaultMode: 0755
+        - name: hermes-bootstrap
+          configMap:
+            name: eda-pcb-agent-hermes-bootstrap
+        - name: bootstrap-seed
+          configMap:
+            name: eda-pcb-agent-hermes-bootstrap
+        - name: staging-ca
+          configMap:
+            name: staging-ca-bundle
+        - name: keytab
+          secret:
+            secretName: eda-pcb-agent-keytab
+            # ⚠ optional: a first bring-up can schedule before keytab-job.yaml has minted it.
+            # The startup script fails fast and loudly rather than starting sssd without it.
+            optional: true
+        # Carries the directory uid from the seed initContainer to the hermes container.
+        # In-memory and tiny; it holds no secret, only two numbers.
+        - name: agent-ids
+          emptyDir:
+            medium: Memory
+        - name: scratch
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi

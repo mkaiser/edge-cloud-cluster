@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: remote-desktop
+spec:
+  encryptedData:
+    token: AgCFcbqkFS9O8zAnJR6dukkQySa+ltT6Ag8iygAzO9bJURxn+YnyG1yqssq83FCx45Mb7uLgdzdrTb3ZGX28k9RNaqaHDlv55Y73k8DkDXyP9h5SsYvjzhgeU9JaDshH7X5ska7LbPUQO2oNK7e7lID/WMwi43WV5mh+XHKM5kavH1oJJuEXmH+HsCDC9HJgfP6pzU2yzjM+FPTttBPqSu1ZXI1fFS4XSXEA6DzC1ovjItWRPl5R2PEVRPWbtzc6GJ6h9uWz1hxEyoQDVTgA/JJ4wmDN+VgCcYFoegVvT2eYFzbkvUpYZCQ1OpaFDgPfvcW9YZmI7ifTKxrSTAr1L+ISNnX1RAG81SXwmFjk44RcYn3trDMe9UR7NUOFJFmwDyH+qDxVXPy9qgL2VbuHmEE5EDNL4FnjHqGhcPp6qipePUDqNu5XBJGvmZLrVMcRX9VBs3IZQ4o3Wi/8FE+kDLWtYWcX5FJ8m2rd0pD9j9fvaOrt5QFHm+elDsjp8HU/3qgyVmbEEpcEgQjEim6+WOLvo6Ic/4cqitifCu4yMKaIY3AtUbaPlLYTb1n2iofdeM9AFQUnM9WzBFf5+RkI9OxxkHppdInesSgIPR8e/bzgRqgiyZB8IRyOWWXDN5t8G2di7mtwutyUMBZK5GZziOUZPk+HBQmm50OHNuja1EkJ/SPIxfgOpEHrP3MU5r6C6TGGBQIrvCHqQNr5Jsc/w6TkQNXZmesINAsE5eH2L9JFL18sK2+HqyjQVO9Rc/uD3OXueG1tIi+CZ+YwPfeJWrWGxBQN4QFGFyV6s/lAin/RmLZl5mRg3jzPrwdp+gCWXi7+Crgf53xWV01kT0bvOO6gUWGOhXVrriU=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: remote-desktop

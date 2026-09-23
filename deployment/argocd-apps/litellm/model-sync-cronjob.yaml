@@ -1,0 +1,222 @@
+# Make a newly pulled model appear in the picker WITHOUT anyone touching the cluster.
+#
+# WHY THIS EXISTS
+# ---------------
+# LiteLLM's per-node wildcard routes (`turing/*`, `thor/*`) enumerate live (GET /api/tags),
+# so no per-model config is ever
+# needed. But the running proxy only recomputes that list at STARTUP: MEASURED, a model
+# pulled at t=0 was still absent from /v1/models at t=635s and appeared immediately after a
+# `rollout restart`. (litellm/utils.py caches provider enumeration in AvailableModelsCache;
+# its ttl_seconds=300 is hardcoded, and in practice the listing did not refresh on its own.)
+#
+# So the last manual step — "an admin restarts LiteLLM after a pull" — is automated here.
+# This is a RECONCILER, not a timer: it compares the model set Ollama actually serves against
+# the set LiteLLM advertises, and restarts the proxy ONLY on drift. A quiet cluster does
+# nothing at all; a pull converges within one interval.
+#
+# Deliberately NOT a blind periodic restart: that would drop in-flight streaming requests
+# (600s timeouts are configured on the HTTPRoute) for no reason on an idle cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litellm-model-sync
+  namespace: litellm
+---
+# Everything lives in the litellm namespace, NOT ollama-turing, for one hard reason: a Secret
+# cannot be read across namespaces, and the master key this needs
+# (litellm-secrets:master-key) is there. The Deployment being restarted is there too, so
+# co-locating also keeps the RBAC to a single namespace-scoped Role. Filed under the litellm
+# app (not ollama-turing) because every object here is in the litellm namespace, and an
+# ArgoCD Application whose destination namespace differs would fight over ownership.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-model-sync
+  namespace: litellm
+rules:
+  # `kubectl rollout restart` = PATCH the Deployment's pod-template annotations. It also
+  # GETs first. No watch verb needed because we never wait on rollout status here — a Job
+  # that watches without the verb hangs forever.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-model-sync
+  namespace: litellm
+subjects:
+  - kind: ServiceAccount
+    name: litellm-model-sync
+    namespace: litellm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: litellm-model-sync
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: litellm-model-sync
+  namespace: litellm
+spec:
+  # Every 5 min: fast enough that "add a model" feels immediate, slow enough to be free.
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Do not let a missed window queue up a burst of catch-up runs.
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: litellm-model-sync
+          # No GPU request and no node pin: this only talks to two Services.
+          tolerations:
+            - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+              operator: Exists
+              effect: NoSchedule
+            - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: sync
+              # The house standard for in-cluster kubectl jobs (47 other uses in this repo);
+              # bundles kubectl AND curl, which is exactly the pair needed here.
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              env:
+                - name: LITELLM_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: litellm-secrets
+                      key: master-key
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -uo pipefail
+
+                  LITELLM=http://litellm.litellm.svc:4000
+
+                  # ONE entry per Ollama backend: "<advertised prefix>|<service URL>".
+                  # Both nodes now carry a live wildcard route, so both must be reconciled —
+                  # checking only the Turing node would leave a freshly pulled Thor model
+                  # unadvertised until someone restarted the proxy by hand.
+                  # Prefix = the NODE, matching litellm/config.yaml. Keep these in step: a
+                  # prefix here that no route advertises reports every model as "not
+                  # advertised" and restarts the proxy on every run.
+                  BACKENDS="turing|http://ollama-turing.ollama-turing.svc:11434
+                  thor|http://ollama.ollama.svc:11434"
+
+                  # What LiteLLM advertises, fetched ONCE for all backends. Fail CLOSED: if
+                  # the proxy cannot be reached we must not conclude "nothing is advertised"
+                  # and restart it pointlessly.
+                  models=$(curl -sf -m 20 "$LITELLM/v1/models" \
+                    -H "Authorization: Bearer $LITELLM_KEY") || {
+                    echo "LiteLLM unreachable — exiting 0."; exit 0; }
+
+                  drift=0
+                  while IFS='|' read -r prefix url; do
+                    prefix=$(echo "$prefix" | tr -d ' ')
+                    url=$(echo "$url" | tr -d ' ')
+                    [ -z "$prefix" ] && continue
+
+                    # What this node actually serves. /api/tags is a DISK LISTING, not
+                    # inference: measured at ~0 ms and it loads nothing into VRAM. That is why
+                    # it is the right liveness signal here, and why LiteLLM's own
+                    # background_health_checks are not — those send a real completion, which
+                    # pulls a model into VRAM and marks anything slower than the probe timeout
+                    # "unhealthy" (see doc/llm-agents.md).
+                    #
+                    # A single failed poll is NOT evidence a backend is gone: the mesh link
+                    # blips, and wiping a node's models on one bad curl would flap the picker.
+                    # But an advertised model whose backend is genuinely down is worse — a user
+                    # picks it and gets APIConnectionError, which reads as a cluster fault.
+                    #
+                    # So: retry briefly, then treat a sustained failure as real and force the
+                    # re-enumeration. LiteLLM caches its wildcard expansion at startup, so a
+                    # restart is what actually drops a dead backend's models from /v1/models;
+                    # when the backend returns, the next restart brings them back.
+                    tags=""
+                    for attempt in 1 2 3; do
+                      tags=$(curl -sf -m 20 "$url/api/tags") && break
+                      tags=""
+                      [ "$attempt" -lt 3 ] && sleep 10
+                    done
+                    if [ -z "$tags" ]; then
+                      # Only act if this backend still HAS advertised models to withdraw;
+                      # otherwise a node that is deliberately scaled to 0 would request a
+                      # restart on every run forever.
+                      still_adv=$(echo "$models" \
+                        | grep -o "\"id\":\"$prefix/[^\"]*\"" \
+                        | sed "s|\"id\":\"$prefix/||;s/\"//" \
+                        | grep -v '^\*$' | sort -u)
+                      # A restart cannot empty the list entirely: with the server unreachable
+                      # LiteLLM falls back to its COST MAP and advertises a phantom
+                      # ("thor/llama2" — measured), which also fails when picked. So converge on
+                      # that state instead of chasing an empty one, or this restarts every run
+                      # forever. One restart withdraws the REAL models (the ones a user would
+                      # plausibly choose); the phantom is cleaned up automatically when the
+                      # backend returns, because it then shows as "advertised but GONE".
+                      real_adv=$(echo "$still_adv" | grep -vx 'llama2' || true)
+                      if [ -n "$real_adv" ]; then
+                        echo "[$prefix] backend unreachable after 3 tries, still advertising: $(echo "$real_adv" | tr '\n' ' ')"
+                        echo "[$prefix] withdrawing them so nobody picks a model that cannot answer."
+                        drift=1
+                      elif [ -n "$still_adv" ]; then
+                        echo "[$prefix] backend unreachable; only the cost-map placeholder is left ($(echo "$still_adv" | tr '\n' ' ')) — converged, no restart."
+                      else
+                        echo "[$prefix] backend unreachable, nothing advertised — nothing to do."
+                      fi
+                      continue
+                    fi
+                    have=$(echo "$tags" \
+                      | grep -o '"name":"[^"]*"' | sed 's/"name":"//;s/"//' | sort -u)
+
+                    # Match only THIS prefix. The trailing / in the pattern matters: without
+                    # it, "ollama" would also match every "ollama/..." id when the prefixes
+                    # share a stem.
+                    adv=$(echo "$models" \
+                      | grep -o "\"id\":\"$prefix/[^\"]*\"" \
+                      | sed "s|\"id\":\"$prefix/||;s/\"//" \
+                      | grep -v '^\*$' | sort -u)
+
+                    echo "[$prefix] on the node : $(echo "$have" | tr '\n' ' ')"
+                    echo "[$prefix] advertised  : $(echo "$adv"  | tr '\n' ' ')"
+
+                  # Drift in BOTH directions matters, and neither can loop: a restart makes
+                  # LiteLLM re-read /api/tags, so after one restart the two sets agree by
+                  # construction and the next run is a no-op (verified).
+                  #   missing = on the node, not advertised  -> a pull; the model is unusable
+                  #   stale   = advertised, not on the node  -> a delete; a dead picker entry
+                  #                                             that errors when selected
+                    missing=$(comm -23 <(echo "$have") <(echo "$adv"))
+                    stale=$(comm -13 <(echo "$have") <(echo "$adv"))
+
+                    [ -n "$missing" ] && { echo "[$prefix] NOT advertised yet: $(echo "$missing" | tr '\n' ' ')"; drift=1; }
+                    [ -n "$stale" ]   && { echo "[$prefix] advertised but GONE: $(echo "$stale" | tr '\n' ' ')"; drift=1; }
+                  done <<< "$BACKENDS"
+
+                  if [ "$drift" -eq 0 ]; then
+                    echo "In sync — no restart."
+                    exit 0
+                  fi
+
+                  # ONE restart covers every backend: the new pod re-enumerates all wildcard
+                  # routes at startup, so after one restart every set agrees by construction
+                  # and the next run is a no-op.
+                  echo "Restarting litellm so it re-enumerates..."
+                  # --wait=false is implicit: rollout restart only patches, it does not watch.
+                  kubectl -n litellm rollout restart deploy/litellm
+                  echo "Restart requested. The models appear once the new pod is serving."
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi

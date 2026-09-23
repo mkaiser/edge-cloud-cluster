@@ -1,0 +1,82 @@
+# ⚠ THE `server:` VALUE ONLY TAKES EFFECT ON A FRESH CLUSTER. A PersistentVolume's
+# `spec.persistentvolumesource` is IMMUTABLE after creation, so on a cluster whose PVs
+# already exist this change cannot be applied — ArgoCD reports the PV OutOfSync and keeps
+# serving the old value. That drift is EXPECTED and harmless: the existing PV still mounts
+# via the IP, and the next recreate builds it from scratch with the name. Do NOT "fix" it
+# by deleting a Bound PV to force the update — that detaches live data.
+# Blob store for the lab-local OCI registry — TrueNAS NFSv4, STATIC PV.
+#
+# WHY THIS EXISTS: the GitLab registry keeps blobs in Hetzner S3 (nbg1). Every EDA push
+# therefore leaves the Bielefeld lab and crosses the internet to Nuremberg, measured at
+# ~5.3 MB/s from the registry's own access log — a 31 GB HyperLynx push took 16 min and a
+# 40 GB Vivado restore never completed. The same appliance on the lab LAN measures ~92 MB/s
+# write / ~126 MB/s read. This store is that LAN path.
+#
+# ⚠ THIS IS NOT THE MODULE REGISTRY. The broker's authorisation boundary — the
+# <name>/<version>/module.yaml store whose contents decide what the PRIVILEGED broker may
+# pull and run AS ROOT — lives in a DIFFERENT dataset (datapool/eda/modulefiles) and is
+# claimed by remote-desktop/nfs-eda-modulefiles-pv.yaml, mounted in the broker sidecar only. The two
+# are split precisely so that this Deployment, an ordinary workload, never mounts the
+# volume that grants root execution. Do not merge them back.
+#
+# ⚠ Retain + STATIC, for the same reason as the module store: the pushed images must
+# survive a cluster recreate. That is the whole point — a recreate destroys the in-cluster
+# registry, and rebuilding an EDA image from installer media is hours of Xvfb batch install.
+# A dynamic StorageClass would mint a fresh directory per PVC and silently lose every blob.
+#
+# ⚠ GROWTH IS BOUNDED ONLY FOR THE ARCHIVES. retention-cronjob.yaml keeps the 2 most
+# recent tags per `image-archives/*` repository and garbage-collects weekly. Everything
+# under `deployments/**` — the module images the broker runs as root — is deliberately out
+# of its scope and still only ever grows; re-pushing one of those tags orphans the previous
+# blobs and nothing reclaims them. EDA images are 20-40 GB each. See README.md.
+#
+# ⚠ ecc/fileserver-lan nodes only: the csi-driver-nfs node DaemonSet is pinned there, and
+# cloud nodes have
+# no route to 192.168.1.0/24 (the CP's tailscaled has RouteAll=false
+# and cannot accept the subnet route without hijacking etcd peer traffic).
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-images
+  labels:
+    ecc/volume: nfs-images
+spec:
+  capacity:
+    # Nominal — an NFS "volume" is a directory; the real limit is the datapool (1.4T).
+    storage: 500Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""          # static binding only — no provisioner involved
+  mountOptions:
+    # Same set as the artifacts claim; see gitlab-runner-eda/nfs-installers-pv.yaml for the why.
+    - nfsvers=4.2
+    - hard
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  csi:
+    driver: nfs.csi.k8s.io
+    # Must be unique cluster-wide.
+    volumeHandle: fs-1-datapool-images
+    volumeAttributes:
+      server: "fs-1.ad.base.internal" # automatically updated from project-settings:storage.fileserver.fqdn
+      share: /mnt/datapool/images # automatically updated from project-settings:storage.fileserver.datasets.imageRegistry.dataset
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-images
+  namespace: image-registry
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 500Gi
+  selector:
+    matchLabels:
+      ecc/volume: nfs-images

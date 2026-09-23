@@ -1,0 +1,66 @@
+# External Redis 7 for GitLab — required by chart 10.0+ (bundled Redis removed).
+# Service name 'gitlab-redis' matches global.redis.host in values.yaml.
+# No auth — internal cluster traffic only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab-redis
+  namespace: gitlab
+spec:
+  selector:
+    app: gitlab-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gitlab-redis
+  namespace: gitlab
+spec:
+  serviceName: gitlab-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab-redis
+  template:
+    metadata:
+      labels:
+        app: gitlab-redis
+    spec:
+      priorityClassName: high
+      containers:
+        - name: redis
+          image: redis:8.10-alpine  # renovate: tracked by "Container image tags" regex (docker datasource)
+          ports:
+            - containerPort: 6379
+          command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn-cloud
+        resources:
+          requests:
+            storage: 5Gi

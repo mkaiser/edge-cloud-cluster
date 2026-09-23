@@ -1,0 +1,42 @@
+# Topology-aware Service for the in-cluster registry PUSH path.
+#
+# WHY a SEPARATE Service (not the chart's gitlab-registry Service): the vLLM Thor CI
+# build pushes a ~6 GB image to the registry. The chart's `gitlab-registry` Service is
+# `internalTrafficPolicy: Cluster` and Helm-owned (can't be patched — ArgoCD reverts),
+# so a push is load-balanced 50/50 to either replica. With one replica on cloud, half
+# the pushes cross the Thor→cloud WireGuard link (~0.28 MB/s, ~6 h, drops mid-blob).
+#
+# This Service selects the SAME registry pods but sets `trafficDistribution: PreferClose`
+# (GA since k8s 1.33; k3s 1.36 supports it). PreferClose routes each client to the
+# topologically-closest endpoint — so a build pod on a unibi-hclab node is served by the
+# unibi-hclab (mesh) registry replica over the LAN, not the cloud one over WireGuard. The
+# registry mesh replica is placed by the soft nodeAffinity + descheduler (see
+# deployment/argocd-apps/gitlab/values.yaml `registry:` and
+# deployment/argocd-infra/descheduler/).
+#
+# The CI push targets THIS Service (INTERNAL_REGISTRY in vllm/.gitlab-ci.yml). It stores
+# to the same shared-S3 backend, so the image is identical to what the canonical ingress
+# PULLS. Plain HTTP :5000 (registry listen port), --tls-verify=false in CI.
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-preferclose
+  namespace: gitlab
+  labels:
+    app.kubernetes.io/part-of: gitlab
+    ecc/purpose: registry-push-local
+spec:
+  type: ClusterIP
+  # Route to the topologically nearest registry replica (same node/zone first).
+  # This is the built-in traffic-steering half of the mesh-replica design; it does
+  # NOT move pods (that's the descheduler) — it steers REQUESTS to the near replica.
+  trafficDistribution: PreferClose
+  # Same selector as the chart's gitlab-registry Service → same backing pods.
+  selector:
+    app: registry
+    release: gitlab
+  ports:
+    - name: registry
+      port: 5000
+      targetPort: http   # registry pod's containerPort 5000 is named "http"
+      protocol: TCP

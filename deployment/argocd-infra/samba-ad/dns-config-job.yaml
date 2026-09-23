@@ -1,0 +1,450 @@
+# Sync Job: point the lab DC at the cloud DC for AD-zone DNS, and publish the AD zone to
+# cluster pods via CoreDNS.
+#
+# TWO DNS CONSUMERS, TWO MECHANISMS — do not conflate them:
+#
+#   1. The DCs themselves. They must resolve their own and each other's names IN THE AD
+#      ZONE, and they must NOT go through CoreDNS to do it (CoreDNS forwards TO them —
+#      that would be a loop). Both run dnsPolicy: None. The cloud DC can point at
+#      127.0.0.1 alone because it is authoritative from the moment it provisions. The lab
+#      DC cannot: at first start it has no domain, so `wait-domain` would have nothing to
+#      ask. It needs the cloud DC's address as a second resolver — and dnsConfig.nameservers
+#      takes IP ADDRESSES ONLY, so a Service name will not do, and a literal would break on
+#      every cluster recreate. Hence this Job patches it in at sync time.
+#
+#   2. Cluster pods (the desktop pod in Phase 4, Authentik's LDAPSource in Phase 2). They
+#      reach the AD zone through CoreDNS, via a `forward` stanza this Job also writes.
+#      `forward` needs an IP too, for the same reason.
+#
+# Hook: Sync + sync-wave 1 — NOT a negative wave. The SealedSecret and the StatefulSets are
+# ordinary wave-0 resources; a negative wave puts this Job before them, so it would look for
+# a cloud DC that the (blocked) sync has not created yet and the Application would hang on
+# "waiting for completion of hook". The same trap is documented at length in
+# csi-driver-smb/storageclass-job.yaml, observed.
+#
+# Idempotent: recomputes and re-applies on every sync. Safe to re-run.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: samba-ad-dns-config
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # A Job's spec.template is immutable, so ArgoCD must delete+recreate it. With
+    # ServerSideApply=true on the Application, its usual `kubectl apply --force` is
+    # rejected ("--force cannot be used with --server-side") and the hook then fails on
+    # EVERY sync. Replace=true makes ArgoCD delete+create instead. Same reasoning as
+    # csi-driver-smb/storageclass-job.yaml.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # NO ttlSecondsAfterFinished — deliberately. Cleanup is already covered by
+  # hook-delete-policy: BeforeHookCreation (the next sync deletes this Job before
+  # recreating it), so a TTL buys nothing and COSTS the post-mortem: it deletes the
+  # pod, and with it the only copy of the logs.
+  #
+  # Alloy/Loki does not save you here — its pod discovery is a poll, so a short-lived
+  # Job can finish and be deleted before it is ever scraped, leaving Loki with zero
+  # lines for it. A failed hook Job is exactly what you most need logs for after a
+  # recreate.
+  backoffLimit: 10
+  # Bounded because this is a SYNC HOOK: without a deadline a wedged run blocks the
+  # Application on "waiting for completion of hook batch/Job/..." indefinitely, and the
+  # sites Job behind it never runs. 20m covers the worst realistic case — the cloud-DC-IP
+  # wait (5m) plus up to 5m of DNS retry per DC — with headroom.
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: samba-ad-dns-config
+      containers:
+        - name: configure-dns
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          env:
+            - name: AD_DOMAIN
+              value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+            # Pinned ClusterIP of the ad-cloud-dns Service — the CoreDNS forward target for
+            # the AD zone. Stable across pod restarts and cluster recreates, unlike a pod IP.
+            - name: AD_DNS_CLUSTER_IP
+              value: "10.43.48.96" # automatically updated from project-settings:network.adDnsClusterIp
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # Classify a failed `samba-tool dns update`. It is delete-then-add, so when the
+              # TARGET value is already present the add half returns
+              # WERR_DNS_ERROR_RECORD_ALREADY_EXISTS — the record is already what we want and
+              # there is nothing to do. That is the common case on a re-sync, and reporting it
+              # as "update failed" sent two people digging through DNS on ecc214 for a zone
+              # that was correct. Anything else is a REAL failure and keeps the loud message,
+              # now with the tool's own error instead of >/dev/null 2>&1 swallowing it.
+              dns_update_failed() {
+                _pod="$1"; _want="$2"; _out="$3"
+                case "$_out" in
+                  *WERR_DNS_ERROR_RECORD_ALREADY_EXISTS*)
+                    echo "    already $_want on $_pod — nothing to do" ;;
+                  *)
+                    echo "    UPDATE FAILED on $_pod: $(echo "$_out" | grep -E 'ERROR|WERR' | head -1)" >&2 ;;
+                esac
+              }
+
+              echo "waiting for the cloud DC pod to have an address..."
+              CLOUD_IP=""
+              i=0
+              while [ "$i" -lt 60 ]; do
+                CLOUD_IP=$(kubectl get pod -n samba-ad \
+                  -l app=samba-ad,dc=cloud \
+                  -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+                [ -n "$CLOUD_IP" ] && break
+                i=$((i+1)); sleep 5
+              done
+              if [ -z "$CLOUD_IP" ]; then
+                echo "ERROR: cloud DC has no pod IP after 5 minutes." >&2
+                echo "  The lab DC cannot bootstrap its DNS without it, and pods cannot" >&2
+                echo "  resolve the AD zone. Check the ad-cloud StatefulSet." >&2
+                exit 1
+              fi
+              echo "cloud DC: $CLOUD_IP"
+
+              # --- 1. lab DC resolver -------------------------------------------------
+              # Append the cloud DC as a second nameserver. The first (127.0.0.1) is in the
+              # committed manifest. Patching the StatefulSet triggers a rollout only when
+              # the value actually changes, so this is a no-op on steady-state syncs.
+              # Compare against the LIVE POD, not the StatefulSet template. The template
+              # can carry the right value while the running pod does not: ArgoCD's sync
+              # applies the git manifest (one nameserver) AFTER this Job has patched the
+              # template, so the pod is recreated without the second resolver. Checking the
+              # template then reports "already correct" and skips — leaving the lab DC
+              # unable to resolve its peer, with replication silently one-directional.
+              # ⚠ THE SERVICE ClusterIP, NOT $CLOUD_IP. The cloud DC's POD ip changes on every
+              # ad-cloud-0 restart, and this Job is a SYNC HOOK — nothing re-runs it on a
+              # restart, so a pod-ip resolver leaves the lab DC pointing at an address owned by
+              # nothing. ad-cloud-dns has a PINNED ClusterIP (network.adDnsClusterIp) that
+              # survives restarts and recreates, and the hostNetwork lab DC can reach it
+              # (Cilium socket-LB intercepts a ClusterIP at connect() in the host netns).
+              # replication-guard.yaml re-asserts this every 5 min, so a restart does not have
+              # to wait for a sync. Both write the SAME value — keep them in step.
+              # Read from the StatefulSet TEMPLATE, not from a named pod: there are several
+              # on-prem DCs and the template is what they are all created from, so it is the
+              # thing that is actually being reconciled. Reading pod-0 also broke whenever
+              # pod-0 happened to be the one restarting.
+              CURRENT=$(kubectl get statefulset -n samba-ad ad-onprem \
+                -o jsonpath='{.spec.template.spec.dnsConfig.nameservers[1]}' 2>/dev/null || true)
+              if [ "$CURRENT" != "$AD_DNS_CLUSTER_IP" ]; then
+                echo "setting lab DC secondary resolver: ${CURRENT:-<none>} -> $AD_DNS_CLUSTER_IP"
+                kubectl patch statefulset -n samba-ad ad-onprem --type=json -p "$(cat <<EOF
+              [{"op":"replace","path":"/spec/template/spec/dnsConfig/nameservers","value":["127.0.0.1","$AD_DNS_CLUSTER_IP"]}]
+              EOF
+              )"
+                # Patching the StatefulSet does NOT restart existing pods, so delete them
+                # and let the controller recreate them from the patched template. A lab DC
+                # is idempotent on restart (_prep_join: "Already configured. Not joining"),
+                # so this is safe even after it has joined.
+                #
+                # ⚠ BY LABEL, not by name: which on-prem DCs exist follows the ecc/ad-dc node
+                # labels. Deleted TOGETHER rather than one at a time — every one of them is
+                # about to get a resolver it did not have, so a rolling delete would only
+                # stretch the window in which some DCs have the old value.
+                #
+                # --wait=false is REQUIRED, not an optimisation. `kubectl delete` otherwise
+                # WATCHES the pods until they are gone, and this ServiceAccount has only
+                # get/list/delete on pods — no `watch`. The delete succeeds, then the client
+                # retries the forbidden watch forever:
+                #   Failed to watch... pods "ad-onprem-0" is forbidden... cannot watch
+                # The Job never completes, and because it is a Sync hook the whole
+                # Application stays "waiting for completion of hook batch/Job/..." — which
+                # blocks the sites Job behind it.
+                #
+                # Nothing here needs the pods to be gone: the StatefulSet controller recreates
+                # them, and the next steps only touch CoreDNS.
+                kubectl delete pod -n samba-ad -l dc=onprem --ignore-not-found --wait=false
+              else
+                echo "lab DC resolver already correct"
+              fi
+
+              # --- 2. CoreDNS forward for cluster pods --------------------------------
+              # ⚠ THE KEY MUST GO IN `coredns-custom`, NOT A ConfigMap OF OUR OWN.
+              #
+              # k3s CoreDNS mounts exactly ONE ConfigMap:
+              #   {"configMap": {"name": "coredns-custom", "optional": true},
+              #    "name": "custom-config-volume"}
+              # and `import /etc/coredns/custom/*.override` globs INSIDE that single mounted
+              # object — it does not scan other ConfigMaps in the namespace. An earlier
+              # version of this Job wrote a dedicated `coredns-samba-ad` ConfigMap to avoid
+              # sharing; that ConfigMap was never mounted, so the forward NEVER took effect
+              # while the Job reported success every time.
+              #
+              # Sharing is safe ONLY because of the DISTINCT field manager below, and the
+              # distinction matters — an earlier version of this comment credited
+              # ServerSideApply itself with per-key safety, which is wrong and cost a
+              # cluster-wide DNS outage elsewhere.
+              #
+              # SSA does track ownership per key, but ownership is per MANAGER, and every
+              # ArgoCD Application on one instance applies as the SAME manager,
+              # `argocd-controller`. So two ArgoCD apps shipping this object as a manifest
+              # silently delete each other's keys: app A applying `data` without app B's key
+              # reads as "argocd-controller dropped that field". That is correct SSA
+              # semantics, so nothing errors and nothing retries. It happened to
+              # remote-desktop's `license-alias.override`, which vanished with no error and
+              # took `licence.internal` to NXDOMAIN cluster-wide.
+              #
+              # `kubectl patch --field-manager=<name>` is the only way to get a manager of
+              # one's own, so all three contributors now patch their key and none applies the
+              # object. Verified live: managedFields shows each manager owning exactly its
+              # own key, and a full hard-refresh sync of any one app leaves the others alone.
+              #
+              # Use `kubectl patch --field-manager`, NOT `kubectl apply` of a whole
+              # ConfigMap: applying the object would make us claim every field and delete
+              # the gitlab key.
+              #
+              # The heredoc is UNQUOTED (expands $AD_DOMAIN/$AD_DNS_CLUSTER_IP) and <<-EOF with
+              # TAB indentation is deliberately avoided — the body is written flush-left so no
+              # leading whitespace ends up inside the Corefile stanza.
+              #
+              # ⚠ FORWARD TO THE SERVICE, NOT THE POD IP. The cloud DC's POD address changes on
+              # every restart of ad-cloud-0; forwarding the zone there means CoreDNS points the
+              # whole AD zone at an address owned by nothing (or, worse, recycled to an
+              # unrelated pod), and since nothing re-runs this Job on a DC restart the zone
+              # stays broken cluster-wide until the next samba-ad sync. The ad-cloud-dns
+              # Service has a PINNED ClusterIP (network.adDnsClusterIp) chosen precisely so it
+              # is stable across restarts AND recreates, and its selector follows the pod
+              # wherever it lands.
+              #
+              # $CLOUD_IP is still needed ABOVE for the lab DC's dnsConfig.nameservers: a pod's
+              # resolver list is plumbed into /etc/resolv.conf at pod creation and a ClusterIP
+              # there would need kube-proxy/Cilium inside a DC that is still bootstrapping.
+              AD_SERVER_BLOCK="${AD_DOMAIN}:53 {
+                  errors
+                  cache 30
+                  forward . ${AD_DNS_CLUSTER_IP}
+              }
+              "
+              # Strip the YAML block indentation so CoreDNS sees a clean stanza.
+              AD_SERVER_BLOCK=$(printf '%s\n' "$AD_SERVER_BLOCK" | sed 's/^              //')
+
+              # ⚠ THE KEY MUST END IN `.server`, NOT `.override`. The k3s Corefile imports
+              # the two globs at DIFFERENT places:
+              #     .:53 {
+              #         ...
+              #         import /etc/coredns/custom/*.override   <- INSIDE the server block
+              #     }
+              #     import /etc/coredns/custom/*.server         <- top level
+              # A forward for a NEW zone opens its own server block, which is illegal inside
+              # `.:53`. Named `.override` it fails to parse and CoreDNS keeps serving the OLD
+              # config, so the symptom is an unchanged NXDOMAIN with the reason visible only
+              # in the CoreDNS log:
+              #   [ERROR] Restart failed: /etc/coredns/custom/ad.override:1 -
+              #   Error during parsing: Unknown directive 'ad.cape.internal:53'
+              # (`.override` is right for the gitlab and remote-desktop snippets because a
+              # `rewrite` rule belongs inside the existing block — do not copy that suffix
+              # here.)
+              #
+              # `coredns-custom` has no single creator: all three contributors (this Job,
+              # gitlab, remote-desktop) create-if-absent then patch their own key, so
+              # whichever syncs first makes the object. The other two live in the argocd-apps
+              # instance, which can be absent — it is switched off wholesale during
+              # bring-up/debugging by renaming wave19-argocd-apps.yaml to .disable — and
+              # without the create below this patch would fail with
+              # `configmaps "coredns-custom" not found`, crash-loop the Job, and leave
+              # samba-ad OutOfSync forever even though BOTH DCs are healthy and replicating.
+              #
+              # Create it empty if absent: k3s mounts it `optional: true`, so an empty
+              # ConfigMap is harmless, and each contributor adds its own key whenever it
+              # next syncs.
+              kubectl create configmap coredns-custom -n kube-system \
+                --dry-run=client -o yaml | kubectl apply --server-side \
+                --field-manager=samba-ad-dns-config-bootstrap -f - 2>/dev/null || true
+
+              kubectl patch configmap coredns-custom -n kube-system \
+                --field-manager=samba-ad-dns-config --type merge \
+                -p "$(jq -n --arg v "$AD_SERVER_BLOCK" '{data:{"ad.server":$v}}')"
+
+              # Remove the mis-named key if a previous run created it, so CoreDNS stops
+              # failing to parse it on every reload.
+              kubectl patch configmap coredns-custom -n kube-system \
+                --field-manager=samba-ad-dns-config --type json \
+                -p '[{"op":"remove","path":"/data/ad.override"}]' >/dev/null 2>&1 || true
+
+              # Drop a stale coredns-samba-ad ConfigMap if one is present, so nobody debugging
+              # this later finds a plausible-looking but inert object.
+              kubectl delete configmap coredns-samba-ad -n kube-system \
+                --ignore-not-found --wait=false
+
+              echo "CoreDNS forward for ${AD_DOMAIN} -> ${AD_DNS_CLUSTER_IP} (ad-cloud-dns Service) applied to coredns-custom"
+
+              # --- 3. Repair the cloud DC's own A record ------------------------------
+              # THE CLOUD DC'S POD IP IS NOT STABLE, AND A STALE A RECORD BREAKS
+              # REPLICATION. On every restart the pod gets a new address while the
+              # directory still advertises the old one, so the peer dials a dead IP and
+              # `drs showrepl` fills with WERR_HOST_UNREACHABLE — which takes BOTH DCs to
+              # 0/10 healthy partition-directions.
+              #
+              # samba_dnsupdate is supposed to self-heal this on start and does eventually,
+              # but the window is minutes of failed replication and it has hung outright.
+              #
+              # ⚠ REPAIR IT ON BOTH DCs, NOT JUST THE CLOUD ONE. The obvious fix — update
+              # the record on the cloud DC and let it replicate — DEADLOCKS: the lab DC
+              # cannot pull the corrected record because reaching the cloud DC is precisely
+              # what the record enables. So each DC is updated against its OWN local server,
+              # breaking the cycle.
+              #
+              # Idempotent: `dns update` with old==new is a no-op, and a wrong/missing old
+              # value just fails the one command (tolerated with || true) rather than the Job.
+              # ⚠ RETRY per DC. A DC that is mid-restart answers nothing on 127.0.0.1:53, and
+              # a single probe then reads "<unresolvable>" and SKIPS the repair — leaving that
+              # DC pinned to the stale address with no second chance until the next sync. This
+              # Job restarts the lab DC itself a few steps earlier, so the race is the normal
+              # case here, not a rare one — the cloud DC gets repaired while the lab one is
+              # skipped and stays on the stale IP.
+              # Every DC, discovered rather than named: which on-prem DCs exist follows the
+              # ecc/ad-dc node labels. Each must be repaired against its OWN 127.0.0.1 — a
+              # DC with a stale record cannot be fixed via the peer whose reachability the
+              # record is what breaks.
+              ALL_DCS="ad-cloud-0 $(kubectl get pods -n samba-ad -l dc=onprem \
+                        -o jsonpath='{range .items[*]}{.metadata.name} {end}' 2>/dev/null || true)"
+              echo "DCs to reconcile: $ALL_DCS"
+              for dcpod in $ALL_DCS; do
+                kubectl get pod -n samba-ad "$dcpod" >/dev/null 2>&1 || continue
+                CUR=""
+                j=0
+                while [ "$j" -lt 30 ]; do
+                  CUR=$(kubectl exec -n samba-ad "$dcpod" -c samba -- \
+                          host -t A "ad-cloud-0.${AD_DOMAIN}" 127.0.0.1 2>/dev/null \
+                        | awk '/has address/{print $NF}' | head -1)
+                  [ -n "$CUR" ] && break
+                  j=$((j+1)); sleep 10
+                done
+                if [ -z "$CUR" ]; then
+                  echo "  $dcpod: still not answering DNS after 5m — SKIPPED (will retry next sync)" >&2
+                elif [ "$CUR" != "$CLOUD_IP" ]; then
+                  echo "  $dcpod: A record $CUR is stale, updating to $CLOUD_IP"
+                  OUT=$(kubectl exec -n samba-ad "$dcpod" -c samba -- samba-tool dns update \
+                    127.0.0.1 "$AD_DOMAIN" ad-cloud-0 A "$CUR" "$CLOUD_IP" -P 2>&1) \
+                    || dns_update_failed "$dcpod" "$CLOUD_IP" "$OUT"
+                else
+                  echo "  $dcpod: A record already correct ($CUR)"
+                fi
+              done
+
+              # --- 3b. each ON-PREM DC's OWN A record --------------------------------
+              # Symmetric to the loop above, and both halves are needed: repairing only
+              # ad-cloud-0's record leaves the on-prem DCs stale whenever a LAB node is
+              # re-addressed. DRS then resolves that DC to an address nothing answers on and
+              # every replicate fails `{Device Timeout}` — including the DC to ITSELF.
+              #
+              # samba_dnsupdate cannot self-heal this: it needs the very DRS path the
+              # stale record breaks, so it hangs. The repair has to be an explicit
+              # `dns update` like the cloud one.
+              #
+              # Under hostNetwork status.podIP IS the node's mesh address, which is the
+              # address that must be published (the cloud DC can reach the mesh but NOT the
+              # lab LAN — see the sealSecrets.sh `dns update command` note).
+              #
+              # ⚠ ONE PASS PER ON-PREM DC, each with its OWN podIP. Reading `.items[0]` (as
+              # this did when there was one DC) would publish the FIRST DC's address for
+              # every DC name — pointing peers and clients at the wrong box, which presents
+              # exactly like a stale record and is harder to spot because the address is live.
+              kubectl get pods -n samba-ad -l dc=onprem \
+                -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP}{"\n"}{end}' \
+                2>/dev/null | awk 'NF==2' > /tmp/onprem-ips || true
+              if [ ! -s /tmp/onprem-ips ]; then
+                echo "no on-prem DC has a pod IP — skipping their A-record repair" >&2
+              else
+                while read -r LAB_DC LAB_IP; do
+                  echo "on-prem DC $LAB_DC: $LAB_IP"
+                  for dcpod in $ALL_DCS; do
+                    kubectl get pod -n samba-ad "$dcpod" >/dev/null 2>&1 || continue
+                    CUR=""
+                    j=0
+                    while [ "$j" -lt 30 ]; do
+                      CUR=$(kubectl exec -n samba-ad "$dcpod" -c samba -- \
+                              host -t A "${LAB_DC}.${AD_DOMAIN}" 127.0.0.1 2>/dev/null \
+                            | awk '/has address/{print $NF}' | head -1)
+                      [ -n "$CUR" ] && break
+                      j=$((j+1)); sleep 10
+                    done
+                    if [ -z "$CUR" ]; then
+                      echo "  $dcpod: no $LAB_DC A record yet — SKIPPED (retries next sync)" >&2
+                    elif [ "$CUR" != "$LAB_IP" ]; then
+                      echo "  $dcpod: $LAB_DC A record $CUR is stale, updating to $LAB_IP"
+                      OUT=$(kubectl exec -n samba-ad "$dcpod" -c samba -- samba-tool dns update \
+                        127.0.0.1 "$AD_DOMAIN" "$LAB_DC" A "$CUR" "$LAB_IP" -P 2>&1) \
+                        || dns_update_failed "$dcpod" "$LAB_IP" "$OUT"
+                    else
+                      echo "  $dcpod: $LAB_DC A record already correct ($CUR)"
+                    fi
+                  done
+                done < /tmp/onprem-ips
+              fi
+
+              echo
+              echo "NOTE: the AD zone is forwarded to the CLOUD DC. Pods therefore depend on"
+              echo "the mesh link for AD DNS. Lab-side clients (TrueNAS, laptops) must use the"
+              echo "LAB DC's node IP directly — that is what makes them partition-tolerant."
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-dns-config
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: samba-ad-dns-config
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  # Read the cloud DC's pod IP.
+  - apiGroups: [""]
+    resources: ["pods"]
+    # delete: after patching the lab DC's dnsConfig the pod must be recreated to adopt it
+    # (a StatefulSet patch does not restart a running pod).
+    # watch: `kubectl delete` watches the object until it is gone unless --wait=false. The
+    # call site passes --wait=false so this is belt-and-braces, but without BOTH the Job
+    # hangs forever on a forbidden watch and blocks every hook behind it.
+    verbs: ["get", "list", "watch", "delete"]
+  # Run `host` and `samba-tool dns update` inside each DC to repair the cloud DC's A record
+  # after its pod IP changes (step 3 in the Job body).
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Patch the lab DC's dnsConfig.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "patch"]
+  # Patch the `ad.server` key into the SHARED coredns-custom ConfigMap in kube-system
+  # (see the Job body for why it must be that object, and why the key ends in `.server`
+  # rather than `.override`).
+  # `delete` is for retiring the inert coredns-samba-ad ConfigMap the previous version
+  # created; it is NOT used on coredns-custom itself.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: samba-ad-dns-config
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: samba-ad-dns-config
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-dns-config
+    namespace: samba-ad

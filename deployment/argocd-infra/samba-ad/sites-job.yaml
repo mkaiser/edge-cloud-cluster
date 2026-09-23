@@ -1,0 +1,398 @@
+# Create the AD Sites and Subnets, and bind each DC to its site.
+#
+# ⚠ SHAPE: a SUSPENDED CronJob template plus a thin Sync-hook runner, not a bare Job. The
+# work has to be startable by things that are NOT this app's sync — specifically
+# replication-guard.yaml, which rebuilds an expelled DC by deleting its pod. That rebuild
+# produces a FRESH JOIN, and a fresh join lands in whatever site its subnet says, so the
+# placement reconcile below must run again afterwards. A pod-level rebuild triggers no
+# ArgoCD sync, so a plain hook Job would never re-run (see the identical argument in
+# postsync-provision-users.yaml: a self-deleted hook Job cannot be resurrected by any
+# sequence of syncs, because a no-op sync runs no hooks at all).
+#
+# Measured 2026-09-15: the guard rebuilt ad-onprem-0 and it joined into
+# Default-First-Site-Name instead of the lab site. Replication still converged, so nothing
+# looked broken — the damage is that its site-scoped SRV records were published under the
+# WRONG site, which is invisible until a lab client picks a DC across the WAN. It had to be
+# corrected by hand. The guard now starts this template itself with
+# `kubectl create job --from=cronjob/samba-ad-sites`.
+#
+# WHY THIS IS NOT OPTIONAL:
+# A Samba DC is a full multi-master replica and authenticates entirely from its local copy,
+# so a lab-site DC keeps working when the mesh↔cloud link drops. But that only helps if
+# lab CLIENTS actually talk to the lab DC. Clients locate a DC via
+# `_ldap._tcp.<site>._sites.dc._msdcs.<realm>` SRV records, and those site-specific records
+# only exist once Sites and Subnets are defined. Without this Job every client resolves the
+# generic `_ldap._tcp.dc._msdcs.<realm>` and may pick the CLOUD DC — so a partition breaks
+# authentication for the lab even though a perfectly healthy DC is sitting on the same LAN.
+# This is the single most-skipped step in two-DC designs and it silently negates the whole
+# reason for the second DC.
+#
+# SUBNET → SITE mapping:
+#   192.168.1.0/24 → lab site    the unibi lab LAN (the subnet-router node is
+#                                192.168.1.216 on eno2np1). This is where TrueNAS and the
+#                                users' laptops live, and the address they reach the lab
+#                                DC's real AD ports on (hostNetwork).
+#   10.0.0.0/23    → cloud site  the Hetzner private network (serverSubnetRange +
+#                                vswitchRange). Cloud pods and CP nodes.
+#   10.0.10.0/23   → cloud site  the headscale/tailscale mesh plane. Deliberately CLOUD:
+#                                traffic over this range is already crossing the WireGuard
+#                                overlay, so there is no locality to preserve, and mapping
+#                                it to the lab site would make cloud-side pods prefer a DC
+#                                across the very link this design routes around.
+#   10.42.0.0/16   → cloud site  pod CIDR. Pods reach the AD zone through CoreDNS, which
+#                                dns-config-job.yaml points at the cloud DC.
+#
+# Idempotent: every step tolerates "already exists". Safe on every re-sync.
+#
+# Ordering: the RUNNER below is a Sync hook at sync-wave 2 — after dns-config-job.yaml
+# (wave 1). NOT a negative wave: the same deadlock documented in
+# csi-driver-smb/storageclass-job.yaml applies.
+#
+# ORDERING MATTERS MORE THAN IT LOOKS. A DC's site membership is fixed AT JOIN TIME from
+# whichever subnet its IP falls in, and there is no `samba-tool sites move` to correct it
+# afterwards. So this Job waits on the CLOUD DC only — it must NOT wait for the lab DC,
+# because the whole point is to have the lab subnet defined BEFORE the lab DC joins. The
+# lab DC is meanwhile blocked in its own `wait-domain` step polling SRV records, which
+# gives this Job the window it needs.
+#
+# That race is not guaranteed to be won on a cold cluster, and losing it is quiet: the lab
+# DC ends up in the cloud site and lab clients keep preferring the cloud DC — which is what
+# happens whenever the lab DC joins while the mesh is down. So the Job does not rely on
+# winning it: its last step RECONCILES the lab DC's site placement, moving its server object
+# into the lab site if the join put it elsewhere. That is a no-op in the normal case and
+# repairs the race in the bad one, on every re-sync.
+#
+# The Phase-1 verification gate "site affinity" still applies — check it, do not assume it.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: samba-ad-sites
+  namespace: samba-ad
+  annotations:
+    # An ORDINARY resource, not a hook: the guard must be able to `--from` it at any time,
+    # which is only true of something ArgoCD reconciles like any other manifest.
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  # ⚠ THIS CRONJOB NEVER FIRES. It is a TEMPLATE — `suspend: true` plus a date that does not
+  # exist (31 February). Everything that runs this work does so with
+  # `kubectl create job --from=cronjob/samba-ad-sites`, never by the clock. Same shape and
+  # same reasoning as postsync-provision-users.yaml; read the long note there before
+  # changing this.
+  #
+  # ⚠ DO NOT give it a real schedule. The reconcile authenticates to the cloud DC as
+  # Administrator on every run; on a timer that is a standing load source against the KDC
+  # for work whose input only changes when a DC joins.
+  schedule: "0 0 31 2 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  # ⚠ These limits apply to `--from` runs too: kubectl stamps a controller ownerReference
+  # pointing here, so the CronJob controller prunes manual runs exactly as if it had
+  # scheduled them — even while suspended. 3/3 keeps a post-mortem for the last few runs.
+  # ⚠ Deleting this CronJob CASCADES to every run it owns. Do not delete it to "clean up".
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # NO ttlSecondsAfterFinished — deliberately. It would delete the pod, and with it the
+      # only copy of the logs. Alloy/Loki does not save you here: its pod discovery is a
+      # poll, so a short-lived Job can finish before it is ever scraped. A failed run is
+      # exactly what you most need logs for after a recreate. History limits above bound
+      # the growth instead.
+      #
+      # Generous: this waits on the lab DC finishing `wait-domain` + `join`, which itself
+      # waits on the cloud DC provisioning. On a cold cluster that is several minutes.
+      backoffLimit: 20
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: configure-sites
+              # Same image as the DCs: it is the only one here that has samba-tool.
+              image: quay.io/samba.org/samba-ad-server:v0.9 # renovate: tracked by "Container image tags" regex (docker datasource)
+              env:
+                - name: AD_REALM
+                  value: "AD.BASE.INTERNAL" # automatically updated from project-settings:activeDirectory.realm
+                - name: LAB_SITE
+                  value: "unibi-hclab"  # automatically updated from project-settings:applicationPlacements.meshSite
+                # The on-prem DCs' netbios names are their POD names (see sealSecrets.sh
+                # instance_name), and a StatefulSet's pods are always `<name>-<ordinal>` — so
+                # this prefix matches every on-prem DC without this Job needing to know how many
+                # there are or which nodes they landed on. Used to find their server objects when
+                # correcting a wrong-site join.
+                #
+                # ⚠ A PREFIX, not a name. There is no single lab DC any more: one runs per node
+                # labelled ecc/ad-dc, and a named DC here would silently leave every other one in
+                # the cloud site — where its site-scoped SRV records would be published under the
+                # WRONG site, which is invisible until a client picks a DC across the WAN.
+                - name: LAB_DC_PREFIX
+                  value: "ad-onprem"
+                - name: CLOUD_SITE
+                  value: "Default-First-Site-Name" # the site `samba-tool domain provision` creates
+                - name: LAB_SUBNETS
+                  value: "192.168.1.0/24" # automatically updated from project-settings:network.labSubnets
+                - name: CLOUD_SUBNETS
+                  value: "10.0.0.0/23 10.0.10.0/23 10.42.0.0/16" # automatically updated from project-settings:network.cloudSubnets
+                - name: ADMIN_PASSWORD_FILE
+                  value: "/etc/samba/container/config.json"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+    
+                  # The admin password lives inside the sealed sambacc config; pull it out
+                  # rather than duplicating it into a second secret.
+                  ADMIN_PW=$(python3 -c "import json;print(json.load(open('$ADMIN_PASSWORD_FILE'))['domain_settings']['primary']['admin_password'])")
+    
+                  # Wait for the CLOUD DC to answer LDAP. samba-tool talks to it over the
+                  # network, so this Job cannot run until the domain exists.
+                  echo "waiting for the domain to answer..."
+                  i=0
+                  until samba-tool domain info ad-cloud.samba-ad.svc.cluster.local \
+                        >/dev/null 2>&1; do
+                    i=$((i+1))
+                    if [ "$i" -ge 60 ]; then
+                      echo "ERROR: cloud DC did not answer within 10 minutes." >&2
+                      exit 1
+                    fi
+                    sleep 10
+                  done
+                  DC=ad-cloud.samba-ad.svc.cluster.local
+                  echo "domain is up on $DC"
+    
+                  run() {
+                    # Tolerate "already exists" so the Job is idempotent, but let any other
+                    # failure surface.
+                    if out=$("$@" 2>&1); then
+                      echo "  ok: $*"
+                    else
+                      case "$out" in
+                        *already*exists*|*Already*exists*|*ALREADY_EXISTS*)
+                          echo "  exists: $*" ;;
+                        *)
+                          echo "  FAILED: $*" >&2
+                          echo "  $out" >&2
+                          return 1 ;;
+                      esac
+                    fi
+                  }
+    
+                  echo "creating sites..."
+                  run samba-tool sites create "$LAB_SITE" \
+                      -H "ldap://$DC" -U "Administrator%$ADMIN_PW"
+    
+                  echo "mapping subnets..."
+                  for s in $LAB_SUBNETS; do
+                    run samba-tool sites subnet create "$s" "$LAB_SITE" \
+                        -H "ldap://$DC" -U "Administrator%$ADMIN_PW"
+                  done
+                  for s in $CLOUD_SUBNETS; do
+                    run samba-tool sites subnet create "$s" "$CLOUD_SITE" \
+                        -H "ldap://$DC" -U "Administrator%$ADMIN_PW"
+                  done
+    
+                  echo
+                  echo "sites now defined:"
+                  samba-tool sites list -H "ldap://$DC" -U "Administrator%$ADMIN_PW" || true
+    
+                  # --- correct a DC that joined into the wrong site --------------------------
+                  #
+                  # Site membership is decided AT JOIN TIME from the subnet the DC's IP falls in,
+                  # and the header explains why this Job deliberately does not wait for the lab
+                  # DC. That race is not guaranteed to be won on a cold cluster: a lab DC that
+                  # joins while the mesh is down lands in $CLOUD_SITE, so lab clients would chase
+                  # the cloud DC across the very link this design routes around.
+                  #
+                  # There is no `samba-tool sites move` (4.24.3 has only create/list/remove/
+                  # subnet/view), so this does the LDAP rename that underlies it. The server
+                  # object's `CN=NTDS Settings` child carries the replication identity and moves
+                  # with the parent, so this is metadata-only: no reprovision, no data touched.
+                  #
+                  # Written as a reconcile rather than a one-shot fix: it is a no-op once the DC
+                  # is in the right site, so it also repairs a future recreate that loses the
+                  # race again instead of leaving a silent misconfiguration behind.
+                  echo
+                  echo "checking DC site placement..."
+                  LAB_DC_PREFIX_UC="$(echo "$LAB_DC_PREFIX" | tr '[:lower:]' '[:upper:]')"
+                  python3 - <<PYEOF
+                  import sys
+                  from samba.auth import system_session
+                  from samba.credentials import Credentials
+                  from samba.samdb import SamDB
+                  from samba.param import LoadParm
+                  import ldb
+    
+                  lp = LoadParm()
+                  creds = Credentials()
+                  creds.guess(lp)
+                  creds.set_username("Administrator")
+                  creds.set_password("""$ADMIN_PW""")
+    
+                  db = SamDB(url="ldap://$DC", session_info=system_session(),
+                             credentials=creds, lp=lp)
+                  cfg = str(db.get_config_basedn())
+                  sites = "CN=Sites," + cfg
+    
+                  # Wildcard on the StatefulSet prefix: every AD-ONPREM-<n> server object,
+                  # however many have joined so far.
+                  res = db.search(base=sites, scope=ldb.SCOPE_SUBTREE,
+                                  expression="(&(objectClass=server)(cn=$LAB_DC_PREFIX_UC-*))",
+                                  attrs=["cn"])
+                  if len(res) == 0:
+                      print("  no on-prem DC in the directory yet - skipping.")
+                      print("  None has joined; they land in $LAB_SITE once they do.")
+                      sys.exit(0)
+    
+                  want = ldb.Dn(db, "CN=Servers,CN=$LAB_SITE," + sites)
+                  moved = 0
+                  for entry in res:
+                      old = entry.dn
+                      cn = str(entry["cn"][0], "utf-8") if isinstance(entry["cn"][0], bytes) \
+                           else str(entry["cn"][0])
+                      if str(old.parent()) == str(want):
+                          print("  ok: %s is already in site $LAB_SITE" % cn)
+                          continue
+                      new = ldb.Dn(db, "CN=%s" % cn)
+                      new.add_base(want)
+                      print("  MOVING %s into $LAB_SITE" % cn)
+                      print("    from: %s" % old)
+                      print("    to  : %s" % new)
+                      # ⚠ The destination can ALREADY EXIST as an orphan, and then the rename
+                      # dies with LDAP_ENTRY_ALREADY_EXISTS (68) and crash-loops this job
+                      # forever. It happens whenever a DC was joined, wiped and re-joined: the
+                      # first join left a server object in the lab site, the re-join created a
+                      # fresh one in the cloud site, and now both exist. Measured on the ecc213
+                      # bring-up 2026-09-17, after ad-onprem-0/1 had their PVCs recreated —
+                      # site placement and every _msdcs DNS record stayed wrong because this
+                      # job never got past the first move.
+                      #
+                      # The orphan is identifiable: a LIVE server object carries
+                      # serverReference (pointing at its Domain Controllers entry), an orphan
+                      # has none. Only ever delete one with no serverReference, so a genuine
+                      # DC object can never be removed by this path.
+                      try:
+                          dup = db.search(base=new, scope=ldb.SCOPE_BASE,
+                                          attrs=["serverReference"])
+                      except ldb.LdbError:
+                          dup = []
+                      if dup:
+                          if "serverReference" in dup[0]:
+                              print("    SKIP: %s already exists in $LAB_SITE and is LIVE "
+                                    "(has serverReference) — not touching it." % cn)
+                              continue
+                          print("    stale orphan at the destination (no serverReference) "
+                                "— removing it first")
+                          for child in sorted(
+                                  (e.dn for e in db.search(base=new, scope=ldb.SCOPE_SUBTREE,
+                                                           attrs=["dn"])),
+                                  key=lambda d: len(str(d)), reverse=True):
+                              db.delete(child)
+                      db.rename(old, new)
+                      moved += 1
+                  print("  %d moved, %d already correct." % (moved, len(res) - moved))
+                  PYEOF
+    
+                  echo
+                  echo "VERIFY (client-side affinity is what actually matters):"
+                  echo "  samba-tool sites view $LAB_SITE -H ldap://\$DC -U Administrator"
+                  echo "  dig -t SRV _ldap._tcp.$LAB_SITE._sites.dc._msdcs.$AD_REALM"
+              volumeMounts:
+                - { name: config, mountPath: /etc/samba/container, readOnly: true }
+          volumes:
+            - name: config
+              secret:
+                secretName: samba-ad-config
+---
+# The Sync-hook RUNNER: starts a run of the template above and waits for it. Deliberately
+# tiny — `kubectl create job --from=cronjob/...` plus a wait. All the sites/subnets logic and
+# the config volume live in the template, so there is exactly ONE copy of the script and this
+# hook cannot drift from it. Same shape as postsync-provision-users.yaml's runner; the ⚠
+# notes there apply verbatim and are not repeated.
+#
+# ⚠ THE HOOK MUST FAIL IF THE RUN FAILS. `kubectl create job` returns as soon as the object
+# exists, which would report success for a run that then fails — a wrong-site DC looking
+# green. The `kubectl wait` is what makes this hook honest.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-sites-run
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-sites-run
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-sites-run
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "2"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-sites-run
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-sites-run
+    namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: samba-ad-sites-run
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  backoffLimit: 2
+  # The template's own backoffLimit is 20 and it waits on the cloud DC, so allow for that.
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      serviceAccountName: samba-ad-sites-run
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              # ⚠ The run name carries a timestamp: Job names are immutable and nothing here
+              # deletes old runs (the CronJob's history limits collect them instead), so a
+              # fixed name would make the next create fail.
+              RUN="samba-ad-sites-$(date +%s)"
+              echo "starting $RUN from cronjob/samba-ad-sites"
+              kubectl -n samba-ad create job "$RUN" --from=cronjob/samba-ad-sites
+              echo "waiting for $RUN (up to 900s)..."
+              if kubectl -n samba-ad wait --for=condition=complete "job/$RUN" --timeout=900s; then
+                echo "$RUN completed"
+                exit 0
+              fi
+              echo "ERROR: $RUN did not complete." >&2
+              echo "  Its logs: kubectl -n samba-ad logs job/$RUN" >&2
+              echo "  They are NOT deleted with this hook — the run is an ordinary Job." >&2
+              exit 1
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 128Mi }

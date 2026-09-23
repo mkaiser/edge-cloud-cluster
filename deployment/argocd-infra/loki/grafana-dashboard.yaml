@@ -1,0 +1,113 @@
+# Loki overview dashboard, discovered by the Grafana dashboard sidecar.
+#
+# Lives in ns `prometheus` alongside the Loki datasource ConfigMap: the dashboard
+# sidecar is searchNamespace: ALL so it would be found anywhere, but keeping both
+# next to Grafana avoids a split that only confuses.
+#
+# The flush-reason panel is the point of this dashboard. Loki's S3 cost and its
+# Hetzner-RGW SlowDown risk are driven by OBJECT COUNT, and object count is one
+# chunk per stream per flush. A high `idle` share means chunks are being cut by the
+# idle timer long before chunk_target_size — the state that drives object count into
+# the hundreds per hour. Watch that ratio, not the byte volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-overview-dashboard
+  namespace: prometheus
+  labels:
+    grafana_dashboard: "1"
+data:
+  loki-overview.json: |
+    {
+      "title": "Loki — ingest & object churn",
+      "uid": "loki-overview",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "1m",
+      "time": { "from": "now-6h", "to": "now" },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Chunk flushes by reason (idle share is the cost driver)",
+          "description": "One flush = one S3 object. A dominant 'idle' share means chunk_target_size never binds — cut stream count or raise chunk_idle_period.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum by (reason) (rate(loki_ingester_chunks_flushed_total[5m])) * 3600",
+              "legendFormat": "{{reason}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+        },
+        {
+          "type": "stat",
+          "title": "Active streams",
+          "description": "Stream count sets the floor on object count. Each label added to the Alloy pipeline multiplies this.",
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+          "targets": [
+            { "expr": "sum(loki_ingester_memory_streams)", "refId": "A" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+        },
+        {
+          "type": "stat",
+          "title": "Mean chunk size",
+          "description": "Compare against chunk_target_size (8 MB). Far below it means idle-driven flushing.",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(loki_ingester_chunk_stored_bytes_total[30m])) / clamp_min(sum(rate(loki_ingester_chunks_flushed_total[30m])), 0.0001)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] }
+        },
+        {
+          "type": "timeseries",
+          "title": "Log lines / s by namespace",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "sum by (namespace) (rate({namespace=~\".+\"}[5m]))",
+              "legendFormat": "{{namespace}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Error-ish lines / s by namespace",
+          "description": "Case-insensitive match on error|fatal|panic. A blunt instrument, but it surfaces a namespace that has started shouting.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "sum by (namespace) (rate({namespace=~\".+\"} |~ \"(?i)(error|fatal|panic)\"[5m]))",
+              "legendFormat": "{{namespace}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Compactor: retention + compaction runs",
+          "description": "retention_period is silently ignored unless the compactor's retention loop runs. A flat line here means retention is not happening.",
+          "gridPos": { "h": 7, "w": 24, "x": 0, "y": 16 },
+          "targets": [
+            {
+              "expr": "sum(rate(loki_compactor_apply_retention_operation_total[15m])) * 3600",
+              "legendFormat": "retention runs/h",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(loki_boltdb_shipper_compact_tables_operation_total[15m])) * 3600",
+              "legendFormat": "compaction runs/h",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+        }
+      ]
+    }

@@ -1,0 +1,45 @@
+# The `remote-desktop` namespace as a PLAIN Sync-phase manifest.
+#
+# ⚠ IT MUST NOT BE A HOOK. Every hook-delete-policy deletes the object, and the DEFAULT
+# when the annotation is absent is `BeforeHookCreation` — "any existing hook resource is
+# deleted before the new one is created" (argo-cd docs, user-guide/sync-waves.md). There is
+# no policy meaning "keep". As a PreSync hook this namespace therefore deleted ITSELF on
+# every sync, cascading away the five namespaced PreSync hooks inside it
+# ("waiting for deletion of hook /Namespace/remote-desktop and 13 more hooks"), failing the
+# sync with `Resource /Namespace/remote-desktop is missing, it might have been deleted`, and
+# restarting under `retry.limit: -1`. It converged after a retry or two, so it read as a slow
+# sync rather than a fault.
+#
+# The lasting damage was to the four static NFS PVs: deleting the namespace deletes the PVCs
+# while the `Retain` PVs survive holding a stale claimRef.uid, and Kubernetes NEVER re-binds
+# a Released PV. remote-desktop-gvisor then stays Pending forever — that half does not
+# self-heal (measured 2026-09-04; recovered by removing /spec/claimRef from each PV).
+#
+# ⚠ THE NAMESPACE THE PRESYNC HOOKS NEED COMES FROM `CreateNamespace=true`, NOT FROM HERE.
+# That option is applied by the controller BEFORE the PreSync task list is built, so the
+# namespaced PreSync hooks already have their namespace. Verified on this cluster's own
+# first sync (2026-09-04 07:20:08Z):
+#
+#     Creating namespace
+#     Adding resource result, status: 'Synced', message: 'namespace/remote-desktop created'
+#     Tasks (dry-run)                     <- the PreSync list is built only now
+#
+# and no hook failed in the twenty minutes that followed. A hook here was never what made
+# PreSync work.
+#
+# ⚠ SO WHY KEEP THE FILE AT ALL? For the THREE OTHER APPS that write in here and cannot
+# create it, because CreateNamespace=true only ever creates an app's OWN destination
+# namespace: desktop-rollout (its desktop-rollout-read Role), image-registry (the broker's
+# pull credentials) and samba-ad (the keytab Secret and its RBAC, from the argocd-infra
+# instance at wave 13). Without a manifest the namespace would exist only once
+# remote-desktop itself had synced, and those apps would fail until then. samba-ad
+# additionally carries `retry` on its Application for that window — see wave13-samba-ad.yaml.
+#
+# Wave -10 orders it ahead of everything else in the Sync phase so the PVCs, ConfigMaps and
+# workloads that live in it are applied after it exists.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: remote-desktop
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"

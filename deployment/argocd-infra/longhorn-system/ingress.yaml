@@ -1,0 +1,42 @@
+# TLS terminates at the shared Gateway's wildcard listener (argocd-infra/gateway);
+# the HTTP→HTTPS redirect is handled once, cluster-wide, by
+# argocd-infra/gateway/redirect-to-https.yaml.
+#
+# The UI is deliberately reachable from the public internet (not only via
+# VPN/internal ranges). Auth is not IP allow-listing but Authentik OIDC: this
+# route points at the Authentik embedded outpost (proxy provider "longhorn", see
+# authentik/blueprint-apps.yaml), which authenticates the user before proxying to
+# longhorn-frontend. Longhorn's UI has no native auth, so the outpost is what
+# protects it. To fall back to VPN-only access, add an Envoy Gateway
+# SecurityPolicy with an authorization rule on the client CIDRs — Gateway API
+# core has no equivalent of the old whitelist-source-range annotation.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: longhorn-ui
+  namespace: longhorn-system
+spec:
+  parentRefs:
+    - name: main
+      namespace: argocd-infra
+      sectionName: https-wildcard
+  hostnames:
+    - longhorn.subdomain1.your-domain.tld # automatically updated from project-settings:{general.subdomain,general.domain}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # authentik-server lives in the authentik namespace; this cross-namespace
+        # backendRef is permitted by the ReferenceGrant in
+        # authentik/outpost-referencegrant.yaml. Do NOT replace it with an
+        # ExternalName alias in THIS namespace to avoid the grant: Envoy Gateway
+        # builds no upstream cluster for an ExternalName Service, so every request
+        # gets a local HTTP 500 while the HTTPRoute still reports
+        # Accepted=True/ResolvedRefs=True.
+        # Chicken/egg: longhorn-config is sync-wave 2, authentik is wave 6 —
+        # until Authentik is up this backend returns 503, then self-heals.
+        - name: authentik-server
+          namespace: authentik
+          port: 80

@@ -6,6 +6,15 @@
             "headers": {
                 "Authorization": "Bearer ${PULUMI_MCP_ACCESS_TOKEN}"
             }
+        },
+        "argocd": {
+            "command": "npx",
+            "args": ["-y", "argocd-mcp@0.9.0", "stdio"],
+            "env": {
+                "ARGOCD_BASE_URL": "${ARGOCD_MCP_BASE_URL}",
+                "ARGOCD_TOKEN_REGISTRY_PATH": "${ARGOCD_MCP_TOKEN_REGISTRY}",
+                "MCP_READ_ONLY": "true"
+            }
         }
     }
 }

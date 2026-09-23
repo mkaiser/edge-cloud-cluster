@@ -1,0 +1,36 @@
+# RDP access to the remote desktop.
+#
+#   remote-desktop-gvisor-vnc  — the gVisor desktop (container modules).
+#
+# Exposes RDP 3389 and SSH 22 (mapped to the pod's 2222). The pod runs
+# SESSION_MODE=per-user: xrdp spawns a private X server + Xfce session per LDAP login, so
+# nothing binds 5901/6901 and there is no shared-screen or shared-password path into the
+# desktop. SSH authenticates through the SAME PAM/SSSD stack as RDP (startup-configmap.yaml)
+# and serves SFTP plus X11 forwarding for single-GUI-tool use.
+#
+# The Service publishes 22 while the container listens on 2222: inside the pod a distinct
+# port keeps a tailnet grant for the DESKTOP from being confused with node SSH, and on the
+# Service side users still get the default port so `ssh user@remote-desktop-gvisor-vnc`
+# just works.
+#
+# The `-vnc` NAME is historical and kept on purpose: Guacamole's seeded connection
+# addresses this Service by name (connection-seed.yaml), so renaming it would mean
+# re-seeding every connection parameter for no functional gain.
+#
+# Targets: Guacamole (browser) and native RDP clients on the headscale mesh VPN.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-desktop-gvisor-vnc
+  namespace: remote-desktop
+spec:
+  selector:
+    app: remote-desktop-gvisor
+  ports:
+    - name: rdp
+      port: 3389
+      targetPort: 3389
+    - name: ssh
+      port: 22
+      targetPort: 2222

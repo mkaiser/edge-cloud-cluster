@@ -1,0 +1,84 @@
+# RE-ENABLED 2026-09-18 (was .disable'd 2026-09-01 while ollama-thor held the GPU).
+#
+# ⚠ vLLM and ollama-thor are EXCLUSIVE on Thor's single non-shareable GPU — both models can
+# never coexist, and ollama-on-Tegra cannot request nvidia.com/gpu, so the SCHEDULER does
+# not enforce this. Exclusivity is arranged by hand:
+#   `scripts/runtime/switchLLMBackend.sh vllm` — scales ollama-thor to 0, waits for the GPU
+#   to free, scales vLLM up, and un-hides `coder` in the Open WebUI picker.
+#   ⚠ Do NOT just scale the Deployment by hand: without the picker flip the working
+#     backend stays invisible to UI users.
+# Until that script is run this app sits at replicas 0 and reports Progressing; that is the
+# documented intermediate state, not a fault.
+#
+# WHY IT CAME BACK: ollama's compiled-in `PARSER qwen3-coder` leaks tool calls into message
+# content as literal `<function=…></function></tool_call>` when the model omits the opening
+# <tool_call> tag, so the eda-pcb-agent could not call a single tool. That is
+# ollama/ollama#16686 — OPEN, with fixes #17742/#16398/#17021 all unmerged — and no ollama
+# release fixes it. vLLM parses the SAME XML shape correctly via --tool-call-parser
+# qwen3_xml, so this app is now the agent's tool-calling path, not just a benchmark.
+#
+# ArgoCD Application: vLLM (OpenAI-compatible LLM server on the Jetson-Thor GPU).
+# IN-CLUSTER ONLY — no Ingress; the sole client is the LiteLLM gateway.
+# Depends on Plan A (GPU integration): nvidia.com/gpu must be schedulable and the
+# GPU node must carry ecc/gpu=true + ecc/gpu-model=jetson-thor and the ecc/mesh +
+# ecc/gpu taints (which this app tolerates).
+#
+# placement.ecc/tier: mesh — the pod runs on the mesh GPU node (not cloud).
+# Manifests: deployment.yaml + sealed secrets + postsync-build-image.yaml (the CI
+# build seed/trigger, a PreSync hook despite the name) + presync-registry-cred.yaml
+# (mints the image pull secret BEFORE the Deployment is applied — PreSync, because a
+# PostSync cred deadlocks: the Deployment can't get Healthy without it). The image
+# itself is built by GitLab CI, not by ArgoCD. Wave 20.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vllm
+  namespace: argocd-apps
+  annotations:
+    placement.ecc/tier: mesh
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:YourProject/yourGit.git
+    targetRevision: main
+    path: deployment/argocd-apps/vllm
+    directory:
+      # recurse defaults false — only top-level manifests sync. The image build is
+      # CI-driven: postsync-build-image.yaml mirrors Dockerfile + .gitlab-ci.yml into
+      # GitLab and triggers the pipeline. Exclude the non-manifest build inputs
+      # (Dockerfile/.gitlab-ci.yml) and *.sh (sealSecrets.sh).
+      exclude: "{*.sh,Dockerfile,.gitlab-ci.yml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: vllm
+  # vLLM is EXCLUSIVE with Ollama on the single Thor GPU (see app-of-apps/ollama.yaml):
+  # scripts/runtime/switchLLMBackend.sh scales this Deployment 0↔1 at runtime. Without
+  # this ignore, selfHeal would snap replicas back to the git value (1) minutes after
+  # switching to Ollama — two pods fighting over one GPU.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: vllm
+      namespace: vllm
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # Make the sync itself respect the ignored replicas field (ignoreDifferences
+      # alone only affects diffing).
+      - RespectIgnoreDifferences=true
+    # Retry failed syncs forever (limit<0 = unlimited): on recreate the PreSync hooks
+    # (build-trigger + registry-cred) race GitLab bring-up (gitlab app is also wave 20).
+    # Without retry a single hook failure leaves the app Failed until a git change or
+    # drift-selfHeal. Backoff caps at 5m, so vllm converges minutes after GitLab is up.
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

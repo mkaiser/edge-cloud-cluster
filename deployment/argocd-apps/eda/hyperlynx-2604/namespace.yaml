@@ -1,0 +1,11 @@
+# Namespace for the HyperLynx module build app. This app is BUILD-ONLY: it holds the
+# build trigger + the build-files ConfigMap. No secrets — the installer media is on the
+# TrueNAS artifacts export. HyperLynx itself RUNS inside the shared remote-desktop pod —
+# there is no desktop here.
+#
+# One namespace per EDA app, named after the app: pruning one app can never delete the
+# namespace another app's resources live in.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-hyperlynx-2604

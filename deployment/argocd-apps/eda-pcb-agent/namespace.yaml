@@ -1,0 +1,23 @@
+# The `eda-pcb-agent` namespace as a PLAIN Sync-phase manifest.
+#
+# A plain manifest is sufficient here — unlike remote-desktop, this app has no NAMESPACED
+# PreSync hook whose creation would race the namespace. (Its PreSync build/registry hooks
+# are namespaced too, but they are covered by `CreateNamespace=true` on the parent
+# Application, which the controller applies BEFORE the PreSync task list is built.)
+#
+# ⚠ IT MUST NOT BE A HOOK. Every hook-delete-policy deletes the object and the default when
+# the annotation is absent is `BeforeHookCreation`, so as a hook this namespace would delete
+# ITSELF on every sync, cascading away everything inside it. There is no policy meaning "keep".
+#
+# ⚠ Deleting this namespace strands the static NFS PV: the PVC goes with the namespace while
+# the `Retain` PV survives holding a stale claimRef.uid, and Kubernetes NEVER re-binds a
+# Released PV. The pod then sits Pending forever — that does not self-heal (recover by
+# removing /spec/claimRef from the PV).
+#
+# Wave -10 orders it ahead of everything else in the Sync phase.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-pcb-agent
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"

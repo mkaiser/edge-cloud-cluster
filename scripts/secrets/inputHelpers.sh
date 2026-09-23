@@ -44,3 +44,21 @@ read_multiline_var() {
   done
   printf -v "$__var" '%s' "$__val"
 }
+
+# Generate a passphrase-less ed25519 SSH keypair. Stores the PRIVATE key in the
+# named variable and prints the PUBLIC key to stderr for registration.
+#   generate_ssh_key_var DEPLOY_KEY "argocd-deploy-key"
+generate_ssh_key_var() {
+  local __var="$1" __comment="${2:-deploy-key}" __tmp
+  __tmp="$(mktemp -d)"
+  ssh-keygen -t ed25519 -N "" -C "$__comment" -f "$__tmp/key" >/dev/null
+  printf -v "$__var" '%s' "$(cat "$__tmp/key")"
+  {
+    echo ""
+    echo "  Generated ed25519 keypair. Public key (register as a read-only Deploy key):"
+    echo ""
+    cat "$__tmp/key.pub"
+    echo ""
+  } >&2
+  rm -rf "$__tmp"
+}

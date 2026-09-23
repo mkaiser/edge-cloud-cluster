@@ -1,0 +1,122 @@
+# Model catalogue for the Thor, as a GitOps artifact.
+#
+# Backported from ollama-turing, which solved this first. Before this, the model the Thor
+# serves lived as a hardcoded shell variable in scripts/runtime/switchLLMBackend.sh — so the
+# answer to "which model does the Thor serve?" was in an imperative script rather than in
+# declarative data, and a fresh node needed someone to remember an `ollama pull`.
+#
+# ONE model here, deliberately, unlike the multi-model Turing catalogue: the Thor is the
+# high-capacity single-pinned-model node (OLLAMA_KEEP_ALIVE=-1, never unload), whereas the
+# discrete node is the dynamic multi-model pool. Keep this list to what the LiteLLM
+# `coder-ollama` route requests.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-thor-catalogue
+  namespace: ollama
+data:
+  models: |
+    # One model ref per line. Blank lines and #-comments ignored.
+    # GGUF twin of the NVFP4 model vLLM serves. IQ3_XXS (~14 GiB) is the quant that stays
+    # GPU-resident in the Thor's budget; the UD-Q4_K_M (~22.7 GiB) spilled to CPU.
+    # Keep in sync with the `coder-ollama` route in ../litellm/config.yaml.
+    hf.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-IQ3_XXS
+    # Coder models, measured on the R39 flash (~117 GiB free unified memory).
+    # Neither fits smartmirror1 at all — this is what the Thor is FOR.
+    #   qwen3-coder:30b  18 GB on disk / 20 GB resident, 49/49 layers, 100% GPU, ~56 tok/s
+    # Note qwen3-coder:30b-a3b does NOT exist as an Ollama tag despite the upstream model
+    # being a 30B-A3B MoE; the tag is plain `:30b`.
+    qwen3-coder:30b
+    # 8-bit, near-lossless: 38 GB resident, 65/65 layers, 100% GPU — but ~7 tok/s, 8x
+    # slower than the 30b above. GPU-resident does NOT mean fast: the Thor's unified memory
+    # has far less bandwidth than a discrete card, so a 38 GB weight sweep per token
+    # dominates. Keep it for accuracy-critical one-shots, not interactive use.
+    qwen2.5-coder:32b-instruct-q8_0
+---
+# PostSync: needs the Deployment serving to accept /api/pull.
+#
+# NOTE this Job is a no-op whenever the Deployment is scaled to 0, which happens while vLLM
+# holds the Thor's single GPU (`switchLLMBackend.sh vllm`). It exits 0 rather than failing,
+# so it never blocks a sync; the pull then happens the first time ollama is scaled up
+# (either by this Job on the next sync, or lazily on first request).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-thor-prepull
+  namespace: ollama
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 2
+  # 3h: ~14 GiB over the lab uplink, and the Thor is behind a WireGuard hop.
+  activeDeadlineSeconds: 10800
+  template:
+    spec:
+      restartPolicy: Never
+      # No GPU request and no node pin: it drives the Service over the network. A GPU request
+      # would sit Pending behind whichever backend currently owns the single device.
+      tolerations:
+        - key: ecc/mesh  # automatically updated from project-settings:applicationPlacements.labels.mesh
+          operator: Exists
+          effect: NoSchedule
+        - key: ecc/gpu  # automatically updated from project-settings:applicationPlacements.labels.gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: prepull
+          image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              OLLAMA=http://ollama.ollama.svc:11434
+
+              # Short probe, not a long wait: if ollama is scaled to 0 (the normal state)
+              # there is nothing to do and we must not hold the sync open.
+              i=0
+              until curl -sf -m 5 "$OLLAMA/api/tags" >/dev/null 2>&1; do
+                i=$((i+1))
+                if [ "$i" -gt 12 ]; then
+                  echo "ollama is not serving (likely replicas=0, vLLM owns the GPU)."
+                  echo "Nothing to prepull. The catalogue applies next time it is scaled up."
+                  exit 0
+                fi
+                sleep 5
+              done
+
+              echo "Server is up. Present models:"
+              curl -sf -m 20 "$OLLAMA/api/tags" | grep -o '"name":"[^"]*"' || true
+
+              sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' /catalogue/models | while read -r ref; do
+                ref=$(echo "$ref" | tr -d '[:space:]')
+                [ -z "$ref" ] && continue
+                echo "=== pull $ref ==="
+                # Per-model failure is a WARNING: one bad tag must not fail the hook Job and
+                # wedge later syncs (a retained failed hook Job makes new commits re-run the
+                # OLD pod spec).
+                if curl -sf -m 10800 -X POST "$OLLAMA/api/pull" \
+                     -H 'Content-Type: application/json' \
+                     -d "{\"model\":\"$ref\",\"stream\":false}" >/dev/null; then
+                  echo "ok: $ref"
+                else
+                  echo "WARN: failed to pull $ref (continuing)" >&2
+                fi
+              done
+
+              echo "=== catalogue after prepull ==="
+              curl -sf -m 20 "$OLLAMA/api/tags" | grep -o '"name":"[^"]*"' || true
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: catalogue
+          configMap:
+            name: ollama-thor-catalogue

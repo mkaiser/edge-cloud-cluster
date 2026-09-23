@@ -1,0 +1,602 @@
+# AD replication guard — the PERIODIC counterpart to replication-job.yaml.
+#
+# WHY A CRONJOB AND NOT AN ARGOCD HOOK. replication-job.yaml is a Sync hook, so it runs only
+# when the samba-ad Application actually syncs: cluster bring-up, a commit under
+# deployment/argocd-infra/samba-ad/, or a manual `argocd app sync`. That is the wrong cadence
+# for the failure it repairs, because the failure is triggered by something on a completely
+# different schedule — REPROVISIONING the on-prem DC's mesh node, which re-addresses the node
+# (new tailscale IP, new pod CIDR slice) and strands the old A records in sam.ldb. Between
+# syncs, nothing notices.
+#
+# ⚠ AND IT IS NOT AN ARGOCD DESYNC, WHICH IS THE WHOLE PROBLEM. The obvious wiring — hang
+# something off `on-sync-status-unknown` / `on-health-degraded`, or lean on selfHeal — cannot
+# work here, and reaching for it is the trap:
+#   - Both DC pods stay Running and every manifest still matches git, so the Application
+#     reports Synced/Healthy the entire time replication is dead — hours of consecutive
+#     WERR_SEM_TIMEOUT while ArgoCD shows green. There is no desync event to hook.
+#   - selfHeal compares manifests to live state; nothing drifts, so no sync happens. And a
+#     no-op sync runs no hooks at all, so even a forced reconcile would not re-run the Job.
+#   - ArgoCD Notifications only SENDS messages — it has no action hook that could re-run work.
+# Replication health is EXTERNAL state (inside sam.ldb), invisible to a manifest differ. The
+# only mechanism that observes it on a schedule is a periodic probe, which is exactly the
+# shape of sealed-secrets-guard/guard.yaml: a condition that never self-corrects and never
+# shows up as drift.
+#
+# WHAT: every 5 minutes, read the pull-side replication state on both DCs. If it is already
+# 5 inbound + 5 outbound with zero failures, exit 0 having changed NOTHING — that is the
+# normal case and it must stay cheap. Only when it is not does it reconcile the on-prem DC's
+# A records to the pod's live status.hostIP and force the partitions, i.e. exactly what
+# replication-job.yaml does, so the two cannot diverge in behaviour.
+#
+# Step 0c additionally repairs a DIFFERENT fault that no amount of DNS or `drs replicate`
+# can touch: a DC whose machine account has been deleted from the domain. See its own header
+# below — it is the only destructive path in this guard.
+#
+# The repair path authenticates to both DCs and can force 10 partitions, so it must not
+# become a load source or a self-inflicted DoS on the KDC. concurrencyPolicy Forbid so a slow
+# run never overlaps itself, and a healthy pass stays a cheap read that mutates nothing.
+#
+# NOTE ON DUPLICATION: the repair logic is deliberately NOT shared with replication-job.yaml
+# via a ConfigMap. Both read the same admin password out of the sealed sambacc config and both
+# address the DCs by cluster DNS, but a shared ConfigMap mounted by a Sync HOOK and a CronJob
+# hits the hook-weight/sync-wave ordering trap (a hook Job cannot mount a ConfigMap that is
+# itself sync-waved), and the guard must keep working when the hook's resources are absent
+# between syncs. The gate below is intentionally the CHEAP half only — detect, then delegate
+# the heavy repair by creating a Job from the same image.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-replication-guard
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-replication-guard
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  # Read the on-prem DC's live status.hostIP (the reconcile target) and exec samba-tool
+  # inside the DCs — the samba image is the only one here that HAS samba-tool, and this
+  # guard runs on alpine/k8s (which has kubectl and jq, but no samba-tool).
+  # `delete` is for step 0c ONLY: an expelled DC is rebuilt by deleting its pod so the
+  # StatefulSet recreates it against empty PVCs. Nothing else here deletes a pod.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Step 0b re-asserts the lab DC's secondary resolver on the ad-onprem StatefulSet. `get` to
+  # compare (the guard patches ONLY on a real difference — an unconditional patch would roll
+  # the DC every 5 minutes), `patch` to write. Without these the guard fails with a Forbidden
+  # that does not stop the rest of the run, so the resolver would silently never be repaired.
+  #
+  # `get` is ALSO what step 0c reads .spec.replicas from, to refuse to "repair" an ordinal
+  # that is being scaled away on purpose.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "patch"]
+  # Step 0c wipes BOTH PVCs of an expelled DC. This is the only destructive verb the guard
+  # holds, and the three conditions in step 0c are what stand in front of it.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
+  # Step 0c's consecutive-sweep counter (condition 2), and step 0d's pending-site marker.
+  # A single sweep must never trigger a destructive repair, so the count has to outlive the
+  # Job that observed it. `delete` clears 0d's marker once the reconcile has succeeded.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch", "delete"]
+  # Step 0d starts sites-job.yaml's suspended CronJob template with
+  # `kubectl create job --from=cronjob/samba-ad-sites` and waits for it. NOT permission to
+  # write the reconcile itself — the one copy of that logic stays in sites-job.yaml.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-replication-guard
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-replication-guard
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-replication-guard
+    namespace: samba-ad
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: samba-ad-replication-guard
+  namespace: samba-ad
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  # ⚠ 5 MINUTES, NOT 15. An ArgoCD hook cannot cover this: hooks fire only on a sync, and a
+  # NO-OP sync skips them entirely. A `make up` that re-addresses the mesh nodes leaves the
+  # on-prem DC's A record stale, replication drops to 5/10, and a subsequent sync reports
+  # Succeeded while repairing nothing — only this CronJob fixes it. Every minute of that
+  # window is dead cross-site AD, so 5 bounds it tightly; a healthy pass is a cheap read
+  # that exits without mutating anything.
+  schedule: "*/5 * * * *"
+  timeZone: "Europe/Berlin"
+  # Forbid: the repair path can take minutes (forcing 10 partitions). Overlapping runs would
+  # fight each other over the same DNS records.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      # A step 0c rebuild waits on a DC re-joining the domain, which is minutes, so this is
+      # deliberately longer than the 5-minute period; concurrencyPolicy Forbid (not the
+      # deadline) is what prevents overlap.
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 300
+      # 0, deliberately: the next scheduled run IS the retry. A backoff storm here would
+      # re-authenticate to both DCs repeatedly for no benefit.
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: samba-ad-replication-guard
+          restartPolicy: Never
+          containers:
+            - name: guard
+              image: docker.io/alpine/k8s:1.37.0 # renovate: tracked by "Container image tags" regex (docker datasource)
+              resources:
+                requests: { cpu: 10m, memory: 64Mi }
+                limits: { memory: 128Mi }
+              env:
+                - name: AD_DOMAIN
+                  value: "ad.base.internal" # automatically updated from project-settings:activeDirectory.adDomain
+                - name: CLOUD_DC
+                  value: "ad-cloud-0"
+                # ⚠ NO ONPREM_DC. There is one on-prem DC per node labelled ecc/ad-dc, so
+                # the set is DISCOVERED from the live pods (label dc=onprem) below. A name
+                # here would guard exactly one DC and silently ignore the rest.
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  # --- 0. every DC present? -------------------------------------------
+                  # A DC that is absent or not Running is not a replication fault: it is a
+                  # rollout, a drain, or a node reboot. Exit 0 — flagging it would make this
+                  # guard cry wolf on every ordinary restart, which is how a periodic check
+                  # gets ignored.
+                  ONPREM_DCS=$(kubectl get pods -n samba-ad -l dc=onprem \
+                    -o jsonpath='{range .items[*]}{.metadata.name} {end}' 2>/dev/null || true)
+                  if [ -z "$ONPREM_DCS" ]; then
+                    echo "no on-prem DC pods yet — nothing to assert."
+                    exit 0
+                  fi
+                  ALL_DCS="$CLOUD_DC $ONPREM_DCS"
+                  for dc in $ALL_DCS; do
+                    phase=$(kubectl get pod -n samba-ad "$dc" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+                    if [ "$phase" != "Running" ]; then
+                      echo "$dc is not Running (phase='${phase:-absent}') — nothing to assert yet."
+                      exit 0
+                    fi
+                  done
+
+                  # --- 0b. the lab DC's SECONDARY RESOLVER --------------------------
+                  # Asserted BEFORE the replication gate on purpose: this value can be stale
+                  # while replication is still perfectly healthy, so a check placed after the
+                  # `exit 0` below would never run in the case it exists for.
+                  #
+                  # WHAT ROTS: dns-config-job.yaml patches ad-onprem's dnsConfig.nameservers[1]
+                  # to the cloud DC's POD IP. That address changes on every ad-cloud-0 restart,
+                  # and the Job is an ArgoCD SYNC HOOK — it fires only on a sync, and a no-op
+                  # sync skips it entirely (the same trap described at length above). So a
+                  # plain DC restart leaves the lab DC's bootstrap resolver
+                  # pointing at an address owned by nothing, or recycled to an unrelated pod.
+                  #
+                  # WHY THE SERVICE, AND WHY ONLY HERE: ad-cloud-dns has a PINNED ClusterIP
+                  # (network.adDnsClusterIp) that survives restarts AND cluster recreates, and
+                  # its selector follows the pod. The hostNetwork lab DC can reach it because
+                  # Cilium's socket-LB intercepts a ClusterIP at connect() in the host netns.
+                  # It is used ONLY for this bootstrap resolver:
+                  #   * ad-cloud-0's own A record must stay the POD ip — samba_dnsupdate
+                  #     maintains it as the DC's Kerberos/DRS identity (statefulset-cloud.yaml),
+                  #     and a ClusterIP there would break replication.
+                  #   * the CoreDNS ad.server forward already targets this Service.
+                  #
+                  # ⚠ Patching the StatefulSet ROLLS the lab DC, so only patch on a real
+                  # difference — an unconditional patch every 5 min would restart a DC forever.
+                  AD_DNS_CLUSTER_IP="10.43.48.96" # automatically updated from project-settings:network.adDnsClusterIp
+                  CUR_NS=$(kubectl get statefulset -n samba-ad ad-onprem \
+                    -o jsonpath='{.spec.template.spec.dnsConfig.nameservers[1]}' 2>/dev/null || true)
+                  if [ -n "$AD_DNS_CLUSTER_IP" ] && [ "$CUR_NS" != "$AD_DNS_CLUSTER_IP" ]; then
+                    echo "lab DC secondary resolver: ${CUR_NS:-<none>} -> $AD_DNS_CLUSTER_IP (ad-cloud-dns Service)"
+                    kubectl patch statefulset -n samba-ad ad-onprem --type=json \
+                      -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/dnsConfig/nameservers\",\"value\":[\"127.0.0.1\",\"$AD_DNS_CLUSTER_IP\"]}]" \
+                      >/dev/null && echo "  patched (the lab DC will roll)."
+                  fi
+
+                  # The admin password lives INSIDE the sealed sambacc config on the DC, so it
+                  # is read there rather than mounted here — this guard never holds it.
+                  # Defined before step 0c because that step is the first to need it.
+                  PWCMD='python3 -c "import json;print(json.load(open(\"/etc/samba/container/config.json\"))[\"domain_settings\"][\"primary\"][\"admin_password\"])"'
+
+                  # --- 0c. EXPELLED DC: account deleted from the domain ----------------
+                  # THE FAULT. A DC's machine account is deleted from the domain while the DC
+                  # itself keeps running. It then authenticates with a credential every peer
+                  # has repudiated: WERR_LOGON_FAILURE on all 5 NCs in BOTH directions.
+                  # Measured 2026-09-15 on ad-onprem-0 — 32 inbound / 1904 outbound
+                  # consecutive failures, three tombstones in CN=Deleted Objects.
+                  #
+                  # ⚠ IT NEVER SELF-HEALS, and steps 1-3 below cannot touch it. sambacc gates
+                  # the join on ONE thing (sambacc/addc.py:44,106):
+                  #     _provisioned = "/etc/samba/smb.conf"
+                  #     if os.path.exists(_provisioned): "Already configured. Not joining"
+                  # /etc/samba is its own PVC, so smb.conf survives every restart and the DC
+                  # comes back just as repudiated. No A record and no `drs replicate` fixes a
+                  # dead credential — the guard ran 32 times printing "needs a human".
+                  #
+                  # ⚠ showrepl CANNOT NAME THIS FAULT. To the counting gate in step 1 an
+                  # expelled DC and an unreachable one are identical. Detection must ask the
+                  # DC ACCOUNT SET instead, which is also what keeps a draining or rolling DC
+                  # from tripping it: its account is still there, it just is not answering.
+                  #
+                  # ⚠ READ EACH SURVIVOR'S OWN sam.ldb (-H), never LDAP against the suspect.
+                  # The suspect still answers for itself — that lie IS the signature.
+                  ACCOUNT_CM="ad-dc-account-watch"
+                  SITE_CM="ad-dc-site-reconcile"
+                  dc_accounts() { # $1 = pod -> its view of the DC account set
+                    kubectl exec -n samba-ad "$1" -c samba -- \
+                      ldbsearch -H /var/lib/samba/private/sam.ldb \
+                        -b "OU=Domain Controllers,$(echo "$AD_DOMAIN" | awk -F. '{for(i=1;i<=NF;i++){printf "%sDC=%s",(i>1?",":""),$i}}')" \
+                        "(objectClass=computer)" sAMAccountName 2>/dev/null \
+                      | sed -n 's/^sAMAccountName: //p'
+                  }
+
+                  # Upper-case AD name of a pod, e.g. ad-onprem-0 -> AD-ONPREM-0$
+                  acct_of() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
+
+                  EXPELLED=""
+                  for d in $ONPREM_DCS; do
+                    WANT_ACCT="$(acct_of "$d")\$"
+                    # Condition 1: absent from >=2 survivors (or from ALL when only one).
+                    SURVIVORS=""
+                    for s in $ALL_DCS; do [ "$s" = "$d" ] || SURVIVORS="$SURVIVORS $s"; done
+                    n_sur=0; n_missing=0
+                    for s in $SURVIVORS; do
+                      ACCTS=$(dc_accounts "$s") || continue
+                      # An empty read is a FAILED read (exec died, DC starting), not evidence
+                      # of absence. Skipping it is what stops a restarting survivor voting.
+                      [ -n "$ACCTS" ] || continue
+                      n_sur=$((n_sur + 1))
+                      echo "$ACCTS" | grep -qxF "$WANT_ACCT" || n_missing=$((n_missing + 1))
+                    done
+                    [ "$n_sur" -gt 0 ] || continue
+                    NEED=2; [ "$n_sur" -ge 2 ] || NEED=$n_sur
+                    [ "$n_missing" -ge "$NEED" ] || continue
+
+                    # Condition 3: the suspect is Ready AND still sees its own account.
+                    # "locally present, globally absent" is the signature; a DC that is down,
+                    # crashlooping or mid-rollout fails this and is left entirely alone.
+                    READY=$(kubectl get pod -n samba-ad "$d" \
+                      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+                    [ "$READY" = "True" ] || { echo "0c: $d missing from $n_missing/$n_sur survivors but not Ready — leaving alone."; continue; }
+                    dc_accounts "$d" | grep -qxF "$WANT_ACCT" || { echo "0c: $d missing globally AND locally — not an expulsion, leaving alone."; continue; }
+
+                    # ⚠ NEVER "repair" a DELIBERATE removal. An operator following the
+                    # documented demote produces exactly this signature. An ordinal at or
+                    # above .spec.replicas is being scaled away on purpose.
+                    ORD="${d##*-}"
+                    REPL=$(kubectl get statefulset -n samba-ad ad-onprem -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
+                    if [ "${ORD:-0}" -ge "${REPL:-0}" ]; then
+                      echo "0c: $d is ordinal $ORD >= replicas $REPL — being scaled away, not expelled."
+                      continue
+                    fi
+                    EXPELLED="$EXPELLED $d"
+                  done
+
+                  # Condition 2: >=3 CONSECUTIVE sweeps (>=15 min). Rides out a survivor
+                  # mid-restart and any in-flight replication of a legitimate removal. The
+                  # count must outlive this Job, hence the ConfigMap.
+                  PREV=$(kubectl get configmap -n samba-ad "$ACCOUNT_CM" \
+                    -o jsonpath='{.data.streak}' 2>/dev/null || true)
+                  PREV_DCS=$(kubectl get configmap -n samba-ad "$ACCOUNT_CM" \
+                    -o jsonpath='{.data.dcs}' 2>/dev/null || true)
+                  NOW_DCS=$(echo $EXPELLED)
+                  if [ -n "$NOW_DCS" ] && [ "$NOW_DCS" = "$PREV_DCS" ]; then
+                    STREAK=$(( ${PREV:-0} + 1 ))
+                  elif [ -n "$NOW_DCS" ]; then
+                    STREAK=1
+                  else
+                    STREAK=0
+                  fi
+                  kubectl create configmap -n samba-ad "$ACCOUNT_CM" \
+                    --from-literal=streak="$STREAK" --from-literal=dcs="$NOW_DCS" \
+                    --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+
+                  if [ -n "$NOW_DCS" ]; then
+                    echo "0c: EXPELLED (no domain account):$NOW_DCS  [sweep $STREAK/3]"
+                  fi
+
+                  if [ -n "$NOW_DCS" ] && [ "$STREAK" -ge 3 ]; then
+                    # SAFETY GATE — never take the site's directory to zero. Same rule as
+                    # tests/adFailover.sh refusing below N>=2: a rebuild is minutes of
+                    # downtime for that DC, which is only acceptable while another on-prem
+                    # DC is still serving.
+                    SURVIVING=0
+                    for d in $ONPREM_DCS; do
+                      case " $NOW_DCS " in *" $d "*) continue ;; esac
+                      R=$(kubectl get pod -n samba-ad "$d" \
+                        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+                      [ "$R" = "True" ] && SURVIVING=$((SURVIVING + 1))
+                    done
+                    if [ "$SURVIVING" -lt 1 ]; then
+                      echo "0c: REFUSING to rebuild$NOW_DCS — no other on-prem DC is Ready." >&2
+                      echo "0c: rebuilding now would leave the site with NO serving DC." >&2
+                      exit 1
+                    fi
+
+                    for d in $NOW_DCS; do
+                      NAME=$(acct_of "$d")
+                      echo "0c: rebuilding $d (surviving on-prem DCs: $SURVIVING)"
+
+                      # 1. Metadata cleanup on a survivor. Removes the orphaned NTDS Settings
+                      #    + server object the re-join would otherwise collide with. Treat
+                      #    "already gone" as success — this step is re-entrant.
+                      for s in $ALL_DCS; do
+                        case " $NOW_DCS " in *" $s "*) continue ;; esac
+                        kubectl exec -n samba-ad "$s" -c samba -- sh -c '
+                          PW=$('"$PWCMD"')
+                          samba-tool domain demote \
+                            --remove-other-dead-server="'"$NAME"'" \
+                            -U "Administrator%$PW" 2>&1 | tail -2
+                        ' && break
+                      done
+
+                      # 2. ⚠ BOTH PVCs, or this silently no-ops. samba-config carries
+                      #    /etc/samba/smb.conf — THE join gate — and samba-data carries the
+                      #    repudiated sam.ldb. Deleting only samba-data leaves smb.conf, so
+                      #    sambacc still says "Already configured. Not joining" and the DC
+                      #    returns just as broken with its directory now gone too. Deleting
+                      #    only samba-config leaves a stale sam.ldb the join trips over.
+                      #    The two-PVC split is load-bearing.
+                      for pvc in "samba-config-$d" "samba-data-$d"; do
+                        kubectl delete pvc -n samba-ad "$pvc" --wait=false >/dev/null 2>&1 \
+                          && echo "0c:   deleted pvc $pvc" \
+                          || echo "0c:   WARN: could not delete pvc $pvc"
+                      done
+
+                      # 3. Delete the pod. The StatefulSet recreates it, the PVCs provision
+                      #    empty, _prep_join finds no smb.conf, and --setup=wait-domain,join
+                      #    performs a GENUINE join. No manifest changes, so ArgoCD is not
+                      #    involved — `argocd app sync samba-ad` would roll every DC and can
+                      #    deadlock on the tls.key 0600 CVE check.
+                      kubectl delete pod -n samba-ad "$d" --wait=false >/dev/null 2>&1 \
+                        && echo "0c:   deleted pod $d — StatefulSet will re-join it" \
+                        || echo "0c:   WARN: could not delete pod $d"
+                    done
+
+                    # ⚠ A FRESH JOIN LANDS IN WHATEVER SITE ITS SUBNET SAYS, and nothing
+                    # else here corrects it. Site membership is fixed AT JOIN TIME, so a
+                    # rebuilt DC can land in the cloud site: replication still converges and
+                    # nothing looks broken, but its site-scoped SRV records are published
+                    # under the WRONG site, which is invisible until a lab client picks a DC
+                    # across the WAN. Measured 2026-09-15 on the ad-onprem-0 rebuild.
+                    #
+                    # sites-job.yaml owns that reconcile and is idempotent. It is a SUSPENDED
+                    # CronJob template precisely so it can be started from here — a pod-level
+                    # rebuild triggers no ArgoCD sync, so its Sync-hook runner never fires.
+                    #
+                    # Marked for a LATER sweep, not run now: the server object does not exist
+                    # until the join completes, which is minutes away.
+                    kubectl create configmap -n samba-ad "$SITE_CM" \
+                      --from-literal=pending="$NOW_DCS" \
+                      --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+
+                    # Streak consumed: the next sweep must re-observe the fault from scratch
+                    # rather than immediately rebuilding again while the join is in flight.
+                    kubectl create configmap -n samba-ad "$ACCOUNT_CM" \
+                      --from-literal=streak=0 --from-literal=dcs="" \
+                      --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+
+                    # A join takes minutes. Exit 0 and let the NEXT sweep verify: steps 1-4
+                    # already assert exactly the end state ("5 NCs, zero failures") and will
+                    # fail loudly if the rebuild did not take. Blocking here would burn the
+                    # activeDeadline and Forbid the next run.
+                    echo "0c: rebuild dispatched — next sweep verifies replication."
+                    exit 0
+                  fi
+
+                  # --- 0d. site placement for a DC this guard rebuilt ------------------
+                  # Consumes the marker step 0c leaves, once the rebuilt DC is Ready — its
+                  # server object does not exist in the directory until the join completes.
+                  #
+                  # ⚠ NO LOGIC HERE, DELIBERATELY. This starts sites-job.yaml's template and
+                  # nothing more. An earlier attempt inlined the reconcile's Python into this
+                  # block scalar and had to be reverted: the script is emitted inside a YAML
+                  # block scalar AND a shell single-quoted string, so every heredoc body line
+                  # carries the block's indentation while Python demands column 0. That fails
+                  # at runtime with IndentationError and passes `sh -n` silently. Keep the one
+                  # copy of the reconcile in sites-job.yaml, where its own Sync hook runs it.
+                  if [ -n "$(kubectl get configmap -n samba-ad "$SITE_CM" \
+                       -o jsonpath='{.data.pending}' 2>/dev/null || true)" ]; then
+                    SITE_DCS=$(kubectl get configmap -n samba-ad "$SITE_CM" \
+                      -o jsonpath='{.data.pending}' 2>/dev/null)
+                    SITE_READY=1
+                    for d in $SITE_DCS; do
+                      R=$(kubectl get pod -n samba-ad "$d" \
+                        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+                      [ "$R" = "True" ] || SITE_READY=0
+                    done
+                    if [ "$SITE_READY" = "1" ]; then
+                      RUN="samba-ad-sites-guard-$(date +%s)"
+                      echo "0d: rebuilt DC(s) Ready:$SITE_DCS — starting $RUN to reconcile site placement"
+                      if kubectl -n samba-ad create job "$RUN" \
+                           --from=cronjob/samba-ad-sites >/dev/null 2>&1 \
+                         && kubectl -n samba-ad wait --for=condition=complete \
+                              "job/$RUN" --timeout=600s >/dev/null 2>&1; then
+                        kubectl -n samba-ad logs "job/$RUN" 2>/dev/null \
+                          | grep -E "MOVING|already in site|moved," | sed 's/^/0d:   /' || true
+                        # Cleared only on success: a failed run must be retried next sweep,
+                        # not silently forgotten.
+                        kubectl delete configmap -n samba-ad "$SITE_CM" >/dev/null 2>&1 || true
+                        echo "0d: site placement reconciled."
+                      else
+                        echo "0d: WARN: $RUN did not complete — retrying next sweep." >&2
+                        echo "0d:   logs: kubectl -n samba-ad logs job/$RUN" >&2
+                      fi
+                    else
+                      echo "0d: site reconcile pending:$SITE_DCS (not Ready yet)"
+                    fi
+                  fi
+
+                  # --- 1. the CHEAP gate ----------------------------------------------
+                  # Read the pull-side state from each DC. WHAT showrepl REPORTS, because the
+                  # obvious reading is wrong in both directions: samba tracks the PULL side,
+                  # so with 2 DCs x 5 partitions the healthy steady state is ASYMMETRIC and
+                  # NEITHER DC EVER REPORTS 10 —
+                  #   ad-cloud-0 : 0 inbound, 5 outbound
+                  #   ad-onprem-0: 5 inbound, 0 outbound
+                  #
+                  # ⚠ AND THE "5 + 5 = 10" TOTAL DOES NOT GENERALISE — do not restore it. It
+                  # is arithmetic for exactly two DCs. With several on-prem DCs the KCC also
+                  # builds intra-site agreements among them and picks one bridgehead per site,
+                  # so any fixed total is a number that happens to be right today. The
+                  # topology-independent invariant is asserted instead: every on-prem DC pulls
+                  # all FIVE naming contexts, and the cloud DC serves all five. Same rule as
+                  # replication-job.yaml — keep the two in step.
+                  side() { # $1 = pod, $2 = INBOUND|OUTBOUND
+                    # ⚠ $1 == "0", NOT /0 consecutive failure/. The count line is indented
+                    # with TABS, and as a bare substring the pattern also matches "10"/"20"
+                    # consecutive failures — counting a badly broken partition as healthy.
+                    # Keep in step with replication-job.yaml.
+                    kubectl exec -n samba-ad "$1" -c samba -- \
+                      samba-tool drs showrepl 2>/dev/null \
+                      | awk -v want="$2" '
+                          /^==== .* NEIGHBORS ====/ { sec = ($2 == want); next }
+                          /^==== /                  { sec = 0; next }
+                          sec && /consecutive failure/ && $1 == "0" { n++ }
+                          END { print n + 0 }'
+                  }
+
+                  healthy() {
+                    ok=0
+                    C=$(side "$CLOUD_DC" OUTBOUND)
+                    echo "replication: $CLOUD_DC outbound=$C/5"
+                    [ "${C:-0}" -ge 5 ] || ok=1
+                    for d in $ONPREM_DCS; do
+                      O=$(side "$d" INBOUND)
+                      echo "             $d inbound=$O/5"
+                      [ "${O:-0}" -ge 5 ] || ok=1
+                    done
+                    return $ok
+                  }
+
+                  if healthy; then
+                    echo "OK: every DC has all 5 naming contexts — nothing to do."
+                    exit 0
+                  fi
+
+                  # --- 2. degraded: report, and reconcile the A records ----------------
+                  # The single most common cause, and the one that does NOT self-heal: the
+                  # on-prem DC is hostNetwork, samba_dnsupdate only ever ADDS, and a node
+                  # reprovision leaves stale A records (an old mesh IP, a dead pod's CNI
+                  # address) that the cloud DC then dials and stalls on. The live hostIP may
+                  # not be registered at all. Reconcile to exactly one record: the live one.
+                  echo
+                  echo "DEGRADED — reconciling every on-prem DC's A records to its live hostIP."
+                  kubectl get pods -n samba-ad -l dc=onprem \
+                    -o jsonpath='{range .items[*]}{.metadata.name} {.status.hostIP}{"\n"}{end}' \
+                    2>/dev/null | awk 'NF==2' > /tmp/onprem-ips || true
+                  if [ ! -s /tmp/onprem-ips ]; then
+                    echo "ERROR: no on-prem DC has a hostIP — refusing to touch DNS." >&2
+                    exit 1
+                  fi
+
+                  # Each DC is repaired against its OWN 127.0.0.1, never via replication: the
+                  # record is what MAKES replication work, so relying on replication to carry
+                  # the correction deadlocks.
+                  while read -r NAME WANT; do
+                   echo "  == $NAME -> $WANT"
+                   for dc in $ALL_DCS; do
+                    echo "  -- on $dc"
+                    kubectl exec -n samba-ad "$dc" -c samba -- sh -c '
+                      set -eu
+                      PW=$('"$PWCMD"')
+                      U="Administrator%$PW"
+                      DOM="'"$AD_DOMAIN"'"; NAME="'"$NAME"'"; WANT="'"$WANT"'"
+                      have=$(samba-tool dns query 127.0.0.1 "$DOM" "$NAME" A -U "$U" 2>/dev/null \
+                             | sed -n "s/.*A: \([0-9.]*\).*/\1/p")
+                      # ASSERT FIRST, then prune. A prune-first pass would have to refuse
+                      # outright when the correct record is absent entirely — which happens —
+                      # and it would leave the name unresolvable in between.
+                      case " $have " in
+                        *" $WANT "*) echo "     current A $WANT present" ;;
+                        *) samba-tool dns add 127.0.0.1 "$DOM" "$NAME" A "$WANT" -U "$U" >/dev/null 2>&1 \
+                             && echo "     ADDED current A $WANT" \
+                             || echo "     WARN: could not add $WANT" ;;
+                      esac
+                      for a in $have; do
+                        [ "$a" = "$WANT" ] && continue
+                        samba-tool dns delete 127.0.0.1 "$DOM" "$NAME" A "$a" -U "$U" >/dev/null 2>&1 \
+                          && echo "     deleted stale A $a" \
+                          || echo "     WARN: could not delete $a"
+                      done
+                    ' || echo "     WARN: repair pass failed on $dc"
+                   done
+                  done < /tmp/onprem-ips
+
+                  # --- 3. force the partitions ----------------------------------------
+                  # Forced, not waited on: once the DCs are in different AD sites the default
+                  # inter-site interval is 180 min, so waiting for the schedule would blow the
+                  # deadline. `drs replicate` takes "<destination> <source> <NC>", and the
+                  # SOURCE must be the DC's real AD name (samba-tool resolves it in the
+                  # directory; a cluster DNS name fails "Failed to find source DC").
+                  echo
+                  echo "forcing all 5 partitions, cloud <-> each on-prem DC..."
+                  # ⚠ Only the cloud<->on-prem pairs, not the full mesh: those are the ones
+                  # crossing the slow inter-site link. On-prem DCs share a site, where the
+                  # interval is seconds and the KCC converges them without help.
+                  for OPDC in $ONPREM_DCS; do
+                   kubectl exec -n samba-ad "$CLOUD_DC" -c samba -- sh -c '
+                    PW=$('"$PWCMD"')
+                    U="Administrator%$PW"
+                    DOM="'"$AD_DOMAIN"'"
+                    BASE=$(echo "$DOM" | awk -F. "{for(i=1;i<=NF;i++){printf \"%sdc=%s\",(i>1?\",\":\"\"),\$i}}")
+                    CL="'"$CLOUD_DC"'.$DOM"; OP="'"$OPDC"'.$DOM"
+                    for nc in "CN=Schema,CN=Configuration,$BASE" "CN=Configuration,$BASE" "$BASE" \
+                              "DC=DomainDnsZones,$BASE" "DC=ForestDnsZones,$BASE"; do
+                      samba-tool drs replicate "$CL" "$OP" "$nc" -U "$U" >/dev/null 2>&1 \
+                        && echo "  ok: $OP -> $CL  ${nc%%,*}" || echo "  FAILED: $OP -> $CL  ${nc%%,*}"
+                    done
+                   ' || true
+                  done
+
+                  # --- 4. re-read, and FAIL if still broken ---------------------------
+                  # Exiting 0 on an unrepaired domain would make this guard worse than
+                  # nothing: a green CronJob asserting a broken directory. A failed Job is
+                  # visible in `kubectl get jobs` and in the ArgoCD UI.
+                  sleep 10
+                  echo
+                  echo "after repair:"
+                  if healthy; then
+                    echo "REPAIRED: every DC has all 5 naming contexts."
+                    exit 0
+                  fi
+                  echo "STILL DEGRADED after repair — needs a human." >&2
+                  echo "  Check: mesh link up? Is each on-prem node reachable on tcp/389" >&2
+                  echo "  from the cloud DC at its MESH address (not its LAN one — the cloud" >&2
+                  echo "  side deliberately has no route to the lab LAN)?" >&2
+                  awk '{print "    " $1 " -> " $2}' /tmp/onprem-ips >&2 || true
+                  echo "  Do NOT 'fix' this with 'argocd app sync samba-ad': that rolls every" >&2
+                  echo "  DC and can deadlock on the tls.key 0600 CVE check." >&2
+                  exit 1

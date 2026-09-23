@@ -1,0 +1,106 @@
+# Layer 1 of the image-registry boundary, rebuilt: WHO MAY WRITE, not just who may connect.
+#
+# ⚠ WHY THIS EXISTS AT ALL. `registry:3`'s htpasswd backend authenticates but does NOT
+# authorise — distribution's own docs say the htpasswd backend has no notion of
+# authorization, so every account that can log in can PUSH. One credential therefore had to
+# be shared by the CI (which pushes) and the remote-desktop broker (which only pulls), and
+# that same push-capable credential was mounted into a multi-user LDAP desktop. Since the
+# broker runs what it pulls AS ROOT, publish rights are root-execution rights: any user with
+# a shell on the desktop could overwrite a module tag and own the next `module load`.
+#
+# nginx sits in front and does authn *and* authz: it owns the htpasswd file, so it knows
+# WHICH account is calling, and refuses anything but GET/HEAD for the read-only one. The
+# registry itself then listens on loopback with no auth of its own — it is unreachable
+# except through this container.
+#
+# MEASURED 2026-09-02, with this exact config against registry:3.1.1 in a scratch namespace:
+#
+#   anonymous GET /v2/              401
+#   eda-pull  GET /v2/              200
+#   eda-pull  POST blobs/uploads/   405   <- the authorisation the registry cannot express
+#   eda-push  POST blobs/uploads/   202
+#   eda-push  PUT 5 GiB blob        201, 34s, ~156 MB/s
+#   eda-pull  GET that blob back    digest matches byte for byte
+#   nginx /tmp/proxy, /tmp/client_body   4 KiB each — nothing was buffered to disk
+#
+# The upload Location came back RELATIVE (`/v2/.../uploads/<uuid>?_state=…`), which is what
+# REGISTRY_HTTP_RELATIVEURLS buys: without it the client is redirected to 127.0.0.1:5100 and
+# the push dies on the second request against a host that is not the one it dialled.
+#
+# ⚠ DO NOT "SIMPLIFY" THIS BY GIVING THE REGISTRY BACK ITS OWN htpasswd. That is exactly
+# the arrangement this replaces, and it looks identical from the outside: pulls work, pushes
+# work, and the read-only account silently regains write access.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: image-registry-authz
+  namespace: image-registry
+data:
+  nginx.conf: |
+    worker_processes  auto;
+    error_log         /dev/stderr warn;
+    pid               /tmp/nginx.pid;
+
+    events { worker_connections 1024; }
+
+    http {
+      access_log /dev/stdout combined;
+      # nginx needs writable temp paths, and the root filesystem is read-only.
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path       /tmp/proxy;
+      fastcgi_temp_path     /tmp/fastcgi;
+      uwsgi_temp_path       /tmp/uwsgi;
+      scgi_temp_path        /tmp/scgi;
+
+      # ⚠ ORDER MATTERS: nginx tries exact matches first, then REGEXES IN DEFINITION ORDER.
+      # The two read verbs must therefore be listed before the catch-all deny.
+      map "$remote_user:$request_method" $forbid_write {
+        default            0;
+        "~^eda-pull:GET$"  0;
+        "~^eda-pull:HEAD$" 0;
+        "~^eda-pull:"      1;
+      }
+
+      server {
+        listen 5000 ssl;
+        http2  on;
+
+        ssl_certificate     /tls/tls.crt;
+        ssl_certificate_key /tls/tls.key;
+
+        # ⚠ 0 = UNLIMITED, and it is load-bearing. EDA module images are 20–40 GB and a
+        # single blob PUT can be most of that; any cap here truncates a push mid-blob and
+        # the client reports a connection error, not a size error.
+        client_max_body_size 0;
+
+        auth_basic           "image-registry";
+        auth_basic_user_file /auth/htpasswd;
+
+        location / {
+          if ($forbid_write) {
+            # 405, not 403: it is the METHOD that is refused for this account, and clients
+            # surface it as "unsupported" rather than "bad credentials", which is the
+            # distinction someone debugging a failed push actually needs.
+            return 405;
+          }
+
+          proxy_pass http://127.0.0.1:5100;
+          proxy_set_header Host              $http_host;
+          proxy_set_header X-Real-IP         $remote_addr;
+          proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto https;
+
+          # ⚠ STREAM, DO NOT BUFFER. With request buffering on, nginx spools each blob to
+          # disk before forwarding — on a 40 GB layer that means filling the container's
+          # /tmp and adding a full extra write pass to every push.
+          proxy_request_buffering  off;
+          proxy_buffering          off;
+          proxy_http_version       1.1;
+
+          # A multi-GB blob over the LAN takes minutes; nginx's 60s default would cut it.
+          proxy_read_timeout    3600s;
+          proxy_send_timeout    3600s;
+          proxy_connect_timeout 10s;
+        }
+      }
+    }

@@ -1,0 +1,16 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: xwiki-pg-user
+  namespace: xwiki
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  encryptedData:
+    password: AgCZqRADP7mwgJ7wuLCc8ReErHKSpYO246/JdkLaTMQ1pBcKFWVam9bZQ19TZsNNuNUcUeng2ZGWsaQUVo+1Mk8XatC3yP88fQ22Ee+7t2cg/kPDOLGukd7U9nmHnZQr1a847oxA2TktVGF+4NYq8IVbPcjjC3koamPykgnsvjhrIX+B1TO7AldU5dXoGaGuVAQAznZKB8Sf06M7a91OzR58y3rKEtn0NfjtnKlfgZ/SXlvLbeM3jjK8rTmFDcP73/YQFpyl5aBYwN/c0A18bssXbX2YSeyvZ/BXjumex0Vq1kqa2jfgQ8E81dxAOahub1o0Ifa0FOEFks1B7KIHzo62VgLvQwBytGEHbZABSxQ5lUceSrFzsp5pOnwrZHlDXo3nR1+02MH2W+8DmNy1fsx5i6GLWfTeC6jd8jBpEUHf3pC/NbHEd16kYp8CDzmEv6nVSi8RTdLpyz3cbO+hts5HVbSC22L9cTs0k87tSRBnxyy7qGm5rZAy3xVTkCi40FyzvFneGjeqyPmLqs3SLHOKrjddShTwIhlrBAl9/dVmtJXKlEGD3pV1Yp6BZeIzg2DF6ORKPFcwPevFOjWhFOgubY29oMgVajngGhp/6iFAsOK5VbZ8uyPRKhU0e7wgVyMs6iY5IQrQ+WiU8LgLeLOMN731YQCbTXOnQ/kHzlrd3v0ipviFYuuJZUi/a6UzMAXukZ7nFai9qLQvy5WHLI8IJqsE27qAKQtWhk2byZv1e+5KoS3CKUyDqFkhgqHf2X4=
+    username: ""
+  template:
+    metadata:
+      name: xwiki-pg-user
+      namespace: xwiki

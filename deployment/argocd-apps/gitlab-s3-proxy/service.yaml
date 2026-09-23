@@ -1,0 +1,29 @@
+# ⚠ THE SERVICE NAME IS PART OF THE CONFIGURATION, NOT AN IMPLEMENTATION DETAIL.
+#
+# `gitlab-s3-proxy.gitlab-s3-proxy.svc.cluster.local:30304` is the `endpoint` GitLab signs
+# its SigV4 requests against, and it must appear as a SAN on the appliance's certificate
+# (TLS is passed through, not terminated here — see README.md). Renaming this Service or its
+# namespace invalidates both, and the symptom is a TLS name mismatch that reads like a
+# certificate problem rather than a rename.
+#
+# ClusterIP only. It is reached over the pod network from cloud pods; no Gateway is involved
+# and it must not get an HTTPRoute — the appliance's certificate is not publicly verifiable,
+# and a public listener in front of an object store holding CI artifacts is a separate
+# decision with its own prerequisites.
+#
+# The port is deliberately the SAME on both sides (30304, the TrueNAS SeaweedFS app's
+# published S3 port) so the endpoint URL reads identically whether you are looking at the
+# GitLab connection secret, this Service, or the appliance.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab-s3-proxy
+  namespace: gitlab-s3-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: gitlab-s3-proxy
+  ports:
+    - name: s3
+      port: 30304
+      targetPort: 30304

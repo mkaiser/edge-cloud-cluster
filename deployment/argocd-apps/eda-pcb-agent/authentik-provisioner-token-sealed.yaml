@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: authentik-provisioner-token
+  namespace: eda-pcb-agent
+spec:
+  encryptedData:
+    token: AgBSNlpmY2FLx7Ic0uMxX9NAt2ALG6jO7zu8yOq0gBHC8MQJXA0kOD5PM+RSPIOkYflo8Mp5gnFGVhb8di3xlwbvdTs/npTbfvSv91vbSXfGObSiZ5f1OHw/JMRMfbM1bR+1/50br1UamG+SDx2VzQ5G21b/IJTkZO6Fw5moRhVQr6Po4uXOmpZ0j9MFSSybA771eFE0W0UtR5ugtPTVkGvN2kTDx9ox+EK/3XGZLNgHdfkFt+bNqfv/WXClwV6o2DKBY/kV5syQxRD1TnnIdikTFMTlHade13FeR7INv/E+j5yKVzVKBGQ5H/nl9rXagvsrcAkqRPnBv+O1uBETdccaR3MHVWQ5X2PG3p4oD/2nalDOZkNiGLK5PjBEBV3CIgzOwMJdM3ZJ+bN7ZbR7bbbHGTIU5Gh984QyUwiympm1j79Nah02DI9b+bWfEC6Ea4oJYjLspjn47ZvIeG2FKFhjEwRxOxw3TnaiyrObw3ea+dDgnwAFIRh3+3wcu4NXzh8FzDWvDaCS37OPMNbc90z8ldI0vfuC6EA4AkndsdbJlGqmSCAXGSECFjMnRGVrDo0DGqmwP3v2z47DLCAtmdOVpjYO6kGYlYHCJLHbhwsd+8Pj3eMijcNih4G340iWBPY9CC/EpenPW6S3SxHa3TV2ZvMqSJU0Yn5rvoFmGlgMD2pme2oqeBDnfj6zbxX9l6EVKTk18X3HOSRA8bdjLQPywicJ2dqLwJEOz4Rw7JqcCZNX8IggC1swDFAkVx+ZB4sAx9h7uidB/XQNCCHrgkKWj+MVsWA9y1K7M7ICzr5yaoJn07cax0QXGRLcMAI9SROEVSmWm5TXaEW8wAFmqQyizD+uRUr+QfU=
+  template:
+    metadata:
+      name: authentik-provisioner-token
+      namespace: eda-pcb-agent

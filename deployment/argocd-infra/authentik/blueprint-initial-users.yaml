@@ -1,0 +1,101 @@
+# Authentik blueprint: test users.
+# Creates testadmin and testuser with their PASSWORDS (group membership is reconciled
+# separately — see below).
+#
+# ⚠ THE PASSWORD MUST BE SET HERE, NOT VIA THE API. On Authentik 2026.5 a blueprint is the
+# ONLY supported way to write a user password. Two things rule the API path out:
+#   1. `POST /api/v3/core/users/<pk>/set_password/` DOES NOT EXIST -> HTTP 405. The user
+#      viewset's only remaining url_path is `me` (authentik/core/api/users.py).
+#   2. The serializer adds the `password` / `password_hash` fields ONLY inside blueprint
+#      context — verbatim: "Setting password and permissions directly is allowed only in
+#      blueprints" (users.py:198-207, gated on SERIALIZER_CONTEXT_BLUEPRINT), and
+#      create()/update() likewise apply them only when that context is present.
+# A PostSync job doing this dies on the 405 after the first user, leaving every user with
+# NO USABLE password.
+#
+# ⚠ HOW THAT FAILURE PRESENTS, because it does not look like a password problem at all:
+# `id testuser` resolves with the correct uid and groups, the LDAP outpost logs a successful
+# bind ("authenticated from session"), and every pod is Healthy — while PAM returns
+# "Authentication failure" for the right password. `has_usable_password()` in `ak shell` is
+# the one-step check that settles it — it returns False.
+#
+# ⚠ Do NOT try to repair it by hand with `u.set_password(...); u.save()` from `ak shell`:
+# the post-save signal performs LDAP password write-back to the Samba DC
+# (authentik-blueprint-ad-source.yaml, sync_users_password: true) and dies with
+# `LDAPExtensionError: extension not in DSA list of supported extensions`. The blueprint path
+# avoids the manual save entirely.
+#
+# Values come from the `authentik-secrets` sealed secret, which the chart injects into EVERY
+# pod via global.envFrom (values.yaml) — so the worker that applies this blueprint already
+# has CLUSTER_ADMIN_PASSWORD / TEST_USER_PASSWORD in its environment, and !Env reads them at
+# apply time. The plaintext therefore never appears in git.
+#
+# Emails move here too, for the same reason: they were the OTHER thing
+# postsync-set-passwords.yaml did, and that Job is now retired (it cannot complete on this
+# version — it dies on the 405 before reaching the second user). Same !Env source.
+#
+# ⚠ GROUP MEMBERSHIP IS NOT SET HERE — it is reconciled by seed-user-group-sync.yaml
+# (CronJob, every 5 min) from each group's `ecc/seed` attribute:
+#   ecc/seed: all         → both seed users      (employees, mfa-exempt, and every
+#                           per-app ACCESS group: jitsi, zulip, ai, remote-desktop-users,
+#                           windows-users, ryax, …)
+#   ecc/seed: admin-only  → testadmin only       (authentik-admins, employees-extended,
+#                           argocd-admins, xwiki-oidc-admins, gitlab-admins, rocketchat-admins)
+#   ecc/seed: none        → neither              (external, service-account groups)
+# An UNLABELLED group is never synced and is logged as a WARN by that CronJob — that
+# warning is the signal a newly added app still needs its label.
+#
+# Why membership moved out, and why a `groups:` list here is actively DANGEROUS:
+# it required naming every app centrally (defeating per-app ownership), and each entry
+# was a `!Find`. !Find returns None on a miss (blueprints/v1/common.py Find.resolve) —
+# it does NOT raise. A None in the groups list is rejected by the users serializer's
+# PrimaryKeyRelatedField, which invalidates the WHOLE ENTRY, so the importer skips it
+# — INCLUDING THE PASSWORD ABOVE. One group not yet created (a later sync-wave, a
+# disabled app) therefore silently left the seed accounts with no usable password,
+# presenting exactly as the failure described above. Omitting `groups:` is safe:
+# the importer applies existing objects with partial=True, so a field that is absent
+# is left untouched rather than reset.
+#
+# NOTE: both bootstrap users get `mfa-exempt` (via ecc/seed: all) so they skip forced
+# MFA while you test. Relabel that group or delete the users once real accounts exist.
+#
+# NOTE: state is the default `present`, so name/email/PASSWORD are re-asserted on every
+# apply — that is what makes a fresh cluster get a working login with no manual step.
+# It also means a password changed in the UI is reverted on the next apply. Fine for
+# throwaway test accounts; never use these two entries as a template for real users.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authentik-blueprint-initial-users
+  namespace: authentik
+  labels:
+    goauthentik.io/blueprint: "true"
+data:
+  test-users.yaml: |
+    version: 1
+    metadata:
+      name: test-users
+    entries:
+      - model: authentik_core.user
+        identifiers:
+          username: !Env CLUSTER_ADMIN_USERNAME
+        attrs:
+          name: Cluster Admin
+          is_active: true
+          path: users
+          # !Env, never a literal — see the header. Re-applied on every blueprint run, which
+          # is what makes a fresh cluster get a working login with no manual step.
+          password: !Env CLUSTER_ADMIN_PASSWORD
+          email: !Env CLUSTER_ADMIN_EMAIL
+          # No `groups:` — see the header. Membership is reconciled by
+          # seed-user-group-sync.yaml; listing it here would reset it on every apply.
+      - model: authentik_core.user
+        identifiers:
+          username: !Env TEST_USER_USERNAME
+        attrs:
+          name: Test User
+          is_active: true
+          path: users
+          password: !Env TEST_USER_PASSWORD
+          email: !Env TEST_USER_EMAIL
+          # No `groups:` — see the header (same reasoning as testadmin above).
